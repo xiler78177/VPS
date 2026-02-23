@@ -4823,8 +4823,14 @@ WGCONF_EOF
         print_info "部署反向 SSH 密钥 (新节点→本机)..."
         local remote_pubkey
         remote_pubkey=$(ssh $ssh_opts "$ssh_target" '
+            mkdir -p ~/.ssh && chmod 700 ~/.ssh
             if [ ! -f ~/.ssh/id_ed25519.pub ] && [ ! -f ~/.ssh/id_rsa.pub ]; then
-                ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -q 2>/dev/null
+                if command -v ssh-keygen >/dev/null 2>&1; then
+                    ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -q 2>/dev/null
+                elif command -v dropbearkey >/dev/null 2>&1; then
+                    dropbearkey -t ed25519 -f ~/.ssh/id_dropbear 2>/dev/null
+                    dropbearkey -y -f ~/.ssh/id_dropbear 2>/dev/null | grep "^ssh-" > ~/.ssh/id_ed25519.pub
+                fi
             fi
             cat ~/.ssh/id_ed25519.pub 2>/dev/null || cat ~/.ssh/id_rsa.pub 2>/dev/null
         ' 2>/dev/null)
@@ -5454,7 +5460,7 @@ wg_cluster_mesh_setup() {
             # 检测远程节点系统类型
             local remote_mesh_os=""
             remote_mesh_os=$(ssh $ssh_opts "$ssh_target" '
-                if [ -f /etc/os-release ]; then . /etc/os-release; echo "$ID"; elif [ -f /etc/openwrt_release ]; then echo "openwrt"; else echo "unknown"; fi
+                if [ -f /etc/openwrt_release ]; then echo "openwrt"; elif [ -f /etc/os-release ]; then . /etc/os-release; echo "$ID"; else echo "unknown"; fi
             ' 2>/dev/null)
 
             if [[ "$remote_mesh_os" == "openwrt" ]]; then
