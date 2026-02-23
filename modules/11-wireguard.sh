@@ -1623,6 +1623,7 @@ WGCONF_EOF
                 local local_mesh_data=$(wg_db_get '.cluster.mesh // null')
                 backup_db_content=$(jq -n \
                     --arg role "server" \
+                    --arg sname "$name" \
                     --arg privkey "$target_privkey" \
                     --arg pubkey "$node_pubkey_sync" \
                     --arg subnet "$server_subnet" \
@@ -1637,6 +1638,7 @@ WGCONF_EOF
                     '{
                         role: $role,
                         server: {
+                            name: $sname,
                             private_key: $privkey,
                             public_key: $pubkey,
                             subnet: $subnet,
@@ -4705,6 +4707,7 @@ WGCONF_EOF
     local local_mesh_data_deploy=$(wg_db_get '.cluster.mesh // null')
     backup_db_content=$(jq -n \
         --arg role "server" \
+        --arg sname "$node_name" \
         --arg privkey "$node_privkey" \
         --arg pubkey "$node_pubkey" \
         --arg subnet "$server_subnet" \
@@ -4719,6 +4722,7 @@ WGCONF_EOF
         '{
             role: $role,
             server: {
+                name: $sname,
                 private_key: $privkey,
                 public_key: $pubkey,
                 subnet: $subnet,
