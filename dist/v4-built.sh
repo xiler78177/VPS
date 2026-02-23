@@ -5793,6 +5793,7 @@ WGCONF_EOF
                 target_cluster_nodes=$(echo "$target_cluster_nodes" | jq --argjson me "$my_node_json" '. + [$me]')
 
                 local backup_db_content
+                local local_mesh_data=$(wg_db_get '.cluster.mesh // null')
                 backup_db_content=$(jq -n \
                     --arg role "server" \
                     --arg privkey "$target_privkey" \
@@ -5805,6 +5806,7 @@ WGCONF_EOF
                     --argjson peers "$(wg_db_get '.peers')" \
                     --argjson pf "$(wg_db_get '.port_forwards // []')" \
                     --argjson cluster_nodes "$target_cluster_nodes" \
+                    --argjson mesh_data "${local_mesh_data:-null}" \
                     '{
                         role: $role,
                         server: {
@@ -5822,7 +5824,7 @@ WGCONF_EOF
                             enabled: true,
                             nodes: $cluster_nodes
                         }
-                    }')
+                    } | if $mesh_data != null then .cluster.mesh = $mesh_data else . end')
                 local tmp_db=$(mktemp)
                 echo "$backup_db_content" > "$tmp_db"
                 ssh $ssh_opts "${ssh_user}@${ssh_host}" "mkdir -p /etc/wireguard/db" 2>/dev/null || true
@@ -8873,6 +8875,7 @@ WGCONF_EOF
     new_node_cluster_nodes=$(echo "$existing_nodes" | jq --argjson me "$my_node_json" '. + [$me]')
 
     local backup_db_content
+    local local_mesh_data_deploy=$(wg_db_get '.cluster.mesh // null')
     backup_db_content=$(jq -n \
         --arg role "server" \
         --arg privkey "$node_privkey" \
@@ -8885,6 +8888,7 @@ WGCONF_EOF
         --argjson peers "$(wg_db_get '.peers // []')" \
         --argjson pf "$(wg_db_get '.port_forwards // []')" \
         --argjson cluster_nodes "$new_node_cluster_nodes" \
+        --argjson mesh_data "${local_mesh_data_deploy:-null}" \
         '{
             role: $role,
             server: {
@@ -8902,7 +8906,7 @@ WGCONF_EOF
                 enabled: true,
                 nodes: $cluster_nodes
             }
-        }')
+        } | if $mesh_data != null then .cluster.mesh = $mesh_data else . end')
 
     local tmp_db=$(mktemp)
     echo "$backup_db_content" > "$tmp_db"
@@ -8983,6 +8987,28 @@ WGCONF_EOF
             print_success "数据库已初始化 (节点可独立管理)"
         else
             print_warn "数据库上传失败 (不影响运行，但节点脚本管理功能受限)"
+        fi
+        # 反向 SSH 密钥部署：让新节点能免密 SSH 回本机和其他节点
+        print_info "部署反向 SSH 密钥 (新节点→本机)..."
+        local remote_pubkey
+        remote_pubkey=$(ssh $ssh_opts "$ssh_target" '
+            if [ ! -f ~/.ssh/id_ed25519.pub ] && [ ! -f ~/.ssh/id_rsa.pub ]; then
+                ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -q 2>/dev/null
+            fi
+            cat ~/.ssh/id_ed25519.pub 2>/dev/null || cat ~/.ssh/id_rsa.pub 2>/dev/null
+        ' 2>/dev/null)
+        if [[ -n "$remote_pubkey" ]]; then
+            # 部署到本机
+            mkdir -p ~/.ssh && chmod 700 ~/.ssh
+            touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
+            if ! grep -qF "$remote_pubkey" ~/.ssh/authorized_keys 2>/dev/null; then
+                echo "$remote_pubkey" >> ~/.ssh/authorized_keys
+                print_success "反向 SSH 密钥已部署到本机"
+            else
+                print_success "反向 SSH 密钥已存在于本机"
+            fi
+        else
+            print_warn "获取新节点 SSH 公钥失败 (仪表盘可能显示'无密钥'，可手动配置)"
         fi
     else
         print_error "WireGuard 启动失败"
@@ -9737,6 +9763,31 @@ uci set network.${msection}.route_allowed_ips='1'
     done
     log_action "WG mesh deployed: ${total} nodes, $((total * (total - 1) / 2)) links"
 
+    # 同步 mesh 数据到所有远程节点的数据库
+    print_info "同步 Mesh 数据到远程节点..."
+    idx=1
+    while [[ $idx -lt $total ]]; do
+        local _cm_sock="${cm_sockets[$idx]}"
+        local ssh_opts
+        if [[ -n "$_cm_sock" ]]; then
+            ssh_opts="-o ControlPath=${_cm_sock} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -p ${node_ssh_ports[$idx]}"
+        else
+            ssh_opts=$(wg_ssh_opts "${node_ssh_ports[$idx]}")
+        fi
+        local ssh_target="${node_ssh_users[$idx]}@${node_ssh_hosts[$idx]}"
+        local escaped_mesh_json=$(echo "$mesh_json" | sed "s/'/'\\\\''/g")
+        ssh $ssh_opts "$ssh_target" "
+            if [ -f /etc/wireguard/db/wg-data.json ]; then
+                local_tmp=\$(mktemp /etc/wireguard/db/.tmp.XXXXXX)
+                jq --argjson mesh '${escaped_mesh_json}' '.cluster.mesh = \$mesh' /etc/wireguard/db/wg-data.json > \"\$local_tmp\" 2>/dev/null && \
+                    mv \"\$local_tmp\" /etc/wireguard/db/wg-data.json && \
+                    chmod 600 /etc/wireguard/db/wg-data.json
+            fi
+        " 2>/dev/null && print_success "  ${node_names[$idx]}: Mesh 数据已同步" || \
+            print_warn "  ${node_names[$idx]}: Mesh 数据同步失败"
+        idx=$((idx+1))
+    done
+
     # 自动部署 Mesh 看门狗（默认安装，保障 Mesh 稳定性）
     echo ""
     wg_mesh_watchdog_setup "true"
@@ -9792,6 +9843,13 @@ wg_cluster_mesh_teardown() {
             systemctl disable wg-quick@${mesh_iface} 2>/dev/null || true
             rm -f /etc/wireguard/${mesh_iface}.conf
             command -v ufw >/dev/null 2>&1 && ufw delete allow ${node_mesh_port}/udp 2>/dev/null || true
+            # 重置远程节点 mesh 数据库
+            if [ -f /etc/wireguard/db/wg-data.json ]; then
+                _tmp=\$(mktemp /etc/wireguard/db/.tmp.XXXXXX)
+                jq '.cluster.mesh = {\"enabled\": false, \"peers\": []}' /etc/wireguard/db/wg-data.json > \"\$_tmp\" 2>/dev/null && \
+                    mv \"\$_tmp\" /etc/wireguard/db/wg-data.json && \
+                    chmod 600 /etc/wireguard/db/wg-data.json
+            fi
         " 2>/dev/null; then
             print_success "${name}: 已拆除"
         else
