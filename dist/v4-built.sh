@@ -8957,14 +8957,26 @@ WGCONF_EOF
             uci set firewall.wg_allow.target='ACCEPT'
             uci commit firewall
             /etc/init.d/firewall reload 2>/dev/null || true
+            # 清理旧的 wireguard peers 配置
+            while uci -q get network.@wireguard_wg0[0] >/dev/null 2>&1; do
+                uci delete network.@wireguard_wg0[0] 2>/dev/null; true
+            done
+            uci commit network 2>/dev/null; true
             # 启动 WireGuard 接口
-            ifdown wg0 2>/dev/null; true
             /etc/init.d/network reload 2>/dev/null
-            sleep 2
+            sleep 3
             ifup wg0 2>/dev/null
-            sleep 2
+            sleep 3
             # 验证
-            ip link show wg0 &>/dev/null && echo 'WG_UP' || echo 'WG_DOWN'
+            if ip link show wg0 &>/dev/null; then
+                echo 'WG_UP'
+            else
+                /etc/init.d/network restart 2>/dev/null
+                sleep 5
+                ifup wg0 2>/dev/null
+                sleep 3
+                ip link show wg0 &>/dev/null && echo 'WG_UP' || echo 'WG_DOWN'
+            fi
         " 2>/dev/null)
     else
         # ── 标准 Linux: wg-quick + systemctl + ufw ──
