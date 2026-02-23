@@ -4907,7 +4907,7 @@ WGCONF_EOF
             cat ~/.ssh/id_ed25519.pub 2>/dev/null || cat ~/.ssh/id_rsa.pub 2>/dev/null
         ' 2>/dev/null)
         if [[ -n "$remote_pubkey" ]]; then
-            # 部署到本机
+            # 新节点公钥 → 本机
             mkdir -p ~/.ssh && chmod 700 ~/.ssh
             touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
             if ! grep -qF "$remote_pubkey" ~/.ssh/authorized_keys 2>/dev/null; then
@@ -4916,6 +4916,33 @@ WGCONF_EOF
             else
                 print_success "反向 SSH 密钥已存在于本机"
             fi
+            # 本机公钥 → 新节点
+            local local_pubkey=""
+            [[ -f ~/.ssh/id_ed25519.pub ]] && local_pubkey=$(cat ~/.ssh/id_ed25519.pub)
+            [[ -z "$local_pubkey" && -f ~/.ssh/id_rsa.pub ]] && local_pubkey=$(cat ~/.ssh/id_rsa.pub)
+            if [[ -n "$local_pubkey" ]]; then
+                ssh $ssh_opts "$ssh_target" "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && grep -qF '${local_pubkey}' ~/.ssh/authorized_keys 2>/dev/null || echo '${local_pubkey}' >> ~/.ssh/authorized_keys" 2>/dev/null \
+                    && print_success "本机公钥已部署到新节点" || true
+            fi
+            # 双向交换：新节点 ↔ 其他已有节点
+            local oi=0 other_count
+            other_count=$(echo "$existing_nodes" | jq 'length')
+            while [[ $oi -lt $other_count ]]; do
+                local o_host=$(echo "$existing_nodes" | jq -r ".[$oi].ssh_host")
+                local o_port=$(echo "$existing_nodes" | jq -r ".[$oi].ssh_port")
+                local o_user=$(echo "$existing_nodes" | jq -r ".[$oi].ssh_user")
+                local o_name=$(echo "$existing_nodes" | jq -r ".[$oi].name")
+                local o_opts="$(wg_ssh_opts "$o_port" 5) -o BatchMode=yes"
+                # 新节点公钥 → 其他节点
+                ssh $o_opts "${o_user}@${o_host}" "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && grep -qF '${remote_pubkey}' ~/.ssh/authorized_keys 2>/dev/null || echo '${remote_pubkey}' >> ~/.ssh/authorized_keys" 2>/dev/null \
+                    && print_success "  ${o_name}: 已接受新节点密钥" || print_warn "  ${o_name}: 密钥部署失败"
+                # 其他节点公钥 → 新节点
+                local o_pub
+                o_pub=$(ssh $o_opts "${o_user}@${o_host}" 'cat ~/.ssh/id_ed25519.pub 2>/dev/null || cat ~/.ssh/id_rsa.pub 2>/dev/null' 2>/dev/null)
+                [[ -n "$o_pub" ]] && ssh $ssh_opts "$ssh_target" "grep -qF '${o_pub}' ~/.ssh/authorized_keys 2>/dev/null || echo '${o_pub}' >> ~/.ssh/authorized_keys" 2>/dev/null \
+                    && print_success "  ${o_name}: 密钥已部署到新节点" || true
+                oi=$((oi+1))
+            done
         else
             print_warn "获取新节点 SSH 公钥失败 (仪表盘可能显示'无密钥'，可手动配置)"
         fi
