@@ -3177,6 +3177,19 @@ wg_uninstall() {
         systemctl disable "wg-quick@wg-mesh" 2>/dev/null || true
         rm -f /etc/wireguard/wg-mesh.conf
     fi
+    # OpenWrt Mesh (wg_mesh)
+    if ip link show wg_mesh &>/dev/null || uci -q get network.wg_mesh >/dev/null 2>&1; then
+        print_info "停止 Mesh 接口 (OpenWrt)..."
+        ifdown wg_mesh 2>/dev/null || true
+        uci delete network.wg_mesh 2>/dev/null; true
+        while uci -q get "network.@wireguard_wg_mesh[0]" >/dev/null 2>&1; do
+            uci delete "network.@wireguard_wg_mesh[0]" 2>/dev/null; true
+        done
+        for s in mesh_peer0 mesh_peer1 mesh_peer2 mesh_peer3 mesh_peer4; do
+            uci delete "network.$s" 2>/dev/null; true
+        done
+        uci commit network 2>/dev/null; true
+    fi
     print_info "[2/6] 清理端口转发规则..."
     if [[ "$role" == "server" ]]; then
         local pf_count
@@ -4206,14 +4219,25 @@ wg_mesh_watchdog_setup() {
     cat > "$watchdog_script" << 'MESHWD_HEAD'
 #!/bin/bash
 LOG="/var/log/wg-mesh-watchdog.log"
-IFACE="wg-mesh"
+# 自动检测接口名：OpenWrt 用 wg_mesh，标准 Linux 用 wg-mesh
+if ip link show wg_mesh &>/dev/null; then IFACE="wg_mesh"
+elif ip link show wg-mesh &>/dev/null; then IFACE="wg-mesh"
+elif [ -f /etc/openwrt_release ]; then IFACE="wg_mesh"
+else IFACE="wg-mesh"; fi
 STALE=300
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG"; }
 
 # 接口存活检测
+restart_iface() {
+    if [ -f /etc/openwrt_release ]; then
+        ifdown "$IFACE" 2>>"$LOG"; sleep 1; ifup "$IFACE" 2>>"$LOG"
+    else
+        wg-quick down "$IFACE" 2>>"$LOG"; sleep 1; wg-quick up "$IFACE" 2>>"$LOG"
+    fi
+}
 if ! ip link show "$IFACE" &>/dev/null; then
     log "WARN: $IFACE missing, restarting"
-    wg-quick up "$IFACE" 2>>"$LOG"
+    restart_iface
     sleep 2
     ip link show "$IFACE" &>/dev/null && log "OK: $IFACE recovered" || log "ERROR: restart failed"
     exit 0
@@ -4222,8 +4246,7 @@ fi
 # wg show 检测
 if ! wg show "$IFACE" &>/dev/null; then
     log "WARN: wg show $IFACE failed, restarting"
-    wg-quick down "$IFACE" 2>>"$LOG"; sleep 1
-    wg-quick up "$IFACE" 2>>"$LOG"
+    restart_iface
     exit 0
 fi
 
@@ -4241,8 +4264,7 @@ if [[ "$all_stale" == "true" ]]; then
     if [[ "$peer_count" -gt 0 ]]; then
         if [[ -f /tmp/.mesh-wd-stale ]]; then
             log "WARN: all mesh peers stale 2x, restarting"
-            wg-quick down "$IFACE" 2>>"$LOG"; sleep 1
-            wg-quick up "$IFACE" 2>>"$LOG"
+            restart_iface
             rm -f /tmp/.mesh-wd-stale
         else
             log "NOTICE: all mesh peers stale, flagging"
@@ -4531,6 +4553,46 @@ wg_cluster_deploy_node() {
     esac
     [[ "$remote_os" == "openwrt" ]] && print_info "检测到远程节点为 OpenWrt，将使用 uci 部署方式"
 
+    # ── 清理远程节点旧 WireGuard 配置 ──
+    print_info "清理远程节点旧配置..."
+    if [[ "$remote_os" == "openwrt" ]]; then
+        ssh $ssh_opts "$ssh_target" '
+            ifdown wg0 2>/dev/null; true
+            ifdown wg-mesh 2>/dev/null; true
+            uci delete network.wg0 2>/dev/null; true
+            uci delete network.wg-mesh 2>/dev/null; true
+            while uci -q get network.@wireguard_wg0[0] >/dev/null 2>&1; do
+                uci delete network.@wireguard_wg0[0] 2>/dev/null; true
+            done
+            while uci -q get "network.@wireguard_wg-mesh[0]" >/dev/null 2>&1; do
+                uci delete "network.@wireguard_wg-mesh[0]" 2>/dev/null; true
+            done
+            for s in mesh_peer0 mesh_peer1 mesh_peer2 mesh_peer3 mesh_peer4; do
+                uci delete "network.$s" 2>/dev/null; true
+            done
+            uci delete firewall.wg_zone 2>/dev/null; true
+            uci delete firewall.wg_fwd_lan 2>/dev/null; true
+            uci delete firewall.wg_fwd_wg 2>/dev/null; true
+            uci delete firewall.wg_allow 2>/dev/null; true
+            uci delete firewall.mesh_zone 2>/dev/null; true
+            uci delete firewall.mesh_fwd_lan 2>/dev/null; true
+            uci delete firewall.mesh_fwd_mesh 2>/dev/null; true
+            uci delete firewall.mesh_allow 2>/dev/null; true
+            uci commit network 2>/dev/null; true
+            uci commit firewall 2>/dev/null; true
+            rm -f /usr/local/bin/wg-mesh-watchdog.sh 2>/dev/null
+            crontab -l 2>/dev/null | grep -v wg-mesh-watchdog | crontab - 2>/dev/null; true
+        ' 2>/dev/null
+    else
+        ssh $ssh_opts "$ssh_target" '
+            ip link show wg0 &>/dev/null && wg-quick down wg0 2>/dev/null; true
+            ip link show wg-mesh &>/dev/null && wg-quick down wg-mesh 2>/dev/null; true
+            rm -f /etc/wireguard/wg-mesh.conf 2>/dev/null
+            rm -f /usr/local/bin/wg-mesh-watchdog.sh 2>/dev/null
+            crontab -l 2>/dev/null | grep -v wg-mesh-watchdog | crontab - 2>/dev/null; true
+        ' 2>/dev/null
+    fi
+
     # ── Step 3: 开启 IP 转发 ──
     print_info "[3/6] 配置 IP 转发..."
     if [[ "$remote_os" == "openwrt" ]]; then
@@ -4627,10 +4689,13 @@ uci set network.${peer_section}.persistent_keepalive='25'
 
         local uci_result
         uci_result=$(ssh $ssh_opts "$ssh_target" "
-            # 清理旧配置
-            uci delete network.wg0 2>/dev/null; true
-            uci commit network 2>/dev/null; true
+            # 清理旧配置（接口 + 所有旧 peers）
             ifdown wg0 2>/dev/null; true
+            uci delete network.wg0 2>/dev/null; true
+            while uci -q get network.@wireguard_wg0[0] >/dev/null 2>&1; do
+                uci delete network.@wireguard_wg0[0] 2>/dev/null; true
+            done
+            uci commit network 2>/dev/null; true
             # 创建 WireGuard 接口
             uci set network.wg0=interface
             uci set network.wg0.proto='wireguard'
@@ -4775,11 +4840,6 @@ WGCONF_EOF
             uci set firewall.wg_allow.target='ACCEPT'
             uci commit firewall
             /etc/init.d/firewall reload 2>/dev/null || true
-            # 清理旧的 wireguard peers 配置
-            while uci -q get network.@wireguard_wg0[0] >/dev/null 2>&1; do
-                uci delete network.@wireguard_wg0[0] 2>/dev/null; true
-            done
-            uci commit network 2>/dev/null; true
             # 启动 WireGuard 接口
             /etc/init.d/network reload 2>/dev/null
             sleep 3
@@ -5073,9 +5133,9 @@ wg_cluster_dashboard() {
         elif [[ "$ssh_ok" != "true" ]]; then
             # SSH 不可用时，检查 Mesh 握手状态
             local mesh_alive=false
-            if [[ "$mesh_enabled" == "true" ]] && wg show wg-mesh &>/dev/null; then
+            if [[ "$mesh_enabled" == "true" ]] && { wg show wg-mesh &>/dev/null || wg show wg_mesh &>/dev/null; }; then
                 local _mesh_hs
-                _mesh_hs=$(wg show wg-mesh dump 2>/dev/null | tail -n +2 | while IFS=$'\t' read -r _ _ _ aips last_hs _ _ _; do
+                _mesh_hs=$({ wg show wg-mesh dump 2>/dev/null || wg show wg_mesh dump 2>/dev/null; } | tail -n +2 | while IFS=$'\t' read -r _ _ _ aips last_hs _ _ _; do
                     if [[ "$aips" == *"${ip}/32"* && "$last_hs" != "0" && -n "$last_hs" ]]; then
                         local _age=$((now - last_hs))
                         [[ $_age -lt 180 ]] && echo "alive"
@@ -5116,8 +5176,8 @@ wg_cluster_dashboard() {
     # ── Mesh 状态 ──
     if [[ "$mesh_enabled" == "true" ]]; then
         echo -e "${C_CYAN}Mesh 互联:${C_RESET}"
-        if wg show wg-mesh &>/dev/null; then
-            wg show wg-mesh dump 2>/dev/null | tail -n +2 | while IFS=$'\t' read -r pubkey _ endpoint _ last_hs rx tx _; do
+        if wg show wg-mesh &>/dev/null || wg show wg_mesh &>/dev/null; then
+            { wg show wg-mesh dump 2>/dev/null || wg show wg_mesh dump 2>/dev/null; } | tail -n +2 | while IFS=$'\t' read -r pubkey _ endpoint _ last_hs rx tx _; do
                 local peer_name="unknown"
                 local mnc=$(wg_db_get '.cluster.mesh.nodes | length')
                 local mi=0
@@ -5172,7 +5232,7 @@ wg_cluster_dashboard() {
         echo -e "  ${C_YELLOW}[警告]${C_RESET} $degraded 个节点 WG 未运行"
         alerts=$((alerts+1))
     fi
-    if [[ "$mesh_enabled" == "true" ]] && ! ip link show wg-mesh &>/dev/null; then
+    if [[ "$mesh_enabled" == "true" ]] && ! ip link show wg-mesh &>/dev/null && ! ip link show wg_mesh &>/dev/null; then
         echo -e "  ${C_RED}[告警]${C_RESET} 本机 Mesh 接口未运行"
         alerts=$((alerts+1))
     fi
@@ -5385,13 +5445,24 @@ wg_cluster_mesh_setup() {
         if [[ $idx -eq 0 ]]; then
             if [[ "$PLATFORM" == "openwrt" ]]; then
                 # ── 本地节点是 OpenWrt: 使用 uci 配置 Mesh ──
+                local local_uci_mesh="wg_mesh"
                 uci delete network.${mesh_iface} 2>/dev/null; true
-                uci set network.${mesh_iface}=interface
-                uci set network.${mesh_iface}.proto='wireguard'
-                uci set network.${mesh_iface}.private_key="${mesh_privkeys[$idx]}"
-                uci set network.${mesh_iface}.listen_port="${mesh_port}"
-                uci delete network.${mesh_iface}.addresses 2>/dev/null; true
-                uci add_list network.${mesh_iface}.addresses="${node_ips[$idx]}/32"
+                uci delete network.${local_uci_mesh} 2>/dev/null; true
+                while uci -q get "network.@wireguard_${mesh_iface}[0]" >/dev/null 2>&1; do
+                    uci delete "network.@wireguard_${mesh_iface}[0]" 2>/dev/null; true
+                done
+                while uci -q get "network.@wireguard_${local_uci_mesh}[0]" >/dev/null 2>&1; do
+                    uci delete "network.@wireguard_${local_uci_mesh}[0]" 2>/dev/null; true
+                done
+                for s in mesh_peer0 mesh_peer1 mesh_peer2 mesh_peer3 mesh_peer4; do
+                    uci delete "network.$s" 2>/dev/null; true
+                done
+                uci set network.${local_uci_mesh}=interface
+                uci set network.${local_uci_mesh}.proto='wireguard'
+                uci set network.${local_uci_mesh}.private_key="${mesh_privkeys[$idx]}"
+                uci set network.${local_uci_mesh}.listen_port="${mesh_port}"
+                uci delete network.${local_uci_mesh}.addresses 2>/dev/null; true
+                uci add_list network.${local_uci_mesh}.addresses="${node_ips[$idx]}/32"
                 # 添加 mesh peers
                 local mj=0
                 local mesh_peer_idx=0
@@ -5402,7 +5473,7 @@ wg_cluster_mesh_setup() {
                         local mpsk=$(_mesh_get_psk "${mpa}_${mpb}")
                         local msection="mesh_peer${mesh_peer_idx}"
                         local remote_mp=$((${node_ports[$mj]} + 1))
-                        uci set network.${msection}=wireguard_${mesh_iface}
+                        uci set network.${msection}=wireguard_${local_uci_mesh}
                         uci set network.${msection}.description="${node_names[$mj]}"
                         uci set network.${msection}.public_key="${mesh_pubkeys[$mj]}"
                         uci set network.${msection}.preshared_key="${mpsk}"
@@ -5428,7 +5499,7 @@ wg_cluster_mesh_setup() {
                 uci set firewall.mesh_zone.output='ACCEPT'
                 uci set firewall.mesh_zone.forward='ACCEPT'
                 uci set firewall.mesh_zone.masq='1'
-                uci add_list firewall.mesh_zone.network="${mesh_iface}"
+                uci add_list firewall.mesh_zone.network="${local_uci_mesh}"
                 uci set firewall.mesh_fwd_lan=forwarding
                 uci set firewall.mesh_fwd_lan.src='lan'
                 uci set firewall.mesh_fwd_lan.dest='mesh'
@@ -5444,10 +5515,10 @@ wg_cluster_mesh_setup() {
                 uci commit network
                 uci commit firewall
                 /etc/init.d/firewall reload 2>/dev/null || true
-                ifdown "${mesh_iface}" 2>/dev/null; true
+                ifdown "${local_uci_mesh}" 2>/dev/null; true
                 /etc/init.d/network reload 2>/dev/null
-                sleep 2
-                ifup "${mesh_iface}" 2>/dev/null
+                sleep 3
+                ifup "${local_uci_mesh}" 2>/dev/null
             else
                 # ── 本地节点是标准 Linux ──
                 cp "$tmp_conf" "/etc/wireguard/${mesh_iface}.conf"
@@ -5477,6 +5548,8 @@ wg_cluster_mesh_setup() {
 
             if [[ "$remote_mesh_os" == "openwrt" ]]; then
                 # ── 远程 OpenWrt 节点: 使用 uci 配置 Mesh ──
+                # OpenWrt uci section 名不能含连字符，用 wg_mesh 作 uci 名，ifname 映射到 wg-mesh
+                local uci_mesh_name="wg_mesh"
                 # 构建 uci peers 命令
                 local uci_mesh_peers=""
                 local mj=0
@@ -5489,7 +5562,7 @@ wg_cluster_mesh_setup() {
                         local msection="mesh_peer${mesh_peer_idx}"
                         local remote_mp=$((${node_ports[$mj]} + 1))
                         local m_allowed="${node_ips[$mj]}/32"
-                        uci_mesh_peers+="uci set network.${msection}=wireguard_${mesh_iface}
+                        uci_mesh_peers+="uci set network.${msection}=wireguard_${uci_mesh_name}
 uci set network.${msection}.description='${node_names[$mj]}'
 uci set network.${msection}.public_key='${mesh_pubkeys[$mj]}'
 uci set network.${msection}.preshared_key='${mpsk}'
@@ -5508,17 +5581,28 @@ uci set network.${msection}.route_allowed_ips='1'
                     mj=$((mj+1))
                 done
                 ssh $ssh_opts "$ssh_target" "
-                    # 清理旧 Mesh 配置
-                    uci delete network.${mesh_iface} 2>/dev/null; true
-                    uci commit network 2>/dev/null; true
+                    # 清理旧 Mesh 配置（两种可能的名称）
                     ifdown ${mesh_iface} 2>/dev/null; true
+                    ifdown ${uci_mesh_name} 2>/dev/null; true
+                    uci delete network.${mesh_iface} 2>/dev/null; true
+                    uci delete network.${uci_mesh_name} 2>/dev/null; true
+                    while uci -q get network.@wireguard_${mesh_iface}[0] >/dev/null 2>&1; do
+                        uci delete network.@wireguard_${mesh_iface}[0] 2>/dev/null; true
+                    done
+                    while uci -q get network.@wireguard_${uci_mesh_name}[0] >/dev/null 2>&1; do
+                        uci delete network.@wireguard_${uci_mesh_name}[0] 2>/dev/null; true
+                    done
+                    for s in mesh_peer0 mesh_peer1 mesh_peer2 mesh_peer3 mesh_peer4; do
+                        uci delete network.\$s 2>/dev/null; true
+                    done
+                    uci commit network 2>/dev/null; true
                     # 创建 Mesh 接口
-                    uci set network.${mesh_iface}=interface
-                    uci set network.${mesh_iface}.proto='wireguard'
-                    uci set network.${mesh_iface}.private_key='${mesh_privkeys[$idx]}'
-                    uci set network.${mesh_iface}.listen_port='${mesh_port}'
-                    uci delete network.${mesh_iface}.addresses 2>/dev/null; true
-                    uci add_list network.${mesh_iface}.addresses='${node_ips[$idx]}/32'
+                    uci set network.${uci_mesh_name}=interface
+                    uci set network.${uci_mesh_name}.proto='wireguard'
+                    uci set network.${uci_mesh_name}.private_key='${mesh_privkeys[$idx]}'
+                    uci set network.${uci_mesh_name}.listen_port='${mesh_port}'
+                    uci delete network.${uci_mesh_name}.addresses 2>/dev/null; true
+                    uci add_list network.${uci_mesh_name}.addresses='${node_ips[$idx]}/32'
                     # 添加 Mesh peers
                     ${uci_mesh_peers}
                     # Mesh 防火墙
@@ -5532,7 +5616,7 @@ uci set network.${msection}.route_allowed_ips='1'
                     uci set firewall.mesh_zone.output='ACCEPT'
                     uci set firewall.mesh_zone.forward='ACCEPT'
                     uci set firewall.mesh_zone.masq='1'
-                    uci add_list firewall.mesh_zone.network='${mesh_iface}'
+                    uci add_list firewall.mesh_zone.network='${uci_mesh_name}'
                     uci set firewall.mesh_fwd_lan=forwarding
                     uci set firewall.mesh_fwd_lan.src='lan'
                     uci set firewall.mesh_fwd_lan.dest='mesh'
@@ -5549,8 +5633,17 @@ uci set network.${msection}.route_allowed_ips='1'
                     uci commit firewall
                     /etc/init.d/firewall reload 2>/dev/null || true
                     /etc/init.d/network reload 2>/dev/null
-                    sleep 2
-                    ifup ${mesh_iface} 2>/dev/null
+                    sleep 3
+                    ifup ${uci_mesh_name} 2>/dev/null
+                    sleep 3
+                    # 验证
+                    if ip link show ${uci_mesh_name} &>/dev/null || ip link show ${mesh_iface} &>/dev/null; then
+                        echo 'MESH_UP'
+                    else
+                        /etc/init.d/network restart 2>/dev/null
+                        sleep 5
+                        ifup ${uci_mesh_name} 2>/dev/null
+                    fi
                 " 2>/dev/null
                 print_success "${node_names[$idx]}: Mesh 已部署 (SSH/uci, 端口 ${mesh_port}/udp)"
             else
@@ -5667,6 +5760,24 @@ wg_cluster_mesh_teardown() {
     fi
     systemctl disable "wg-quick@${mesh_iface}" 2>/dev/null || true
     rm -f "/etc/wireguard/${mesh_iface}.conf"
+    # OpenWrt 本地清理
+    if ip link show wg_mesh &>/dev/null || uci -q get network.wg_mesh >/dev/null 2>&1; then
+        ifdown wg_mesh 2>/dev/null || true
+        uci delete network.wg_mesh 2>/dev/null; true
+        while uci -q get "network.@wireguard_wg_mesh[0]" >/dev/null 2>&1; do
+            uci delete "network.@wireguard_wg_mesh[0]" 2>/dev/null; true
+        done
+        for s in mesh_peer0 mesh_peer1 mesh_peer2 mesh_peer3 mesh_peer4; do
+            uci delete "network.$s" 2>/dev/null; true
+        done
+        uci delete firewall.mesh_zone 2>/dev/null; true
+        uci delete firewall.mesh_fwd_lan 2>/dev/null; true
+        uci delete firewall.mesh_fwd_mesh 2>/dev/null; true
+        uci delete firewall.mesh_allow 2>/dev/null; true
+        uci commit network 2>/dev/null; true
+        uci commit firewall 2>/dev/null; true
+        /etc/init.d/network reload 2>/dev/null || true
+    fi
     local primary_port=$(wg_db_get '.server.port')
     if [[ "$primary_port" =~ ^[0-9]+$ ]]; then
         local primary_mesh_port=$((primary_port + 1))
@@ -5688,10 +5799,28 @@ wg_cluster_mesh_teardown() {
         local ssh_opts="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -p ${ssh_port}"
         local node_mesh_port=$((node_wg_port + 1))
         if ssh $ssh_opts "${ssh_user}@${ssh_host}" "
+            # 标准 Linux
             ip link show ${mesh_iface} &>/dev/null && wg-quick down ${mesh_iface} 2>/dev/null
             systemctl disable wg-quick@${mesh_iface} 2>/dev/null || true
             rm -f /etc/wireguard/${mesh_iface}.conf
             command -v ufw >/dev/null 2>&1 && ufw delete allow ${node_mesh_port}/udp 2>/dev/null || true
+            # OpenWrt
+            ifdown wg_mesh 2>/dev/null; true
+            uci delete network.wg_mesh 2>/dev/null; true
+            while uci -q get network.@wireguard_wg_mesh[0] >/dev/null 2>&1; do
+                uci delete network.@wireguard_wg_mesh[0] 2>/dev/null; true
+            done
+            for s in mesh_peer0 mesh_peer1 mesh_peer2 mesh_peer3 mesh_peer4; do
+                uci delete network.\$s 2>/dev/null; true
+            done
+            uci delete firewall.mesh_zone 2>/dev/null; true
+            uci delete firewall.mesh_fwd_lan 2>/dev/null; true
+            uci delete firewall.mesh_fwd_mesh 2>/dev/null; true
+            uci delete firewall.mesh_allow 2>/dev/null; true
+            uci commit network 2>/dev/null; true
+            uci commit firewall 2>/dev/null; true
+            /etc/init.d/network reload 2>/dev/null; true
+            /etc/init.d/firewall reload 2>/dev/null; true
             # 重置远程节点 mesh 数据库
             if [ -f /etc/wireguard/db/wg-data.json ]; then
                 _tmp=\$(mktemp /etc/wireguard/db/.tmp.XXXXXX)
@@ -5724,12 +5853,12 @@ wg_cluster_mesh_status() {
         echo "  使用 '部署 Mesh 全互联' 来建立节点间互通"
         pause; return
     fi
-    if ip link show "$mesh_iface" &>/dev/null; then
+    if ip link show "$mesh_iface" &>/dev/null || ip link show wg_mesh &>/dev/null; then
         echo -e "  本地 Mesh 接口: ${C_GREEN}运行中${C_RESET}"
     else
         echo -e "  本地 Mesh 接口: ${C_RED}未运行${C_RESET}"
     fi
-    if wg show "$mesh_iface" &>/dev/null; then
+    if wg show "$mesh_iface" &>/dev/null || wg show wg_mesh &>/dev/null; then
         echo -e "${C_CYAN}Mesh Peers:${C_RESET}"
         local mesh_node_count=$(wg_db_get '.cluster.mesh.nodes | length')
         local now=$(date +%s)
@@ -5759,7 +5888,7 @@ wg_cluster_mesh_status() {
             local rx_h=$(numfmt --to=iec-i --suffix=B "$rx" 2>/dev/null || echo "${rx}B")
             local tx_h=$(numfmt --to=iec-i --suffix=B "$tx" 2>/dev/null || echo "${tx}B")
             printf "  %-16s %-24s %-20b  ↓%s ↑%s\n" "$peer_name" "$endpoint" "$status" "$rx_h" "$tx_h"
-        done < <(wg show "$mesh_iface" dump 2>/dev/null | tail -n +2)
+        done < <({ wg show "$mesh_iface" dump 2>/dev/null || wg show wg_mesh dump 2>/dev/null; } | tail -n +2)
     else
         print_warn "无法读取 ${mesh_iface} 状态"
     fi
