@@ -4247,6 +4247,33 @@ wg_set_role() {
 wg_is_installed() { command_exists wg && [[ -f "$WG_DB_FILE" ]]; }
 wg_is_running()   { ip link show "$WG_INTERFACE" &>/dev/null; }
 
+wg_get_server_name() {
+    local name
+    name=$(wg_db_get '.server.name // empty')
+    if [[ -z "$name" || "$name" == "null" ]]; then
+        name=$(hostname -s 2>/dev/null)
+        [[ -z "$name" ]] && name="server"
+    fi
+    echo "$name"
+}
+
+wg_rename_server() {
+    print_title "修改服务器名称"
+    local current_name=$(wg_get_server_name)
+    echo -e "  当前名称: ${C_CYAN}${current_name}${C_RESET}"
+    local new_name=""
+    read -e -r -p "新名称 [${current_name}]: " new_name
+    new_name=${new_name:-$current_name}
+    if [[ ! "$new_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        print_error "名称只能包含字母、数字、下划线、连字符"
+        pause; return
+    fi
+    wg_db_set --arg n "$new_name" '.server.name = $n'
+    print_success "服务器名称已更新为: ${new_name}"
+    log_action "WireGuard server renamed: ${current_name} -> ${new_name}"
+    pause
+}
+
 wg_check_installed() {
     if ! wg_is_installed; then
         print_error "WireGuard 未安装，请先执行安装。"
@@ -4576,10 +4603,17 @@ wg_server_install() {
     server_privkey=$(wg genkey)
     server_pubkey=$(echo "$server_privkey" | wg pubkey)
     print_success "密钥已生成"
+    # 服务器名称
+    local server_name=""
+    local default_name=$(hostname -s 2>/dev/null)
+    [[ -z "$default_name" ]] && default_name="server"
+    read -e -r -p "服务器名称 [${default_name}]: " server_name
+    server_name=${server_name:-$default_name}
     print_info "[5/5] 写入配置并启动..."
     wg_db_init
     wg_set_role "server"
-    wg_db_set --arg pk "$server_privkey" \
+    wg_db_set --arg sname "$server_name" \
+              --arg pk "$server_privkey" \
               --arg pub "$server_pubkey" \
               --arg ip "$server_ip" \
               --arg sub "$wg_subnet" \
@@ -4587,6 +4621,7 @@ wg_server_install() {
               --arg dns "$wg_dns" \
               --arg ep "$wg_endpoint" \
     '.server = {
+        name: $sname,
         private_key: $pk,
         public_key: $pub,
         ip: $ip,
@@ -5514,7 +5549,7 @@ wg_cluster_remove_node() {
     fi
     local i=0
     while [[ $i -lt $node_count ]]; do
-        local name=$(wg_db_get ".cluster.nodes[$i].name")
+        local name=$(wg_db_get ".cluster.nodes[$i].name // \"unknown\"")
         local ep=$(wg_db_get ".cluster.nodes[$i].endpoint")
         local port=$(wg_db_get ".cluster.nodes[$i].port")
         echo "  $((i+1)). ${name} (${ep}:${port})"
@@ -5527,7 +5562,7 @@ wg_cluster_remove_node() {
         print_error "无效序号"; pause; return
     fi
     local ti=$((idx-1))
-    local del_name=$(wg_db_get ".cluster.nodes[$ti].name")
+    local del_name=$(wg_db_get ".cluster.nodes[$ti].name // \"unknown\"")
     if confirm "确认移除节点 '${del_name}'?"; then
         wg_db_set --argjson idx "$ti" 'del(.cluster.nodes[$idx])'
         local remaining=$(wg_db_get '.cluster.nodes | length')
@@ -5563,7 +5598,7 @@ wg_cluster_sync() {
     local mask=$(echo "$server_subnet" | cut -d'/' -f2)
     local i=0
     while [[ $i -lt $node_count ]]; do
-        local name=$(wg_db_get ".cluster.nodes[$i].name")
+        local name=$(wg_db_get ".cluster.nodes[$i].name // \"unknown\"")
         local ssh_host=$(wg_db_get ".cluster.nodes[$i].ssh_host")
         local ssh_port=$(wg_db_get ".cluster.nodes[$i].ssh_port")
         local ssh_user=$(wg_db_get ".cluster.nodes[$i].ssh_user")
@@ -5746,7 +5781,7 @@ WGCONF_EOF
                     '[.cluster.nodes[] | select(.name != $skip_name)]')
                 local my_node_json
                 my_node_json=$(jq -n \
-                    --arg name "$(hostname -s)" \
+                    --arg name "$(wg_get_server_name)" \
                     --arg ep "$my_endpoint" \
                     --argjson port "$my_port" \
                     --arg ip "$my_ip" \
@@ -6258,7 +6293,7 @@ wg_generate_clash_config() {
     local all_proxy_yaml=""
 
     # 主机节点
-    local primary_name="WG-本机"
+    local primary_name="WG-$(wg_get_server_name)"
     all_proxy_names+=("$primary_name")
     all_proxy_yaml+="  - name: \"${primary_name}\"
     type: wireguard
@@ -6280,7 +6315,7 @@ wg_generate_clash_config() {
     if [[ "$has_cluster" == "true" && "$group_mode" != "4" ]]; then
         local ni=0
         while [[ $ni -lt $node_count ]]; do
-            local nname=$(wg_db_get ".cluster.nodes[$ni].name")
+            local nname=$(wg_db_get ".cluster.nodes[$ni].name // \"unknown\"")
             local nep=$(wg_db_get ".cluster.nodes[$ni].endpoint")
             local nport=$(wg_db_get ".cluster.nodes[$ni].port")
             local npubkey=$(wg_db_get ".cluster.nodes[$ni].public_key")
@@ -7184,7 +7219,7 @@ wg_server_status() {
         draw_line
         local ci=0
         while [[ $ci -lt $node_count ]]; do
-            local cname=$(wg_db_get ".cluster.nodes[$ci].name")
+            local cname=$(wg_db_get ".cluster.nodes[$ci].name // \"unknown\"")
             local cep=$(wg_db_get ".cluster.nodes[$ci].endpoint")
             local cport=$(wg_db_get ".cluster.nodes[$ci].port")
             local cip=$(wg_db_get ".cluster.nodes[$ci].ip")
@@ -7297,22 +7332,21 @@ wg_uninstall() {
     if ! confirm "再次确认: 所有配置将被永久删除，是否继续?"; then
         return
     fi
-    print_info "[1/5] 停止 WireGuard..."
+    print_info "[1/6] 停止 WireGuard..."
     if wg_is_running; then
         wg-quick down "$WG_INTERFACE" 2>/dev/null || true
     fi
     if is_systemd; then
         systemctl disable "wg-quick@${WG_INTERFACE}" >/dev/null 2>&1 || true
     fi
-
-        # 清理 Mesh 接口
+    # 清理 Mesh 接口
     if ip link show wg-mesh &>/dev/null; then
         print_info "停止 Mesh 接口..."
         wg-quick down wg-mesh 2>/dev/null || true
         systemctl disable "wg-quick@wg-mesh" 2>/dev/null || true
         rm -f /etc/wireguard/wg-mesh.conf
     fi
-    print_info "[2/5] 清理端口转发规则..."
+    print_info "[2/6] 清理端口转发规则..."
     if [[ "$role" == "server" ]]; then
         local pf_count
         pf_count=$(wg_db_get '.port_forwards | length' 2>/dev/null)
@@ -7330,7 +7364,7 @@ wg_uninstall() {
             wg_save_iptables
         fi
     fi
-    print_info "[3/5] 清理防火墙规则..."
+    print_info "[3/6] 清理防火墙规则..."
     if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
         if [[ "$role" == "server" ]]; then
             local port
@@ -7341,20 +7375,55 @@ wg_uninstall() {
             yes | ufw delete "$num" 2>/dev/null || true
         done
     fi
-    print_info "[3.5/5] 清理看门狗..."
+    print_info "[4/6] 清理所有看门狗和定时任务..."
+    # 主看门狗
     if crontab -l 2>/dev/null | grep -q "wg-watchdog.sh"; then
         cron_remove_job "wg-watchdog.sh"
     fi
-    rm -f /usr/local/bin/wg-watchdog.sh /var/log/wg-watchdog.log /tmp/.wg-watchdog-stale 2>/dev/null || true
-    print_info "[4/5] 删除配置文件..."
+    rm -f /usr/local/bin/wg-watchdog.sh /var/log/wg-watchdog.log 2>/dev/null || true
+    # OpenWrt 看门狗（不同路径）
+    rm -f /usr/bin/wg-watchdog.sh 2>/dev/null || true
+    # Mesh 看门狗
+    if crontab -l 2>/dev/null | grep -q "wg-mesh-watchdog.sh"; then
+        cron_remove_job "wg-mesh-watchdog.sh"
+    fi
+    rm -f /usr/local/bin/wg-mesh-watchdog.sh /var/log/wg-mesh-watchdog.log 2>/dev/null || true
+    # 故障转移脚本
+    if crontab -l 2>/dev/null | grep -q "wg-failover.sh"; then
+        cron_remove_job "wg-failover.sh"
+    fi
+    rm -f /usr/local/bin/wg-failover.sh /var/log/wg-failover.log 2>/dev/null || true
+    print_info "[5/6] 删除配置文件和临时文件..."
     rm -f "$WG_CONF" 2>/dev/null || true
     rm -rf /etc/wireguard/clients 2>/dev/null || true
     rm -f "$WG_DB_FILE" 2>/dev/null || true
-    rm -rf "$WG_DB_DIR" 2>/dev/null || true          
-    rm -f "$WG_ROLE_FILE" 2>/dev/null || true         
+    rm -rf "$WG_DB_DIR" 2>/dev/null || true
+    rm -f "$WG_ROLE_FILE" 2>/dev/null || true
     rm -f /etc/wireguard/*.key 2>/dev/null || true
+    rm -f /etc/wireguard/wg-mesh.conf 2>/dev/null || true
     rmdir /etc/wireguard 2>/dev/null || true
-    print_info "[5/5] 卸载软件包..."
+    # 清理所有 /tmp 临时文件
+    rm -rf /tmp/.wg-ssh-cm /tmp/.wg-wd-fail /tmp/.wg-watchdog-ping-fail \
+           /tmp/.wg-fo-fail-count /tmp/.wg-db-tmp.json /tmp/clash-wg-*.yaml \
+           /tmp/.wg-watchdog-stale 2>/dev/null || true
+    # OpenWrt: 自动清理 uci 配置
+    if [[ "$PLATFORM" == "openwrt" ]]; then
+        print_info "清理 OpenWrt 网络和防火墙配置..."
+        uci delete network.wg0 2>/dev/null || true
+        uci delete network.wg_server 2>/dev/null || true
+        local _fwi=0
+        while uci get firewall.@zone[$_fwi] &>/dev/null 2>&1; do
+            local _fname=$(uci get firewall.@zone[$_fwi].name 2>/dev/null)
+            if [[ "$_fname" == "wg" || "$_fname" == "wireguard" ]]; then
+                uci delete "firewall.@zone[$_fwi]" 2>/dev/null || true
+                continue
+            fi
+            _fwi=$((_fwi + 1))
+        done
+        uci commit network 2>/dev/null || true
+        uci commit firewall 2>/dev/null || true
+    fi
+    print_info "[6/6] 卸载软件包..."
     local remove_pkg=true
     if confirm "是否卸载 WireGuard 软件包? (选 N 仅删除配置)"; then
         case $PLATFORM in
@@ -7382,6 +7451,16 @@ wg_uninstall() {
     else
         remove_pkg=false
     fi
+    # 清理可能残留的 WireGuard iptables 规则
+    if command_exists iptables; then
+        iptables -S 2>/dev/null | grep -i "wg\|wireguard\|${WG_INTERFACE}" | while read -r rule; do
+            iptables $(echo "$rule" | sed 's/^-A/-D/') 2>/dev/null || true
+        done
+        iptables -t nat -S 2>/dev/null | grep -i "wg\|wireguard\|${WG_INTERFACE}" | while read -r rule; do
+            iptables -t nat $(echo "$rule" | sed 's/^-A/-D/') 2>/dev/null || true
+        done
+        wg_save_iptables 2>/dev/null || true
+    fi
     if [[ "$role" == "server" ]]; then
         if confirm "是否恢复 IP 转发设置? (如果其他服务需要转发请选 N)"; then
             sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf 2>/dev/null || true
@@ -7389,7 +7468,7 @@ wg_uninstall() {
         fi
     fi
     draw_line
-    print_success "WireGuard 已完全卸载"
+    print_success "WireGuard 已完全卸载 (所有配置、脚本、定时任务已清理)"
     draw_line
     log_action "WireGuard uninstalled: role=${role} pkg_removed=${remove_pkg}"
     pause
@@ -8042,7 +8121,7 @@ wg_cluster_failover_setup() {
     local -a node_names_arr=() node_ips_arr=()
     local ni=0
     while [[ $ni -lt $node_count ]]; do
-        local nname=$(wg_db_get ".cluster.nodes[$ni].name")
+        local nname=$(wg_db_get ".cluster.nodes[$ni].name // \"unknown\"")
         local nep=$(wg_db_get ".cluster.nodes[$ni].endpoint")
         node_names_arr+=("$nname")
         node_ips_arr+=("$nep")
@@ -8079,7 +8158,7 @@ wg_cluster_failover_setup() {
     # 生成 failover 脚本 (部署到每个节点)
     local ni2=0
     while [[ $ni2 -lt $node_count ]]; do
-        local nname=$(wg_db_get ".cluster.nodes[$ni2].name")
+        local nname=$(wg_db_get ".cluster.nodes[$ni2].name // \"unknown\"")
         local nep=$(wg_db_get ".cluster.nodes[$ni2].endpoint")
         local ssh_host=$(wg_db_get ".cluster.nodes[$ni2].ssh_host")
         local ssh_port=$(wg_db_get ".cluster.nodes[$ni2].ssh_port")
@@ -8208,7 +8287,7 @@ _wg_failover_client_helper() {
     echo -e "  主机: ${C_GREEN}${server_ep}:${server_port}${C_RESET}"
     local ni=0
     while [[ $ni -lt $node_count ]]; do
-        local nname=$(wg_db_get ".cluster.nodes[$ni].name")
+        local nname=$(wg_db_get ".cluster.nodes[$ni].name // \"unknown\"")
         local nep=$(wg_db_get ".cluster.nodes[$ni].endpoint")
         local nport=$(wg_db_get ".cluster.nodes[$ni].port")
         echo -e "  ${nname}: ${C_GREEN}${nep}:${nport}${C_RESET}"
@@ -8371,7 +8450,7 @@ MESHWD_TAIL
         local node_count=$(wg_db_get '.cluster.nodes | length')
         local ni=0
         while [[ $ni -lt $node_count ]]; do
-            local nname=$(wg_db_get ".cluster.nodes[$ni].name")
+            local nname=$(wg_db_get ".cluster.nodes[$ni].name // \"unknown\"")
             local ssh_host=$(wg_db_get ".cluster.nodes[$ni].ssh_host")
             local ssh_port=$(wg_db_get ".cluster.nodes[$ni].ssh_port")
             local ssh_user=$(wg_db_get ".cluster.nodes[$ni].ssh_user")
@@ -8389,7 +8468,7 @@ MESHWD_TAIL
             local remote_lans=""
             local rmi=0
             while [[ $rmi -lt $mesh_node_count ]]; do
-                local rn=$(wg_db_get ".cluster.mesh.nodes[$rmi].name")
+                local rn=$(wg_db_get ".cluster.mesh.nodes[$rmi].name // \"unknown\"")
                 local rl=$(wg_db_get ".cluster.mesh.nodes[$rmi].lan // empty")
                 [[ "$rn" != "$nname" && -n "$rl" ]] && remote_lans+="${rl} "
                 rmi=$((rmi+1))
@@ -8780,7 +8859,7 @@ WGCONF_EOF
     # 构建本机的节点信息（含本机公钥，供新节点生成 Clash 配置时使用）
     local my_node_json
     my_node_json=$(jq -n \
-        --arg name "$(hostname -s)" \
+        --arg name "$(wg_get_server_name)" \
         --arg ep "$my_endpoint" \
         --argjson port "$my_port" \
         --arg ip "$my_ip" \
@@ -9048,14 +9127,15 @@ wg_cluster_dashboard() {
     local s_peers=0
     wg_is_running && s_peers=$(wg show "$WG_INTERFACE" dump 2>/dev/null | tail -n +2 | wc -l)
     local s_load=$(awk '{printf "%.1f", $1}' /proc/loadavg 2>/dev/null || echo "N/A")
+    local my_name=$(wg_get_server_name)
     printf "%-3s %-14s %-24s %-10b %-10s %-8s %-12s %s\n" \
-        "0" "本机" "${s_ep}:${s_port}" "$s_wg_status" \
+        "0" "$my_name" "${s_ep}:${s_port}" "$s_wg_status" \
         "${C_GREEN}本机${C_RESET}" "-" "${s_peers}个" "$s_load"
 
     # 其他节点
     local i=0 healthy=0 degraded=0 down=0
     while [[ $i -lt $node_count ]]; do
-        local name=$(wg_db_get ".cluster.nodes[$i].name")
+        local name=$(wg_db_get ".cluster.nodes[$i].name // \"unknown\"")
         local ep=$(wg_db_get ".cluster.nodes[$i].endpoint")
         local port=$(wg_db_get ".cluster.nodes[$i].port")
         local ip=$(wg_db_get ".cluster.nodes[$i].ip")
@@ -9168,7 +9248,7 @@ wg_cluster_dashboard() {
                 local mi=0
                 while [[ $mi -lt $mnc ]]; do
                     [[ "$(wg_db_get ".cluster.mesh.nodes[$mi].pubkey")" == "$pubkey" ]] && {
-                        peer_name=$(wg_db_get ".cluster.mesh.nodes[$mi].name"); break
+                        peer_name=$(wg_db_get ".cluster.mesh.nodes[$mi].name // \"unknown\""); break
                     }
                     mi=$((mi+1))
                 done
@@ -9240,7 +9320,7 @@ wg_cluster_mesh_setup() {
     local -a node_names=() node_eps=() node_ports=() node_ips=()
     local -a node_ssh_hosts=() node_ssh_ports=() node_ssh_users=()
     local -a node_lans=()
-    node_names+=("primary")
+    node_names+=("$(wg_get_server_name)")
     node_eps+=("$(wg_db_get '.server.endpoint')")
     node_ports+=("$(wg_db_get '.server.port')")
     node_ips+=("$(wg_db_get '.server.ip')")
@@ -9250,7 +9330,7 @@ wg_cluster_mesh_setup() {
     node_lans+=("")
     local i=0
     while [[ $i -lt $node_count ]]; do
-        node_names+=("$(wg_db_get ".cluster.nodes[$i].name")")
+        node_names+=("$(wg_db_get ".cluster.nodes[$i].name // \"unknown\"")")
         node_eps+=("$(wg_db_get ".cluster.nodes[$i].endpoint")")
         node_ports+=("$(wg_db_get ".cluster.nodes[$i].port")")
         node_ips+=("$(wg_db_get ".cluster.nodes[$i].ip")")
@@ -9699,7 +9779,7 @@ wg_cluster_mesh_teardown() {
     # 其他节点
     local i=0
     while [[ $i -lt $node_count ]]; do
-        local name=$(wg_db_get ".cluster.nodes[$i].name")
+        local name=$(wg_db_get ".cluster.nodes[$i].name // \"unknown\"")
         local ssh_host=$(wg_db_get ".cluster.nodes[$i].ssh_host")
         local ssh_port=$(wg_db_get ".cluster.nodes[$i].ssh_port")
         local ssh_user=$(wg_db_get ".cluster.nodes[$i].ssh_user")
@@ -9755,7 +9835,7 @@ wg_cluster_mesh_status() {
             while [[ $ni -lt $mesh_node_count ]]; do
                 local npub=$(wg_db_get ".cluster.mesh.nodes[$ni].pubkey")
                 if [[ "$npub" == "$pubkey" ]]; then
-                    peer_name=$(wg_db_get ".cluster.mesh.nodes[$ni].name")
+                    peer_name=$(wg_db_get ".cluster.mesh.nodes[$ni].name // \"unknown\"")
                     break
                 fi
                 ni=$((ni+1))
@@ -9780,10 +9860,12 @@ wg_cluster_mesh_status() {
     local mesh_node_count=$(wg_db_get '.cluster.mesh.nodes | length')
     local ti=0
     while [[ $ti -lt $mesh_node_count ]]; do
-        local nname=$(wg_db_get ".cluster.mesh.nodes[$ti].name")
+        local nname=$(wg_db_get ".cluster.mesh.nodes[$ti].name // \"unknown\"")
         local nip=$(wg_db_get ".cluster.mesh.nodes[$ti].ip")
         local nlan=$(wg_db_get ".cluster.mesh.nodes[$ti].lan // empty")
-        [[ "$nname" == "primary" ]] && { ti=$((ti+1)); continue; }
+        local npubkey_check=$(wg_db_get ".cluster.mesh.nodes[$ti].pubkey // empty")
+        local my_pubkey_check=$(wg_db_get '.server.public_key // empty')
+        [[ "$npubkey_check" == "$my_pubkey_check" ]] && { ti=$((ti+1)); continue; }
         local ping_result="${C_RED}不通${C_RESET}"
         if ping -c 1 -W 2 "$nip" &>/dev/null; then
             local latency=$(ping -c 1 -W 2 "$nip" 2>/dev/null | awk -F'=' '/time=/{print $NF}')
@@ -9980,10 +10062,11 @@ wg_import_peers() {
 wg_server_menu() {
     while true; do
         print_title "WireGuard 服务端管理"
+        local srv_name=$(wg_get_server_name)
         if wg_is_running; then
-            echo -e "  状态: ${C_GREEN}● 运行中${C_RESET}    接口: ${C_CYAN}${WG_INTERFACE}${C_RESET}"
+            echo -e "  状态: ${C_GREEN}● 运行中${C_RESET}    接口: ${C_CYAN}${WG_INTERFACE}${C_RESET}    名称: ${C_CYAN}${srv_name}${C_RESET}"
         else
-            echo -e "  状态: ${C_RED}● 已停止${C_RESET}    接口: ${C_CYAN}${WG_INTERFACE}${C_RESET}"
+            echo -e "  状态: ${C_RED}● 已停止${C_RESET}    接口: ${C_CYAN}${WG_INTERFACE}${C_RESET}    名称: ${C_CYAN}${srv_name}${C_RESET}"
         fi
         local peer_count=$(wg_db_get '.peers | length')
         echo -e "  设备数: ${C_CYAN}${peer_count}${C_RESET}"
@@ -10009,22 +10092,23 @@ wg_server_menu() {
   9. 停止 WireGuard
   10. 重启 WireGuard
   11. 修改服务端配置
-  12. 卸载 WireGuard
-  13. 生成 OpenWrt 清空 WG 配置命令
-  14. 服务端看门狗 (自动重启保活)
+  12. 修改服务器名称
+  13. 卸载 WireGuard
+  14. 生成 OpenWrt 清空 WG 配置命令
+  15. 服务端看门狗 (自动重启保活)
   ── 集群管理 (高可用) ─────────
-  15. 集群健康仪表盘
-  16. 一键部署新节点 (SSH 自动安装+同步)
-  17. 加入已有集群 (Join)
-  18. 移除集群节点
-  19. 同步 Peers 到所有节点
-  20. 部署 Mesh 全互联
-  21. 拆除 Mesh 互联
-  22. Mesh 看门狗
-  23. 自动故障转移
+  16. 集群健康仪表盘
+  17. 一键部署新节点 (SSH 自动安装+同步)
+  18. 加入已有集群 (Join)
+  19. 移除集群节点
+  20. 同步 Peers 到所有节点
+  21. 部署 Mesh 全互联
+  22. 拆除 Mesh 互联
+  23. Mesh 看门狗
+  24. 自动故障转移
   ── 数据管理 ──────────────────
-  24. 导出设备配置 (JSON)
-  25. 导入设备配置 (JSON)
+  25. 导出设备配置 (JSON)
+  26. 导入设备配置 (JSON)
   0. 返回上级菜单
 "
         read -e -r -p "$(echo -e "${C_CYAN}选择操作: ${C_RESET}")" choice
@@ -10040,20 +10124,21 @@ wg_server_menu() {
             9) wg_stop; pause ;;
             10) wg_restart; pause ;;
             11) wg_modify_server ;;
-            12) wg_uninstall; return ;;
-            13) wg_openwrt_clean_cmd ;;
-            14) wg_setup_watchdog ;;
-            15) wg_cluster_dashboard ;;
-            16) wg_cluster_deploy_node ;;
-            17) wg_cluster_join ;;
-            18) wg_cluster_remove_node ;;
-            19) wg_cluster_sync ;;
-            20) wg_cluster_mesh_setup ;;
-            21) wg_cluster_mesh_teardown ;;
-            22) wg_mesh_watchdog_setup ;;
-            23) wg_cluster_failover_setup ;;
-            24) wg_export_peers ;;
-            25) wg_import_peers ;;
+            12) wg_rename_server ;;
+            13) wg_uninstall; return ;;
+            14) wg_openwrt_clean_cmd ;;
+            15) wg_setup_watchdog ;;
+            16) wg_cluster_dashboard ;;
+            17) wg_cluster_deploy_node ;;
+            18) wg_cluster_join ;;
+            19) wg_cluster_remove_node ;;
+            20) wg_cluster_sync ;;
+            21) wg_cluster_mesh_setup ;;
+            22) wg_cluster_mesh_teardown ;;
+            23) wg_mesh_watchdog_setup ;;
+            24) wg_cluster_failover_setup ;;
+            25) wg_export_peers ;;
+            26) wg_import_peers ;;
             0|"") return ;;
             *) print_warn "无效选项" ;;
         esac
