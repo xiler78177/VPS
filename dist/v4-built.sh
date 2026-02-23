@@ -4331,6 +4331,15 @@ wg_ssh_opts() {
     echo "-o StrictHostKeyChecking=accept-new -o ConnectTimeout=${timeout} -p ${port}"
 }
 
+# 获取本机 SSH 端口
+wg_get_local_ssh_port() {
+    local p=""
+    p=$(ss -tlnp 2>/dev/null | awk '/sshd/{print $4}' | grep -oP '\d+$' | head -1)
+    [[ -z "$p" ]] && p=$(grep -m1 '^Port ' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+    [[ -z "$p" ]] && p=22
+    echo "$p"
+}
+
 # SSH ControlMaster 连接复用 —— 一次认证，多次使用
 wg_ssh_cm_start() {
     local host="${1:?}" port="${2:-22}" user="${3:-root}"
@@ -5787,7 +5796,7 @@ WGCONF_EOF
                     --arg ip "$my_ip" \
                     --arg pubkey "$server_pubkey" \
                     --arg ssh_host "$my_endpoint" \
-                    --argjson ssh_port 22 \
+                    --argjson ssh_port "$(wg_get_local_ssh_port)" \
                     --arg ssh_user "root" \
                     '{name:$name, endpoint:$ep, port:$port, ip:$ip, public_key:$pubkey, ssh_host:$ssh_host, ssh_port:$ssh_port, ssh_user:$ssh_user}')
                 target_cluster_nodes=$(echo "$target_cluster_nodes" | jq --argjson me "$my_node_json" '. + [$me]')
@@ -6103,7 +6112,7 @@ WGCONF_EOF
         --arg ip "$my_ip" \
         --arg pubkey "$my_pubkey" \
         --arg ssh_host "$my_endpoint" \
-        --argjson ssh_port 22 \
+        --argjson ssh_port "$(wg_get_local_ssh_port)" \
         --arg ssh_user "root" \
         '{name:$name, endpoint:$ep, port:$port, ip:$ip, public_key:$pubkey, ssh_host:$ssh_host, ssh_port:$ssh_port, ssh_user:$ssh_user}')
 
@@ -6116,7 +6125,7 @@ WGCONF_EOF
                --arg ip '${my_ip}' \
                --arg pubkey '${my_pubkey}' \
                --arg ssh_host '${my_endpoint}' \
-               --argjson ssh_port 22 \
+               --argjson ssh_port $(wg_get_local_ssh_port) \
                --arg ssh_user 'root' \
                '.cluster.enabled = true | .cluster.nodes += [{name:\$name,endpoint:\$ep,port:\$port,ip:\$ip,public_key:\$pubkey,ssh_host:\$ssh_host,ssh_port:\$ssh_port,ssh_user:\$ssh_user}]' \
                /etc/wireguard/db/wg-data.json > /tmp/.wg-db-tmp.json && \
@@ -6158,7 +6167,7 @@ WGCONF_EOF
                    --arg ip '${my_ip}' \
                    --arg pubkey '${my_pubkey}' \
                    --arg ssh_host '${my_endpoint}' \
-                   --argjson ssh_port 22 \
+                   --argjson ssh_port $(wg_get_local_ssh_port) \
                    --arg ssh_user 'root' \
                    '.cluster.enabled = true | .cluster.nodes += [{name:\$name,endpoint:\$ep,port:\$port,ip:\$ip,public_key:\$pubkey,ssh_host:\$ssh_host,ssh_port:\$ssh_port,ssh_user:\$ssh_user}]' \
                    /etc/wireguard/db/wg-data.json > /tmp/.wg-db-tmp.json && \
@@ -8856,7 +8865,7 @@ WGCONF_EOF
     local existing_nodes=$(wg_db_get '.cluster.nodes // []')
     local my_ssh_host my_ssh_port_val my_ssh_user_val
     my_ssh_host=$(wg_db_get '.server.endpoint')
-    my_ssh_port_val=22
+    my_ssh_port_val=$(wg_get_local_ssh_port)
     my_ssh_user_val="root"
     # 构建本机的节点信息（含本机公钥，供新节点生成 Clash 配置时使用）
     local my_node_json
