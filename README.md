@@ -1,4 +1,4 @@
-sh <(curl -sSL https://raw.githubusercontent.com/xiler78177/Certbot-DNS/main/install.sh)
+sh <(curl -sSL https://raw.githubusercontent.com/xiler78177/VPS/main/install.sh)
 # 服务器初始化与管理脚本
 # 功能:
 # 1.  **基础工具**: 安装常用软件包。
@@ -12,3 +12,4 @@ sh <(curl -sSL https://raw.githubusercontent.com/xiler78177/Certbot-DNS/main/ins
 #     - 自动配置 Nginx 反向代理 (支持自定义端口, HTTP/HTTPS 后端)。
 #     - 证书自动续期与部署 (通过 Cron)。
 #     - 集中查看/删除已配置域名信息。
+
