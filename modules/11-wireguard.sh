@@ -250,8 +250,8 @@ wg_rebuild_conf() {
         echo "PrivateKey = ${priv_key}"
         echo "Address = ${server_ip}/${mask}"
         echo "ListenPort = ${port}"
-        echo "PostUp = iptables -I FORWARD 1 -i %i -j ACCEPT; iptables -I FORWARD 2 -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -s ${subnet} -o ${main_iface} -j MASQUERADE"
-        echo "PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -s ${subnet} -o ${main_iface} -j MASQUERADE"
+        echo "PostUp = iptables -C FORWARD -i %i -j ACCEPT 2>/dev/null || iptables -A FORWARD -i %i -j ACCEPT; iptables -C FORWARD -o %i -j ACCEPT 2>/dev/null || iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -C POSTROUTING -s ${subnet} -o ${main_iface} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s ${subnet} -o ${main_iface} -j MASQUERADE"
+        echo "PostDown = iptables -D FORWARD -i %i -j ACCEPT 2>/dev/null; iptables -D FORWARD -o %i -j ACCEPT 2>/dev/null; iptables -t nat -D POSTROUTING -s ${subnet} -o ${main_iface} -j MASQUERADE 2>/dev/null"
         local pc=$(wg_db_get '.peers | length') i=0
         while [[ $i -lt $pc ]]; do
             if [[ "$(wg_db_get ".peers[$i].enabled")" == "true" ]]; then
@@ -712,6 +712,13 @@ uci delete firewall.wg_mesh_zone 2>/dev/null; true
 uci delete firewall.wg_mesh_fwd 2>/dev/null; true
 uci delete firewall.wg_mesh_fwd_lan 2>/dev/null; true
 
+# 清理 OpenClash 绕过规则
+ip rule del lookup main prio 100 2>/dev/null; true
+for h in \$(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print \$NF}'); do
+    nft delete rule inet fw4 mangle_prerouting handle "\$h" 2>/dev/null; true
+done
+sed -i '/wg_bypass/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null; true
+
 uci commit network 2>/dev/null; true
 uci commit firewall 2>/dev/null; true
 
@@ -786,8 +793,28 @@ uci set firewall.wg_fwd_wg.src='wg'
 uci set firewall.wg_fwd_wg.dest='lan'
 uci commit network
 uci commit firewall
-/etc/init.d/firewall restart
-ifup wg0
+/etc/init.d/firewall reload
+
+# === OpenClash 绕过: 让 WireGuard 流量直连不走代理 ===
+EP_IP='${ep_host}'
+echo "\${EP_IP}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\$' || \
+    EP_IP=\$(nslookup '${ep_host}' 2>/dev/null | awk '/^Address:/{a=\$2} END{if(a) print a}')
+if [ -n "\${EP_IP}" ]; then
+    # 添加策略路由: VPS IP 走主路由表，绕过 OpenClash 的路由表 354
+    ip rule del to "\${EP_IP}" lookup main prio 100 2>/dev/null; true
+    ip rule add to "\${EP_IP}" lookup main prio 100
+    # nftables: 标记发往 VPS 的包跳过 OpenClash
+    nft list chain inet fw4 mangle_prerouting &>/dev/null && {
+        nft delete rule inet fw4 mangle_prerouting handle \$(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print \$NF}') 2>/dev/null; true
+        nft insert rule inet fw4 mangle_prerouting ip daddr "\${EP_IP}" udp dport ${sport} counter return comment \"wg_bypass\" 2>/dev/null; true
+    }
+    # 持久化: 写入 /etc/rc.local
+    sed -i '/wg_bypass/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null; true
+    sed -i "/^exit 0/i # WireGuard bypass OpenClash\nip rule add to \${EP_IP} lookup main prio 100 2>/dev/null; true" /etc/rc.local 2>/dev/null; true
+    echo "[+] OpenClash 绕过规则已添加: \${EP_IP}"
+fi
+
+/etc/init.d/network reload
 
 # === 验证 ===
 sleep 3
@@ -1181,6 +1208,13 @@ uci delete firewall.wg_mesh_zone 2>/dev/null; true
 uci delete firewall.wg_mesh_fwd 2>/dev/null; true
 uci delete firewall.wg_mesh_fwd_lan 2>/dev/null; true
 
+# 清理 OpenClash 绕过规则
+ip rule del lookup main prio 100 2>/dev/null; true
+for h in \$(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print \$NF}'); do
+    nft delete rule inet fw4 mangle_prerouting handle "\$h" 2>/dev/null; true
+done
+sed -i '/wg_bypass/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null; true
+
 uci commit network 2>/dev/null; true
 uci commit firewall 2>/dev/null; true
 
@@ -1244,8 +1278,28 @@ uci set firewall.wg_fwd_wg.src='wg'
 uci set firewall.wg_fwd_wg.dest='lan'
 uci commit network
 uci commit firewall
-/etc/init.d/firewall restart
-ifup wg0
+/etc/init.d/firewall reload
+
+# === OpenClash 绕过: 让 WireGuard 流量直连不走代理 ===
+EP_IP='${ep_host}'
+echo "\${EP_IP}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\$' || \
+    EP_IP=\$(nslookup '${ep_host}' 2>/dev/null | awk '/^Address:/{a=\$2} END{if(a) print a}')
+if [ -n "\${EP_IP}" ]; then
+    # 添加策略路由: VPS IP 走主路由表，绕过 OpenClash 的路由表 354
+    ip rule del to "\${EP_IP}" lookup main prio 100 2>/dev/null; true
+    ip rule add to "\${EP_IP}" lookup main prio 100
+    # nftables: 标记发往 VPS 的包跳过 OpenClash
+    nft list chain inet fw4 mangle_prerouting &>/dev/null && {
+        nft delete rule inet fw4 mangle_prerouting handle \$(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print \$NF}') 2>/dev/null; true
+        nft insert rule inet fw4 mangle_prerouting ip daddr "\${EP_IP}" udp dport ${sport} counter return comment \"wg_bypass\" 2>/dev/null; true
+    }
+    # 持久化: 写入 /etc/rc.local
+    sed -i '/wg_bypass/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null; true
+    sed -i "/^exit 0/i # WireGuard bypass OpenClash\nip rule add to \${EP_IP} lookup main prio 100 2>/dev/null; true" /etc/rc.local 2>/dev/null; true
+    echo "[+] OpenClash 绕过规则已添加: \${EP_IP}"
+fi
+
+/etc/init.d/network reload
 
 # === 验证 ===
 sleep 3
@@ -2119,6 +2173,12 @@ wg_uninstall() {
             fi
             _fwi=$((_fwi + 1))
         done
+        # 清理 OpenClash 绕过规则
+        ip rule del lookup main prio 100 2>/dev/null || true
+        for h in $(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print $NF}'); do
+            nft delete rule inet fw4 mangle_prerouting handle "$h" 2>/dev/null || true
+        done
+        sed -i '/wg_bypass/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null || true
         uci commit network 2>/dev/null || true
         uci commit firewall 2>/dev/null || true
     fi
@@ -2203,11 +2263,18 @@ uci delete firewall.wg_mesh_zone 2>/dev/null; true
 uci delete firewall.wg_mesh_fwd 2>/dev/null; true
 uci delete firewall.wg_mesh_fwd_lan 2>/dev/null; true
 
+# 清理 OpenClash 绕过规则
+ip rule del lookup main prio 100 2>/dev/null; true
+for h in $(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print $NF}'); do
+    nft delete rule inet fw4 mangle_prerouting handle "$h" 2>/dev/null; true
+done
+sed -i '/wg_bypass/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null; true
+
 # 提交并重载
 uci commit network
 uci commit firewall
 /etc/init.d/firewall reload
-ifup wg0 2>/dev/null; true
+/etc/init.d/network reload
 
 echo "[OK] WireGuard 配置已清空"
 CLEANEOF
