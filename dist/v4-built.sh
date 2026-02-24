@@ -4869,14 +4869,33 @@ PersistentKeepalive = 25"
                         cat << OPENWRT_EOF
 
 # === 清理旧配置 ===
-uci delete network.wg0 2>/dev/null; true
+# 停止所有 WireGuard 接口
+ifdown wg0 2>/dev/null; true
+ifdown wg_mesh 2>/dev/null; true
+
+# 删除所有 wireguard peer 配置段 (含匿名段)
+while uci -q get network.@wireguard_wg0[0] >/dev/null 2>&1; do
+    uci delete network.@wireguard_wg0[0]
+done
+while uci -q get network.@wireguard_wg_mesh[0] >/dev/null 2>&1; do
+    uci delete network.@wireguard_wg_mesh[0]
+done
 uci delete network.wg_server 2>/dev/null; true
+
+# 删除网络接口
+uci delete network.wg0 2>/dev/null; true
+uci delete network.wg_mesh 2>/dev/null; true
+
+# 删除防火墙配置
 uci delete firewall.wg_zone 2>/dev/null; true
 uci delete firewall.wg_fwd_lan 2>/dev/null; true
 uci delete firewall.wg_fwd_wg 2>/dev/null; true
+uci delete firewall.wg_mesh_zone 2>/dev/null; true
+uci delete firewall.wg_mesh_fwd 2>/dev/null; true
+uci delete firewall.wg_mesh_fwd_lan 2>/dev/null; true
+
 uci commit network 2>/dev/null; true
 uci commit firewall 2>/dev/null; true
-ifdown wg0 2>/dev/null; true
 
 # === 安装 WireGuard 组件 ===
 # 检测内核是否已支持 WireGuard
@@ -4950,7 +4969,7 @@ uci set firewall.wg_fwd_wg.dest='lan'
 uci commit network
 uci commit firewall
 /etc/init.d/firewall restart
-/etc/init.d/network restart
+ifup wg0
 
 # === 验证 ===
 sleep 3
@@ -5319,14 +5338,33 @@ PersistentKeepalive = 25"
             cat << OPENWRT_EOF
 
 # === 清理旧配置 ===
-uci delete network.wg0 2>/dev/null; true
+# 停止所有 WireGuard 接口
+ifdown wg0 2>/dev/null; true
+ifdown wg_mesh 2>/dev/null; true
+
+# 删除所有 wireguard peer 配置段 (含匿名段)
+while uci -q get network.@wireguard_wg0[0] >/dev/null 2>&1; do
+    uci delete network.@wireguard_wg0[0]
+done
+while uci -q get network.@wireguard_wg_mesh[0] >/dev/null 2>&1; do
+    uci delete network.@wireguard_wg_mesh[0]
+done
 uci delete network.wg_server 2>/dev/null; true
+
+# 删除网络接口
+uci delete network.wg0 2>/dev/null; true
+uci delete network.wg_mesh 2>/dev/null; true
+
+# 删除防火墙配置
 uci delete firewall.wg_zone 2>/dev/null; true
 uci delete firewall.wg_fwd_lan 2>/dev/null; true
 uci delete firewall.wg_fwd_wg 2>/dev/null; true
+uci delete firewall.wg_mesh_zone 2>/dev/null; true
+uci delete firewall.wg_mesh_fwd 2>/dev/null; true
+uci delete firewall.wg_mesh_fwd_lan 2>/dev/null; true
+
 uci commit network 2>/dev/null; true
 uci commit firewall 2>/dev/null; true
-ifdown wg0 2>/dev/null; true
 
 # === 安装 WireGuard 组件 ===
 WG_KERNEL=0
@@ -5389,7 +5427,7 @@ uci set firewall.wg_fwd_wg.dest='lan'
 uci commit network
 uci commit firewall
 /etc/init.d/firewall restart
-/etc/init.d/network restart
+ifup wg0
 
 # === 验证 ===
 sleep 3
@@ -6235,12 +6273,29 @@ wg_uninstall() {
     # OpenWrt: 自动清理 uci 配置
     if [[ "$PLATFORM" == "openwrt" ]]; then
         print_info "清理 OpenWrt 网络和防火墙配置..."
-        uci delete network.wg0 2>/dev/null || true
+        ifdown wg0 2>/dev/null || true
+        ifdown wg_mesh 2>/dev/null || true
+        # 删除所有 wireguard peer 配置段
+        while uci -q get network.@wireguard_wg0[0] >/dev/null 2>&1; do
+            uci delete network.@wireguard_wg0[0] 2>/dev/null || true
+        done
+        while uci -q get network.@wireguard_wg_mesh[0] >/dev/null 2>&1; do
+            uci delete network.@wireguard_wg_mesh[0] 2>/dev/null || true
+        done
         uci delete network.wg_server 2>/dev/null || true
+        uci delete network.wg0 2>/dev/null || true
+        uci delete network.wg_mesh 2>/dev/null || true
+        # 删除防火墙配置
+        uci delete firewall.wg_zone 2>/dev/null || true
+        uci delete firewall.wg_fwd_lan 2>/dev/null || true
+        uci delete firewall.wg_fwd_wg 2>/dev/null || true
+        uci delete firewall.wg_mesh_zone 2>/dev/null || true
+        uci delete firewall.wg_mesh_fwd 2>/dev/null || true
+        uci delete firewall.wg_mesh_fwd_lan 2>/dev/null || true
         local _fwi=0
         while uci get firewall.@zone[$_fwi] &>/dev/null 2>&1; do
             local _fname=$(uci get firewall.@zone[$_fwi].name 2>/dev/null)
-            if [[ "$_fname" == "wg" || "$_fname" == "wireguard" ]]; then
+            if [[ "$_fname" == "wg" || "$_fname" == "wireguard" || "$_fname" == "wg_mesh" ]]; then
                 uci delete "firewall.@zone[$_fwi]" 2>/dev/null || true
                 continue
             fi
@@ -6305,25 +6360,38 @@ wg_openwrt_clean_cmd() {
     echo -e "${C_YELLOW}复制以下命令到 OpenWrt SSH 终端执行:${C_RESET}"
     draw_line
     cat << 'CLEANEOF'
-# 停止 WireGuard 接口
+# 停止所有 WireGuard 接口
 ifdown wg0 2>/dev/null; true
+ifdown wg_mesh 2>/dev/null; true
 
-# 删除网络配置
-uci delete network.wg0 2>/dev/null; true
+# 删除所有 wireguard peer 配置段 (含匿名段)
+while uci -q get network.@wireguard_wg0[0] >/dev/null 2>&1; do
+    uci delete network.@wireguard_wg0[0]
+done
+while uci -q get network.@wireguard_wg_mesh[0] >/dev/null 2>&1; do
+    uci delete network.@wireguard_wg_mesh[0]
+done
 uci delete network.wg_server 2>/dev/null; true
+
+# 删除网络接口
+uci delete network.wg0 2>/dev/null; true
+uci delete network.wg_mesh 2>/dev/null; true
 
 # 删除防火墙配置
 uci delete firewall.wg_zone 2>/dev/null; true
 uci delete firewall.wg_fwd_lan 2>/dev/null; true
 uci delete firewall.wg_fwd_wg 2>/dev/null; true
+uci delete firewall.wg_mesh_zone 2>/dev/null; true
+uci delete firewall.wg_mesh_fwd 2>/dev/null; true
+uci delete firewall.wg_mesh_fwd_lan 2>/dev/null; true
 
 # 提交并重载
 uci commit network
 uci commit firewall
 /etc/init.d/firewall reload
-/etc/init.d/network reload
+ifup wg0 2>/dev/null; true
 
-echo "[✓] WireGuard 配置已清空"
+echo "[OK] WireGuard 配置已清空"
 CLEANEOF
     draw_line
     echo -e "${C_CYAN}执行后可在 LuCI -> Network -> Interfaces 确认 wg0 已消失${C_RESET}"
