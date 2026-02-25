@@ -1,6 +1,7 @@
 # modules/09d-web-proxy.sh - 反向代理管理 + 主菜单
 
 web_reverse_proxy_site() {
+    local prefill_backend="${1:-}"
     print_title "添加反向代理网站"
     
     # 检查 Nginx 是否可用
@@ -82,20 +83,34 @@ web_reverse_proxy_site() {
     
     # 后端地址
     local BACKEND_URL=""
-    print_guide "输入后端服务地址 (例如 127.0.0.1:8096, 或完整URL http://127.0.0.1:8096)"
-    while [[ -z "$BACKEND_URL" ]]; do
-        read -e -r -p "后端地址: " inp
-        # 纯端口号自动补全
-        [[ "$inp" =~ ^[0-9]+$ ]] && inp="127.0.0.1:$inp"
-        # 没有协议头的自动补 http
-        if [[ "$inp" =~ ^(http|https):// ]]; then
-            BACKEND_URL="$inp"
-        elif [[ "$inp" =~ ^(\[.*\]|[a-zA-Z0-9.-]+):[0-9]+$ ]]; then
-            BACKEND_URL="http://${inp}"
+    if [[ -n "$prefill_backend" ]]; then
+        # 预填模式 (来自端口转发联动等)
+        if [[ "$prefill_backend" =~ ^(http|https):// ]]; then
+            BACKEND_URL="$prefill_backend"
         else
-            print_warn "格式错误，请输入 IP:端口 或完整URL"
+            BACKEND_URL="http://${prefill_backend}"
         fi
-    done
+        echo -e "  后端地址: ${C_GREEN}${BACKEND_URL}${C_RESET} (自动填充)"
+        if ! confirm "使用此后端地址?"; then
+            BACKEND_URL=""
+        fi
+    fi
+    if [[ -z "$BACKEND_URL" ]]; then
+        print_guide "输入后端服务地址 (例如 127.0.0.1:8096, 或完整URL http://127.0.0.1:8096)"
+        while [[ -z "$BACKEND_URL" ]]; do
+            read -e -r -p "后端地址: " inp
+            # 纯端口号自动补全
+            [[ "$inp" =~ ^[0-9]+$ ]] && inp="127.0.0.1:$inp"
+            # 没有协议头的自动补 http
+            if [[ "$inp" =~ ^(http|https):// ]]; then
+                BACKEND_URL="$inp"
+            elif [[ "$inp" =~ ^(\[.*\]|[a-zA-Z0-9.-]+):[0-9]+$ ]]; then
+                BACKEND_URL="http://${inp}"
+            else
+                print_warn "格式错误，请输入 IP:端口 或完整URL"
+            fi
+        done
+    fi
     
     # 端口配置
     local HTTP_PORT HTTPS_PORT
