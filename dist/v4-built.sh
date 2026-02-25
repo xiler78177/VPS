@@ -4596,11 +4596,14 @@ _wg_pf_iptables() {
     _pf_one() {
         iptables -t nat "$action" PREROUTING -i "$iface" -p "$1" --dport "$ext_port" \
             -j DNAT --to-destination "${dest_ip}:${dest_port}" 2>/dev/null || true
+        iptables "$action" ufw-before-forward -i "$iface" -o "$WG_INTERFACE" -p "$1" \
+            --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || \
         iptables "$action" FORWARD -i "$iface" -o "$WG_INTERFACE" -p "$1" \
             --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || true
-        # 回程流量伪装：转发目标回包经由外网口出去时，源地址需伪装为服务器公网IP
-        iptables -t nat "$action" POSTROUTING -o "$iface" -p "$1" \
-            -s "$dest_ip" --sport "$dest_port" -j MASQUERADE 2>/dev/null || true
+        # 对出 wg 方向做 MASQUERADE，解决非对称路由：
+        # 让目标设备看到来源是 VPS 的 WG 内网 IP，确保回包经过 VPS 隧道
+        iptables -t nat "$action" POSTROUTING -o "$WG_INTERFACE" -p "$1" \
+            -d "$dest_ip" --dport "$dest_port" -j MASQUERADE 2>/dev/null || true
     }
     if [[ "$proto" == "tcp+udp" ]]; then _pf_one tcp; _pf_one udp; else _pf_one "$proto"; fi
 }
@@ -4613,15 +4616,20 @@ _wg_pf_iptables_ensure() {
             -j DNAT --to-destination "${dest_ip}:${dest_port}" 2>/dev/null || \
         iptables -t nat -A PREROUTING -i "$iface" -p "$1" --dport "$ext_port" \
             -j DNAT --to-destination "${dest_ip}:${dest_port}" 2>/dev/null || true
-        iptables -C FORWARD -i "$iface" -o "$WG_INTERFACE" -p "$1" \
+        # 优先插入 ufw-before-forward，回退到普通 FORWARD
+        iptables -C ufw-before-forward -i "$iface" -o "$WG_INTERFACE" -p "$1" \
             --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || \
-        iptables -A FORWARD -i "$iface" -o "$WG_INTERFACE" -p "$1" \
-            --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || true
-        # 回程流量伪装：确保转发目标回包经由外网口出去时源地址被伪装
-        iptables -t nat -C POSTROUTING -o "$iface" -p "$1" \
-            -s "$dest_ip" --sport "$dest_port" -j MASQUERADE 2>/dev/null || \
-        iptables -t nat -A POSTROUTING -o "$iface" -p "$1" \
-            -s "$dest_ip" --sport "$dest_port" -j MASQUERADE 2>/dev/null || true
+        iptables -I ufw-before-forward 1 -i "$iface" -o "$WG_INTERFACE" -p "$1" \
+            --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || \
+        { iptables -C FORWARD -i "$iface" -o "$WG_INTERFACE" -p "$1" \
+            --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || \
+          iptables -A FORWARD -i "$iface" -o "$WG_INTERFACE" -p "$1" \
+            --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || true; }
+        # 对出 wg 方向做 MASQUERADE，解决非对称路由
+        iptables -t nat -C POSTROUTING -o "$WG_INTERFACE" -p "$1" \
+            -d "$dest_ip" --dport "$dest_port" -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -o "$WG_INTERFACE" -p "$1" \
+            -d "$dest_ip" --dport "$dest_port" -j MASQUERADE 2>/dev/null || true
     }
     if [[ "$proto" == "tcp+udp" ]]; then _pf_ensure_one tcp; _pf_ensure_one udp; else _pf_ensure_one "$proto"; fi
 }
