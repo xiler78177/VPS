@@ -211,6 +211,7 @@ backup_webdav_upload() {
     print_info "正在上传: ${filename}..."
     local http_code
     http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        -L \
         -T "$upload_file" \
         -u "${WEBDAV_USER}:${WEBDAV_PASS}" \
         --connect-timeout 10 \
@@ -284,6 +285,7 @@ WEBDAV_ENC_KEY=\"\""
             print_info "正在测试连通性..."
             local code
             code=$(curl -s -o /dev/null -w "%{http_code}" \
+                -L \
                 -u "${WEBDAV_USER}:${WEBDAV_PASS}" \
                 --connect-timeout 10 \
                 -X PROPFIND "$WEBDAV_URL" 2>/dev/null)
@@ -580,11 +582,13 @@ backup_list() {
         pause; return
     fi
     echo -e "${C_CYAN}本地备份:${C_RESET}"
+    echo -e "  路径: ${C_GRAY}${BACKUP_LOCAL_DIR}${C_RESET}"
     draw_line
     for f in $(ls -t "$BACKUP_LOCAL_DIR"/*.tar.gz 2>/dev/null | head -20); do
         local fsize=$(du -h "$f" 2>/dev/null | awk '{print $1}')
         local fdate=$(stat -c '%y' "$f" 2>/dev/null | cut -d'.' -f1 || stat -f '%Sm' "$f" 2>/dev/null)
-        printf "  %-50s %8s  %s\n" "$(basename "$f")" "$fsize" "$fdate"
+        printf "  ${C_GREEN}%s${C_RESET}\n" "$f"
+        printf "    大小: %s  日期: %s\n" "$fsize" "$fdate"
     done
     draw_line
     local total=$(ls -1 "$BACKUP_LOCAL_DIR"/*.tar.gz 2>/dev/null | wc -l)
@@ -710,6 +714,39 @@ _backup_clean_webdav() {
     pause
 }
 
+backup_manual_upload() {
+    print_title "手动上传备份到 WebDAV"
+    if [[ ! -f "$BACKUP_CONFIG_FILE" ]]; then
+        print_error "WebDAV 未配置。请先使用菜单配置 WebDAV 参数。"
+        pause; return
+    fi
+    validate_conf_file "$BACKUP_CONFIG_FILE" || { print_error "备份配置文件格式异常"; pause; return; }
+    if [[ ! -d "$BACKUP_LOCAL_DIR" ]] || [[ -z "$(ls -A "$BACKUP_LOCAL_DIR"/*.tar.gz 2>/dev/null)" ]]; then
+        print_warn "本地无备份文件可上传。"
+        pause; return
+    fi
+    echo -e "${C_CYAN}选择要上传的本地备份:${C_RESET}"
+    local i=1 files=()
+    for f in $(ls -t "$BACKUP_LOCAL_DIR"/*.tar.gz 2>/dev/null); do
+        local fsize=$(du -h "$f" 2>/dev/null | awk '{print $1}')
+        printf "  %2d. %-50s (%s)\n" "$i" "$(basename "$f")" "$fsize"
+        files+=("$f")
+        i=$((i + 1))
+        [[ $i -gt 20 ]] && break
+    done
+    echo "   0. 返回"
+    read -e -r -p "选择序号: " idx
+    [[ "$idx" == "0" || -z "$idx" ]] && return
+    if [[ "$idx" =~ ^[0-9]+$ ]] && [[ $idx -ge 1 && $idx -le ${#files[@]} ]]; then
+        local selected="${files[$((idx - 1))]}"
+        print_info "已选择: $(basename "$selected")"
+        backup_webdav_upload "$selected"
+    else
+        print_error "无效序号"
+    fi
+    pause
+}
+
 menu_backup() {
     while true; do
         print_title "备份与恢复 (支持 WebDAV)"
@@ -723,6 +760,7 @@ menu_backup() {
 4. 清理旧备份
 5. 配置 WebDAV 远程存储
 6. 定时备份设置
+7. 手动上传备份到 WebDAV
 0. 返回主菜单
 "
         read -e -r -p "选择: " bc
@@ -733,6 +771,7 @@ menu_backup() {
             4) backup_clean ;;
             5) backup_webdav_config ;;
             6) backup_schedule ;;
+            7) backup_manual_upload ;;
             0|q) break ;;
             *) print_error "无效选项" ;;
         esac
