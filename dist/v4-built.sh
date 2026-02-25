@@ -7418,9 +7418,10 @@ backup_webdav_upload() {
     print_info "正在上传: ${filename}..."
     local http_code
     http_code=$(curl -s -o /dev/null -w "%{http_code}" \
-        -L \
+        --location-trusted \
         -T "$upload_file" \
         -u "${WEBDAV_USER}:${WEBDAV_PASS}" \
+        -H 'Expect:' \
         --connect-timeout 10 \
         --max-time 600 \
         "$upload_url" 2>/dev/null)
@@ -7492,7 +7493,7 @@ WEBDAV_ENC_KEY=\"\""
             print_info "正在测试连通性..."
             local code
             code=$(curl -s -o /dev/null -w "%{http_code}" \
-                -L \
+                --location-trusted \
                 -u "${WEBDAV_USER}:${WEBDAV_PASS}" \
                 --connect-timeout 10 \
                 -X PROPFIND "$WEBDAV_URL" 2>/dev/null)
