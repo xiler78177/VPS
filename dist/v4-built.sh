@@ -3110,6 +3110,16 @@ web_add_domain() {
         read -e -r -p "后端协议 [1]http [2]https: " proto
         BACKEND_PROTOCOL=$([[ "$proto" == "2" ]] && echo "https" || echo "http")
         print_guide "请输入后端服务的实际地址 (例如 127.0.0.1:54321)"
+        # 支持调用方通过 _WEB_PRESET_PROXY 预填反代目标 (如端口转发联动)
+        if [[ -n "${_WEB_PRESET_PROXY:-}" ]]; then
+            local _preset_inp="$_WEB_PRESET_PROXY"
+            _WEB_PRESET_PROXY=""
+            [[ "$_preset_inp" =~ ^[0-9]+$ ]] && _preset_inp="127.0.0.1:$_preset_inp"
+            if [[ "$_preset_inp" =~ ^(\[.*\]|[a-zA-Z0-9.-]+):[0-9]+$ ]]; then
+                LOCAL_PROXY_PASS="${BACKEND_PROTOCOL}://${_preset_inp}"
+                print_info "反代目标 (已预填): ${LOCAL_PROXY_PASS}"
+            fi
+        fi
         while [[ -z "$LOCAL_PROXY_PASS" ]]; do
             read -e -r -p "反代目标: " inp
             [[ "$inp" =~ ^[0-9]+$ ]] && inp="127.0.0.1:$inp"
@@ -4588,6 +4598,9 @@ _wg_pf_iptables() {
             -j DNAT --to-destination "${dest_ip}:${dest_port}" 2>/dev/null || true
         iptables "$action" FORWARD -i "$iface" -o "$WG_INTERFACE" -p "$1" \
             --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || true
+        # 回程流量伪装：转发目标回包经由外网口出去时，源地址需伪装为服务器公网IP
+        iptables -t nat "$action" POSTROUTING -o "$iface" -p "$1" \
+            -s "$dest_ip" --sport "$dest_port" -j MASQUERADE 2>/dev/null || true
     }
     if [[ "$proto" == "tcp+udp" ]]; then _pf_one tcp; _pf_one udp; else _pf_one "$proto"; fi
 }
@@ -4604,6 +4617,11 @@ _wg_pf_iptables_ensure() {
             --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || \
         iptables -A FORWARD -i "$iface" -o "$WG_INTERFACE" -p "$1" \
             --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || true
+        # 回程流量伪装：确保转发目标回包经由外网口出去时源地址被伪装
+        iptables -t nat -C POSTROUTING -o "$iface" -p "$1" \
+            -s "$dest_ip" --sport "$dest_port" -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -o "$iface" -p "$1" \
+            -s "$dest_ip" --sport "$dest_port" -j MASQUERADE 2>/dev/null || true
     }
     if [[ "$proto" == "tcp+udp" ]]; then _pf_ensure_one tcp; _pf_ensure_one udp; else _pf_ensure_one "$proto"; fi
 }
@@ -6762,12 +6780,21 @@ wg_add_port_forward() {
     fi
     print_success "端口转发已添加: ${ext_port}/${proto} -> ${dest_ip}:${dest_port}"
     log_action "WireGuard port forward added: ${ext_port}/${proto} -> ${dest_ip}:${dest_port}"
-    # 联动: 提示配置域名反代
-    if [[ "$proto" == *"tcp"* ]] && command_exists nginx; then
-        echo ""
-        print_guide "已在本机 ${ext_port} 端口监听，可通过域名反代 (HTTPS) 对外提供服务"
-        if confirm "是否为此端口配置域名反代 (Nginx + SSL)?"; then
-            web_reverse_proxy_site "127.0.0.1:${ext_port}"
+    # 联动: 提示配置域名 (申请证书 + 反代 + DDNS)
+    if [[ "$proto" == *"tcp"* ]]; then
+        if declare -f web_add_domain &>/dev/null; then
+            echo ""
+            print_guide "已在本机 ${ext_port} 端口监听，可为其配置域名访问（申请证书 + Nginx 反代 + DDNS）"
+            if confirm "是否为此端口配置域名 (申请证书 + 反代 + DDNS)?"; then
+                _WEB_PRESET_PROXY="127.0.0.1:${ext_port}"
+                web_add_domain
+            fi
+        elif command_exists nginx; then
+            echo ""
+            print_guide "已在本机 ${ext_port} 端口监听，可通过域名反代 (HTTPS) 对外提供服务"
+            if confirm "是否为此端口配置域名反代 (Nginx + SSL)?"; then
+                web_reverse_proxy_site "127.0.0.1:${ext_port}"
+            fi
         fi
     fi
 }
