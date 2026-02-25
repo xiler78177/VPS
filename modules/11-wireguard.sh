@@ -215,6 +215,9 @@ _wg_pf_iptables() {
             -j DNAT --to-destination "${dest_ip}:${dest_port}" 2>/dev/null || true
         iptables "$action" FORWARD -i "$iface" -o "$WG_INTERFACE" -p "$1" \
             --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || true
+        # 回程流量伪装：转发目标回包经由外网口出去时，源地址需伪装为服务器公网IP
+        iptables -t nat "$action" POSTROUTING -o "$iface" -p "$1" \
+            -s "$dest_ip" --sport "$dest_port" -j MASQUERADE 2>/dev/null || true
     }
     if [[ "$proto" == "tcp+udp" ]]; then _pf_one tcp; _pf_one udp; else _pf_one "$proto"; fi
 }
@@ -231,6 +234,11 @@ _wg_pf_iptables_ensure() {
             --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || \
         iptables -A FORWARD -i "$iface" -o "$WG_INTERFACE" -p "$1" \
             --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || true
+        # 回程流量伪装：确保转发目标回包经由外网口出去时源地址被伪装
+        iptables -t nat -C POSTROUTING -o "$iface" -p "$1" \
+            -s "$dest_ip" --sport "$dest_port" -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -o "$iface" -p "$1" \
+            -s "$dest_ip" --sport "$dest_port" -j MASQUERADE 2>/dev/null || true
     }
     if [[ "$proto" == "tcp+udp" ]]; then _pf_ensure_one tcp; _pf_ensure_one udp; else _pf_ensure_one "$proto"; fi
 }

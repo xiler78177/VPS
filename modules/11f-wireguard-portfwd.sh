@@ -115,12 +115,21 @@ wg_add_port_forward() {
     fi
     print_success "端口转发已添加: ${ext_port}/${proto} -> ${dest_ip}:${dest_port}"
     log_action "WireGuard port forward added: ${ext_port}/${proto} -> ${dest_ip}:${dest_port}"
-    # 联动: 提示配置域名反代
-    if [[ "$proto" == *"tcp"* ]] && command_exists nginx; then
-        echo ""
-        print_guide "已在本机 ${ext_port} 端口监听，可通过域名反代 (HTTPS) 对外提供服务"
-        if confirm "是否为此端口配置域名反代 (Nginx + SSL)?"; then
-            web_reverse_proxy_site "127.0.0.1:${ext_port}"
+    # 联动: 提示配置域名 (申请证书 + 反代 + DDNS)
+    if [[ "$proto" == *"tcp"* ]]; then
+        if declare -f web_add_domain &>/dev/null; then
+            echo ""
+            print_guide "已在本机 ${ext_port} 端口监听，可为其配置域名访问（申请证书 + Nginx 反代 + DDNS）"
+            if confirm "是否为此端口配置域名 (申请证书 + 反代 + DDNS)?"; then
+                _WEB_PRESET_PROXY="127.0.0.1:${ext_port}"
+                web_add_domain
+            fi
+        elif command_exists nginx; then
+            echo ""
+            print_guide "已在本机 ${ext_port} 端口监听，可通过域名反代 (HTTPS) 对外提供服务"
+            if confirm "是否为此端口配置域名反代 (Nginx + SSL)?"; then
+                web_reverse_proxy_site "127.0.0.1:${ext_port}"
+            fi
         fi
     fi
 }

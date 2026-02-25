@@ -49,6 +49,16 @@ web_add_domain() {
         read -e -r -p "后端协议 [1]http [2]https: " proto
         BACKEND_PROTOCOL=$([[ "$proto" == "2" ]] && echo "https" || echo "http")
         print_guide "请输入后端服务的实际地址 (例如 127.0.0.1:54321)"
+        # 支持调用方通过 _WEB_PRESET_PROXY 预填反代目标 (如端口转发联动)
+        if [[ -n "${_WEB_PRESET_PROXY:-}" ]]; then
+            local _preset_inp="$_WEB_PRESET_PROXY"
+            _WEB_PRESET_PROXY=""
+            [[ "$_preset_inp" =~ ^[0-9]+$ ]] && _preset_inp="127.0.0.1:$_preset_inp"
+            if [[ "$_preset_inp" =~ ^(\[.*\]|[a-zA-Z0-9.-]+):[0-9]+$ ]]; then
+                LOCAL_PROXY_PASS="${BACKEND_PROTOCOL}://${_preset_inp}"
+                print_info "反代目标 (已预填): ${LOCAL_PROXY_PASS}"
+            fi
+        fi
         while [[ -z "$LOCAL_PROXY_PASS" ]]; do
             read -e -r -p "反代目标: " inp
             [[ "$inp" =~ ^[0-9]+$ ]] && inp="127.0.0.1:$inp"
