@@ -7220,43 +7220,15 @@ backup_create() {
         scan_types+=("$3"); scan_tags+=("$4")
         scan_selected+=(1)
     }
-    [[ -d /etc/nginx ]] && _scan_add "Nginx 配置" "/etc/nginx" "dir" "nginx"
-    [[ -d /etc/wireguard ]] && _scan_add "WireGuard 配置" "/etc/wireguard" "dir" "wireguard"
-    [[ -d "$DDNS_CONFIG_DIR" ]] && _scan_add "DDNS 配置" "$DDNS_CONFIG_DIR" "dir" "ddns"
-    [[ -d "$SAAS_CONFIG_DIR" ]] && _scan_add "SaaS CDN 配置" "$SAAS_CONFIG_DIR" "dir" "saas-cdn"
-    [[ -d "$CONFIG_DIR" ]] && _scan_add "域名管理配置" "$CONFIG_DIR" "dir" "domain-configs"
-    [[ -f /etc/fail2ban/jail.local ]] && _scan_add "Fail2ban 规则" "/etc/fail2ban/jail.local" "file" "fail2ban/jail.local"
-    [[ -d "$CERT_PATH_PREFIX" ]] && _scan_add "SSL 证书" "$CERT_PATH_PREFIX" "dir" "certs"
-    [[ -d "$CERT_HOOKS_DIR" ]] && _scan_add "证书续签 Hooks" "$CERT_HOOKS_DIR" "dir" "cert-hooks"
+    [[ -d /etc/nginx ]]             && _scan_add "Nginx 配置"        "/etc/nginx"             "dir" "nginx"
+    [[ -d "$DDNS_CONFIG_DIR" ]]     && _scan_add "DDNS 配置"         "$DDNS_CONFIG_DIR"       "dir" "ddns"
+    [[ -d "$CONFIG_DIR" ]]          && _scan_add "域名管理配置"      "$CONFIG_DIR"            "dir" "domain-configs"
+    [[ -d "$CERT_PATH_PREFIX" ]]    && _scan_add "SSL 证书"          "$CERT_PATH_PREFIX"      "dir" "certs"
+    [[ -d "$CERT_HOOKS_DIR" ]]      && _scan_add "证书续签 Hooks"    "$CERT_HOOKS_DIR"        "dir" "cert-hooks"
     command -v crontab >/dev/null 2>&1 && _scan_add "Crontab 定时任务" "crontab" "cmd" "crontab.bak"
-    if command_exists docker; then
-        # Docker 运行时配置 (daemon.json/镜像加速等)
-        [[ -d /etc/docker ]] && _scan_add "Docker 配置" "/etc/docker" "dir" "docker-config"
-        # Docker Compose 项目目录 (包含 compose 文件+挂载数据)
-        for dc_dir in /opt /root /home/*; do
-            for dc_file in "$dc_dir"/*/docker-compose.{yml,yaml} "$dc_dir"/*/compose.{yml,yaml}; do
-                [[ -f "$dc_file" ]] || continue
-                local pdir=$(dirname "$dc_file")
-                _scan_add "Docker: $(basename "$pdir")" "$pdir" "dir" "docker-$(basename "$pdir")"
-            done
-        done 2>/dev/null
-    fi
-    [[ -d /etc/x-ui ]]              && _scan_add "3X-UI 面板"        "/etc/x-ui"              "dir" "x-ui"
-    [[ -d /usr/local/x-ui ]]        && _scan_add "3X-UI 程序目录"    "/usr/local/x-ui"        "dir" "x-ui-app"
-    [[ -d /opt/alist ]]             && _scan_add "Alist"             "/opt/alist"             "dir" "alist"
-    [[ -d /opt/1panel ]]            && _scan_add "1Panel"            "/opt/1panel"            "dir" "1panel"
-    [[ -d /root/.acme.sh ]]         && _scan_add "ACME.sh 证书"     "/root/.acme.sh"         "dir" "acme-sh"
-    [[ -d /etc/hysteria ]]          && _scan_add "Hysteria"          "/etc/hysteria"          "dir" "hysteria"
-    [[ -d /usr/local/etc/xray ]]    && _scan_add "Xray"             "/usr/local/etc/xray"    "dir" "xray"
-    [[ -d /usr/local/etc/v2ray ]]   && _scan_add "V2Ray"            "/usr/local/etc/v2ray"   "dir" "v2ray"
-    [[ -d /etc/sing-box ]]          && _scan_add "Sing-box"          "/etc/sing-box"          "dir" "sing-box"
-    [[ -d /etc/caddy ]]             && _scan_add "Caddy"             "/etc/caddy"             "dir" "caddy"
-    [[ -d /etc/haproxy ]]           && _scan_add "HAProxy"           "/etc/haproxy"           "dir" "haproxy"
-    [[ -d /etc/frp ]]               && _scan_add "FRP 内网穿透"      "/etc/frp"               "dir" "frp"
-    [[ -d /etc/nezha ]]             && _scan_add "哪吒监控"          "/etc/nezha"             "dir" "nezha"
-    [[ -d /opt/nezha ]]             && _scan_add "哪吒监控(opt)"     "/opt/nezha"             "dir" "nezha-opt"
     [[ -f "$CONFIG_FILE" ]]         && _scan_add "脚本自身配置"      "$CONFIG_FILE"           "file" "script-config"
     [[ -f /usr/local/bin/ddns-update.sh ]] && _scan_add "DDNS更新脚本" "/usr/local/bin/ddns-update.sh" "file" "ddns-update.sh"
+    [[ -f /etc/x-ui/x-ui.db ]]     && _scan_add "3X-UI 数据库"      "/etc/x-ui/x-ui.db"      "file" "x-ui/x-ui.db"
     local total=${#scan_names[@]}
     if [[ $total -eq 0 ]]; then
         print_warn "未发现任何可备份项。"
@@ -7328,14 +7300,6 @@ backup_create() {
                     crontab -l 2>/dev/null > "${tmp_dir}/data/crontab.bak" && {
                         echo -e "  ${C_GREEN}✓${C_RESET} $name"; items_backed=$((items_backed + 1))
                     }
-                elif [[ "$tag" == "docker-volumes" ]]; then
-                    mkdir -p "${tmp_dir}/data/docker-volumes"
-                    local vol
-                    for vol in $(docker volume ls -q 2>/dev/null); do
-                        local vp=$(docker volume inspect "$vol" --format '{{.Mountpoint}}' 2>/dev/null)
-                        [[ -n "$vp" && -d "$vp" ]] && cp -r "$vp" "${tmp_dir}/data/docker-volumes/${vol}" 2>/dev/null || true
-                    done
-                    echo -e "  ${C_GREEN}✓${C_RESET} $name"; items_backed=$((items_backed + 1))
                 fi ;;
         esac
     done
@@ -7714,26 +7678,16 @@ backup_restore() {
         echo -e "  ${C_GREEN}✓${C_RESET} /etc/nginx"
         restored=$((restored + 1))
     }
-    [[ -d "${tmp_restore}/wireguard" ]] && {
-        cp -r "${tmp_restore}/wireguard/"* /etc/wireguard/ 2>/dev/null
-        echo -e "  ${C_GREEN}✓${C_RESET} /etc/wireguard"
-        restored=$((restored + 1))
-    }
     [[ -d "${tmp_restore}/ddns" ]] && {
         mkdir -p "$DDNS_CONFIG_DIR"
         cp -r "${tmp_restore}/ddns/"* "$DDNS_CONFIG_DIR/" 2>/dev/null
         echo -e "  ${C_GREEN}✓${C_RESET} $DDNS_CONFIG_DIR"
         restored=$((restored + 1))
     }
-    [[ -d "${tmp_restore}/saas-cdn" ]] && {
-        mkdir -p "$SAAS_CONFIG_DIR"
-        cp -r "${tmp_restore}/saas-cdn/"* "$SAAS_CONFIG_DIR/" 2>/dev/null
-        echo -e "  ${C_GREEN}✓${C_RESET} $SAAS_CONFIG_DIR"
-        restored=$((restored + 1))
-    }
-    [[ -d "${tmp_restore}/fail2ban" ]] && {
-        cp "${tmp_restore}/fail2ban/jail.local" /etc/fail2ban/ 2>/dev/null
-        echo -e "  ${C_GREEN}✓${C_RESET} /etc/fail2ban/jail.local"
+    [[ -d "${tmp_restore}/domain-configs" ]] && {
+        mkdir -p "$CONFIG_DIR"
+        cp -r "${tmp_restore}/domain-configs/"* "$CONFIG_DIR/" 2>/dev/null
+        echo -e "  ${C_GREEN}✓${C_RESET} $CONFIG_DIR"
         restored=$((restored + 1))
     }
     [[ -d "${tmp_restore}/certs" ]] && {
@@ -7748,12 +7702,6 @@ backup_restore() {
         echo -e "  ${C_GREEN}✓${C_RESET} $CERT_HOOKS_DIR"
         restored=$((restored + 1))
     }
-    [[ -d "${tmp_restore}/domain-configs" ]] && {
-        mkdir -p "$CONFIG_DIR"
-        cp -r "${tmp_restore}/domain-configs/"* "$CONFIG_DIR/" 2>/dev/null
-        echo -e "  ${C_GREEN}✓${C_RESET} $CONFIG_DIR"
-        restored=$((restored + 1))
-    }
     [[ -f "${tmp_restore}/crontab.bak" ]] && {
         if confirm "是否恢复 crontab? (将替换当前所有 cron 定时任务)"; then
             crontab "${tmp_restore}/crontab.bak" 2>/dev/null
@@ -7761,10 +7709,22 @@ backup_restore() {
             restored=$((restored + 1))
         fi
     }
+    [[ -f "${tmp_restore}/script-config" ]] && {
+        cp "${tmp_restore}/script-config" "$CONFIG_FILE" 2>/dev/null
+        echo -e "  ${C_GREEN}✓${C_RESET} $CONFIG_FILE"
+        restored=$((restored + 1))
+    }
     [[ -f "${tmp_restore}/ddns-update.sh" ]] && {
         cp "${tmp_restore}/ddns-update.sh" /usr/local/bin/ 2>/dev/null
         chmod +x /usr/local/bin/ddns-update.sh 2>/dev/null
         echo -e "  ${C_GREEN}✓${C_RESET} ddns-update.sh"
+        restored=$((restored + 1))
+    }
+    [[ -f "${tmp_restore}/x-ui/x-ui.db" ]] && {
+        mkdir -p /etc/x-ui
+        cp "${tmp_restore}/x-ui/x-ui.db" /etc/x-ui/ 2>/dev/null
+        echo -e "  ${C_GREEN}✓${C_RESET} /etc/x-ui/x-ui.db"
+        restored=$((restored + 1))
     }
     
     # 重载服务（必须在清理临时目录之前检查）
