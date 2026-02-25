@@ -265,26 +265,6 @@ wg_server_status() {
         print_info "暂无设备"
     fi
     draw_line
-    local pf_count
-    pf_count=$(wg_db_get '.port_forwards | length')
-    if [[ "$pf_count" -gt 0 ]]; then
-        echo -e "${C_CYAN}端口转发规则 (${pf_count} 条):${C_RESET}"
-        draw_line
-        local j=0
-        while [[ $j -lt $pf_count ]]; do
-            local proto ext_port dest_ip dest_port pf_enabled
-            proto=$(wg_db_get ".port_forwards[$j].proto")
-            ext_port=$(wg_db_get ".port_forwards[$j].ext_port")
-            dest_ip=$(wg_db_get ".port_forwards[$j].dest_ip")
-            dest_port=$(wg_db_get ".port_forwards[$j].dest_port")
-            pf_enabled=$(wg_db_get ".port_forwards[$j].enabled")
-            local pf_status
-            [[ "$pf_enabled" == "true" ]] && pf_status="${C_GREEN}●${C_RESET}" || pf_status="${C_RED}○${C_RESET}"
-            echo -e "  ${pf_status} ${ext_port}/${proto} -> ${dest_ip}:${dest_port}"
-            j=$((j + 1))
-        done
-        draw_line
-    fi
     pause
 }
 
@@ -304,7 +284,6 @@ wg_start() {
     fi
     sleep 1
     if wg_is_running; then
-        wg_restore_port_forwards
         print_success "WireGuard 已启动"
         log_action "WireGuard started"
     else
@@ -336,7 +315,6 @@ wg_restart() {
     wg-quick up "$WG_INTERFACE" 2>/dev/null
     sleep 1
     if wg_is_running; then
-        wg_restore_port_forwards
         print_success "WireGuard 已重启"
         log_action "WireGuard restarted"
     else
@@ -345,27 +323,6 @@ wg_restart() {
     fi
 }
 
-wg_restore_port_forwards() {
-    local role
-    role=$(wg_get_role)
-    [[ "$role" != "server" ]] && return 0
-    local pf_count
-    pf_count=$(wg_db_get '.port_forwards | length')
-    [[ "$pf_count" -eq 0 || "$pf_count" == "null" ]] && return 0
-    local j=0
-    while [[ $j -lt $pf_count ]]; do
-        local proto ext_port dest_ip dest_port pf_enabled
-        proto=$(wg_db_get ".port_forwards[$j].proto")
-        ext_port=$(wg_db_get ".port_forwards[$j].ext_port")
-        dest_ip=$(wg_db_get ".port_forwards[$j].dest_ip")
-        dest_port=$(wg_db_get ".port_forwards[$j].dest_port")
-        pf_enabled=$(wg_db_get ".port_forwards[$j].enabled")
-        if [[ "$pf_enabled" == "true" ]]; then
-            _wg_pf_iptables_ensure "$proto" "$ext_port" "$dest_ip" "$dest_port"
-        fi
-        j=$((j + 1))
-    done
-}
 
 wg_uninstall() {
     print_title "卸载 WireGuard"
@@ -422,36 +379,16 @@ wg_uninstall() {
             ip link delete "$_r" 2>/dev/null || true
         done
     fi
-    print_info "[2/6] 清理端口转发规则..."
-    if [[ "$role" == "server" ]]; then
-        local pf_count
-        pf_count=$(wg_db_get '.port_forwards | length' 2>/dev/null)
-        if [[ -n "$pf_count" && "$pf_count" != "null" && "$pf_count" -gt 0 ]]; then
-            local j=0
-            while [[ $j -lt $pf_count ]]; do
-                local proto ext_port dest_ip dest_port
-                proto=$(wg_db_get ".port_forwards[$j].proto")
-                ext_port=$(wg_db_get ".port_forwards[$j].ext_port")
-                dest_ip=$(wg_db_get ".port_forwards[$j].dest_ip")
-                dest_port=$(wg_db_get ".port_forwards[$j].dest_port")
-                _wg_pf_iptables -D "$proto" "$ext_port" "$dest_ip" "$dest_port"
-                j=$((j + 1))
-            done
-            wg_save_iptables
-        fi
-    fi
-    print_info "[3/6] 清理防火墙规则..."
+    print_info "[2/5] 清理防火墙规则..."
     if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
         if [[ "$role" == "server" ]]; then
             local port
             port=$(wg_db_get '.server.port' 2>/dev/null)
             [[ -n "$port" ]] && ufw delete allow "${port}/udp" 2>/dev/null || true
         fi
-        ufw status numbered 2>/dev/null | grep "WG-PF" | awk -F'[][]' '{print $2}' | sort -rn | while read -r num; do
-            yes | ufw delete "$num" 2>/dev/null || true
-        done
+
     fi
-    print_info "[4/6] 清理所有看门狗和定时任务..."
+    print_info "[3/5] 清理所有看门狗和定时任务..."
     # 主看门狗
     if crontab -l 2>/dev/null | grep -q "wg-watchdog.sh"; then
         cron_remove_job "wg-watchdog.sh"
@@ -459,7 +396,7 @@ wg_uninstall() {
     rm -f /usr/local/bin/wg-watchdog.sh /var/log/wg-watchdog.log 2>/dev/null || true
     # OpenWrt 看门狗（不同路径）
     rm -f /usr/bin/wg-watchdog.sh 2>/dev/null || true
-    print_info "[5/6] 删除配置文件和临时文件..."
+    print_info "[4/5] 删除配置文件和临时文件..."
     rm -f "$WG_CONF" 2>/dev/null || true
     rm -rf /etc/wireguard/clients 2>/dev/null || true
     rm -f "$WG_DB_FILE" 2>/dev/null || true
@@ -511,7 +448,7 @@ wg_uninstall() {
         uci commit network 2>/dev/null || true
         uci commit firewall 2>/dev/null || true
     fi
-    print_info "[6/6] 卸载软件包..."
+    print_info "[5/5] 卸载软件包..."
     local remove_pkg=true
     if confirm "是否卸载 WireGuard 软件包? (选 N 仅删除配置)"; then
         case $PLATFORM in
@@ -547,7 +484,6 @@ wg_uninstall() {
         iptables -t nat -S 2>/dev/null | grep -i "wg\|wireguard\|${WG_INTERFACE}" | while read -r rule; do
             iptables -t nat $(echo "$rule" | sed 's/^-A/-D/') 2>/dev/null || true
         done
-        wg_save_iptables 2>/dev/null || true
     fi
     if [[ "$role" == "server" ]]; then
         if confirm "是否恢复 IP 转发设置? (如果其他服务需要转发请选 N)"; then

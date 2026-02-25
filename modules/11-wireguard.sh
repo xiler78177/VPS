@@ -5,7 +5,6 @@
 #   11c -> server install/control/uninstall
 #   11d -> peer management
 #   11e -> Clash/OpenClash config
-#   11f -> port forwarding
 #   11g -> watchdog + import/export + menus
 #   11b -> UDP2RAW tunnel
 readonly WG_INTERFACE="wg0"
@@ -22,7 +21,6 @@ wg_db_init() {
   "role": "",
   "server": {},
   "peers": [],
-  "port_forwards": [],
   "client": {}
 }
 WGEOF
@@ -197,59 +195,6 @@ wg_format_bytes() {
     }'
 }
 
-wg_save_iptables() {
-    if command_exists netfilter-persistent; then
-        netfilter-persistent save 2>/dev/null
-    elif command_exists iptables-save; then
-        mkdir -p /etc/iptables
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || \
-        iptables-save > /etc/iptables.rules 2>/dev/null
-    fi
-}
-
-_wg_pf_iptables() {
-    local action=$1 proto=$2 ext_port=$3 dest_ip=$4 dest_port=$5
-    local iface=$(ip route show default | awk '{print $5; exit}')
-    _pf_one() {
-        iptables -t nat "$action" PREROUTING -i "$iface" -p "$1" --dport "$ext_port" \
-            -j DNAT --to-destination "${dest_ip}:${dest_port}" 2>/dev/null || true
-        iptables "$action" ufw-before-forward -i "$iface" -o "$WG_INTERFACE" -p "$1" \
-            --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || \
-        iptables "$action" FORWARD -i "$iface" -o "$WG_INTERFACE" -p "$1" \
-            --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || true
-        # 对出 wg 方向做 MASQUERADE，解决非对称路由：
-        # 让目标设备看到来源是 VPS 的 WG 内网 IP，确保回包经过 VPS 隧道
-        iptables -t nat "$action" POSTROUTING -o "$WG_INTERFACE" -p "$1" \
-            -d "$dest_ip" --dport "$dest_port" -j MASQUERADE 2>/dev/null || true
-    }
-    if [[ "$proto" == "tcp+udp" ]]; then _pf_one tcp; _pf_one udp; else _pf_one "$proto"; fi
-}
-
-_wg_pf_iptables_ensure() {
-    local proto=$1 ext_port=$2 dest_ip=$3 dest_port=$4
-    local iface=$(ip route show default | awk '{print $5; exit}')
-    _pf_ensure_one() {
-        iptables -t nat -C PREROUTING -i "$iface" -p "$1" --dport "$ext_port" \
-            -j DNAT --to-destination "${dest_ip}:${dest_port}" 2>/dev/null || \
-        iptables -t nat -A PREROUTING -i "$iface" -p "$1" --dport "$ext_port" \
-            -j DNAT --to-destination "${dest_ip}:${dest_port}" 2>/dev/null || true
-        # 优先插入 ufw-before-forward，回退到普通 FORWARD
-        iptables -C ufw-before-forward -i "$iface" -o "$WG_INTERFACE" -p "$1" \
-            --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || \
-        iptables -I ufw-before-forward 1 -i "$iface" -o "$WG_INTERFACE" -p "$1" \
-            --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || \
-        { iptables -C FORWARD -i "$iface" -o "$WG_INTERFACE" -p "$1" \
-            --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || \
-          iptables -A FORWARD -i "$iface" -o "$WG_INTERFACE" -p "$1" \
-            --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || true; }
-        # 对出 wg 方向做 MASQUERADE，解决非对称路由
-        iptables -t nat -C POSTROUTING -o "$WG_INTERFACE" -p "$1" \
-            -d "$dest_ip" --dport "$dest_port" -j MASQUERADE 2>/dev/null || \
-        iptables -t nat -A POSTROUTING -o "$WG_INTERFACE" -p "$1" \
-            -d "$dest_ip" --dport "$dest_port" -j MASQUERADE 2>/dev/null || true
-    }
-    if [[ "$proto" == "tcp+udp" ]]; then _pf_ensure_one tcp; _pf_ensure_one udp; else _pf_ensure_one "$proto"; fi
-}
 
 wg_rebuild_conf() {
     [[ "$(wg_get_role)" != "server" ]] && return 1

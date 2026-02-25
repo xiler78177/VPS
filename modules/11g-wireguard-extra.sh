@@ -302,20 +302,18 @@ wg_server_menu() {
   4. 启用/禁用设备
   5. 查看设备配置/二维码
   6. 生成 Clash/OpenClash 配置
-  ── 端口转发 ──────────────────
-  7. 端口转发管理
   ── 服务控制 ──────────────────
-  8. 启动 WireGuard
-  9. 停止 WireGuard
-  10. 重启 WireGuard
-  11. 修改服务端配置
-  12. 修改服务器名称
-  13. 卸载 WireGuard
-  14. 生成 OpenWrt 清空 WG 配置命令
-  15. 服务端看门狗 (自动重启保活)
+  7. 启动 WireGuard
+  8. 停止 WireGuard
+  9. 重启 WireGuard
+  10. 修改服务端配置
+  11. 修改服务器名称
+  12. 卸载 WireGuard
+  13. 生成 OpenWrt 清空 WG 配置命令
+  14. 服务端看门狗 (自动重启保活)
   ── 数据管理 ──────────────────
-  16. 导出设备配置 (JSON)
-  17. 导入设备配置 (JSON)
+  15. 导出设备配置 (JSON)
+  16. 导入设备配置 (JSON)
   0. 返回上级菜单
 "
         read -e -r -p "$(echo -e "${C_CYAN}选择操作: ${C_RESET}")" choice
@@ -326,17 +324,16 @@ wg_server_menu() {
             4) wg_toggle_peer ;;
             5) wg_show_peer_conf ;;
             6) wg_generate_clash_config ;;
-            7) wg_port_forward_menu ;;
-            8) wg_start; pause ;;
-            9) wg_stop; pause ;;
-            10) wg_restart; pause ;;
-            11) wg_modify_server ;;
-            12) wg_rename_server ;;
-            13) wg_uninstall; return ;;
-            14) wg_openwrt_clean_cmd ;;
-            15) wg_setup_watchdog ;;
-            16) wg_export_peers ;;
-            17) wg_import_peers ;;
+            7) wg_start; pause ;;
+            8) wg_stop; pause ;;
+            9) wg_restart; pause ;;
+            10) wg_modify_server ;;
+            11) wg_rename_server ;;
+            12) wg_uninstall; return ;;
+            13) wg_openwrt_clean_cmd ;;
+            14) wg_setup_watchdog ;;
+            15) wg_export_peers ;;
+            16) wg_import_peers ;;
             0|"") return ;;
             *) print_warn "无效选项" ;;
         esac

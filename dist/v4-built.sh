@@ -4388,7 +4388,6 @@ wg_net_qualify_server() {
 #   11c -> server install/control/uninstall
 #   11d -> peer management
 #   11e -> Clash/OpenClash config
-#   11f -> port forwarding
 #   11g -> watchdog + import/export + menus
 #   11b -> UDP2RAW tunnel
 readonly WG_INTERFACE="wg0"
@@ -4405,7 +4404,6 @@ wg_db_init() {
   "role": "",
   "server": {},
   "peers": [],
-  "port_forwards": [],
   "client": {}
 }
 WGEOF
@@ -4580,59 +4578,6 @@ wg_format_bytes() {
     }'
 }
 
-wg_save_iptables() {
-    if command_exists netfilter-persistent; then
-        netfilter-persistent save 2>/dev/null
-    elif command_exists iptables-save; then
-        mkdir -p /etc/iptables
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || \
-        iptables-save > /etc/iptables.rules 2>/dev/null
-    fi
-}
-
-_wg_pf_iptables() {
-    local action=$1 proto=$2 ext_port=$3 dest_ip=$4 dest_port=$5
-    local iface=$(ip route show default | awk '{print $5; exit}')
-    _pf_one() {
-        iptables -t nat "$action" PREROUTING -i "$iface" -p "$1" --dport "$ext_port" \
-            -j DNAT --to-destination "${dest_ip}:${dest_port}" 2>/dev/null || true
-        iptables "$action" ufw-before-forward -i "$iface" -o "$WG_INTERFACE" -p "$1" \
-            --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || \
-        iptables "$action" FORWARD -i "$iface" -o "$WG_INTERFACE" -p "$1" \
-            --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || true
-        # 对出 wg 方向做 MASQUERADE，解决非对称路由：
-        # 让目标设备看到来源是 VPS 的 WG 内网 IP，确保回包经过 VPS 隧道
-        iptables -t nat "$action" POSTROUTING -o "$WG_INTERFACE" -p "$1" \
-            -d "$dest_ip" --dport "$dest_port" -j MASQUERADE 2>/dev/null || true
-    }
-    if [[ "$proto" == "tcp+udp" ]]; then _pf_one tcp; _pf_one udp; else _pf_one "$proto"; fi
-}
-
-_wg_pf_iptables_ensure() {
-    local proto=$1 ext_port=$2 dest_ip=$3 dest_port=$4
-    local iface=$(ip route show default | awk '{print $5; exit}')
-    _pf_ensure_one() {
-        iptables -t nat -C PREROUTING -i "$iface" -p "$1" --dport "$ext_port" \
-            -j DNAT --to-destination "${dest_ip}:${dest_port}" 2>/dev/null || \
-        iptables -t nat -A PREROUTING -i "$iface" -p "$1" --dport "$ext_port" \
-            -j DNAT --to-destination "${dest_ip}:${dest_port}" 2>/dev/null || true
-        # 优先插入 ufw-before-forward，回退到普通 FORWARD
-        iptables -C ufw-before-forward -i "$iface" -o "$WG_INTERFACE" -p "$1" \
-            --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || \
-        iptables -I ufw-before-forward 1 -i "$iface" -o "$WG_INTERFACE" -p "$1" \
-            --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || \
-        { iptables -C FORWARD -i "$iface" -o "$WG_INTERFACE" -p "$1" \
-            --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || \
-          iptables -A FORWARD -i "$iface" -o "$WG_INTERFACE" -p "$1" \
-            --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || true; }
-        # 对出 wg 方向做 MASQUERADE，解决非对称路由
-        iptables -t nat -C POSTROUTING -o "$WG_INTERFACE" -p "$1" \
-            -d "$dest_ip" --dport "$dest_port" -j MASQUERADE 2>/dev/null || \
-        iptables -t nat -A POSTROUTING -o "$WG_INTERFACE" -p "$1" \
-            -d "$dest_ip" --dport "$dest_port" -j MASQUERADE 2>/dev/null || true
-    }
-    if [[ "$proto" == "tcp+udp" ]]; then _pf_ensure_one tcp; _pf_ensure_one udp; else _pf_ensure_one "$proto"; fi
-}
 
 wg_rebuild_conf() {
     [[ "$(wg_get_role)" != "server" ]] && return 1
@@ -4978,26 +4923,6 @@ wg_server_status() {
         print_info "暂无设备"
     fi
     draw_line
-    local pf_count
-    pf_count=$(wg_db_get '.port_forwards | length')
-    if [[ "$pf_count" -gt 0 ]]; then
-        echo -e "${C_CYAN}端口转发规则 (${pf_count} 条):${C_RESET}"
-        draw_line
-        local j=0
-        while [[ $j -lt $pf_count ]]; do
-            local proto ext_port dest_ip dest_port pf_enabled
-            proto=$(wg_db_get ".port_forwards[$j].proto")
-            ext_port=$(wg_db_get ".port_forwards[$j].ext_port")
-            dest_ip=$(wg_db_get ".port_forwards[$j].dest_ip")
-            dest_port=$(wg_db_get ".port_forwards[$j].dest_port")
-            pf_enabled=$(wg_db_get ".port_forwards[$j].enabled")
-            local pf_status
-            [[ "$pf_enabled" == "true" ]] && pf_status="${C_GREEN}●${C_RESET}" || pf_status="${C_RED}○${C_RESET}"
-            echo -e "  ${pf_status} ${ext_port}/${proto} -> ${dest_ip}:${dest_port}"
-            j=$((j + 1))
-        done
-        draw_line
-    fi
     pause
 }
 
@@ -5017,7 +4942,6 @@ wg_start() {
     fi
     sleep 1
     if wg_is_running; then
-        wg_restore_port_forwards
         print_success "WireGuard 已启动"
         log_action "WireGuard started"
     else
@@ -5049,7 +4973,6 @@ wg_restart() {
     wg-quick up "$WG_INTERFACE" 2>/dev/null
     sleep 1
     if wg_is_running; then
-        wg_restore_port_forwards
         print_success "WireGuard 已重启"
         log_action "WireGuard restarted"
     else
@@ -5058,27 +4981,6 @@ wg_restart() {
     fi
 }
 
-wg_restore_port_forwards() {
-    local role
-    role=$(wg_get_role)
-    [[ "$role" != "server" ]] && return 0
-    local pf_count
-    pf_count=$(wg_db_get '.port_forwards | length')
-    [[ "$pf_count" -eq 0 || "$pf_count" == "null" ]] && return 0
-    local j=0
-    while [[ $j -lt $pf_count ]]; do
-        local proto ext_port dest_ip dest_port pf_enabled
-        proto=$(wg_db_get ".port_forwards[$j].proto")
-        ext_port=$(wg_db_get ".port_forwards[$j].ext_port")
-        dest_ip=$(wg_db_get ".port_forwards[$j].dest_ip")
-        dest_port=$(wg_db_get ".port_forwards[$j].dest_port")
-        pf_enabled=$(wg_db_get ".port_forwards[$j].enabled")
-        if [[ "$pf_enabled" == "true" ]]; then
-            _wg_pf_iptables_ensure "$proto" "$ext_port" "$dest_ip" "$dest_port"
-        fi
-        j=$((j + 1))
-    done
-}
 
 wg_uninstall() {
     print_title "卸载 WireGuard"
@@ -5135,36 +5037,16 @@ wg_uninstall() {
             ip link delete "$_r" 2>/dev/null || true
         done
     fi
-    print_info "[2/6] 清理端口转发规则..."
-    if [[ "$role" == "server" ]]; then
-        local pf_count
-        pf_count=$(wg_db_get '.port_forwards | length' 2>/dev/null)
-        if [[ -n "$pf_count" && "$pf_count" != "null" && "$pf_count" -gt 0 ]]; then
-            local j=0
-            while [[ $j -lt $pf_count ]]; do
-                local proto ext_port dest_ip dest_port
-                proto=$(wg_db_get ".port_forwards[$j].proto")
-                ext_port=$(wg_db_get ".port_forwards[$j].ext_port")
-                dest_ip=$(wg_db_get ".port_forwards[$j].dest_ip")
-                dest_port=$(wg_db_get ".port_forwards[$j].dest_port")
-                _wg_pf_iptables -D "$proto" "$ext_port" "$dest_ip" "$dest_port"
-                j=$((j + 1))
-            done
-            wg_save_iptables
-        fi
-    fi
-    print_info "[3/6] 清理防火墙规则..."
+    print_info "[2/5] 清理防火墙规则..."
     if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
         if [[ "$role" == "server" ]]; then
             local port
             port=$(wg_db_get '.server.port' 2>/dev/null)
             [[ -n "$port" ]] && ufw delete allow "${port}/udp" 2>/dev/null || true
         fi
-        ufw status numbered 2>/dev/null | grep "WG-PF" | awk -F'[][]' '{print $2}' | sort -rn | while read -r num; do
-            yes | ufw delete "$num" 2>/dev/null || true
-        done
+
     fi
-    print_info "[4/6] 清理所有看门狗和定时任务..."
+    print_info "[3/5] 清理所有看门狗和定时任务..."
     # 主看门狗
     if crontab -l 2>/dev/null | grep -q "wg-watchdog.sh"; then
         cron_remove_job "wg-watchdog.sh"
@@ -5172,7 +5054,7 @@ wg_uninstall() {
     rm -f /usr/local/bin/wg-watchdog.sh /var/log/wg-watchdog.log 2>/dev/null || true
     # OpenWrt 看门狗（不同路径）
     rm -f /usr/bin/wg-watchdog.sh 2>/dev/null || true
-    print_info "[5/6] 删除配置文件和临时文件..."
+    print_info "[4/5] 删除配置文件和临时文件..."
     rm -f "$WG_CONF" 2>/dev/null || true
     rm -rf /etc/wireguard/clients 2>/dev/null || true
     rm -f "$WG_DB_FILE" 2>/dev/null || true
@@ -5224,7 +5106,7 @@ wg_uninstall() {
         uci commit network 2>/dev/null || true
         uci commit firewall 2>/dev/null || true
     fi
-    print_info "[6/6] 卸载软件包..."
+    print_info "[5/5] 卸载软件包..."
     local remove_pkg=true
     if confirm "是否卸载 WireGuard 软件包? (选 N 仅删除配置)"; then
         case $PLATFORM in
@@ -5260,7 +5142,6 @@ wg_uninstall() {
         iptables -t nat -S 2>/dev/null | grep -i "wg\|wireguard\|${WG_INTERFACE}" | while read -r rule; do
             iptables -t nat $(echo "$rule" | sed 's/^-A/-D/') 2>/dev/null || true
         done
-        wg_save_iptables 2>/dev/null || true
     fi
     if [[ "$role" == "server" ]]; then
         if confirm "是否恢复 IP 转发设置? (如果其他服务需要转发请选 N)"; then
@@ -6672,191 +6553,6 @@ wg_generate_clash_config() {
     pause
 }
 
-wg_port_forward_menu() {
-    wg_check_server || return 1
-
-    while true; do
-        print_title "WireGuard 端口转发管理"
-        local pf_count
-        pf_count=$(wg_db_get '.port_forwards | length')
-        if [[ "$pf_count" != "null" && -n "$pf_count" && "$pf_count" -gt 0 ]]; then
-            printf "${C_CYAN}%-4s %-10s %-14s %-24s %-8s${C_RESET}\n" \
-                "#" "协议" "外部端口" "转发目标" "状态"
-            draw_line
-            local i=0
-            while [[ $i -lt $pf_count ]]; do
-                local proto ext_port dest_ip dest_port enabled
-                proto=$(wg_db_get ".port_forwards[$i].proto")
-                ext_port=$(wg_db_get ".port_forwards[$i].ext_port")
-                dest_ip=$(wg_db_get ".port_forwards[$i].dest_ip")
-                dest_port=$(wg_db_get ".port_forwards[$i].dest_port")
-                enabled=$(wg_db_get ".port_forwards[$i].enabled")
-                local status_str
-                [[ "$enabled" == "true" ]] && status_str="${C_GREEN}启用${C_RESET}" || status_str="${C_RED}禁用${C_RESET}"
-                printf "%-4s %-10s %-14s %-24s %-8b\n" \
-                    "$((i + 1))" "$proto" "$ext_port" "${dest_ip}:${dest_port}" "$status_str"
-                i=$((i + 1))
-            done
-        else
-            print_info "暂无端口转发规则"
-        fi
-        echo "  1. 添加端口转发
-  2. 删除端口转发
-  3. 启用/禁用端口转发
-  0. 返回
-"
-        read -e -r -p "$(echo -e "${C_CYAN}选择操作: ${C_RESET}")" pf_choice
-        case $pf_choice in
-            1) wg_add_port_forward ;;
-            2) wg_delete_port_forward ;;
-            3) wg_toggle_port_forward ;;
-            0|"") return ;;
-            *) print_warn "无效选项" ;;
-        esac
-    done
-}
-
-wg_add_port_forward() {
-    print_info "添加端口转发规则"
-    echo "  1. TCP
-  2. UDP
-  3. TCP+UDP"
-    read -e -r -p "协议 [1]: " proto_choice
-    proto_choice=${proto_choice:-1}
-    local proto
-    case $proto_choice in
-        1) proto="tcp" ;;
-        2) proto="udp" ;;
-        3) proto="tcp+udp" ;;
-        *) proto="tcp" ;;
-    esac
-    local ext_port
-    while true; do
-        read -e -r -p "外部端口 (本机监听): " ext_port
-        validate_port "$ext_port" && break
-        print_warn "端口无效 (1-65535)"
-    done
-    local peer_count
-    peer_count=$(wg_db_get '.peers | length')
-    local dest_ip
-    if [[ "$peer_count" -gt 0 ]]; then
-        echo "选择目标设备:"
-        local i=0
-        while [[ $i -lt $peer_count ]]; do
-            local name ip
-            name=$(wg_db_get ".peers[$i].name")
-            ip=$(wg_db_get ".peers[$i].ip")
-            echo "  $((i + 1)). ${name} (${ip})"
-            i=$((i + 1))
-        done
-        echo "  0. 手动输入 IP"
-        read -e -r -p "选择: " dev_choice
-        if [[ "$dev_choice" == "0" || -z "$dev_choice" ]]; then
-            read -e -r -p "目标 IP: " dest_ip
-        elif [[ "$dev_choice" =~ ^[0-9]+$ ]] && [[ "$dev_choice" -ge 1 && "$dev_choice" -le "$peer_count" ]]; then
-            dest_ip=$(wg_db_get ".peers[$((dev_choice - 1))].ip")
-        else
-            print_error "无效选择"; return
-        fi
-    else
-        read -e -r -p "目标 IP: " dest_ip
-    fi
-    [[ -z "$dest_ip" ]] && { print_error "目标 IP 不能为空"; return; }
-    local dest_port
-    read -e -r -p "目标端口 [${ext_port}]: " dest_port
-    dest_port=${dest_port:-$ext_port}
-    validate_port "$dest_port" || { print_error "端口无效"; return; }
-    _wg_pf_iptables -A "$proto" "$ext_port" "$dest_ip" "$dest_port"
-    wg_save_iptables
-    wg_db_set --arg proto "$proto" \
-              --arg ext "$ext_port" \
-              --arg dip "$dest_ip" \
-              --arg dport "$dest_port" \
-    '.port_forwards += [{
-        proto: $proto,
-        ext_port: ($ext | tonumber),
-        dest_ip: $dip,
-        dest_port: ($dport | tonumber),
-        enabled: true
-    }]'
-    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
-        if [[ "$proto" == "tcp+udp" ]]; then
-            ufw allow "$ext_port" comment "WG-PF" >/dev/null 2>&1
-        else
-            ufw allow "${ext_port}/${proto}" comment "WG-PF" >/dev/null 2>&1
-        fi
-    fi
-    print_success "端口转发已添加: ${ext_port}/${proto} -> ${dest_ip}:${dest_port}"
-    log_action "WireGuard port forward added: ${ext_port}/${proto} -> ${dest_ip}:${dest_port}"
-    # 联动: 提示配置域名 (申请证书 + 反代 + DDNS)
-    if [[ "$proto" == *"tcp"* ]]; then
-        if declare -f web_add_domain &>/dev/null; then
-            echo ""
-            print_guide "已在本机 ${ext_port} 端口监听，可为其配置域名访问（申请证书 + Nginx 反代 + DDNS）"
-            if confirm "是否为此端口配置域名 (申请证书 + 反代 + DDNS)?"; then
-                _WEB_PRESET_PROXY="127.0.0.1:${ext_port}"
-                web_add_domain
-            fi
-        elif command_exists nginx; then
-            echo ""
-            print_guide "已在本机 ${ext_port} 端口监听，可通过域名反代 (HTTPS) 对外提供服务"
-            if confirm "是否为此端口配置域名反代 (Nginx + SSL)?"; then
-                web_reverse_proxy_site "127.0.0.1:${ext_port}"
-            fi
-        fi
-    fi
-}
-
-wg_delete_port_forward() {
-    local pf_count
-    pf_count=$(wg_db_get '.port_forwards | length')
-    [[ "$pf_count" -eq 0 ]] && { print_warn "暂无规则"; return; }
-    read -e -r -p "选择要删除的规则序号: " idx
-    [[ -z "$idx" ]] && return
-    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -lt 1 || "$idx" -gt "$pf_count" ]]; then
-        print_error "无效序号"; return
-    fi
-    local target_idx=$((idx - 1))
-    local proto ext_port dest_ip dest_port
-    proto=$(wg_db_get ".port_forwards[$target_idx].proto")
-    ext_port=$(wg_db_get ".port_forwards[$target_idx].ext_port")
-    dest_ip=$(wg_db_get ".port_forwards[$target_idx].dest_ip")
-    dest_port=$(wg_db_get ".port_forwards[$target_idx].dest_port")
-    _wg_pf_iptables -D "$proto" "$ext_port" "$dest_ip" "$dest_port"
-    wg_save_iptables
-    wg_db_set --argjson idx "$target_idx" 'del(.port_forwards[$idx])'
-    print_success "端口转发规则已删除"
-    log_action "WireGuard port forward deleted: ${ext_port}/${proto} -> ${dest_ip}:${dest_port}"
-}
-
-wg_toggle_port_forward() {
-    local pf_count
-    pf_count=$(wg_db_get '.port_forwards | length')
-    [[ "$pf_count" -eq 0 ]] && { print_warn "暂无规则"; return; }
-    read -e -r -p "选择要切换状态的规则序号: " idx
-    [[ -z "$idx" ]] && return
-    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -lt 1 || "$idx" -gt "$pf_count" ]]; then
-        print_error "无效序号"; return
-    fi
-    local target_idx=$((idx - 1))
-    local proto ext_port dest_ip dest_port current_state
-    proto=$(wg_db_get ".port_forwards[$target_idx].proto")
-    ext_port=$(wg_db_get ".port_forwards[$target_idx].ext_port")
-    dest_ip=$(wg_db_get ".port_forwards[$target_idx].dest_ip")
-    dest_port=$(wg_db_get ".port_forwards[$target_idx].dest_port")
-    current_state=$(wg_db_get ".port_forwards[$target_idx].enabled")
-    if [[ "$current_state" == "true" ]]; then
-        _wg_pf_iptables -D "$proto" "$ext_port" "$dest_ip" "$dest_port"
-        wg_db_set --argjson idx "$target_idx" '.port_forwards[$idx].enabled = false'
-        print_success "端口转发已禁用: ${ext_port}/${proto}"
-    else
-        _wg_pf_iptables -A "$proto" "$ext_port" "$dest_ip" "$dest_port"
-        wg_db_set --argjson idx "$target_idx" '.port_forwards[$idx].enabled = true'
-        print_success "端口转发已启用: ${ext_port}/${proto}"
-    fi
-    wg_save_iptables
-}
-
 wg_setup_watchdog() {
     wg_check_installed || return 1
     local watchdog_script="/usr/local/bin/wg-watchdog.sh"
@@ -7160,20 +6856,18 @@ wg_server_menu() {
   4. 启用/禁用设备
   5. 查看设备配置/二维码
   6. 生成 Clash/OpenClash 配置
-  ── 端口转发 ──────────────────
-  7. 端口转发管理
   ── 服务控制 ──────────────────
-  8. 启动 WireGuard
-  9. 停止 WireGuard
-  10. 重启 WireGuard
-  11. 修改服务端配置
-  12. 修改服务器名称
-  13. 卸载 WireGuard
-  14. 生成 OpenWrt 清空 WG 配置命令
-  15. 服务端看门狗 (自动重启保活)
+  7. 启动 WireGuard
+  8. 停止 WireGuard
+  9. 重启 WireGuard
+  10. 修改服务端配置
+  11. 修改服务器名称
+  12. 卸载 WireGuard
+  13. 生成 OpenWrt 清空 WG 配置命令
+  14. 服务端看门狗 (自动重启保活)
   ── 数据管理 ──────────────────
-  16. 导出设备配置 (JSON)
-  17. 导入设备配置 (JSON)
+  15. 导出设备配置 (JSON)
+  16. 导入设备配置 (JSON)
   0. 返回上级菜单
 "
         read -e -r -p "$(echo -e "${C_CYAN}选择操作: ${C_RESET}")" choice
@@ -7184,17 +6878,16 @@ wg_server_menu() {
             4) wg_toggle_peer ;;
             5) wg_show_peer_conf ;;
             6) wg_generate_clash_config ;;
-            7) wg_port_forward_menu ;;
-            8) wg_start; pause ;;
-            9) wg_stop; pause ;;
-            10) wg_restart; pause ;;
-            11) wg_modify_server ;;
-            12) wg_rename_server ;;
-            13) wg_uninstall; return ;;
-            14) wg_openwrt_clean_cmd ;;
-            15) wg_setup_watchdog ;;
-            16) wg_export_peers ;;
-            17) wg_import_peers ;;
+            7) wg_start; pause ;;
+            8) wg_stop; pause ;;
+            9) wg_restart; pause ;;
+            10) wg_modify_server ;;
+            11) wg_rename_server ;;
+            12) wg_uninstall; return ;;
+            13) wg_openwrt_clean_cmd ;;
+            14) wg_setup_watchdog ;;
+            15) wg_export_peers ;;
+            16) wg_import_peers ;;
             0|"") return ;;
             *) print_warn "无效选项" ;;
         esac

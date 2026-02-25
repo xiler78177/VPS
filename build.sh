@@ -31,7 +31,6 @@ MODULES=(
     "11c-wireguard-server.sh"
     "11d-wireguard-peers.sh"
     "11e-wireguard-clash.sh"
-    "11f-wireguard-portfwd.sh"
     "11g-wireguard-extra.sh"
     "11b-wireguard-udp2raw.sh"
     "12-backup.sh"
