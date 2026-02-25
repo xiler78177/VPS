@@ -5679,7 +5679,6 @@ sed -i '/wg_bypass/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null; true
 uci commit network 2>/dev/null; true
 uci commit firewall 2>/dev/null; true
 /etc/init.d/firewall restart 2>/dev/null; true
-/etc/init.d/network restart 2>/dev/null; true
 
 # === 安装 WireGuard 组件 ===
 # 检测内核是否已支持 WireGuard
@@ -6114,10 +6113,10 @@ PersistentKeepalive = 25"
     is_gateway=$(wg_db_get ".peers[$target_idx].is_gateway // false")
     if [[ "$is_gateway" == "true" ]]; then
         if confirm "显示 OpenWrt uci 部署命令?"; then
-            local peer_privkey peer_ip peer_psk client_allowed_ips
+            local peer_privkey peer_ip psk client_allowed_ips
             peer_privkey=$(wg_db_get ".peers[$target_idx].private_key")
             peer_ip=$(wg_db_get ".peers[$target_idx].ip")
-            peer_psk=$(wg_db_get ".peers[$target_idx].preshared_key")
+            psk=$(wg_db_get ".peers[$target_idx].preshared_key")
             client_allowed_ips=$(wg_db_get ".peers[$target_idx].client_allowed_ips")
             local spub sep sport ssub mask
             spub=$(wg_db_get '.server.public_key')
@@ -6211,7 +6210,6 @@ sed -i '/wg_bypass/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null; true
 uci commit network 2>/dev/null; true
 uci commit firewall 2>/dev/null; true
 /etc/init.d/firewall restart 2>/dev/null; true
-/etc/init.d/network restart 2>/dev/null; true
 
 # === 安装 WireGuard 组件 ===
 WG_KERNEL=0
@@ -6248,7 +6246,7 @@ uci delete network.wg0.addresses 2>/dev/null; true
 uci add_list network.wg0.addresses='${peer_ip}/${mask}'
 uci set network.wg_server=wireguard_wg0
 uci set network.wg_server.public_key='${spub}'
-uci set network.wg_server.preshared_key='${peer_psk}'
+uci set network.wg_server.preshared_key='${psk}'
 uci set network.wg_server.endpoint_host='${ep_host}'
 uci set network.wg_server.endpoint_port='${sport}'
 uci set network.wg_server.persistent_keepalive='25'
