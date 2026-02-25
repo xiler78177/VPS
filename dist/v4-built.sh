@@ -1907,6 +1907,14 @@ menu_net() {
         esac
     done
 }
+# 子模块按依赖顺序加载:
+#   09a → 依赖管理 + 通用辅助函数
+#   09b → Cloudflare API / SaaS / Origin Rules / DNS
+#   09c → 域名管理 (添加/查看/删除 + 证书)
+#   09d → 反向代理 + 主菜单
+#
+# 注意: 通过 build.sh 构建时，此文件和子模块会被直接拼接，
+# 不需要额外的 source 调用。此注释仅用于人类阅读。
 _web_dep_check_results=()
 
 _web_dep_verify() {
@@ -1942,7 +1950,7 @@ _purge_snap_certbot() {
         snap remove certbot 2>/dev/null || true
         snap remove certbot-dns-cloudflare 2>/dev/null || true
         rm -f /usr/bin/certbot /snap/bin/certbot 2>/dev/null || true
-        if snap list 2>/dev/null | wc -l | grep -q "^1$"; then
+        if [[ $(snap list 2>/dev/null | tail -n +2 | wc -l) -eq 0 ]]; then
             print_info "snap 中无其他软件包，清理 snapd..."
             systemctl stop snapd snapd.socket 2>/dev/null || true
             apt-get purge -y snapd 2>/dev/null || true
@@ -2027,6 +2035,13 @@ _install_certbot_dns_cf() {
     _install_certbot_dns_cf_snap
 }
 
+# 统一的 certbot 安装入口（先 apt 后 snap）
+_install_certbot() {
+    _install_certbot_apt && return 0
+    print_warn "apt 安装 certbot 失败，尝试 snap..."
+    _install_certbot_snap
+}
+
 _install_nginx() {
     update_apt_cache
     apt-get install -y nginx >/dev/null 2>&1 || return 1
@@ -2047,6 +2062,68 @@ _check_certbot_dns_cf() {
 
 _check_nginx_dirs() {
     [[ -d /etc/nginx/sites-available && -d /etc/nginx/sites-enabled ]]
+}
+
+# ── 通用辅助函数 ──
+
+# 安全加载 .conf 配置文件（避免 source 注入风险）
+_safe_source_conf() {
+    local file="$1"
+    [[ -f "$file" ]] || return 1
+    # 仅读取 KEY="VALUE" 格式的行，忽略其他内容
+    while IFS='=' read -r key val; do
+        # 跳过注释和空行
+        [[ "$key" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "$key" ]] && continue
+        # 去除首尾引号和空格
+        key=$(echo "$key" | xargs)
+        val=$(echo "$val" | sed 's/^"//;s/"$//' | sed "s/^'//;s/'$//")
+        # 仅允许合法变量名
+        [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+        printf -v "$key" '%s' "$val"
+    done < "$file"
+}
+
+# Nginx 安全重载
+_nginx_reload() {
+    if is_systemd; then
+        systemctl reload nginx || systemctl restart nginx
+    else
+        nginx -s reload 2>/dev/null || service nginx reload
+    fi
+}
+
+# 确保 SSL 参数文件存在
+_ensure_ssl_params() {
+    [[ -f /etc/nginx/snippets/ssl-params.conf ]] && return 0
+    mkdir -p /etc/nginx/snippets
+    local ssl_params="ssl_session_timeout 1d;
+ssl_session_cache shared:SSL:10m;
+ssl_session_tickets off;
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
+ssl_prefer_server_ciphers off;
+add_header Strict-Transport-Security \"max-age=15768000\" always;"
+    write_file_atomic "/etc/nginx/snippets/ssl-params.conf" "$ssl_params"
+}
+
+# Nginx 配置部署（写入 + 测试 + 加载，失败自动回滚）
+# 用法: _nginx_deploy_conf "域名" "配置内容" 成功返回0，失败返回1
+_nginx_deploy_conf() {
+    local domain="$1" conf_content="$2"
+    local avail="/etc/nginx/sites-available/${domain}.conf"
+    local enabled="/etc/nginx/sites-enabled/${domain}.conf"
+    write_file_atomic "$avail" "$conf_content"
+    ln -sf "$avail" "$enabled"
+    if nginx -t >/dev/null 2>&1; then
+        _nginx_reload
+        return 0
+    else
+        print_error "Nginx 配置测试失败！"
+        nginx -t 2>&1 | tail -5
+        rm -f "$enabled" "$avail"
+        return 1
+    fi
 }
 
 web_env_check() {
@@ -2081,7 +2158,7 @@ web_env_check() {
         "jq|command_exists jq|install_package jq silent"
         "nginx|command_exists nginx|_install_nginx"
         "nginx 目录结构|_check_nginx_dirs|mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/snippets"
-        "certbot|command_exists certbot|_install_certbot_apt || _install_certbot_snap"
+        "certbot|command_exists certbot|_install_certbot"
         "certbot dns-cloudflare 插件|_check_certbot_dns_cf|_install_certbot_dns_cf"
     )
 
@@ -2145,17 +2222,58 @@ web_env_check() {
     return 0
 }
 
+# ── CF API 核心 ──
+
 _cf_api() {
     # 基础速率保护：防止触发 CF API 1200 req/5min 限制
     sleep 0.3
     local method=$1 endpoint=$2 token=$3; shift 3
-    curl -s -X "$method" "https://api.cloudflare.com/client/v4${endpoint}" \
-        -H "Authorization: Bearer $token" \
-        -H "Content-Type: application/json" "$@"
+    local attempt resp
+    for attempt in 1 2 3; do
+        resp=$(curl -s --max-time 30 -X "$method" "https://api.cloudflare.com/client/v4${endpoint}" \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json" "$@" 2>/dev/null)
+        # 成功获取响应则返回
+        [[ -n "$resp" ]] && { echo "$resp"; return 0; }
+        # 重试前等待（指数退避）
+        [[ $attempt -lt 3 ]] && sleep $((attempt * 2))
+    done
+    # 3 次全失败，返回错误 JSON
+    echo '{"success":false,"errors":[{"message":"API 请求超时（已重试 3 次）"}]}'
+    return 1
 }
 
-_cf_api_ok() { [[ "$(echo "$1" | jq -r '.success')" == "true" ]]; }
-_cf_api_err() { echo "$1" | jq -r '.errors[0].message // "未知错误"'; }
+_cf_api_ok() { [[ "$(jq -r '.success' <<< "$1")" == "true" ]]; }
+_cf_api_err() { jq -r '.errors[0].message // "未知错误"' <<< "$1"; }
+
+# CF API Token 验证
+_cf_verify_token() {
+    local token="$1"
+    local vr=$(_cf_api GET "/user/tokens/verify" "$token")
+    if ! _cf_api_ok "$vr"; then
+        print_error "Token 验证失败: $(_cf_api_err "$vr")"
+        return 1
+    fi
+    return 0
+}
+
+# 读取并验证 CF API Token
+_cf_read_token() {
+    local _var_name="${1:-CF_API_TOKEN}"
+    local token=""
+    while [[ -z "$token" ]]; do
+        read -s -r -p "Cloudflare API Token: " token; echo ""
+    done
+    print_info "验证 Token..."
+    if ! _cf_verify_token "$token"; then
+        return 1
+    fi
+    print_success "Token 有效"
+    printf -v "$_var_name" '%s' "$token"
+    return 0
+}
+
+# ── DNS 操作 ──
 
 _cf_get_zone_id() {
     local domain=$1 token=$2
@@ -2201,6 +2319,110 @@ _cf_dns_delete() {
     local rid=$(echo "$resp" | jq -r '.result[0].id // empty')
     [[ -n "$rid" ]] && _cf_api DELETE "/zones/$zone_id/dns_records/$rid" "$token"
 }
+
+# 通用 DNS 记录更新
+_cf_update_dns_record() {
+    local zone_id="$1" token="$2" domain="$3" type="$4" ip="$5" proxied="$6"
+    [[ -z "$ip" ]] && return 0
+    print_info "处理 $type 记录 -> $ip (代理: $proxied)"
+    local records=$(_cf_api GET "/zones/$zone_id/dns_records?type=$type&name=$domain" "$token")
+    local record_id=$(jq -r '.result[0].id // empty' <<< "$records")
+    local count=$(jq -r '.result | length' <<< "$records")
+    [[ "$count" -gt 1 ]] && print_warn "警告: 存在 ${count} 条 $type 记录，仅更新第一条。建议手动清理多余记录。"
+    local data=$(jq -n --arg type "$type" --arg name "$domain" --arg content "$ip" --argjson proxied "$proxied" \
+        '{type:$type, name:$name, content:$content, ttl:1, proxied:$proxied}')
+    local resp
+    if [[ -n "$record_id" ]]; then
+        resp=$(_cf_api PUT "/zones/$zone_id/dns_records/$record_id" "$token" --data "$data")
+    else
+        resp=$(_cf_api POST "/zones/$zone_id/dns_records" "$token" --data "$data")
+    fi
+    if _cf_api_ok "$resp"; then
+        print_success "$([[ -n "$record_id" ]] && echo '更新' || echo '创建')成功"
+        return 0
+    else
+        print_error "$([[ -n "$record_id" ]] && echo '更新' || echo '创建')失败: $(_cf_api_err "$resp")"
+        return 1
+    fi
+}
+
+# ── DNS 智能解析 ──
+
+_CF_RESULT_DOMAIN=""
+_CF_RESULT_TOKEN=""
+
+web_cf_dns_update() {
+    local DOMAIN="" CF_API_TOKEN=""
+    _CF_RESULT_DOMAIN=""
+    _CF_RESULT_TOKEN=""
+    print_title "Cloudflare DNS 智能解析"
+    command_exists jq || install_package "jq" "silent"
+    print_info "正在探测本机公网 IP..."
+    local ipv4 ipv6
+    ipv4=$(curl -4 -s --max-time 5 https://4.ipw.cn 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv4=""
+    ipv6=$(curl -6 -s --max-time 5 https://6.ipw.cn 2>/dev/null || curl -6 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv6=""
+    # IPv6 格式校验：必须包含冒号
+    [[ -n "$ipv6" && ! "$ipv6" =~ : ]] && { print_warn "IPv6 探测结果异常 ($ipv6)，已忽略"; ipv6=""; }
+    echo "----------------------------------------"
+    echo "IPv4: ${ipv4:-[✗] 未检测到}"
+    echo "IPv6: ${ipv6:-[✗] 未检测到}"
+    echo "----------------------------------------"
+    echo "1. 仅解析 IPv4 (A)
+2. 仅解析 IPv6 (AAAA)
+3. 双栈解析 (A + AAAA)
+0. 跳过"
+    read -e -r -p "请选择: " mode
+    if [[ "$mode" == "0" ]]; then return; fi
+    # 选择 IPv6 但未检测到时给予提示
+    if [[ ("$mode" == "2" || "$mode" == "3") && -z "$ipv6" ]]; then
+        print_warn "未检测到 IPv6 地址，AAAA 记录将跳过"
+    fi
+    if [[ ("$mode" == "1" || "$mode" == "3") && -z "$ipv4" ]]; then
+        print_warn "未检测到 IPv4 地址，A 记录将跳过"
+    fi
+    # 读取并验证 Token
+    if ! _cf_read_token "CF_API_TOKEN"; then
+        pause; return
+    fi
+    while [[ -z "$DOMAIN" ]]; do
+        read -e -r -p "请输入域名: " DOMAIN
+        if ! validate_domain "$DOMAIN"; then
+            print_error "域名格式无效。"
+            DOMAIN=""
+        fi
+    done
+    print_info "正在获取 Zone ID..."
+    local zone_id=""
+    zone_id=$(_cf_get_zone_id "$DOMAIN" "$CF_API_TOKEN")
+    if [[ -z "$zone_id" ]]; then
+        print_error "无法获取 Zone ID，请检查 Token 权限和域名是否已托管在 CF"
+        pause; return
+    fi
+    print_success "找到 Zone ID: $zone_id"
+    echo -e "${C_YELLOW}注意: 开启代理后，只有 HTTP/HTTPS 流量能通过 Cloudflare。${C_RESET}"
+    echo -e "${C_YELLOW}SSH、RDP、端口转发等非 HTTP 服务将无法使用此域名访问。${C_RESET}"
+    read -e -r -p "是否开启 Cloudflare 代理 (小云朵)? [y/N]: " proxy_choice
+    local proxied="false"
+    [[ "${proxy_choice,,}" == "y" ]] && proxied="true"
+
+    # 使用提取的模块级函数
+    case $mode in
+        1) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "A" "$ipv4" "$proxied" ;;
+        2) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "AAAA" "$ipv6" "$proxied" ;;
+        3) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "A" "$ipv4" "$proxied"
+           _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "AAAA" "$ipv6" "$proxied" ;;
+    esac
+    print_success "DNS 配置完成。"
+    log_action "Cloudflare DNS updated for $DOMAIN"
+    local ddns_v4=$([[ "$mode" == "1" || "$mode" == "3" ]] && echo "true" || echo "false")
+    local ddns_v6=$([[ "$mode" == "2" || "$mode" == "3" ]] && echo "true" || echo "false")
+    ddns_setup "$DOMAIN" "$CF_API_TOKEN" "$zone_id" "$ddns_v4" "$ddns_v6" "$proxied"
+    _CF_RESULT_DOMAIN="$DOMAIN"
+    _CF_RESULT_TOKEN="$CF_API_TOKEN"
+    sleep 2
+}
+
+# ── SaaS 优选加速 ──
 
 web_cf_saas_setup() {
     print_title "Cloudflare SaaS 优选加速配置"
@@ -2293,10 +2515,13 @@ web_cf_saas_setup() {
         echo "  $i. $d"
         ((i++))
     done
+    if [[ ${#pd_arr[@]} -eq 0 ]]; then
+        print_warn "未配置预设优选域名列表 (SAAS_PREFERRED_DOMAINS 为空)"
+    fi
     echo "  $i. 自定义输入"
     local pd_choice preferred_domain
-    read -e -r -p "选择 [1]: " pd_choice
-    pd_choice=${pd_choice:-1}
+    read -e -r -p "选择 [${#pd_arr[@]} -gt 0 && echo 1 || echo $i]: " pd_choice
+    pd_choice=${pd_choice:-$([[ ${#pd_arr[@]} -gt 0 ]] && echo 1 || echo $i)}
     if [[ "$pd_choice" =~ ^[0-9]+$ ]] && (( pd_choice >= 1 && pd_choice <= ${#pd_arr[@]} )); then
         preferred_domain="${pd_arr[$((pd_choice-1))]}"
     else
@@ -2522,6 +2747,8 @@ SAASEOF
     pause
 }
 
+# ── Origin Rules ──
+
 _cf_get_origin_ruleset() {
     local token="$1" zone_id="$2"
     local url="https://api.cloudflare.com/client/v4/zones/${zone_id}/rulesets/phases/http_request_origin/entrypoint"
@@ -2746,22 +2973,24 @@ web_cf_origin_rule_delete() {
     pause
 }
 
+# ── SaaS 状态和删除 ──
+
 web_cf_saas_status() {
     print_title "查看 SaaS 优选配置"
     if [[ ! -d "$SAAS_CONFIG_DIR" ]] || [[ -z "$(ls -A "$SAAS_CONFIG_DIR" 2>/dev/null)" ]]; then
         print_warn "暂无 SaaS 优选配置"
         pause; return
     fi
-        printf "${C_CYAN}%-30s %-10s %-30s %-20s %s${C_RESET}\n" "业务域名" "状态" "优选域名" "回源域名" "创建时间"
+    echo -e "${C_CYAN}业务域名                       状态       优选域名                       回源域名             创建时间${C_RESET}"
     draw_line
     for conf in "$SAAS_CONFIG_DIR"/*.conf; do
         [[ -f "$conf" ]] || continue
         local SAAS_STATUS="" BIZ_DOMAIN="" PREFERRED_DOMAIN="" ORIGIN_DOMAIN="" CREATED=""
         validate_conf_file "$conf" || continue
-        source "$conf"
-        local status_display="${C_GREEN}${SAAS_STATUS}${C_RESET}"
-        [[ "$SAAS_STATUS" == "pending" ]] && status_display="${C_YELLOW}${SAAS_STATUS}${C_RESET}"
-        printf "%-30s %-10b %-30s %-20s %s\n" "$BIZ_DOMAIN" "$status_display" "$PREFERRED_DOMAIN" "$ORIGIN_DOMAIN" "$CREATED"
+        _safe_source_conf "$conf"
+        local status_icon="${C_GREEN}✓${C_RESET}"
+        [[ "$SAAS_STATUS" == "pending" ]] && status_icon="${C_YELLOW}…${C_RESET}"
+        echo -e "  ${BIZ_DOMAIN}  ${status_icon} ${SAAS_STATUS}  ${PREFERRED_DOMAIN}  ${ORIGIN_DOMAIN}  ${CREATED}"
     done
     pause
 }
@@ -2777,7 +3006,7 @@ web_cf_saas_delete() {
         [[ -f "$conf" ]] || continue
         local BIZ_DOMAIN=""
         validate_conf_file "$conf" || continue
-        source "$conf"
+        _safe_source_conf "$conf"
         domains+=("$BIZ_DOMAIN")
         files+=("$conf")
         echo "$i. $BIZ_DOMAIN"
@@ -2795,7 +3024,7 @@ web_cf_saas_delete() {
     if ! validate_conf_file "$target_conf"; then
         print_error "配置文件格式异常"; pause; return
     fi
-    source "$target_conf"
+    _safe_source_conf "$target_conf"
     echo -e "${C_RED}即将删除 SaaS 配置: ${BIZ_DOMAIN}${C_RESET}"
     echo "可选的清理操作:
   1. 仅删除本地配置文件 (CF 上的记录保留)
@@ -2832,97 +3061,234 @@ web_cf_saas_delete() {
     pause
 }
 
-_CF_RESULT_DOMAIN=""
-_CF_RESULT_TOKEN=""
-
-web_cf_dns_update() {
-    local DOMAIN="" CF_API_TOKEN=""
-    _CF_RESULT_DOMAIN=""
-    _CF_RESULT_TOKEN=""
-    print_title "Cloudflare DNS 智能解析"
-    command_exists jq || install_package "jq" "silent"
-    print_info "正在探测本机公网 IP..."
-    local ipv4 ipv6
-    ipv4=$(curl -4 -s --max-time 5 https://4.ipw.cn 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv4=""
-    ipv6=$(curl -6 -s --max-time 5 https://6.ipw.cn 2>/dev/null || curl -6 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv6=""
-    echo "----------------------------------------"
-    echo "IPv4: ${ipv4:-[✗] 未检测到}"
-    echo "IPv6: ${ipv6:-[✗] 未检测到}"
-    echo "----------------------------------------"
-    echo "1. 仅解析 IPv4 (A)
-2. 仅解析 IPv6 (AAAA)
-3. 双栈解析 (A + AAAA)
-0. 跳过"
-    read -e -r -p "请选择: " mode
-    if [[ "$mode" == "0" ]]; then return; fi
-    while [[ -z "$CF_API_TOKEN" ]]; do
-        read -s -r -p "Cloudflare API Token: " CF_API_TOKEN
+web_add_domain() {
+    print_title "添加域名配置 (SSL + Nginx)"
+    local DOMAIN="" CF_API_TOKEN="" LOCAL_PROXY_PASS="" NGINX_HTTP_PORT="" NGINX_HTTPS_PORT="" BACKEND_PROTOCOL=""
+    web_env_check || { pause; return; }
+    print_guide "此步骤将申请 SSL 证书并（可选）配置 Nginx 反向代理。"
+    if confirm "是否需要先自动配置 Cloudflare DNS 解析 (A/AAAA)?"; then
+        web_cf_dns_update
+        [[ -n "$_CF_RESULT_DOMAIN" ]] && DOMAIN="$_CF_RESULT_DOMAIN"
+        [[ -n "$_CF_RESULT_TOKEN" ]] && CF_API_TOKEN="$_CF_RESULT_TOKEN"
+        _CF_RESULT_DOMAIN=""
+        _CF_RESULT_TOKEN=""
         echo ""
-    done
+    fi
     while [[ -z "$DOMAIN" ]]; do
-        read -e -r -p "请输入域名: " DOMAIN
+        read -e -r -p "请输入域名 (如 example.com): " DOMAIN
         if ! validate_domain "$DOMAIN"; then
             print_error "域名格式无效。"
             DOMAIN=""
         fi
     done
-    print_info "正在获取 Zone ID..."
-    local zone_id=""
-    zone_id=$(_cf_get_zone_id "$DOMAIN" "$CF_API_TOKEN")
-    if [[ -z "$zone_id" ]]; then
-        print_error "无法获取 Zone ID，请检查 Token 权限和域名是否已托管在 CF"
+    if [[ -f "${CONFIG_DIR}/${DOMAIN}.conf" ]]; then
+        print_warn "配置已存在，请先删除。"
         pause; return
     fi
-    print_success "找到 Zone ID: $zone_id"
-    echo -e "${C_YELLOW}注意: 开启代理后，只有 HTTP/HTTPS 流量能通过 Cloudflare。${C_RESET}"
-    echo -e "${C_YELLOW}SSH、RDP、端口转发等非 HTTP 服务将无法使用此域名访问。${C_RESET}"
-    read -e -r -p "是否开启 Cloudflare 代理 (小云朵)? [y/N]: " proxy_choice
-    local proxied="false"
-    [[ "${proxy_choice,,}" == "y" ]] && proxied="true"
-    
-    update_record() {
-        local type=$1
-        local ip=$2
-        [[ -z "$ip" ]] && return
-        print_info "处理 $type 记录 -> $ip (代理: $proxied)"
-        local records=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records?type=$type&name=$DOMAIN" \
-            -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json")
-        local record_id=$(echo "$records" | jq -r '.result[0].id')
-        local count=$(echo "$records" | jq -r '.result | length')
-        [[ "$count" -gt 1 ]] && print_warn "警告: 存在多条 $type 记录，仅更新第一条。"
-        if [[ "$record_id" != "null" && -n "$record_id" ]]; then
-            local resp=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records/$record_id" \
-                -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
-                --data "{\"type\":\"$type\",\"name\":\"$DOMAIN\",\"content\":\"$ip\",\"ttl\":1,\"proxied\":$proxied}")
-            if [[ "$(echo "$resp" | jq -r '.success')" == "true" ]]; then
-                print_success "更新成功"
+    print_guide "脚本使用 DNS API 申请证书，需要您的 Cloudflare API Token。"
+    while [[ -z "$CF_API_TOKEN" ]]; do
+        read -s -r -p "Cloudflare API Token: " CF_API_TOKEN
+        echo ""
+    done
+    local do_nginx=0
+    if confirm "是否配置 Nginx 反向代理 (用于隐藏后端端口)?"; then
+        do_nginx=1
+        print_guide "请输入 Nginx 监听的端口 (通常 HTTP=80, HTTPS=443)"
+        
+        while true; do
+            read -e -r -p "HTTP 端口 [80]: " hp
+            NGINX_HTTP_PORT=${hp:-80}
+            if validate_port "$NGINX_HTTP_PORT"; then break; fi
+            print_warn "端口无效"
+        done
+        while true; do
+            read -e -r -p "HTTPS 端口 [443]: " sp
+            NGINX_HTTPS_PORT=${sp:-443}
+            if validate_port "$NGINX_HTTPS_PORT"; then break; fi
+            print_warn "端口无效"
+        done
+        read -e -r -p "后端协议 [1]http [2]https: " proto
+        BACKEND_PROTOCOL=$([[ "$proto" == "2" ]] && echo "https" || echo "http")
+        print_guide "请输入后端服务的实际地址 (例如 127.0.0.1:54321)"
+        while [[ -z "$LOCAL_PROXY_PASS" ]]; do
+            read -e -r -p "反代目标: " inp
+            [[ "$inp" =~ ^[0-9]+$ ]] && inp="127.0.0.1:$inp"
+            if [[ "$inp" =~ ^(\[.*\]|[a-zA-Z0-9.-]+):[0-9]+$ ]]; then
+                LOCAL_PROXY_PASS="${BACKEND_PROTOCOL}://${inp}"
             else
-                print_error "更新失败: $(echo "$resp" | jq -r '.errors[0].message')"
+                print_warn "格式错误，请重试"
             fi
-        else
-            local resp=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records" \
-                -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
-                --data "{\"type\":\"$type\",\"name\":\"$DOMAIN\",\"content\":\"$ip\",\"ttl\":1,\"proxied\":$proxied}")
-            if [[ "$(echo "$resp" | jq -r '.success')" == "true" ]]; then
-                print_success "创建成功"
-            else
-                print_error "创建失败: $(echo "$resp" | jq -r '.errors[0].message')"
+        done
+    else
+        echo ""
+        print_guide "您选择了【不配置 Nginx】。"
+        print_guide "证书生成后，请手动在 3x-ui 面板设置中填写公钥/私钥路径。"
+        echo ""
+    fi
+    mkdir -p "${CERT_PATH_PREFIX}/${DOMAIN}"
+    local CLOUDFLARE_CREDENTIALS="/root/.cloudflare-${DOMAIN}.ini"
+    write_file_atomic "$CLOUDFLARE_CREDENTIALS" "dns_cloudflare_api_token = $CF_API_TOKEN"
+    chmod 600 "$CLOUDFLARE_CREDENTIALS"
+    print_info "正在申请证书 (这可能需要 1-2 分钟)..."
+    if certbot certonly \
+        --dns-cloudflare \
+        --dns-cloudflare-credentials "$CLOUDFLARE_CREDENTIALS" \
+        --dns-cloudflare-propagation-seconds 60 \
+        -d "$DOMAIN" \
+        --email "$EMAIL" \
+        --agree-tos \
+        --no-eff-email \
+        --non-interactive; then
+        print_success "证书获取成功！"
+        local cert_dir="${CERT_PATH_PREFIX}/${DOMAIN}"
+        cp -L "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "$cert_dir/fullchain.pem"
+        cp -L "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "$cert_dir/privkey.pem"
+        chmod 644 "$cert_dir/fullchain.pem"
+        chmod 600 "$cert_dir/privkey.pem"
+        if [[ $do_nginx -eq 1 ]]; then
+            _ensure_ssl_params
+            local redir_port=""
+            [[ "$NGINX_HTTPS_PORT" != "443" ]] && redir_port=":${NGINX_HTTPS_PORT}"
+            local nginx_conf="# Config for $DOMAIN
+# Generated by $SCRIPT_NAME $VERSION
+server {
+    listen $NGINX_HTTP_PORT;
+    listen [::]:$NGINX_HTTP_PORT;
+    server_name $DOMAIN;
+    return 301 https://\$host${redir_port}\$request_uri;
+}
+server {
+    listen $NGINX_HTTPS_PORT ssl http2;
+    listen [::]:$NGINX_HTTPS_PORT ssl http2;
+    server_name $DOMAIN;
+    ssl_certificate ${cert_dir}/fullchain.pem;
+    ssl_certificate_key ${cert_dir}/privkey.pem;
+    ssl_trusted_certificate ${cert_dir}/fullchain.pem;
+    include snippets/ssl-params.conf;
+    location / {
+        proxy_pass $LOCAL_PROXY_PASS;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \"upgrade\";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_buffering off;
+    }
+}"
+            if ! _nginx_deploy_conf "$DOMAIN" "$nginx_conf"; then
+                pause; return
+            fi
+            print_success "Nginx 配置已生效。"
+            if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+                ufw allow "$NGINX_HTTP_PORT/tcp" comment "Nginx-HTTP" >/dev/null 2>&1 || true
+                ufw allow "$NGINX_HTTPS_PORT/tcp" comment "Nginx-HTTPS" >/dev/null 2>&1 || true
+                print_success "防火墙规则已更新。"
             fi
         fi
-    }
-    case $mode in
-        1) update_record "A" "$ipv4" ;;
-        2) update_record "AAAA" "$ipv6" ;;
-        3) update_record "A" "$ipv4"; update_record "AAAA" "$ipv6" ;;
-    esac
-    print_success "DNS 配置完成。"
-    log_action "Cloudflare DNS updated for $DOMAIN"
-    local ddns_v4=$([[ "$mode" == "1" || "$mode" == "3" ]] && echo "true" || echo "false")
-    local ddns_v6=$([[ "$mode" == "2" || "$mode" == "3" ]] && echo "true" || echo "false")
-    ddns_setup "$DOMAIN" "$CF_API_TOKEN" "$zone_id" "$ddns_v4" "$ddns_v6" "$proxied"
-    _CF_RESULT_DOMAIN="$DOMAIN"
-    _CF_RESULT_TOKEN="$CF_API_TOKEN"
-    sleep 2
+        # Hook 脚本和自动续签任务
+        mkdir -p "$CERT_HOOKS_DIR"
+        local DEPLOY_HOOK_SCRIPT="${CERT_HOOKS_DIR}/renew-${DOMAIN}.sh"
+        local hook_content="#!/bin/bash
+# Auto-generated renewal hook for $DOMAIN
+# Generated by $SCRIPT_NAME $VERSION
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+DOMAIN=\"$DOMAIN\"
+CERT_DIR=\"${cert_dir}\"
+LETSENCRYPT_LIVE=\"/etc/letsencrypt/live/\${DOMAIN}\"
+echo \"[\$(date)] Starting renewal hook for \$DOMAIN\" >> /var/log/cert-renew.log
+
+# Copy certificates
+if [[ -f \"\${LETSENCRYPT_LIVE}/fullchain.pem\" ]]; then
+    cp -L \"\${LETSENCRYPT_LIVE}/fullchain.pem\" \"\${CERT_DIR}/fullchain.pem\"
+    cp -L \"\${LETSENCRYPT_LIVE}/privkey.pem\" \"\${CERT_DIR}/privkey.pem\"
+    chmod 644 \"\${CERT_DIR}/fullchain.pem\"
+    chmod 600 \"\${CERT_DIR}/privkey.pem\"
+    echo \"[\$(date)] Certificates copied successfully\" >> /var/log/cert-renew.log
+else
+    echo \"[\$(date)] ERROR: Certificate files not found\" >> /var/log/cert-renew.log
+    exit 1
+fi
+"
+        if [[ $do_nginx -eq 1 ]]; then
+            hook_content+="
+# Reload Nginx
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl reload nginx 2>&1 | tee -a /var/log/cert-renew.log
+elif command -v service >/dev/null 2>&1; then
+    service nginx reload 2>&1 | tee -a /var/log/cert-renew.log
+else
+    nginx -s reload 2>&1 | tee -a /var/log/cert-renew.log
+fi
+echo \"[\$(date)] Nginx reloaded\" >> /var/log/cert-renew.log
+"
+        fi
+        hook_content+="
+echo \"[\$(date)] Renewal hook completed for \$DOMAIN\" >> /var/log/cert-renew.log
+exit 0
+"
+        write_file_atomic "$DEPLOY_HOOK_SCRIPT" "$hook_content"
+        chmod +x "$DEPLOY_HOOK_SCRIPT"
+        if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
+            cron_add_job "certbot renew" "0 3 * * * certbot renew --quiet --deploy-hook 'for h in ${CERT_HOOKS_DIR}/*.sh; do [ -x \"\$h\" ] && bash \"\$h\"; done'"
+            print_success "全局自动续签任务已添加 (每日 3:00 AM)。"
+        else
+            print_info "全局续签任务已存在，无需重复添加。"
+        fi
+        local config_content="# Domain configuration for $DOMAIN
+# Generated by $SCRIPT_NAME $VERSION at $(date)
+DOMAIN=\"$DOMAIN\"
+CERT_PATH=\"${cert_dir}\"
+DEPLOY_HOOK_SCRIPT=\"$DEPLOY_HOOK_SCRIPT\"
+CLOUDFLARE_CREDENTIALS=\"$CLOUDFLARE_CREDENTIALS\"
+"
+        if [[ $do_nginx -eq 1 ]]; then
+            config_content+="NGINX_CONF_PATH=\"$NGINX_CONF_PATH\"
+NGINX_HTTP_PORT=\"$NGINX_HTTP_PORT\"
+NGINX_HTTPS_PORT=\"$NGINX_HTTPS_PORT\"
+LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
+"
+        fi
+        write_file_atomic "${CONFIG_DIR}/${DOMAIN}.conf" "$config_content"
+        if [[ -n "$CF_API_TOKEN" ]] && [[ ! -f "$DDNS_CONFIG_DIR/${DOMAIN}.conf" ]]; then
+                        local zone_id=""
+            zone_id=$(_cf_get_zone_id "$DOMAIN" "$CF_API_TOKEN")
+            if [[ -n "$zone_id" ]]; then
+                local ddns_ipv4="false" ddns_ipv6="false"
+                [[ -n "$(get_public_ipv4)" ]] && ddns_ipv4="true"
+                [[ -n "$(get_public_ipv6)" ]] && ddns_ipv6="true"
+                ddns_setup "$DOMAIN" "$CF_API_TOKEN" "$zone_id" "$ddns_ipv4" "$ddns_ipv6" "false"
+            fi
+        fi
+        draw_line
+        print_success "域名配置完成！"
+        draw_line
+        echo -e "${C_CYAN}[证书路径]${C_RESET}"
+        echo "  公钥: ${cert_dir}/fullchain.pem"
+        echo "  私钥: ${cert_dir}/privkey.pem"
+        if [[ $do_nginx -eq 1 ]]; then
+            echo -e "\n${C_CYAN}[访问地址]${C_RESET}"
+            echo "  https://${DOMAIN}:${NGINX_HTTPS_PORT}"
+            echo -e "\n${C_CYAN}[反代配置]${C_RESET}"
+            echo "  后端: $LOCAL_PROXY_PASS"
+        else
+            echo -e "\n${C_YELLOW}[手动配置提示]${C_RESET}"
+            echo "  请在 3x-ui 面板设置中填写上述证书路径"
+        fi
+        echo -e "\n${C_CYAN}[自动续签]${C_RESET}"
+        echo "  Hook 脚本: $DEPLOY_HOOK_SCRIPT"
+        echo "  Crontab: 每日 3:00 AM 自动检查"
+        draw_line
+        log_action "Domain configured: $DOMAIN (Nginx: $do_nginx)"
+    else
+        print_error "证书申请失败！请检查:"
+        echo "1. 域名 DNS 是否正确解析到本机
+2. API Token 权限是否正确
+3. 网络连接是否正常"
+        rm -f "$CLOUDFLARE_CREDENTIALS"
+    fi
+    pause
 }
 
 web_view_config() {
@@ -2960,7 +3326,7 @@ web_view_config() {
     if ! validate_conf_file "$target_conf"; then
         print_error "配置文件格式异常"; pause; return
     fi
-    source "$target_conf"
+    _safe_source_conf "$target_conf"
     CERT_PATH=${CERT_PATH:-"${CERT_PATH_PREFIX}/${target_domain}"}
     DEPLOY_HOOK_SCRIPT=${DEPLOY_HOOK_SCRIPT:-"/root/cert-renew-hook-${target_domain}.sh"}
     print_title "配置详情: $target_domain"
@@ -3070,7 +3436,7 @@ web_delete_domain() {
     if ! confirm "确认彻底删除吗?"; then return; fi
     print_info "正在执行清理..."
     if certbot delete --cert-name "$target_domain" --non-interactive 2>/dev/null; then
-        print_success "证书已吊销/删除。"
+        print_success "证书本地文件已删除。"
     else
         print_warn "Certbot 删除失败或证书不存在。"
     fi
@@ -3110,253 +3476,71 @@ web_delete_domain() {
     pause
 }
 
-web_add_domain() {
-    print_title "添加域名配置 (SSL + Nginx)"
-    local DOMAIN="" CF_API_TOKEN="" LOCAL_PROXY_PASS="" NGINX_HTTP_PORT="" NGINX_HTTPS_PORT="" BACKEND_PROTOCOL=""
-    web_env_check || { pause; return; }
-    print_guide "此步骤将申请 SSL 证书并（可选）配置 Nginx 反向代理。"
-    if confirm "是否需要先自动配置 Cloudflare DNS 解析 (A/AAAA)?"; then
-        web_cf_dns_update
-        [[ -n "$_CF_RESULT_DOMAIN" ]] && DOMAIN="$_CF_RESULT_DOMAIN"
-        [[ -n "$_CF_RESULT_TOKEN" ]] && CF_API_TOKEN="$_CF_RESULT_TOKEN"
-        _CF_RESULT_DOMAIN=""
-        _CF_RESULT_TOKEN=""
-        echo ""
-    fi
-    while [[ -z "$DOMAIN" ]]; do
-        read -e -r -p "请输入域名 (如 example.com): " DOMAIN
-        if ! validate_domain "$DOMAIN"; then
-            print_error "域名格式无效。"
-            DOMAIN=""
-        fi
-    done
-    if [[ -f "${CONFIG_DIR}/${DOMAIN}.conf" ]]; then
-        print_warn "配置已存在，请先删除。"
+web_cert_overview() {
+    print_title "证书状态总览"
+    shopt -s nullglob
+    local conf_files=("${CONFIG_DIR}"/*.conf)
+    shopt -u nullglob
+    if [[ ${#conf_files[@]} -eq 0 ]]; then
+        print_warn "当前没有已管理的域名。"
         pause; return
     fi
-    print_guide "脚本使用 DNS API 申请证书，需要您的 Cloudflare API Token。"
-    while [[ -z "$CF_API_TOKEN" ]]; do
-        read -s -r -p "Cloudflare API Token: " CF_API_TOKEN
-        echo ""
-    done
-    local do_nginx=0
-    if confirm "是否配置 Nginx 反向代理 (用于隐藏后端端口)?"; then
-        do_nginx=1
-        print_guide "请输入 Nginx 监听的端口 (通常 HTTP=80, HTTPS=443)"
-        
-        while true; do
-            read -e -r -p "HTTP 端口 [80]: " hp
-            NGINX_HTTP_PORT=${hp:-80}
-            if validate_port "$NGINX_HTTP_PORT"; then break; fi
-            print_warn "端口无效"
-        done
-        while true; do
-            read -e -r -p "HTTPS 端口 [443]: " sp
-            NGINX_HTTPS_PORT=${sp:-443}
-            if validate_port "$NGINX_HTTPS_PORT"; then break; fi
-            print_warn "端口无效"
-        done
-        read -e -r -p "后端协议 [1]http [2]https: " proto
-        BACKEND_PROTOCOL=$([[ "$proto" == "2" ]] && echo "https" || echo "http")
-        print_guide "请输入后端服务的实际地址 (例如 127.0.0.1:54321)"
-        while [[ -z "$LOCAL_PROXY_PASS" ]]; do
-            read -e -r -p "反代目标: " inp
-            [[ "$inp" =~ ^[0-9]+$ ]] && inp="127.0.0.1:$inp"
-            if [[ "$inp" =~ ^(\[.*\]|[a-zA-Z0-9.-]+):[0-9]+$ ]]; then
-                LOCAL_PROXY_PASS="${BACKEND_PROTOCOL}://${inp}"
-            else
-                print_warn "格式错误，请重试"
-            fi
-        done
-    else
-        echo ""
-        print_guide "您选择了【不配置 Nginx】。"
-        print_guide "证书生成后，请手动在 3x-ui 面板设置中填写公钥/私钥路径。"
-        echo ""
-    fi
-    mkdir -p "${CERT_PATH_PREFIX}/${DOMAIN}"
-    local CLOUDFLARE_CREDENTIALS="/root/.cloudflare-${DOMAIN}.ini"
-    write_file_atomic "$CLOUDFLARE_CREDENTIALS" "dns_cloudflare_api_token = $CF_API_TOKEN"
-    chmod 600 "$CLOUDFLARE_CREDENTIALS"
-    print_info "正在申请证书 (这可能需要 1-2 分钟)..."
-    if certbot certonly \
-        --dns-cloudflare \
-        --dns-cloudflare-credentials "$CLOUDFLARE_CREDENTIALS" \
-        --dns-cloudflare-propagation-seconds 60 \
-        -d "$DOMAIN" \
-        --email "$EMAIL" \
-        --agree-tos \
-        --no-eff-email \
-        --non-interactive; then
-        print_success "证书获取成功！"
-        local cert_dir="${CERT_PATH_PREFIX}/${DOMAIN}"
-        cp -L "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "$cert_dir/fullchain.pem"
-        cp -L "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "$cert_dir/privkey.pem"
-        chmod 644 "$cert_dir/fullchain.pem"
-        chmod 600 "$cert_dir/privkey.pem"
-        if [[ $do_nginx -eq 1 ]]; then
-            local NGINX_CONF_PATH="/etc/nginx/sites-available/${DOMAIN}.conf"
-            if [[ ! -f /etc/nginx/snippets/ssl-params.conf ]]; then
-                local ssl_params="ssl_session_timeout 1d;
-ssl_session_cache shared:SSL:10m;
-ssl_session_tickets off;
-ssl_protocols TLSv1.2 TLSv1.3;
-ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
-ssl_prefer_server_ciphers off;
-add_header Strict-Transport-Security \"max-age=15768000\" always;"
-                write_file_atomic "/etc/nginx/snippets/ssl-params.conf" "$ssl_params"
-            fi
-            local redir_port=""
-            [[ "$NGINX_HTTPS_PORT" != "443" ]] && redir_port=":${NGINX_HTTPS_PORT}"
-            local nginx_conf="# Config for $DOMAIN
-# Generated by $SCRIPT_NAME $VERSION
-server {
-    listen $NGINX_HTTP_PORT;
-    listen [::]:$NGINX_HTTP_PORT;
-    server_name $DOMAIN;
-    return 301 https://\$host${redir_port}\$request_uri;
-}
-server {
-    listen $NGINX_HTTPS_PORT ssl http2;
-    listen [::]:$NGINX_HTTPS_PORT ssl http2;
-    server_name $DOMAIN;
-    ssl_certificate ${cert_dir}/fullchain.pem;
-    ssl_certificate_key ${cert_dir}/privkey.pem;
-    ssl_trusted_certificate ${cert_dir}/fullchain.pem;
-    include snippets/ssl-params.conf;
-    location / {
-        proxy_pass $LOCAL_PROXY_PASS;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \"upgrade\";
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_buffering off;
-    }
-}"
-            write_file_atomic "$NGINX_CONF_PATH" "$nginx_conf"
-            ln -sf "$NGINX_CONF_PATH" "/etc/nginx/sites-enabled/${DOMAIN}.conf"
-            if nginx -t >/dev/null 2>&1; then
-                if is_systemd; then
-                    systemctl reload nginx || systemctl restart nginx
+    echo -e "${C_CYAN}#    域名                             剩余天数       过期时间               状态${C_RESET}"
+    draw_line
+    local i=1 warn_count=0 expired_count=0 ok_count=0 missing_count=0
+    for conf in "${conf_files[@]}"; do
+        local d=$(grep '^DOMAIN=' "$conf" | cut -d'"' -f2)
+        [[ -z "$d" ]] && continue
+        local cert_path="${CERT_PATH_PREFIX}/${d}"
+        local fullchain="${cert_path}/fullchain.pem"
+        local days_str expiry_str status_str
+        if [[ -f "$fullchain" ]]; then
+            local end_date
+            end_date=$(openssl x509 -enddate -noout -in "$fullchain" 2>/dev/null | cut -d= -f2)
+            if [[ -n "$end_date" ]]; then
+                local end_epoch now_epoch days_left
+                end_epoch=$(date -d "$end_date" +%s 2>/dev/null || echo 0)
+                now_epoch=$(date +%s)
+                days_left=$(( (end_epoch - now_epoch) / 86400 ))
+                expiry_str=$(date -d "$end_date" '+%Y-%m-%d' 2>/dev/null || echo "$end_date")
+                if [[ $days_left -lt 0 ]]; then
+                    days_str="${C_RED}已过期${C_RESET}"
+                    status_str="${C_RED}✗ 过期${C_RESET}"
+                    expired_count=$((expired_count + 1))
+                elif [[ $days_left -lt 7 ]]; then
+                    days_str="${C_RED}${days_left} 天${C_RESET}"
+                    status_str="${C_RED}! 紧急${C_RESET}"
+                    warn_count=$((warn_count + 1))
+                elif [[ $days_left -lt 30 ]]; then
+                    days_str="${C_YELLOW}${days_left} 天${C_RESET}"
+                    status_str="${C_YELLOW}△ 即将过期${C_RESET}"
+                    warn_count=$((warn_count + 1))
                 else
-                    nginx -s reload 2>/dev/null || service nginx reload
+                    days_str="${C_GREEN}${days_left} 天${C_RESET}"
+                    status_str="${C_GREEN}✓ 正常${C_RESET}"
+                    ok_count=$((ok_count + 1))
                 fi
-                print_success "Nginx 配置已生效。"
             else
-                print_error "Nginx 配置测试失败！"
-                nginx -t 2>&1 | tail -5
-                rm -f "/etc/nginx/sites-enabled/${DOMAIN}.conf"
-                rm -f "$NGINX_CONF_PATH"
-                pause; return
+                expiry_str="解析失败"
+                days_str="-"
+                status_str="${C_RED}? 异常${C_RESET}"
+                missing_count=$((missing_count + 1))
             fi
-            if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
-                ufw allow "$NGINX_HTTP_PORT/tcp" comment "Nginx-HTTP" >/dev/null 2>&1 || true
-                ufw allow "$NGINX_HTTPS_PORT/tcp" comment "Nginx-HTTPS" >/dev/null 2>&1 || true
-                print_success "防火墙规则已更新。"
-            fi
-        fi
-                mkdir -p "$CERT_HOOKS_DIR"
-        local DEPLOY_HOOK_SCRIPT="${CERT_HOOKS_DIR}/renew-${DOMAIN}.sh"
-        local hook_content="#!/bin/bash
-# Auto-generated renewal hook for $DOMAIN
-# Generated by $SCRIPT_NAME $VERSION
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-DOMAIN=\"$DOMAIN\"
-CERT_DIR=\"${cert_dir}\"
-LETSENCRYPT_LIVE=\"/etc/letsencrypt/live/\${DOMAIN}\"
-echo \"[\$(date)] Starting renewal hook for \$DOMAIN\" >> /var/log/cert-renew.log
-
-# Copy certificates
-if [[ -f \"\${LETSENCRYPT_LIVE}/fullchain.pem\" ]]; then
-    cp -L \"\${LETSENCRYPT_LIVE}/fullchain.pem\" \"\${CERT_DIR}/fullchain.pem\"
-    cp -L \"\${LETSENCRYPT_LIVE}/privkey.pem\" \"\${CERT_DIR}/privkey.pem\"
-    chmod 644 \"\${CERT_DIR}/fullchain.pem\"
-    chmod 600 \"\${CERT_DIR}/privkey.pem\"
-    echo \"[\$(date)] Certificates copied successfully\" >> /var/log/cert-renew.log
-else
-    echo \"[\$(date)] ERROR: Certificate files not found\" >> /var/log/cert-renew.log
-    exit 1
-fi
-"
-        if [[ $do_nginx -eq 1 ]]; then
-            hook_content+="
-# Reload Nginx
-if command -v systemctl >/dev/null 2>&1; then
-    systemctl reload nginx 2>&1 | tee -a /var/log/cert-renew.log
-elif command -v service >/dev/null 2>&1; then
-    service nginx reload 2>&1 | tee -a /var/log/cert-renew.log
-else
-    nginx -s reload 2>&1 | tee -a /var/log/cert-renew.log
-fi
-echo \"[\$(date)] Nginx reloaded\" >> /var/log/cert-renew.log
-"
-        fi
-        hook_content+="
-echo \"[\$(date)] Renewal hook completed for \$DOMAIN\" >> /var/log/cert-renew.log
-exit 0
-"
-        write_file_atomic "$DEPLOY_HOOK_SCRIPT" "$hook_content"
-        chmod +x "$DEPLOY_HOOK_SCRIPT"
-        if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
-            cron_add_job "certbot renew" "0 3 * * * certbot renew --quiet; for h in ${CERT_HOOKS_DIR}/*.sh; do [ -x \"\$h\" ] && bash \"\$h\"; done"
-            print_success "全局自动续签任务已添加 (每日 3:00 AM)。"
         else
-            print_info "全局续签任务已存在，无需重复添加。"
+            expiry_str="无证书文件"
+            days_str="-"
+            status_str="${C_RED}✗ 缺失${C_RESET}"
+            missing_count=$((missing_count + 1))
         fi
-        local config_content="# Domain configuration for $DOMAIN
-# Generated by $SCRIPT_NAME $VERSION at $(date)
-DOMAIN=\"$DOMAIN\"
-CERT_PATH=\"${cert_dir}\"
-DEPLOY_HOOK_SCRIPT=\"$DEPLOY_HOOK_SCRIPT\"
-CLOUDFLARE_CREDENTIALS=\"$CLOUDFLARE_CREDENTIALS\"
-"
-        if [[ $do_nginx -eq 1 ]]; then
-            config_content+="NGINX_CONF_PATH=\"$NGINX_CONF_PATH\"
-NGINX_HTTP_PORT=\"$NGINX_HTTP_PORT\"
-NGINX_HTTPS_PORT=\"$NGINX_HTTPS_PORT\"
-LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
-"
-        fi
-        write_file_atomic "${CONFIG_DIR}/${DOMAIN}.conf" "$config_content"
-        if [[ -n "$CF_API_TOKEN" ]] && [[ ! -f "$DDNS_CONFIG_DIR/${DOMAIN}.conf" ]]; then
-                        local zone_id=""
-            zone_id=$(_cf_get_zone_id "$DOMAIN" "$CF_API_TOKEN")
-            if [[ -n "$zone_id" ]]; then
-                local ddns_ipv4="false" ddns_ipv6="false"
-                [[ -n "$(get_public_ipv4)" ]] && ddns_ipv4="true"
-                [[ -n "$(get_public_ipv6)" ]] && ddns_ipv6="true"
-                ddns_setup "$DOMAIN" "$CF_API_TOKEN" "$zone_id" "$ddns_ipv4" "$ddns_ipv6" "false"
-            fi
-        fi
-        draw_line
-        print_success "域名配置完成！"
-        draw_line
-        echo -e "${C_CYAN}[证书路径]${C_RESET}"
-        echo "  公钥: ${cert_dir}/fullchain.pem"
-        echo "  私钥: ${cert_dir}/privkey.pem"
-        if [[ $do_nginx -eq 1 ]]; then
-            echo -e "\n${C_CYAN}[访问地址]${C_RESET}"
-            echo "  https://${DOMAIN}:${NGINX_HTTPS_PORT}"
-            echo -e "\n${C_CYAN}[反代配置]${C_RESET}"
-            echo "  后端: $LOCAL_PROXY_PASS"
-        else
-            echo -e "\n${C_YELLOW}[手动配置提示]${C_RESET}"
-            echo "  请在 3x-ui 面板设置中填写上述证书路径"
-        fi
-        echo -e "\n${C_CYAN}[自动续签]${C_RESET}"
-        echo "  Hook 脚本: $DEPLOY_HOOK_SCRIPT"
-        echo "  Crontab: 每日 3:00 AM 自动检查"
-        draw_line
-        log_action "Domain configured: $DOMAIN (Nginx: $do_nginx)"
-    else
-        print_error "证书申请失败！请检查:"
-        echo "1. 域名 DNS 是否正确解析到本机
-2. API Token 权限是否正确
-3. 网络连接是否正常"
-        rm -f "$CLOUDFLARE_CREDENTIALS"
+        echo -e "  $i  $d  $days_str  $expiry_str  $status_str"
+        ((i++))
+    done
+    draw_line
+    local total=$((ok_count + warn_count + expired_count + missing_count))
+    echo -e "共 ${C_CYAN}${total}${C_RESET} 个域名: ${C_GREEN}正常 ${ok_count}${C_RESET} | ${C_YELLOW}警告 ${warn_count}${C_RESET} | ${C_RED}过期 ${expired_count}${C_RESET} | ${C_RED}缺失 ${missing_count}${C_RESET}"
+    if [[ $warn_count -gt 0 || $expired_count -gt 0 ]]; then
+        echo ""
+        print_warn "有证书需要关注，建议使用 [8.手动续签] 进行续签。"
     fi
     pause
 }
@@ -3467,17 +3651,8 @@ web_reverse_proxy_site() {
     HTTPS_PORT=${sp:-443}
     validate_port "$HTTPS_PORT" || { print_error "端口无效"; pause; return; }
     
-    # 生成 SSL 参数文件（如果不存在）
-    if [[ ! -f /etc/nginx/snippets/ssl-params.conf ]]; then
-        local ssl_params="ssl_session_timeout 1d;
-ssl_session_cache shared:SSL:10m;
-ssl_session_tickets off;
-ssl_protocols TLSv1.2 TLSv1.3;
-ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
-ssl_prefer_server_ciphers off;
-add_header Strict-Transport-Security \"max-age=15768000\" always;"
-        write_file_atomic "/etc/nginx/snippets/ssl-params.conf" "$ssl_params"
-    fi
+    # 确保 SSL 参数文件存在
+    _ensure_ssl_params
     local redir_port=""
     [[ "$HTTPS_PORT" != "443" ]] && redir_port=":${HTTPS_PORT}"
     
@@ -3589,24 +3764,11 @@ server {
     }
 }"
     fi
-    local NGINX_CONF_PATH="/etc/nginx/sites-available/${DOMAIN}.conf"
-    write_file_atomic "$NGINX_CONF_PATH" "$nginx_conf"
-    ln -sf "$NGINX_CONF_PATH" "/etc/nginx/sites-enabled/${DOMAIN}.conf"
-    # 测试并加载配置
-    if nginx -t >/dev/null 2>&1; then
-        if is_systemd; then
-            systemctl reload nginx || systemctl restart nginx
-        else
-            nginx -s reload 2>/dev/null || service nginx reload
-        fi
-        print_success "Nginx 反代配置已生效。"
-    else
-        print_error "Nginx 配置测试失败！"
-        nginx -t 2>&1 | tail -5
-        rm -f "/etc/nginx/sites-enabled/${DOMAIN}.conf"
-        rm -f "$NGINX_CONF_PATH"
+    # 部署配置（使用提取的辅助函数）
+    if ! _nginx_deploy_conf "$DOMAIN" "$nginx_conf"; then
         pause; return
     fi
+    print_success "Nginx 反代配置已生效。"
     
     # 防火墙规则
     if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
@@ -3686,11 +3848,7 @@ web_edit_reverse_proxy() {
     cp "$target_conf" "${target_conf}.bak"
     sed -i "s|proxy_pass ${current_backend};|proxy_pass ${new_backend};|g" "$target_conf"
     if nginx -t >/dev/null 2>&1; then
-        if is_systemd; then
-            systemctl reload nginx || systemctl restart nginx
-        else
-            nginx -s reload 2>/dev/null || service nginx reload
-        fi
+        _nginx_reload
         rm -f "${target_conf}.bak"
         print_success "反向代理后端已更新: ${target_domain}"
         echo -e "  ${current_backend} → ${C_GREEN}${new_backend}${C_RESET}"
@@ -3703,82 +3861,15 @@ web_edit_reverse_proxy() {
     pause
 }
 
-web_cert_overview() {
-    print_title "证书状态总览"
-    shopt -s nullglob
-    local conf_files=("${CONFIG_DIR}"/*.conf)
-    shopt -u nullglob
-    if [[ ${#conf_files[@]} -eq 0 ]]; then
-        print_warn "当前没有已管理的域名。"
-        pause; return
-    fi
-    printf "${C_CYAN}%-4s %-32s %-14s %-22s %s${C_RESET}\n" "#" "域名" "剩余天数" "过期时间" "状态"
-    draw_line
-    local i=1 warn_count=0 expired_count=0 ok_count=0 missing_count=0
-    for conf in "${conf_files[@]}"; do
-        local d=$(grep '^DOMAIN=' "$conf" | cut -d'"' -f2)
-        [[ -z "$d" ]] && continue
-        local cert_path="${CERT_PATH_PREFIX}/${d}"
-        local fullchain="${cert_path}/fullchain.pem"
-        local days_str expiry_str status_str
-        if [[ -f "$fullchain" ]]; then
-            local end_date
-            end_date=$(openssl x509 -enddate -noout -in "$fullchain" 2>/dev/null | cut -d= -f2)
-            if [[ -n "$end_date" ]]; then
-                local end_epoch now_epoch days_left
-                end_epoch=$(date -d "$end_date" +%s 2>/dev/null || echo 0)
-                now_epoch=$(date +%s)
-                days_left=$(( (end_epoch - now_epoch) / 86400 ))
-                expiry_str=$(date -d "$end_date" '+%Y-%m-%d' 2>/dev/null || echo "$end_date")
-                if [[ $days_left -lt 0 ]]; then
-                    days_str="${C_RED}已过期${C_RESET}"
-                    status_str="${C_RED}✗ 过期${C_RESET}"
-                    expired_count=$((expired_count + 1))
-                elif [[ $days_left -lt 7 ]]; then
-                    days_str="${C_RED}${days_left} 天${C_RESET}"
-                    status_str="${C_RED}! 紧急${C_RESET}"
-                    warn_count=$((warn_count + 1))
-                elif [[ $days_left -lt 30 ]]; then
-                    days_str="${C_YELLOW}${days_left} 天${C_RESET}"
-                    status_str="${C_YELLOW}△ 即将过期${C_RESET}"
-                    warn_count=$((warn_count + 1))
-                else
-                    days_str="${C_GREEN}${days_left} 天${C_RESET}"
-                    status_str="${C_GREEN}✓ 正常${C_RESET}"
-                    ok_count=$((ok_count + 1))
-                fi
-            else
-                expiry_str="解析失败"
-                days_str="-"
-                status_str="${C_RED}? 异常${C_RESET}"
-                missing_count=$((missing_count + 1))
-            fi
-        else
-            expiry_str="无证书文件"
-            days_str="-"
-            status_str="${C_RED}✗ 缺失${C_RESET}"
-            missing_count=$((missing_count + 1))
-        fi
-        printf "%-4s %-32s %-24b %-22s %b\n" "$i" "$d" "$days_str" "$expiry_str" "$status_str"
-        ((i++))
-    done
-    draw_line
-    local total=$((ok_count + warn_count + expired_count + missing_count))
-    echo -e "共 ${C_CYAN}${total}${C_RESET} 个域名: ${C_GREEN}正常 ${ok_count}${C_RESET} | ${C_YELLOW}警告 ${warn_count}${C_RESET} | ${C_RED}过期 ${expired_count}${C_RESET} | ${C_RED}缺失 ${missing_count}${C_RESET}"
-    if [[ $warn_count -gt 0 || $expired_count -gt 0 ]]; then
-        echo ""
-        print_warn "有证书需要关注，建议使用 [8.手动续签] 进行续签。"
-    fi
-    pause
-}
+# ── 主菜单 ──
 
 menu_web() {
     fix_terminal
     while true; do
         print_title "Web 服务管理 (SSL + Nginx + DDNS)"
-        local cert_count=$(ls -1 "$CONFIG_DIR"/*.conf 2>/dev/null | wc -l)
-        local ddns_count=$(ls -1 "$DDNS_CONFIG_DIR"/*.conf 2>/dev/null | wc -l)
-        local saas_count=$(ls -1 "$SAAS_CONFIG_DIR"/*.conf 2>/dev/null | wc -l)
+        local cert_count=$(find "$CONFIG_DIR" -maxdepth 1 -name '*.conf' 2>/dev/null | wc -l)
+        local ddns_count=$(find "$DDNS_CONFIG_DIR" -maxdepth 1 -name '*.conf' 2>/dev/null | wc -l)
+        local saas_count=$(find "$SAAS_CONFIG_DIR" -maxdepth 1 -name '*.conf' 2>/dev/null | wc -l)
         echo -e "证书域名: ${C_GREEN}${cert_count}${C_RESET} | DDNS域名: ${C_GREEN}${ddns_count}${C_RESET} | SaaS加速: ${C_GREEN}${saas_count}${C_RESET}"
         [[ $ddns_count -gt 0 ]] && crontab -l 2>/dev/null | grep -q "ddns-update.sh" && echo -e "DDNS状态: ${C_GREEN}运行中${C_RESET}"
         echo -e "${C_CYAN}--- 域名管理 ---${C_RESET}"
@@ -4432,8 +4523,8 @@ wg_rebuild_conf() {
         echo "PrivateKey = ${priv_key}"
         echo "Address = ${server_ip}/${mask}"
         echo "ListenPort = ${port}"
-        echo "PostUp = iptables -I FORWARD 1 -i %i -j ACCEPT; iptables -I FORWARD 2 -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -s ${subnet} -o ${main_iface} -j MASQUERADE"
-        echo "PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -s ${subnet} -o ${main_iface} -j MASQUERADE"
+        echo "PostUp = iptables -C FORWARD -i %i -j ACCEPT 2>/dev/null || iptables -A FORWARD -i %i -j ACCEPT; iptables -C FORWARD -o %i -j ACCEPT 2>/dev/null || iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -C POSTROUTING -s ${subnet} -o ${main_iface} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s ${subnet} -o ${main_iface} -j MASQUERADE"
+        echo "PostDown = iptables -D FORWARD -i %i -j ACCEPT 2>/dev/null; iptables -D FORWARD -o %i -j ACCEPT 2>/dev/null; iptables -t nat -D POSTROUTING -s ${subnet} -o ${main_iface} -j MASQUERADE 2>/dev/null"
         local pc=$(wg_db_get '.peers | length') i=0
         while [[ $i -lt $pc ]]; do
             if [[ "$(wg_db_get ".peers[$i].enabled")" == "true" ]]; then
@@ -4894,6 +4985,13 @@ uci delete firewall.wg_mesh_zone 2>/dev/null; true
 uci delete firewall.wg_mesh_fwd 2>/dev/null; true
 uci delete firewall.wg_mesh_fwd_lan 2>/dev/null; true
 
+# 清理 OpenClash 绕过规则
+ip rule del lookup main prio 100 2>/dev/null; true
+for h in \$(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print \$NF}'); do
+    nft delete rule inet fw4 mangle_prerouting handle "\$h" 2>/dev/null; true
+done
+sed -i '/wg_bypass/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null; true
+
 uci commit network 2>/dev/null; true
 uci commit firewall 2>/dev/null; true
 
@@ -4968,8 +5066,28 @@ uci set firewall.wg_fwd_wg.src='wg'
 uci set firewall.wg_fwd_wg.dest='lan'
 uci commit network
 uci commit firewall
-/etc/init.d/firewall restart
-ifup wg0
+/etc/init.d/firewall reload
+
+# === OpenClash 绕过: 让 WireGuard 流量直连不走代理 ===
+EP_IP='${ep_host}'
+echo "\${EP_IP}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\$' || \
+    EP_IP=\$(nslookup '${ep_host}' 2>/dev/null | awk '/^Address:/{a=\$2} END{if(a) print a}')
+if [ -n "\${EP_IP}" ]; then
+    # 添加策略路由: VPS IP 走主路由表，绕过 OpenClash 的路由表 354
+    ip rule del to "\${EP_IP}" lookup main prio 100 2>/dev/null; true
+    ip rule add to "\${EP_IP}" lookup main prio 100
+    # nftables: 标记发往 VPS 的包跳过 OpenClash
+    nft list chain inet fw4 mangle_prerouting &>/dev/null && {
+        nft delete rule inet fw4 mangle_prerouting handle \$(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print \$NF}') 2>/dev/null; true
+        nft insert rule inet fw4 mangle_prerouting ip daddr "\${EP_IP}" udp dport ${sport} counter return comment \"wg_bypass\" 2>/dev/null; true
+    }
+    # 持久化: 写入 /etc/rc.local
+    sed -i '/wg_bypass/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null; true
+    sed -i "/^exit 0/i # WireGuard bypass OpenClash\nip rule add to \${EP_IP} lookup main prio 100 2>/dev/null; true" /etc/rc.local 2>/dev/null; true
+    echo "[+] OpenClash 绕过规则已添加: \${EP_IP}"
+fi
+
+/etc/init.d/network reload
 
 # === 验证 ===
 sleep 3
@@ -5363,6 +5481,13 @@ uci delete firewall.wg_mesh_zone 2>/dev/null; true
 uci delete firewall.wg_mesh_fwd 2>/dev/null; true
 uci delete firewall.wg_mesh_fwd_lan 2>/dev/null; true
 
+# 清理 OpenClash 绕过规则
+ip rule del lookup main prio 100 2>/dev/null; true
+for h in \$(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print \$NF}'); do
+    nft delete rule inet fw4 mangle_prerouting handle "\$h" 2>/dev/null; true
+done
+sed -i '/wg_bypass/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null; true
+
 uci commit network 2>/dev/null; true
 uci commit firewall 2>/dev/null; true
 
@@ -5426,8 +5551,28 @@ uci set firewall.wg_fwd_wg.src='wg'
 uci set firewall.wg_fwd_wg.dest='lan'
 uci commit network
 uci commit firewall
-/etc/init.d/firewall restart
-ifup wg0
+/etc/init.d/firewall reload
+
+# === OpenClash 绕过: 让 WireGuard 流量直连不走代理 ===
+EP_IP='${ep_host}'
+echo "\${EP_IP}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\$' || \
+    EP_IP=\$(nslookup '${ep_host}' 2>/dev/null | awk '/^Address:/{a=\$2} END{if(a) print a}')
+if [ -n "\${EP_IP}" ]; then
+    # 添加策略路由: VPS IP 走主路由表，绕过 OpenClash 的路由表 354
+    ip rule del to "\${EP_IP}" lookup main prio 100 2>/dev/null; true
+    ip rule add to "\${EP_IP}" lookup main prio 100
+    # nftables: 标记发往 VPS 的包跳过 OpenClash
+    nft list chain inet fw4 mangle_prerouting &>/dev/null && {
+        nft delete rule inet fw4 mangle_prerouting handle \$(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print \$NF}') 2>/dev/null; true
+        nft insert rule inet fw4 mangle_prerouting ip daddr "\${EP_IP}" udp dport ${sport} counter return comment \"wg_bypass\" 2>/dev/null; true
+    }
+    # 持久化: 写入 /etc/rc.local
+    sed -i '/wg_bypass/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null; true
+    sed -i "/^exit 0/i # WireGuard bypass OpenClash\nip rule add to \${EP_IP} lookup main prio 100 2>/dev/null; true" /etc/rc.local 2>/dev/null; true
+    echo "[+] OpenClash 绕过规则已添加: \${EP_IP}"
+fi
+
+/etc/init.d/network reload
 
 # === 验证 ===
 sleep 3
@@ -6301,6 +6446,12 @@ wg_uninstall() {
             fi
             _fwi=$((_fwi + 1))
         done
+        # 清理 OpenClash 绕过规则
+        ip rule del lookup main prio 100 2>/dev/null || true
+        for h in $(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print $NF}'); do
+            nft delete rule inet fw4 mangle_prerouting handle "$h" 2>/dev/null || true
+        done
+        sed -i '/wg_bypass/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null || true
         uci commit network 2>/dev/null || true
         uci commit firewall 2>/dev/null || true
     fi
@@ -6385,11 +6536,18 @@ uci delete firewall.wg_mesh_zone 2>/dev/null; true
 uci delete firewall.wg_mesh_fwd 2>/dev/null; true
 uci delete firewall.wg_mesh_fwd_lan 2>/dev/null; true
 
+# 清理 OpenClash 绕过规则
+ip rule del lookup main prio 100 2>/dev/null; true
+for h in $(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print $NF}'); do
+    nft delete rule inet fw4 mangle_prerouting handle "$h" 2>/dev/null; true
+done
+sed -i '/wg_bypass/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null; true
+
 # 提交并重载
 uci commit network
 uci commit firewall
 /etc/init.d/firewall reload
-ifup wg0 2>/dev/null; true
+/etc/init.d/network reload
 
 echo "[OK] WireGuard 配置已清空"
 CLEANEOF
