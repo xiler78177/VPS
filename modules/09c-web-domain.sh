@@ -275,8 +275,8 @@ web_view_config() {
     echo "Hook 脚本: $DEPLOY_HOOK_SCRIPT"
     echo -e "\n${C_CYAN}[自动续签计划 (Crontab)]${C_RESET}"
     local cron_out=$(crontab -l 2>/dev/null | grep -v -E "^[[:space:]]*no crontab for " || true)
-    if [[ -n "$DEPLOY_HOOK_SCRIPT" ]] && echo "$cron_out" | grep -F -q "$DEPLOY_HOOK_SCRIPT"; then
-        echo "$cron_out" | grep -F "$DEPLOY_HOOK_SCRIPT"
+    if echo "$cron_out" | grep -q "certbot renew"; then
+        echo "$cron_out" | grep "certbot renew"
     else
         echo -e "${C_YELLOW}未配置自动续签任务${C_RESET}"
     fi
