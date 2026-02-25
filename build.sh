@@ -26,7 +26,9 @@ MODULES=(
     "09c-web-domain.sh"
     "09d-web-proxy.sh"
     "10-docker.sh"
+    "11a-wireguard-netcheck.sh"
     "11-wireguard.sh"
+    "11b-wireguard-udp2raw.sh"
     "12-backup.sh"
     "13-menus.sh"
 )
