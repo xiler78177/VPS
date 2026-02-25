@@ -51,12 +51,17 @@ for mod in "${MODULES[@]}"; do
         echo "错误: 模块文件不存在 - $mod_path" >&2
         exit 1
     fi
-    # 跳过第一行（模块注释头 # modules/xx-xxx.sh - ...）
-    tail -n +2 "$mod_path" >> "$OUTPUT"
+    # 跳过第一行（模块注释头 # modules/xx-xxx.sh - ...），并去除 Windows 换行符 \r
+    tail -n +2 "$mod_path" | tr -d '\r' >> "$OUTPUT"
 done
 
 # 末尾追加入口调用
 echo 'main "$@"' >> "$OUTPUT"
+
+# 确保整个文件使用 LF 换行符（防止 Windows 环境污染）
+if command -v sed &>/dev/null; then
+    sed -i 's/\r$//' "$OUTPUT"
+fi
 
 chmod +x "$OUTPUT"
 
