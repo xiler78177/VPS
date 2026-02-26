@@ -177,64 +177,57 @@ wg_tunnel_setup() {
     local c_time=$(date +%s000)
 
     local xui_template
-    local subid=$(openssl rand -hex 8 2>/dev/null || head -c 16 /dev/urandom | xxd -p)
-    
-    # 3X-UI 严格要求内部配置为未被压缩过的、带换行符 \n 和固定缩进的美化 JSON 文本字符串。
-    # 这里直接使用 jq -M (不加 -c) 输出带格式的 json 字符串。
-    local inner_settings=$(jq -M \
-        --arg uuid "$uuid" \
-        --arg flow "${vless_flow}" \
-        --arg subid "$subid" \
-        --argjson ctime "$c_time" \
-        '{
+    local subid
+    subid=$(openssl rand -hex 8 2>/dev/null || head -c 8 /dev/urandom | xxd -p)
+    local c_time
+    c_time=$(date +%s000)
+
+    # 直接用 bash 字符串拼 inner JSON，格式与 3X-UI 数据库原生存储完全一致
+    local inner_settings
+    inner_settings=$(printf '{
   "clients": [
     {
-      "id": $uuid,
+      "id": "%s",
       "security": "",
       "password": "",
-      "flow": $flow,
+      "flow": "%s",
       "email": "WG-Tunnel",
       "limitIp": 0,
       "totalGB": 0,
       "expiryTime": 0,
       "enable": true,
       "tgId": "",
-      "subId": $subid,
+      "subId": "%s",
       "comment": "",
       "reset": 0,
-      "created_at": $ctime,
-      "updated_at": $ctime
+      "created_at": %s,
+      "updated_at": %s
     }
   ],
   "decryption": "none",
   "encryption": "none",
   "testseed": [900, 500, 900, 256],
   "fallbacks": []
-}')
+}' "$uuid" "$vless_flow" "$subid" "$c_time" "$c_time")
 
-    local inner_stream=$(jq -M \
-        --arg net "$vless_network" \
-        --arg sni "$server_name" \
-        --arg dest "${dest_server}:${dest_port}" \
-        --arg priv "$reality_private_key" \
-        --arg sid "$short_id" \
-        '{
-  "network": $net,
+    local inner_stream
+    inner_stream=$(printf '{
+  "network": "%s",
   "security": "reality",
   "externalProxy": [],
   "realitySettings": {
     "show": false,
     "xver": 0,
-    "target": $dest,
+    "target": "%s",
     "serverNames": [
-      $sni
+      "%s"
     ],
-    "privateKey": $priv,
+    "privateKey": "%s",
     "minClientVer": "",
     "maxClientVer": "",
     "maxTimediff": 0,
     "shortIds": [
-      $sid
+      "%s"
     ],
     "mldsa65Seed": "",
     "settings": {
@@ -251,10 +244,9 @@ wg_tunnel_setup() {
       "type": "none"
     }
   }
-}')
+}' "$vless_network" "${dest_server}:${dest_port}" "$server_name" "$reality_private_key" "$short_id")
 
-    local inner_sniffing=$(jq -M \
-        '{
+    local inner_sniffing='{
   "enabled": true,
   "destOverride": [
     "http",
@@ -264,56 +256,9 @@ wg_tunnel_setup() {
   ],
   "metadataOnly": false,
   "routeOnly": false
-}')
+}'
 
-    # 包装外层 JSON (包含 clientStats)
-    xui_template=$(jq -n \
-        --arg vp "$vless_port" \
-        --arg uuid "$uuid" \
-        --arg subid "$subid" \
-        --arg set "$inner_settings" \
-        --arg sset "$inner_stream" \
-        --arg snif "$inner_sniffing" \
-        --argjson ctime "$c_time" \
-        '{
-           "id": 15,
-           "userId": 0,
-           "up": 0,
-           "down": 0,
-           "total": 0,
-           "allTime": 0,
-           "remark": "WG-Tunnel",
-           "enable": true,
-           "expiryTime": 0,
-           "trafficReset": "never",
-           "lastTrafficResetTime": 0,
-           "listen": "",
-           "port": ($vp | tonumber),
-           "protocol": "vless",
-           "settings": $set,
-           "streamSettings": $sset,
-           "tag": ("inbound-" + $vp),
-           "sniffing": $snif,
-           "clientStats": [
-             {
-               "id": 3,
-               "inboundId": 15,
-               "enable": true,
-               "email": "WG-Tunnel",
-               "uuid": $uuid,
-               "subId": $subid,
-               "up": 0,
-               "down": 0,
-               "allTime": 0,
-               "expiryTime": 0,
-               "total": 0,
-               "reset": 0,
-               "lastOnline": 0
-             }
-           ]
-         }')
-
-    # 包装外层 JSON (包含 clientStats)
+    # 包装外层 JSON（用 jq 注入变量，避免转义问题）
     xui_template=$(jq -n \
         --arg vp "$vless_port" \
         --arg uuid "$uuid" \
@@ -342,7 +287,6 @@ wg_tunnel_setup() {
            "sniffing": $snif,
            "clientStats": [
              {
-               "id": 1,
                "inboundId": 1,
                "enable": true,
                "email": "WG-Tunnel",
