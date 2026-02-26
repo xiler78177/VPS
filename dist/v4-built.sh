@@ -7734,20 +7734,107 @@ wg_tunnel_setup() {
     # 生成配置
     wg_tunnel_generate_xray_inbound "$wg_port" "$vless_port" "$vless_network" "$vless_flow" "$dest_server" "$dest_port"
 
+    # 生成 3X-UI 可导入的 JSON 模板
+    local xui_template
+    # 首先构建内层的 settings (转义JSON)
+    local inner_settings=$(jq -n -c \
+        --arg uuid "$uuid" \
+        --arg flow "${vless_flow}" \
+        '{
+           "clients": [
+             {
+               "id": $uuid,
+               "flow": $flow,
+               "email": "WG-Tunnel",
+               "enable": true,
+               "expiryTime": 0,
+               "limitIp": 0,
+               "reset": 0,
+               "totalGB": 0
+             }
+           ],
+           "decryption": "none",
+           "fallbacks": []
+         }')
+    
+    # 构建内层的 streamSettings (转义JSON)
+    local inner_stream=$(jq -n -c \
+        --arg net "$vless_network" \
+        --arg sni "$server_name" \
+        --arg dest "${dest_server}:${dest_port}" \
+        --arg priv "$reality_private_key" \
+        --arg sid "$short_id" \
+        '{
+           "network": $net,
+           "security": "reality",
+           "externalProxy": [],
+           "realitySettings": {
+             "show": false,
+             "xver": 0,
+             "dest": $dest,
+             "serverNames": [ $sni ],
+             "privateKey": $priv,
+             "minClientVer": "",
+             "maxClientVer": "",
+             "maxTimediff": 0,
+             "shortIds": [ $sid ],
+             "mldsa65Seed": "",
+             "settings": {
+               "publicKey": "",
+               "fingerprint": "chrome",
+               "serverName": "",
+               "spiderX": "/",
+               "mldsa65Verify": ""
+             }
+           },
+           "tcpSettings": {
+             "acceptProxyProtocol": false,
+             "header": { "type": "none" }
+           }
+         }')
+         
+    # 构建内层的 sniffing (转义JSON)
+    local inner_sniffing=$(jq -n -c \
+        '{
+           "enabled": true,
+           "destOverride": ["http", "tls", "quic", "fakedns"],
+           "metadataOnly": false,
+           "routeOnly": false
+         }')
+
+    # 包装外层 JSON
+    xui_template=$(jq -n \
+        --arg vp "$vless_port" \
+        --arg set "$inner_settings" \
+        --arg sset "$inner_stream" \
+        --arg snif "$inner_sniffing" \
+        '{
+           "up": 0,
+           "down": 0,
+           "total": 0,
+           "remark": "WG-Tunnel",
+           "enable": true,
+           "listen": "",
+           "port": ($vp | tonumber),
+           "protocol": "vless",
+           "settings": $set,
+           "streamSettings": $sset,
+           "tag": ("inbound-" + $vp),
+           "sniffing": $snif
+         }')
+
     # 提供 3X-UI 配置指引
     echo ""
-    echo -e "${C_YELLOW}[下一步] 在 3X-UI 面板中添加入站:${C_RESET}"
-    echo "  1. 登录 3X-UI 面板"
-    echo "  2. 入站列表 → 添加入站"
-    echo "  3. 协议: vless"
-    echo "  4. 端口: ${vless_port}"
-    echo "  5. 传输: ${vless_network}"
-    if [[ -n "$vless_flow" ]]; then
-        echo "     xtls 设置 (Flow): ${vless_flow}"
-    fi
-    echo "  6. 安全: reality"
-    echo "  7. SNI / Dest: ${dest_server}:${dest_port}"
-    echo "  8. (无需额外处理) 客户端直接请求服务端公网 IP，流量自动回环到 WG 端口"
+    echo -e "${C_GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
+    echo -e "${C_CYAN}请复制以下 JSON 文本 (包含括号):${C_RESET}"
+    echo -e "${C_YELLOW}${xui_template}${C_RESET}"
+    echo -e "${C_GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
+    
+    echo -e "${C_CYAN}[下一步] 使用 3X-UI 模板导入:${C_RESET}"
+    echo "  1. 登录 3X-UI 面板，进入 [入站列表]"
+    echo "  2. 点击右上角的 [+] 旁边箭头 或 找到 [导入 (Import)] 按钮"
+    echo "  3. 将上面的 JSON 文本完整粘贴进去，点击确定保存"
+    echo "  4. (无需额外路由处理) 客户端代理请求服务端公网 IP，流量即可自动回环"
     echo ""
 
     log_action "WireGuard tunnel: VLESS-Reality configured (port=${vless_port} net=${vless_network} flow=${vless_flow} sni=${dest_server})"
