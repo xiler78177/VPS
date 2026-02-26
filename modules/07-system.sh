@@ -96,6 +96,8 @@ auto_deps() {
     apt-get update >/dev/null 2>&1 || true
     local installed=0
     local failed=0
+    local ufw_newly_installed=0
+    local f2b_newly_installed=0
     for pkg in $FULL_DEPS; do
         if dpkg -s "$pkg" &>/dev/null; then
             echo "  ✓ $pkg (已安装)"
@@ -104,6 +106,8 @@ auto_deps() {
             if (DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" >/dev/null 2>&1); then
                 echo -e "${C_GREEN}成功${C_RESET}"
                 ((installed++)) || true
+                [[ "$pkg" == "ufw" ]] && ufw_newly_installed=1
+                [[ "$pkg" == "fail2ban" ]] && f2b_newly_installed=1
             else
                 echo -e "${C_RED}失败${C_RESET}"
                 ((failed++)) || true
@@ -113,9 +117,17 @@ auto_deps() {
     if [[ $installed -gt 0 || $failed -gt 0 ]]; then
         print_success "依赖安装完成 (新安装: $installed 个)"
         [[ $failed -gt 0 ]] && print_warn "失败: $failed 个"
-        if [[ $installed -gt 0 ]]; then
-            echo -e "${C_YELLOW}提示:${C_RESET} 安全服务 (UFW/Fail2ban) 已安装但未自动启用"
-            echo "  请通过菜单 [2] 配置 UFW、菜单 [3] 配置 Fail2ban"
+        # 只有当 ufw/fail2ban 是本次新安装且之前未运行时才提示
+        local hints=()
+        if [[ $ufw_newly_installed -eq 1 && $ufw_was_active -eq 0 ]]; then
+            hints+=("菜单 [2] 配置 UFW")
+        fi
+        if [[ $f2b_newly_installed -eq 1 && $f2b_was_active -eq 0 ]]; then
+            hints+=("菜单 [3] 配置 Fail2ban")
+        fi
+        if [[ ${#hints[@]} -gt 0 ]]; then
+            echo -e "${C_YELLOW}提示:${C_RESET} 安全服务已安装但未自动启用"
+            echo "  请通过 $(IFS='、'; echo "${hints[*]}")"
         fi
     fi
     # 恢复之前的服务状态
