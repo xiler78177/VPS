@@ -169,7 +169,13 @@ wg_tunnel_setup() {
     # 生成配置
     wg_tunnel_generate_xray_inbound "$wg_port" "$vless_port" "$vless_network" "$vless_flow" "$dest_server" "$dest_port"
 
-    # 生成 3X-UI 可导入的 JSON 模板
+    # 生成 3X-UI 可导入的 JSON 模板: 需先从数据库中重新提取生成的关键参数
+    local uuid=$(wg_db_get '.server.vless_uuid')
+    local reality_private_key=$(wg_db_get '.server.reality_private_key')
+    local short_id=$(wg_db_get '.server.reality_short_id')
+    local server_name=$(wg_db_get '.server.reality_sni')
+    local c_time=$(date +%s000)
+
     local xui_template
     local subid=$(openssl rand -hex 8 2>/dev/null || head -c 16 /dev/urandom | xxd -p)
     # 首先构建内层的 settings (转义JSON)
@@ -177,6 +183,7 @@ wg_tunnel_setup() {
         --arg uuid "$uuid" \
         --arg flow "${vless_flow}" \
         --arg subid "$subid" \
+        --argjson ctime "$c_time" \
         '{
            "clients": [
              {
@@ -189,12 +196,12 @@ wg_tunnel_setup() {
                "totalGB": 0,
                "expiryTime": 0,
                "enable": true,
-               "tgId": "",
+               "tgId": 0,
                "subId": $subid,
                "comment": "",
                "reset": 0,
-               "created_at": 0,
-               "updated_at": 0
+               "created_at": $ctime,
+               "updated_at": $ctime
              }
            ],
            "decryption": "none",
