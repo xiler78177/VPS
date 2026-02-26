@@ -178,82 +178,139 @@ wg_tunnel_setup() {
 
     local xui_template
     local subid=$(openssl rand -hex 8 2>/dev/null || head -c 16 /dev/urandom | xxd -p)
-    # 首先构建内层的 settings (转义JSON)
-    local inner_settings=$(jq -n -c \
+    
+    # 3X-UI 严格要求内部配置为未被压缩过的、带换行符 \n 和固定缩进的美化 JSON 文本字符串。
+    # 这里直接使用 jq -M (不加 -c) 输出带格式的 json 字符串。
+    local inner_settings=$(jq -M \
         --arg uuid "$uuid" \
         --arg flow "${vless_flow}" \
         --arg subid "$subid" \
         --argjson ctime "$c_time" \
         '{
-           "clients": [
-             {
-               "id": $uuid,
-               "security": "",
-               "password": "",
-               "flow": $flow,
-               "email": "WG-Tunnel",
-               "limitIp": 0,
-               "totalGB": 0,
-               "expiryTime": 0,
-               "enable": true,
-               "tgId": 0,
-               "subId": $subid,
-               "comment": "",
-               "reset": 0,
-               "created_at": $ctime,
-               "updated_at": $ctime
-             }
-           ],
-           "decryption": "none",
-           "encryption": "none",
-           "testseed": [ 900, 500, 900, 256 ],
-           "fallbacks": []
-         }')
-    
-    # 构建内层的 streamSettings (转义JSON)
-    # 注意 3x-ui 的 realitySettings 中目标字段名为 target
-    local inner_stream=$(jq -n -c \
+  "clients": [
+    {
+      "id": $uuid,
+      "security": "",
+      "password": "",
+      "flow": $flow,
+      "email": "WG-Tunnel",
+      "limitIp": 0,
+      "totalGB": 0,
+      "expiryTime": 0,
+      "enable": true,
+      "tgId": "",
+      "subId": $subid,
+      "comment": "",
+      "reset": 0,
+      "created_at": $ctime,
+      "updated_at": $ctime
+    }
+  ],
+  "decryption": "none",
+  "encryption": "none",
+  "testseed": [900, 500, 900, 256],
+  "fallbacks": []
+}')
+
+    local inner_stream=$(jq -M \
         --arg net "$vless_network" \
         --arg sni "$server_name" \
         --arg dest "${dest_server}:${dest_port}" \
         --arg priv "$reality_private_key" \
         --arg sid "$short_id" \
         '{
-           "network": $net,
-           "security": "reality",
-           "externalProxy": [],
-           "realitySettings": {
-             "show": false,
-             "xver": 0,
-             "target": $dest,
-             "serverNames": [ $sni ],
-             "privateKey": $priv,
-             "minClientVer": "",
-             "maxClientVer": "",
-             "maxTimediff": 0,
-             "shortIds": [ $sid ],
-             "mldsa65Seed": "",
-             "settings": {
-               "publicKey": "",
-               "fingerprint": "chrome",
-               "serverName": "",
-               "spiderX": "/",
-               "mldsa65Verify": ""
-             }
-           },
-           "tcpSettings": {
-             "acceptProxyProtocol": false,
-             "header": { "type": "none" }
-           }
-         }')
-         
-    # 构建内层的 sniffing (转义JSON)
-    local inner_sniffing=$(jq -n -c \
+  "network": $net,
+  "security": "reality",
+  "externalProxy": [],
+  "realitySettings": {
+    "show": false,
+    "xver": 0,
+    "target": $dest,
+    "serverNames": [
+      $sni
+    ],
+    "privateKey": $priv,
+    "minClientVer": "",
+    "maxClientVer": "",
+    "maxTimediff": 0,
+    "shortIds": [
+      $sid
+    ],
+    "mldsa65Seed": "",
+    "settings": {
+      "publicKey": "",
+      "fingerprint": "chrome",
+      "serverName": "",
+      "spiderX": "/",
+      "mldsa65Verify": ""
+    }
+  },
+  "tcpSettings": {
+    "acceptProxyProtocol": false,
+    "header": {
+      "type": "none"
+    }
+  }
+}')
+
+    local inner_sniffing=$(jq -M \
         '{
-           "enabled": true,
-           "destOverride": ["http", "tls", "quic", "fakedns"],
-           "metadataOnly": false,
-           "routeOnly": false
+  "enabled": true,
+  "destOverride": [
+    "http",
+    "tls",
+    "quic",
+    "fakedns"
+  ],
+  "metadataOnly": false,
+  "routeOnly": false
+}')
+
+    # 包装外层 JSON (包含 clientStats)
+    xui_template=$(jq -n \
+        --arg vp "$vless_port" \
+        --arg uuid "$uuid" \
+        --arg subid "$subid" \
+        --arg set "$inner_settings" \
+        --arg sset "$inner_stream" \
+        --arg snif "$inner_sniffing" \
+        --argjson ctime "$c_time" \
+        '{
+           "id": 15,
+           "userId": 0,
+           "up": 0,
+           "down": 0,
+           "total": 0,
+           "allTime": 0,
+           "remark": "WG-Tunnel",
+           "enable": true,
+           "expiryTime": 0,
+           "trafficReset": "never",
+           "lastTrafficResetTime": 0,
+           "listen": "",
+           "port": ($vp | tonumber),
+           "protocol": "vless",
+           "settings": $set,
+           "streamSettings": $sset,
+           "tag": ("inbound-" + $vp),
+           "sniffing": $snif,
+           "clientStats": [
+             {
+               "id": 3,
+               "inboundId": 15,
+               "enable": true,
+               "email": "WG-Tunnel",
+               "uuid": $uuid,
+               "subId": $subid,
+               "up": 0,
+               "down": 0,
+               "allTime": 0,
+               "expiryTime": 0,
+               "total": 0,
+               "reset": 0,
+               "lastOnline": 0
+             }
+           ]
          }')
 
     # 包装外层 JSON (包含 clientStats)
