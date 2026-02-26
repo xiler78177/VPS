@@ -4888,7 +4888,7 @@ wg_server_install() {
         fi
     else
         # === 境外模式 ===
-        listen_addr="127.0.0.1"
+        listen_addr="0.0.0.0"
         mtu=$WG_MTU_TUNNEL
 
         # DNS (境外默认)
@@ -6912,7 +6912,8 @@ wg_generate_clash_config() {
       - ${server_dns}
 "
         else
-            all_proxy_yaml+="  - name: \"${primary_name}\"
+            local vless_node_name="${primary_name}-VLESS"
+            all_proxy_yaml+="  - name: \"${vless_node_name}\"
     type: vless
     server: ${server_endpoint}
     port: ${vless_port}
@@ -6926,6 +6927,22 @@ wg_generate_clash_config() {
       public-key: ${reality_pub}
       short-id: ${reality_sid}
     client-fingerprint: chrome
+
+  - name: \"${primary_name}\"
+    type: wireguard
+    server: ${server_endpoint}
+    port: ${server_port}
+    dialer-proxy: \"${vless_node_name}\"
+    ip: ${peer_ip}
+    private-key: \"${peer_privkey}\"
+    public-key: \"${server_pubkey}\"
+    pre-shared-key: \"${peer_psk}\"
+    reserved: [0, 0, 0]
+    udp: true
+    mtu: 1280
+    remote-dns-resolve: false
+    dns:
+      - ${server_dns}
 "
         fi
     else
@@ -7638,7 +7655,7 @@ wg_tunnel_generate_xray_inbound() {
     echo -e "  Reality Dest:  ${C_CYAN}${dest_server}:${dest_port}${C_RESET}"
     echo -e "  Short ID:      ${C_CYAN}${short_id}${C_RESET}"
     echo -e "  Public Key:    ${C_CYAN}${reality_public_key}${C_RESET}"
-    echo -e "  WG 转发端口:   ${C_CYAN}127.0.0.1:${wg_port} (UDP)${C_RESET}"
+    echo -e "  WG 监听端口:   ${C_CYAN}0.0.0.0:${wg_port} (UDP)${C_RESET}"
     draw_line
 }
 
@@ -7648,7 +7665,7 @@ wg_tunnel_setup() {
     print_title "配置 VLESS-Reality 隧道"
 
     echo -e "${C_CYAN}架构说明:${C_RESET}"
-    echo "  客户端 → VLESS-Reality (伪装TLS) → 本机 xray → WG Server (127.0.0.1:${wg_port})"
+    echo "  客户端 → VLESS-Reality (伪装TLS) → 本机 xray → WG Server (0.0.0.0:${wg_port})"
     echo "  GFW 看到的是正常的 TLS 1.3 流量"
     echo ""
 
@@ -7700,14 +7717,10 @@ wg_tunnel_setup() {
     echo "  2. 入站列表 → 添加入站"
     echo "  3. 协议: vless"
     echo "  4. 端口: ${vless_port}"
-    echo "  5. 传输: xhttp (或 httpupgrade)"
-    echo "  6. 安全: reality"
-    echo "  7. SNI / Dest: ${dest_server}:${dest_port}"
-    echo "  8. 在 Fallback 或路由中将流量转发到 127.0.0.1:${wg_port} (UDP)"
+    echo "  5. 传输: xhttp (或 httpupgrade), 安全: reality"
+    echo "  6. SNI / Dest: ${dest_server}:${dest_port}"
+    echo "  7. (无需额外处理) 客户端直接请求服务端公网 IP，流量自动回环到 WG 端口"
     echo ""
-    echo -e "${C_CYAN}或者使用 dokodemo-door 入站直接转发:${C_RESET}"
-    echo "  添加一个 dokodemo-door 入站，目标 127.0.0.1:${wg_port}，协议 UDP"
-    echo "  然后在 VLESS-Reality 的路由规则中将 WG 流量转发到此入站"
 
     log_action "WireGuard tunnel: VLESS-Reality configured (vless_port=${vless_port} sni=${dest_server})"
 }
@@ -7744,7 +7757,7 @@ wg_tunnel_generate_client_xray() {
       "listen": "127.0.0.1",
       "protocol": "dokodemo-door",
       "settings": {
-        "address": "127.0.0.1",
+        "address": "${server_ip}",
         "port": ${wg_port},
         "network": "udp"
       }
@@ -7894,7 +7907,7 @@ wg_tunnel_manage() {
         echo -e "  Reality SNI: ${C_CYAN}${reality_sni}${C_RESET}"
         echo -e "  Short ID:    ${C_CYAN}${reality_sid}${C_RESET}"
         echo -e "  Public Key:  ${C_CYAN}${reality_pub}${C_RESET}"
-        echo -e "  WG 转发:    ${C_CYAN}127.0.0.1:${wg_port}/udp${C_RESET}"
+        echo -e "  WG 本地监听: ${C_CYAN}0.0.0.0:${wg_port}/udp${C_RESET}"
     else
         echo -e "  ${C_YELLOW}隧道参数未配置${C_RESET}"
     fi
@@ -7934,7 +7947,7 @@ wg_tunnel_manage() {
             echo "  3. 协议: vless, 端口: ${vless_port:-自定义}"
             echo "  4. 传输: xhttp, 安全: reality"
             echo "  5. SNI/Dest: ${reality_sni:-www.microsoft.com}:443"
-            echo "  6. 添加 dokodemo-door 入站转发到 127.0.0.1:${wg_port} (UDP)"
+            echo "  6. 面板无需特殊设置（客户端直连公网 IP 环回）"
             pause
             ;;
     esac

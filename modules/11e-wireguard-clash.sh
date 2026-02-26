@@ -92,7 +92,8 @@ wg_generate_clash_config() {
       - ${server_dns}
 "
         else
-            all_proxy_yaml+="  - name: \"${primary_name}\"
+            local vless_node_name="${primary_name}-VLESS"
+            all_proxy_yaml+="  - name: \"${vless_node_name}\"
     type: vless
     server: ${server_endpoint}
     port: ${vless_port}
@@ -106,6 +107,22 @@ wg_generate_clash_config() {
       public-key: ${reality_pub}
       short-id: ${reality_sid}
     client-fingerprint: chrome
+
+  - name: \"${primary_name}\"
+    type: wireguard
+    server: ${server_endpoint}
+    port: ${server_port}
+    dialer-proxy: \"${vless_node_name}\"
+    ip: ${peer_ip}
+    private-key: \"${peer_privkey}\"
+    public-key: \"${server_pubkey}\"
+    pre-shared-key: \"${peer_psk}\"
+    reserved: [0, 0, 0]
+    udp: true
+    mtu: 1280
+    remote-dns-resolve: false
+    dns:
+      - ${server_dns}
 "
         fi
     else

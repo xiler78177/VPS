@@ -106,7 +106,7 @@ wg_server_install() {
         fi
     else
         # === 境外模式 ===
-        listen_addr="127.0.0.1"
+        listen_addr="0.0.0.0"
         mtu=$WG_MTU_TUNNEL
 
         # DNS (境外默认)
