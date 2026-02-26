@@ -176,132 +176,46 @@ wg_tunnel_setup() {
     local server_name=$(wg_db_get '.server.reality_sni')
     local c_time=$(date +%s000)
 
-    local xui_template
     local subid
     subid=$(openssl rand -hex 8 2>/dev/null || head -c 8 /dev/urandom | xxd -p)
-    local c_time
-    c_time=$(date +%s000)
 
-    # 直接用 bash 字符串拼 inner JSON，格式与 3X-UI 数据库原生存储完全一致
-    local inner_settings
-    inner_settings=$(printf '{
-  "clients": [
-    {
-      "id": "%s",
-      "security": "",
-      "password": "",
-      "flow": "%s",
-      "email": "WG-Tunnel",
-      "limitIp": 0,
-      "totalGB": 0,
-      "expiryTime": 0,
-      "enable": true,
-      "tgId": "",
-      "subId": "%s",
-      "comment": "",
-      "reset": 0,
-      "created_at": %s,
-      "updated_at": %s
-    }
-  ],
-  "decryption": "none",
-  "encryption": "none",
-  "testseed": [900, 500, 900, 256],
-  "fallbacks": []
-}' "$uuid" "$vless_flow" "$subid" "$c_time" "$c_time")
-
-    local inner_stream
-    inner_stream=$(printf '{
-  "network": "%s",
-  "security": "reality",
-  "externalProxy": [],
-  "realitySettings": {
-    "show": false,
-    "xver": 0,
-    "target": "%s",
-    "serverNames": [
-      "%s"
-    ],
-    "privateKey": "%s",
-    "minClientVer": "",
-    "maxClientVer": "",
-    "maxTimediff": 0,
-    "shortIds": [
-      "%s"
-    ],
-    "mldsa65Seed": "",
-    "settings": {
-      "publicKey": "",
-      "fingerprint": "chrome",
-      "serverName": "",
-      "spiderX": "/",
-      "mldsa65Verify": ""
-    }
-  },
-  "tcpSettings": {
-    "acceptProxyProtocol": false,
-    "header": {
-      "type": "none"
-    }
-  }
-}' "$vless_network" "${dest_server}:${dest_port}" "$server_name" "$reality_private_key" "$short_id")
-
-    local inner_sniffing='{
-  "enabled": true,
-  "destOverride": [
-    "http",
-    "tls",
-    "quic",
-    "fakedns"
-  ],
-  "metadataOnly": false,
-  "routeOnly": false
-}'
-
-    # 包装外层 JSON（用 jq 注入变量，避免转义问题）
+    # 纯 jq 构建: 内层对象用 tojson 自动转为 JSON 字符串，匹配 3X-UI 数据库存储格式
+    local xui_template
     xui_template=$(jq -n \
-        --arg vp "$vless_port" \
         --arg uuid "$uuid" \
+        --arg flow "$vless_flow" \
         --arg subid "$subid" \
-        --arg set "$inner_settings" \
-        --arg sset "$inner_stream" \
-        --arg snif "$inner_sniffing" \
-        '{
-           "id": 1,
-           "userId": 0,
-           "up": 0,
-           "down": 0,
-           "total": 0,
-           "allTime": 0,
-           "remark": "WG-Tunnel",
-           "enable": true,
-           "expiryTime": 0,
-           "trafficReset": "never",
-           "lastTrafficResetTime": 0,
-           "listen": "",
-           "port": ($vp | tonumber),
-           "protocol": "vless",
-           "settings": $set,
-           "streamSettings": $sset,
-           "tag": ("inbound-" + $vp),
-           "sniffing": $snif,
-           "clientStats": [
-             {
-               "inboundId": 1,
-               "enable": true,
-               "email": "WG-Tunnel",
-               "uuid": $uuid,
-               "subId": $subid,
-               "up": 0,
-               "down": 0,
-               "allTime": 0,
-               "expiryTime": 0,
-               "total": 0,
-               "reset": 0,
-               "lastOnline": 0
-             }
-           ]
-         }')
+        --arg vp "$vless_port" \
+        --arg net "$vless_network" \
+        --arg dest "${dest_server}:${dest_port}" \
+        --arg sni "$server_name" \
+        --arg pk "$reality_private_key" \
+        --arg sid "$short_id" \
+    '{
+      "id": 1,
+      "userId": 0,
+      "up": 0,
+      "down": 0,
+      "total": 0,
+      "allTime": 0,
+      "remark": "WG-Tunnel",
+      "enable": true,
+      "expiryTime": 0,
+      "trafficReset": "never",
+      "lastTrafficResetTime": 0,
+      "listen": "",
+      "port": ($vp|tonumber),
+      "protocol": "vless",
+      "settings": ({"clients":[{"id":$uuid,"security":"","password":"","flow":$flow,"email":"WG-Tunnel","limitIp":0,"totalGB":0,"expiryTime":0,"enable":true,"tgId":0,"subId":$subid,"comment":"","reset":0}],"decryption":"none","encryption":"none"}|tojson),
+      "streamSettings": ({"network":$net,"security":"reality","externalProxy":[],"realitySettings":{"show":false,"xver":0,"target":$dest,"serverNames":[$sni],"privateKey":$pk,"minClientVer":"","maxClientVer":"","maxTimediff":0,"shortIds":[$sid],"mldsa65Seed":"","settings":{"publicKey":"","fingerprint":"chrome","serverName":"","spiderX":"/","mldsa65Verify":""}},"tcpSettings":{"acceptProxyProtocol":false,"header":{"type":"none"}}}|tojson),
+      "tag": ("inbound-"+$vp),
+      "sniffing": ({"enabled":true,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}|tojson)
+    }')
+
+    if [[ -z "$xui_template" ]]; then
+        print_error "JSON 模板生成失败 (请检查 jq 是否安装)"
+        return 1
+    fi
 
     # 提供 3X-UI 配置指引
     echo ""
@@ -318,6 +232,13 @@ wg_tunnel_setup() {
     echo ""
 
     log_action "WireGuard tunnel: VLESS-Reality configured (port=${vless_port} net=${vless_network} flow=${vless_flow} sni=${dest_server})"
+
+    echo ""
+    read -e -r -p "是否立即生成 Clash/mihomo 客户端配置? [Y/n]: " _gen_clash
+    _gen_clash=${_gen_clash:-Y}
+    if [[ "$_gen_clash" =~ ^[Yy]$ ]]; then
+        wg_generate_clash_config
+    fi
 }
 
 # 生成客户端 xray 配置 (用于连接 VLESS-Reality 隧道)
