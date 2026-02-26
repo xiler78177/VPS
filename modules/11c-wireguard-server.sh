@@ -4,14 +4,23 @@ wg_server_install() {
     if wg_is_installed && [[ "$(wg_get_role)" == "server" ]]; then
         print_warn "WireGuard 服务端已安装。"
         wg_is_running && echo -e "  状态: ${C_GREEN}● 运行中${C_RESET}" || echo -e "  状态: ${C_RED}● 已停止${C_RESET}"
+        local dm=$(wg_db_get '.server.deploy_mode // "unknown"')
+        echo -e "  模式: ${C_CYAN}${dm}${C_RESET}"
         pause; return 0
     fi
     if wg_is_installed && [[ "$(wg_get_role)" == "client" ]]; then
         print_error "当前已安装为客户端模式。如需切换为服务端，请先卸载。"
         pause; return 1
     fi
+
+    # ── 步骤 1: 选择部署模式 ──
+    wg_select_deploy_mode || return 1
+
+    # ── 步骤 2: 安装软件包 ──
     print_info "[1/5] 安装软件包..."
     wg_install_packages || { pause; return 1; }
+
+    # ── 步骤 3: 配置 IP 转发 ──
     print_info "[2/5] 配置 IP 转发..."
     if ! grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null; then
         sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf
@@ -19,15 +28,22 @@ wg_server_install() {
     fi
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
     print_success "IP 转发已开启"
+
+    # ── 步骤 4: 配置服务端参数 (根据模式分支) ──
     print_info "[3/5] 配置服务端参数..."
-    local wg_port
+
+    local wg_port listen_addr mtu wg_dns wg_endpoint
+    local wg_subnet="10.66.66.0/24"
+
+    # WG 监听端口
     while true; do
         read -e -r -p "WireGuard 监听端口 [${WG_DEFAULT_PORT}]: " wg_port
         wg_port=${wg_port:-$WG_DEFAULT_PORT}
         if validate_port "$wg_port"; then break; fi
         print_warn "端口无效 (1-65535)"
     done
-    local wg_subnet
+
+    # VPN 子网
     while true; do
         read -e -r -p "VPN 内网子网 [10.66.66.0/24]: " wg_subnet
         wg_subnet=${wg_subnet:-10.66.66.0/24}
@@ -42,30 +58,89 @@ wg_server_install() {
     local prefix server_ip
     prefix=$(echo "$wg_subnet" | cut -d'.' -f1-3)
     server_ip="${prefix}.1"
-    local wg_dns
-    read -e -r -p "客户端 DNS [1.1.1.1, 8.8.8.8]: " wg_dns
-    wg_dns=${wg_dns:-"1.1.1.1, 8.8.8.8"}
-    local wg_endpoint default_ip
-    default_ip=$(get_public_ipv4 || echo "")
-    if [[ -n "$default_ip" ]]; then
-        read -e -r -p "公网端点 IP/域名 [${default_ip}]: " wg_endpoint
-        wg_endpoint=${wg_endpoint:-$default_ip}
+
+    # ── 根据部署模式设置参数 ──
+    if [[ "$WG_DEPLOY_MODE" == "domestic" ]]; then
+        # === 境内模式 ===
+        listen_addr="0.0.0.0"
+        mtu=$WG_MTU_DIRECT
+
+        # DNS (境内默认)
+        read -e -r -p "客户端 DNS [223.5.5.5, 114.114.114.114]: " wg_dns
+        wg_dns=${wg_dns:-"223.5.5.5, 114.114.114.114"}
+
+        # Endpoint: 优先使用 DDNS 域名
+        local ddns_domain=""
+        if [[ -d "$DDNS_CONFIG_DIR" ]] && ls "$DDNS_CONFIG_DIR"/*.conf &>/dev/null 2>&1; then
+            echo ""
+            echo -e "${C_CYAN}检测到已配置的 DDNS 域名:${C_RESET}"
+            local idx=1 ddns_domains=()
+            for conf in "$DDNS_CONFIG_DIR"/*.conf; do
+                [[ -f "$conf" ]] || continue
+                local d=$(grep '^DDNS_DOMAIN=' "$conf" | cut -d'"' -f2)
+                [[ -n "$d" ]] && { ddns_domains+=("$d"); echo "  ${idx}. ${d}"; idx=$((idx+1)); }
+            done
+            if [[ ${#ddns_domains[@]} -gt 0 ]]; then
+                echo "  0. 不使用 DDNS，手动输入 IP/域名"
+                local ddns_choice
+                read -e -r -p "选择 DDNS 域名 [1]: " ddns_choice
+                ddns_choice=${ddns_choice:-1}
+                if [[ "$ddns_choice" != "0" && "$ddns_choice" =~ ^[0-9]+$ && "$ddns_choice" -ge 1 && "$ddns_choice" -le ${#ddns_domains[@]} ]]; then
+                    ddns_domain="${ddns_domains[$((ddns_choice-1))]}"
+                    wg_endpoint="$ddns_domain"
+                    print_success "Endpoint 将使用 DDNS 域名: ${ddns_domain}"
+                fi
+            fi
+        fi
+        if [[ -z "$wg_endpoint" ]]; then
+            local default_ip
+            default_ip=$(get_public_ipv4 || echo "")
+            if [[ -n "$default_ip" ]]; then
+                read -e -r -p "公网端点 IP/域名 [${default_ip}]: " wg_endpoint
+                wg_endpoint=${wg_endpoint:-$default_ip}
+            else
+                while [[ -z "$wg_endpoint" ]]; do
+                    read -e -r -p "公网端点 IP/域名: " wg_endpoint
+                done
+            fi
+        fi
     else
-        while [[ -z "$wg_endpoint" ]]; do
-            read -e -r -p "公网端点 IP/域名: " wg_endpoint
-        done
+        # === 境外模式 ===
+        listen_addr="127.0.0.1"
+        mtu=$WG_MTU_TUNNEL
+
+        # DNS (境外默认)
+        read -e -r -p "客户端 DNS [1.1.1.1, 8.8.8.8]: " wg_dns
+        wg_dns=${wg_dns:-"1.1.1.1, 8.8.8.8"}
+
+        # Endpoint: 使用公网 IP (客户端通过 VLESS 连接，但 WG 配置仍需记录)
+        local default_ip
+        default_ip=$(get_public_ipv4 || echo "")
+        if [[ -n "$default_ip" ]]; then
+            read -e -r -p "VPS 公网 IP [${default_ip}]: " wg_endpoint
+            wg_endpoint=${wg_endpoint:-$default_ip}
+        else
+            while [[ -z "$wg_endpoint" ]]; do
+                read -e -r -p "VPS 公网 IP: " wg_endpoint
+            done
+        fi
     fi
+
+    # ── 步骤 5: 生成密钥 ──
     print_info "[4/5] 生成服务端密钥..."
     local server_privkey server_pubkey
     server_privkey=$(wg genkey)
     server_pubkey=$(echo "$server_privkey" | wg pubkey)
     print_success "密钥已生成"
+
     # 服务器名称
     local server_name=""
     local default_name=$(hostname -s 2>/dev/null)
     [[ -z "$default_name" ]] && default_name="server"
     read -e -r -p "服务器名称 [${default_name}]: " server_name
     server_name=${server_name:-$default_name}
+
+    # ── 步骤 6: 写入配置并启动 ──
     print_info "[5/5] 写入配置并启动..."
     wg_db_init
     wg_set_role "server"
@@ -77,6 +152,10 @@ wg_server_install() {
               --arg port "$wg_port" \
               --arg dns "$wg_dns" \
               --arg ep "$wg_endpoint" \
+              --arg mode "$WG_DEPLOY_MODE" \
+              --arg laddr "$listen_addr" \
+              --argjson mtu "$mtu" \
+              --arg ddns "${ddns_domain:-}" \
     '.server = {
         name: $sname,
         private_key: $pk,
@@ -85,19 +164,30 @@ wg_server_install() {
         subnet: $sub,
         port: ($port | tonumber),
         dns: $dns,
-        endpoint: $ep
+        endpoint: $ep,
+        deploy_mode: $mode,
+        listen_address: $laddr,
+        mtu: $mtu,
+        ddns_domain: $ddns
     }'
     wg_rebuild_conf
+
     if [[ "$PLATFORM" == "openwrt" ]]; then
         wg-quick up "$WG_INTERFACE" 2>/dev/null || true
     elif is_systemd; then
         systemctl enable "wg-quick@${WG_INTERFACE}" >/dev/null 2>&1
         wg-quick up "$WG_INTERFACE" 2>/dev/null
     fi
-    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw allow "${wg_port}/udp" comment "WireGuard" >/dev/null 2>&1
-        print_success "UFW 已放行端口 ${wg_port}/udp"
+
+    # 防火墙: 境内模式开放 WG 端口，境外模式不开放 (仅本地监听)
+    if [[ "$WG_DEPLOY_MODE" == "domestic" ]]; then
+        if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+            ufw allow "${wg_port}/udp" comment "WireGuard" >/dev/null 2>&1
+            print_success "UFW 已放行端口 ${wg_port}/udp"
+        fi
     fi
+
+    # ── 安装结果展示 ──
     draw_line
     if wg_is_running; then
         print_success "WireGuard 服务端安装并启动成功！"
@@ -105,12 +195,29 @@ wg_server_install() {
         print_warn "WireGuard 已安装，但启动可能失败，请检查日志"
     fi
     echo -e "  角色:     ${C_GREEN}服务端 (Server)${C_RESET}"
-    echo -e "  监听端口: ${C_GREEN}${wg_port}/udp${C_RESET}"
+    echo -e "  部署模式: ${C_GREEN}${WG_DEPLOY_MODE}${C_RESET}"
+    echo -e "  监听地址: ${C_GREEN}${listen_addr}:${wg_port}/udp${C_RESET}"
+    echo -e "  MTU:      ${C_GREEN}${mtu}${C_RESET}"
     echo -e "  内网子网: ${C_GREEN}${wg_subnet}${C_RESET}"
     echo -e "  服务端 IP: ${C_GREEN}${server_ip}${C_RESET}"
-    echo -e "  公网端点: ${C_GREEN}${wg_endpoint}:${wg_port}${C_RESET}"
+    if [[ "$WG_DEPLOY_MODE" == "domestic" ]]; then
+        if [[ -n "${ddns_domain:-}" ]]; then
+            echo -e "  公网端点: ${C_GREEN}${ddns_domain}:${wg_port}${C_RESET} (DDNS)"
+        else
+            echo -e "  公网端点: ${C_GREEN}${wg_endpoint}:${wg_port}${C_RESET}"
+        fi
+    else
+        echo -e "  公网端点: ${C_GREEN}${wg_endpoint}${C_RESET} (客户端通过 VLESS-Reality 连接)"
+    fi
     draw_line
-    log_action "WireGuard server installed: port=$wg_port subnet=$wg_subnet endpoint=$wg_endpoint"
+
+    # ── 境外模式: 配置 VLESS-Reality 隧道 ──
+    if [[ "$WG_DEPLOY_MODE" == "overseas" ]]; then
+        echo ""
+        wg_tunnel_setup "$wg_port"
+    fi
+
+    log_action "WireGuard server installed: mode=$WG_DEPLOY_MODE port=$wg_port subnet=$wg_subnet endpoint=$wg_endpoint mtu=$mtu"
 
     # 自动安装服务端看门狗
     echo ""
@@ -179,21 +286,31 @@ wg_modify_server() {
 wg_server_status() {
     wg_check_server || return 1
     print_title "WireGuard 服务端状态"
-    local port subnet endpoint dns
+    local port subnet endpoint dns deploy_mode mtu
     port=$(wg_db_get '.server.port')
     subnet=$(wg_db_get '.server.subnet')
     endpoint=$(wg_db_get '.server.endpoint')
     dns=$(wg_db_get '.server.dns')
+    deploy_mode=$(wg_db_get '.server.deploy_mode // "domestic"')
+    mtu=$(wg_db_get '.server.mtu // empty')
     echo -e "  角色:     ${C_GREEN}服务端 (Server)${C_RESET}"
     if wg_is_running; then
         echo -e "  状态:     ${C_GREEN}● 运行中${C_RESET}"
     else
         echo -e "  状态:     ${C_RED}● 已停止${C_RESET}"
     fi
+    if [[ "$deploy_mode" == "overseas" ]]; then
+        echo -e "  部署模式: ${C_YELLOW}境外 (VLESS-Reality 隧道)${C_RESET}"
+    else
+        echo -e "  部署模式: ${C_GREEN}境内 (标准 UDP 直连)${C_RESET}"
+    fi
     echo -e "  端口:     ${port}/udp"
+    [[ -n "$mtu" && "$mtu" != "null" ]] && echo -e "  MTU:      ${mtu}"
     echo -e "  子网:     ${subnet}"
     echo -e "  端点:     ${endpoint}"
     echo -e "  DNS:      ${dns}"
+    local ddns_domain=$(wg_db_get '.server.ddns_domain // empty')
+    [[ -n "$ddns_domain" ]] && echo -e "  DDNS:     ${C_CYAN}${ddns_domain}${C_RESET}"
     local peer_count
     peer_count=$(wg_db_get '.peers | length')
     echo -e "${C_CYAN}设备列表 (${peer_count} 个):${C_RESET}"

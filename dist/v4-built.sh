@@ -9,6 +9,8 @@ readonly CACHE_FILE="${CACHE_DIR}/sysinfo.cache"
 readonly CACHE_TTL=300 
 readonly CERT_HOOKS_DIR="/root/cert-hooks"
 readonly WG_DEFAULT_PORT=50000
+readonly WG_MTU_DIRECT=1420
+readonly WG_MTU_TUNNEL=1280
 readonly BACKUP_LOCAL_DIR="/root/${SCRIPT_NAME}-backups"
 readonly BACKUP_CONFIG_FILE="/etc/${SCRIPT_NAME}-backup.conf"
 PLATFORM="debian"
@@ -4374,102 +4376,129 @@ menu_docker() {
         esac
     done
 }
-# 在部署 WG 服务端前检测本机是否直接接入公网（排除 NAT 环境）
+# 替代原有的自动网络检测，改为用户交互式选择部署场景
 
-# 部署方案全局变量: A=标准 UDP (公网直连), B=UDP over TCP (NAT 环境)
-WG_DEPLOY_PLAN="A"
+# 部署模式全局变量: domestic=境内直连, overseas=境外隧道
+WG_DEPLOY_MODE=""
 
 # 判断一个 IPv4 是否属于私有/CGNAT 地址段
 _wg_is_private_ip() {
     local ip="$1"
     local IFS='.'
     read -r o1 o2 o3 o4 <<< "$ip"
-    [[ "$o1" -eq 10 ]] && return 0                                    # 10.0.0.0/8
-    [[ "$o1" -eq 172 && "$o2" -ge 16 && "$o2" -le 31 ]] && return 0  # 172.16.0.0/12
-    [[ "$o1" -eq 192 && "$o2" -eq 168 ]] && return 0                  # 192.168.0.0/16
-    [[ "$o1" -eq 100 && "$o2" -ge 64 && "$o2" -le 127 ]] && return 0 # 100.64.0.0/10 (CGNAT)
+    [[ "$o1" -eq 10 ]] && return 0
+    [[ "$o1" -eq 172 && "$o2" -ge 16 && "$o2" -le 31 ]] && return 0
+    [[ "$o1" -eq 192 && "$o2" -eq 168 ]] && return 0
+    [[ "$o1" -eq 100 && "$o2" -ge 64 && "$o2" -le 127 ]] && return 0
     return 1
 }
 
-# 检测本机是否拥有公网 IP（排除虚拟接口）
-# 返回 0 = 有公网 IP，返回 1 = 全部为私有 IP（NAT 环境）
+# 检测本机是否拥有公网 IP
 wg_check_public_ip() {
     local found_public=false found_any=false
     local line ip iface
-
     while IFS= read -r line; do
-        # 匹配: inet x.x.x.x/xx ... <接口名>
         [[ "$line" =~ inet[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/[0-9]+.*[[:space:]]([a-zA-Z0-9_.-]+)[[:space:]]*$ ]] || continue
         ip="${BASH_REMATCH[1]}"
         iface="${BASH_REMATCH[2]}"
-
-        # 排除虚拟/容器接口
         case "$iface" in
             docker*|br-*|veth*|virbr*|lo|cni*|flannel*|cali*) continue ;;
         esac
-
         found_any=true
-
         if _wg_is_private_ip "$ip"; then
-            echo -e "  ${C_YELLOW}├ ${iface}: ${ip} (内网/NAT)${C_RESET}"
+            echo -e "  ${C_YELLOW}├ ${iface}: ${ip} (内网)${C_RESET}"
         else
             echo -e "  ${C_GREEN}├ ${iface}: ${ip} (公网)${C_RESET}"
             found_public=true
         fi
     done < <(ip -4 addr show scope global 2>/dev/null | grep 'inet ')
-
     if ! $found_any; then
         echo -e "  ${C_RED}└ 未检测到任何 scope global 的 IPv4 地址${C_RESET}"
         return 1
     fi
-
     $found_public && return 0 || return 1
 }
 
-# 交互式网络资质检测
-# 设置 WG_DEPLOY_PLAN: A (公网直连) 或 B (NAT + udp2raw)
+# 检测 3X-UI 是否已安装并运行
+wg_check_xui_installed() {
+    if [[ -f /usr/local/x-ui/x-ui ]] || systemctl is-active --quiet x-ui 2>/dev/null; then
+        return 0
+    fi
+    if [[ -f /etc/x-ui/x-ui.db ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# 交互式部署模式选择
+# 设置 WG_DEPLOY_MODE: domestic (境内) 或 overseas (境外)
 # 返回 0 = 允许继续安装，返回 1 = 用户取消
-wg_net_qualify_server() {
-    echo -e "\n${C_CYAN}[网络资质检测] 检查本机网络环境...${C_RESET}"
+wg_select_deploy_mode() {
+    echo -e "\n${C_CYAN}[部署模式选择]${C_RESET}"
     draw_line
-
-    if wg_check_public_ip; then
-        draw_line
-        print_success "检测通过: 公网直连，使用方案 A (标准 UDP)"
-        WG_DEPLOY_PLAN="A"
-        return 0
-    fi
-
+    echo -e "  ${C_CYAN}检测本机网络环境...${C_RESET}"
+    wg_check_public_ip
     draw_line
     echo ""
-    print_warn "所有网络接口均为内网 IP，判定为 NAT 环境"
-    echo -e "  ${C_YELLOW}NAT 环境下 WG 的 UDP 流量可能被识别并封禁端口${C_RESET}"
-    echo -e "  ${C_CYAN}将自动启用 B 方案: 使用 udp2raw 将 UDP 封装为伪 TCP${C_RESET}"
+    echo "请选择 WireGuard 部署场景:"
+    echo ""
+    echo -e "  ${C_GREEN}1. 境内部署${C_RESET} (家庭NAS/内网设备/境内VPS)"
+    echo "     WireGuard 标准 UDP 直连，可配合 DDNS"
+    echo "     MTU=${WG_MTU_DIRECT}，无额外封装开销"
+    echo ""
+    echo -e "  ${C_YELLOW}2. 境外部署${C_RESET} (翻墙/境外VPS)"
+    echo "     WireGuard 仅监听本地，通过 VLESS-Reality 隧道对外"
+    echo "     MTU=${WG_MTU_TUNNEL}，需要已安装 3X-UI 面板"
+    echo ""
+    echo "  0. 取消安装"
     echo ""
 
-    if [[ "$PLATFORM" == "openwrt" ]]; then
-        print_error "OpenWrt 暂不支持 B 方案 (udp2raw)"
-        pause; return 1
-    fi
-
-    if confirm "使用 B 方案继续部署？"; then
-        WG_DEPLOY_PLAN="B"
-        print_info "已选择 B 方案: UDP over TCP (udp2raw)"
-        log_action "WireGuard: NAT detected, Plan B (udp2raw) selected"
-        return 0
-    fi
-
-    print_info "安装已取消"
-    pause; return 1
+    local choice
+    while true; do
+        read -e -r -p "选择部署模式 [1]: " choice
+        choice=${choice:-1}
+        case "$choice" in
+            1)
+                WG_DEPLOY_MODE="domestic"
+                print_success "已选择: 境内部署 (标准 UDP 直连)"
+                log_action "WireGuard: deploy_mode=domestic selected"
+                return 0
+                ;;
+            2)
+                if [[ "$PLATFORM" == "openwrt" ]]; then
+                    print_error "OpenWrt 暂不支持境外隧道模式"
+                    continue
+                fi
+                if ! wg_check_xui_installed; then
+                    print_warn "未检测到 3X-UI 面板"
+                    echo -e "  境外模式需要 3X-UI 提供 VLESS-Reality 隧道"
+                    if ! confirm "是否仍要继续？(需要后续手动安装 3X-UI)"; then
+                        continue
+                    fi
+                fi
+                WG_DEPLOY_MODE="overseas"
+                print_success "已选择: 境外部署 (VLESS-Reality 隧道)"
+                log_action "WireGuard: deploy_mode=overseas selected"
+                return 0
+                ;;
+            0)
+                print_info "安装已取消"
+                return 1
+                ;;
+            *)
+                print_warn "无效选项"
+                ;;
+        esac
+    done
 }
 # Sub-modules (loaded via build.sh concatenation):
-#   11a -> netcheck
+#   11a -> netcheck (部署模式选择: domestic/overseas)
 #   11  -> constants + db + utilities (this file)
 #   11c -> server install/control/uninstall
 #   11d -> peer management
 #   11e -> Clash/OpenClash config
 #   11g -> watchdog + import/export + menus
-#   11b -> UDP2RAW tunnel
+#   11b -> VLESS-Reality tunnel (境外模式)
 readonly WG_INTERFACE="wg0"
 readonly WG_DB_DIR="/etc/wireguard/db"
 readonly WG_DB_FILE="${WG_DB_DIR}/wg-data.json"
@@ -4678,11 +4707,21 @@ wg_rebuild_conf() {
         print_warn "未检测到默认网关接口，NAT 转发可能无法工作"
         main_iface="eth0"
     fi
+    local listen_addr mtu deploy_mode
+    deploy_mode=$(wg_db_get '.server.deploy_mode // "domestic"')
+    listen_addr=$(wg_db_get '.server.listen_address // "0.0.0.0"')
+    mtu=$(wg_db_get '.server.mtu // empty')
+    [[ -z "$mtu" || "$mtu" == "null" ]] && {
+        [[ "$deploy_mode" == "overseas" ]] && mtu=$WG_MTU_TUNNEL || mtu=$WG_MTU_DIRECT
+    }
     {
         echo "[Interface]"
         echo "PrivateKey = ${priv_key}"
         echo "Address = ${server_ip}/${mask}"
         echo "ListenPort = ${port}"
+        echo "MTU = ${mtu}"
+        # 境外模式仅监听本地回环
+        [[ "$deploy_mode" == "overseas" ]] && echo "# deploy_mode=overseas: listen on localhost only"
         echo "PostUp = iptables -C FORWARD -i %i -j ACCEPT 2>/dev/null || iptables -A FORWARD -i %i -j ACCEPT; iptables -C FORWARD -o %i -j ACCEPT 2>/dev/null || iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -C POSTROUTING -s ${subnet} -o ${main_iface} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s ${subnet} -o ${main_iface} -j MASQUERADE"
         echo "PostDown = iptables -D FORWARD -i %i -j ACCEPT 2>/dev/null; iptables -D FORWARD -o %i -j ACCEPT 2>/dev/null; iptables -t nat -D POSTROUTING -s ${subnet} -o ${main_iface} -j MASQUERADE 2>/dev/null"
         local pc=$(wg_db_get '.peers | length') i=0
@@ -4709,21 +4748,26 @@ wg_rebuild_conf() {
 wg_regenerate_client_confs() {
     local pc=$(wg_db_get '.peers | length')
     [[ "$pc" -eq 0 ]] && return
-    local spub sep sport sdns mask
+    local spub sep sport sdns mask mtu deploy_mode
     spub=$(wg_db_get '.server.public_key')
     sep=$(wg_db_get '.server.endpoint')
     sport=$(wg_db_get '.server.port')
     sdns=$(wg_db_get '.server.dns')
     mask=$(echo "$(wg_db_get '.server.subnet')" | cut -d'/' -f2)
+    deploy_mode=$(wg_db_get '.server.deploy_mode // "domestic"')
+    mtu=$(wg_db_get '.server.mtu // empty')
+    [[ -z "$mtu" || "$mtu" == "null" ]] && {
+        [[ "$deploy_mode" == "overseas" ]] && mtu=$WG_MTU_TUNNEL || mtu=$WG_MTU_DIRECT
+    }
     mkdir -p /etc/wireguard/clients
     local i=0
     while [[ $i -lt $pc ]]; do
         local name=$(wg_db_get ".peers[$i].name")
         local is_gw=$(wg_db_get ".peers[$i].is_gateway // false")
-        # 条件拼接避免空行问题
         local conf_content="[Interface]
 PrivateKey = $(wg_db_get ".peers[$i].private_key")
-Address = $(wg_db_get ".peers[$i].ip")/${mask}"
+Address = $(wg_db_get ".peers[$i].ip")/${mask}
+MTU = ${mtu}"
         [[ "$is_gw" != "true" ]] && conf_content+=$'\n'"DNS = ${sdns}"
         conf_content+="
 [Peer]
@@ -4742,14 +4786,23 @@ wg_server_install() {
     if wg_is_installed && [[ "$(wg_get_role)" == "server" ]]; then
         print_warn "WireGuard 服务端已安装。"
         wg_is_running && echo -e "  状态: ${C_GREEN}● 运行中${C_RESET}" || echo -e "  状态: ${C_RED}● 已停止${C_RESET}"
+        local dm=$(wg_db_get '.server.deploy_mode // "unknown"')
+        echo -e "  模式: ${C_CYAN}${dm}${C_RESET}"
         pause; return 0
     fi
     if wg_is_installed && [[ "$(wg_get_role)" == "client" ]]; then
         print_error "当前已安装为客户端模式。如需切换为服务端，请先卸载。"
         pause; return 1
     fi
+
+    # ── 步骤 1: 选择部署模式 ──
+    wg_select_deploy_mode || return 1
+
+    # ── 步骤 2: 安装软件包 ──
     print_info "[1/5] 安装软件包..."
     wg_install_packages || { pause; return 1; }
+
+    # ── 步骤 3: 配置 IP 转发 ──
     print_info "[2/5] 配置 IP 转发..."
     if ! grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null; then
         sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf
@@ -4757,15 +4810,22 @@ wg_server_install() {
     fi
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
     print_success "IP 转发已开启"
+
+    # ── 步骤 4: 配置服务端参数 (根据模式分支) ──
     print_info "[3/5] 配置服务端参数..."
-    local wg_port
+
+    local wg_port listen_addr mtu wg_dns wg_endpoint
+    local wg_subnet="10.66.66.0/24"
+
+    # WG 监听端口
     while true; do
         read -e -r -p "WireGuard 监听端口 [${WG_DEFAULT_PORT}]: " wg_port
         wg_port=${wg_port:-$WG_DEFAULT_PORT}
         if validate_port "$wg_port"; then break; fi
         print_warn "端口无效 (1-65535)"
     done
-    local wg_subnet
+
+    # VPN 子网
     while true; do
         read -e -r -p "VPN 内网子网 [10.66.66.0/24]: " wg_subnet
         wg_subnet=${wg_subnet:-10.66.66.0/24}
@@ -4780,30 +4840,89 @@ wg_server_install() {
     local prefix server_ip
     prefix=$(echo "$wg_subnet" | cut -d'.' -f1-3)
     server_ip="${prefix}.1"
-    local wg_dns
-    read -e -r -p "客户端 DNS [1.1.1.1, 8.8.8.8]: " wg_dns
-    wg_dns=${wg_dns:-"1.1.1.1, 8.8.8.8"}
-    local wg_endpoint default_ip
-    default_ip=$(get_public_ipv4 || echo "")
-    if [[ -n "$default_ip" ]]; then
-        read -e -r -p "公网端点 IP/域名 [${default_ip}]: " wg_endpoint
-        wg_endpoint=${wg_endpoint:-$default_ip}
+
+    # ── 根据部署模式设置参数 ──
+    if [[ "$WG_DEPLOY_MODE" == "domestic" ]]; then
+        # === 境内模式 ===
+        listen_addr="0.0.0.0"
+        mtu=$WG_MTU_DIRECT
+
+        # DNS (境内默认)
+        read -e -r -p "客户端 DNS [223.5.5.5, 114.114.114.114]: " wg_dns
+        wg_dns=${wg_dns:-"223.5.5.5, 114.114.114.114"}
+
+        # Endpoint: 优先使用 DDNS 域名
+        local ddns_domain=""
+        if [[ -d "$DDNS_CONFIG_DIR" ]] && ls "$DDNS_CONFIG_DIR"/*.conf &>/dev/null 2>&1; then
+            echo ""
+            echo -e "${C_CYAN}检测到已配置的 DDNS 域名:${C_RESET}"
+            local idx=1 ddns_domains=()
+            for conf in "$DDNS_CONFIG_DIR"/*.conf; do
+                [[ -f "$conf" ]] || continue
+                local d=$(grep '^DDNS_DOMAIN=' "$conf" | cut -d'"' -f2)
+                [[ -n "$d" ]] && { ddns_domains+=("$d"); echo "  ${idx}. ${d}"; idx=$((idx+1)); }
+            done
+            if [[ ${#ddns_domains[@]} -gt 0 ]]; then
+                echo "  0. 不使用 DDNS，手动输入 IP/域名"
+                local ddns_choice
+                read -e -r -p "选择 DDNS 域名 [1]: " ddns_choice
+                ddns_choice=${ddns_choice:-1}
+                if [[ "$ddns_choice" != "0" && "$ddns_choice" =~ ^[0-9]+$ && "$ddns_choice" -ge 1 && "$ddns_choice" -le ${#ddns_domains[@]} ]]; then
+                    ddns_domain="${ddns_domains[$((ddns_choice-1))]}"
+                    wg_endpoint="$ddns_domain"
+                    print_success "Endpoint 将使用 DDNS 域名: ${ddns_domain}"
+                fi
+            fi
+        fi
+        if [[ -z "$wg_endpoint" ]]; then
+            local default_ip
+            default_ip=$(get_public_ipv4 || echo "")
+            if [[ -n "$default_ip" ]]; then
+                read -e -r -p "公网端点 IP/域名 [${default_ip}]: " wg_endpoint
+                wg_endpoint=${wg_endpoint:-$default_ip}
+            else
+                while [[ -z "$wg_endpoint" ]]; do
+                    read -e -r -p "公网端点 IP/域名: " wg_endpoint
+                done
+            fi
+        fi
     else
-        while [[ -z "$wg_endpoint" ]]; do
-            read -e -r -p "公网端点 IP/域名: " wg_endpoint
-        done
+        # === 境外模式 ===
+        listen_addr="127.0.0.1"
+        mtu=$WG_MTU_TUNNEL
+
+        # DNS (境外默认)
+        read -e -r -p "客户端 DNS [1.1.1.1, 8.8.8.8]: " wg_dns
+        wg_dns=${wg_dns:-"1.1.1.1, 8.8.8.8"}
+
+        # Endpoint: 使用公网 IP (客户端通过 VLESS 连接，但 WG 配置仍需记录)
+        local default_ip
+        default_ip=$(get_public_ipv4 || echo "")
+        if [[ -n "$default_ip" ]]; then
+            read -e -r -p "VPS 公网 IP [${default_ip}]: " wg_endpoint
+            wg_endpoint=${wg_endpoint:-$default_ip}
+        else
+            while [[ -z "$wg_endpoint" ]]; do
+                read -e -r -p "VPS 公网 IP: " wg_endpoint
+            done
+        fi
     fi
+
+    # ── 步骤 5: 生成密钥 ──
     print_info "[4/5] 生成服务端密钥..."
     local server_privkey server_pubkey
     server_privkey=$(wg genkey)
     server_pubkey=$(echo "$server_privkey" | wg pubkey)
     print_success "密钥已生成"
+
     # 服务器名称
     local server_name=""
     local default_name=$(hostname -s 2>/dev/null)
     [[ -z "$default_name" ]] && default_name="server"
     read -e -r -p "服务器名称 [${default_name}]: " server_name
     server_name=${server_name:-$default_name}
+
+    # ── 步骤 6: 写入配置并启动 ──
     print_info "[5/5] 写入配置并启动..."
     wg_db_init
     wg_set_role "server"
@@ -4815,6 +4934,10 @@ wg_server_install() {
               --arg port "$wg_port" \
               --arg dns "$wg_dns" \
               --arg ep "$wg_endpoint" \
+              --arg mode "$WG_DEPLOY_MODE" \
+              --arg laddr "$listen_addr" \
+              --argjson mtu "$mtu" \
+              --arg ddns "${ddns_domain:-}" \
     '.server = {
         name: $sname,
         private_key: $pk,
@@ -4823,19 +4946,30 @@ wg_server_install() {
         subnet: $sub,
         port: ($port | tonumber),
         dns: $dns,
-        endpoint: $ep
+        endpoint: $ep,
+        deploy_mode: $mode,
+        listen_address: $laddr,
+        mtu: $mtu,
+        ddns_domain: $ddns
     }'
     wg_rebuild_conf
+
     if [[ "$PLATFORM" == "openwrt" ]]; then
         wg-quick up "$WG_INTERFACE" 2>/dev/null || true
     elif is_systemd; then
         systemctl enable "wg-quick@${WG_INTERFACE}" >/dev/null 2>&1
         wg-quick up "$WG_INTERFACE" 2>/dev/null
     fi
-    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw allow "${wg_port}/udp" comment "WireGuard" >/dev/null 2>&1
-        print_success "UFW 已放行端口 ${wg_port}/udp"
+
+    # 防火墙: 境内模式开放 WG 端口，境外模式不开放 (仅本地监听)
+    if [[ "$WG_DEPLOY_MODE" == "domestic" ]]; then
+        if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+            ufw allow "${wg_port}/udp" comment "WireGuard" >/dev/null 2>&1
+            print_success "UFW 已放行端口 ${wg_port}/udp"
+        fi
     fi
+
+    # ── 安装结果展示 ──
     draw_line
     if wg_is_running; then
         print_success "WireGuard 服务端安装并启动成功！"
@@ -4843,12 +4977,29 @@ wg_server_install() {
         print_warn "WireGuard 已安装，但启动可能失败，请检查日志"
     fi
     echo -e "  角色:     ${C_GREEN}服务端 (Server)${C_RESET}"
-    echo -e "  监听端口: ${C_GREEN}${wg_port}/udp${C_RESET}"
+    echo -e "  部署模式: ${C_GREEN}${WG_DEPLOY_MODE}${C_RESET}"
+    echo -e "  监听地址: ${C_GREEN}${listen_addr}:${wg_port}/udp${C_RESET}"
+    echo -e "  MTU:      ${C_GREEN}${mtu}${C_RESET}"
     echo -e "  内网子网: ${C_GREEN}${wg_subnet}${C_RESET}"
     echo -e "  服务端 IP: ${C_GREEN}${server_ip}${C_RESET}"
-    echo -e "  公网端点: ${C_GREEN}${wg_endpoint}:${wg_port}${C_RESET}"
+    if [[ "$WG_DEPLOY_MODE" == "domestic" ]]; then
+        if [[ -n "${ddns_domain:-}" ]]; then
+            echo -e "  公网端点: ${C_GREEN}${ddns_domain}:${wg_port}${C_RESET} (DDNS)"
+        else
+            echo -e "  公网端点: ${C_GREEN}${wg_endpoint}:${wg_port}${C_RESET}"
+        fi
+    else
+        echo -e "  公网端点: ${C_GREEN}${wg_endpoint}${C_RESET} (客户端通过 VLESS-Reality 连接)"
+    fi
     draw_line
-    log_action "WireGuard server installed: port=$wg_port subnet=$wg_subnet endpoint=$wg_endpoint"
+
+    # ── 境外模式: 配置 VLESS-Reality 隧道 ──
+    if [[ "$WG_DEPLOY_MODE" == "overseas" ]]; then
+        echo ""
+        wg_tunnel_setup "$wg_port"
+    fi
+
+    log_action "WireGuard server installed: mode=$WG_DEPLOY_MODE port=$wg_port subnet=$wg_subnet endpoint=$wg_endpoint mtu=$mtu"
 
     # 自动安装服务端看门狗
     echo ""
@@ -4917,21 +5068,31 @@ wg_modify_server() {
 wg_server_status() {
     wg_check_server || return 1
     print_title "WireGuard 服务端状态"
-    local port subnet endpoint dns
+    local port subnet endpoint dns deploy_mode mtu
     port=$(wg_db_get '.server.port')
     subnet=$(wg_db_get '.server.subnet')
     endpoint=$(wg_db_get '.server.endpoint')
     dns=$(wg_db_get '.server.dns')
+    deploy_mode=$(wg_db_get '.server.deploy_mode // "domestic"')
+    mtu=$(wg_db_get '.server.mtu // empty')
     echo -e "  角色:     ${C_GREEN}服务端 (Server)${C_RESET}"
     if wg_is_running; then
         echo -e "  状态:     ${C_GREEN}● 运行中${C_RESET}"
     else
         echo -e "  状态:     ${C_RED}● 已停止${C_RESET}"
     fi
+    if [[ "$deploy_mode" == "overseas" ]]; then
+        echo -e "  部署模式: ${C_YELLOW}境外 (VLESS-Reality 隧道)${C_RESET}"
+    else
+        echo -e "  部署模式: ${C_GREEN}境内 (标准 UDP 直连)${C_RESET}"
+    fi
     echo -e "  端口:     ${port}/udp"
+    [[ -n "$mtu" && "$mtu" != "null" ]] && echo -e "  MTU:      ${mtu}"
     echo -e "  子网:     ${subnet}"
     echo -e "  端点:     ${endpoint}"
     echo -e "  DNS:      ${dns}"
+    local ddns_domain=$(wg_db_get '.server.ddns_domain // empty')
+    [[ -n "$ddns_domain" ]] && echo -e "  DDNS:     ${C_CYAN}${ddns_domain}${C_RESET}"
     local peer_count
     peer_count=$(wg_db_get '.peers | length')
     echo -e "${C_CYAN}设备列表 (${peer_count} 个):${C_RESET}"
@@ -6718,11 +6879,24 @@ wg_generate_clash_config() {
     # ── 构建 proxy 节点列表 ──
     local all_proxy_names=()
     local all_proxy_yaml=""
+    local deploy_mode=$(wg_db_get '.server.deploy_mode // "domestic"')
 
     # 主机节点
     local primary_name="WG-$(wg_get_server_name)"
     all_proxy_names+=("$primary_name")
-    all_proxy_yaml+="  - name: \"${primary_name}\"
+
+    if [[ "$deploy_mode" == "overseas" ]]; then
+        # 境外模式: 生成 VLESS-Reality 节点 (WG 流量通过 VLESS 隧道承载)
+        local vless_port=$(wg_db_get '.server.vless_port // empty')
+        local vless_uuid=$(wg_db_get '.server.vless_uuid // empty')
+        local reality_pub=$(wg_db_get '.server.reality_public_key // empty')
+        local reality_sid=$(wg_db_get '.server.reality_short_id // empty')
+        local reality_sni=$(wg_db_get '.server.reality_sni // empty')
+
+        if [[ -z "$vless_uuid" || -z "$reality_pub" ]]; then
+            print_warn "VLESS-Reality 隧道参数不完整，请先配置隧道"
+            print_warn "回退为 WG 直连节点"
+            all_proxy_yaml+="  - name: \"${primary_name}\"
     type: wireguard
     server: ${server_endpoint}
     port: ${server_port}
@@ -6737,6 +6911,42 @@ wg_generate_clash_config() {
     dns:
       - ${server_dns}
 "
+        else
+            all_proxy_yaml+="  - name: \"${primary_name}\"
+    type: vless
+    server: ${server_endpoint}
+    port: ${vless_port}
+    uuid: ${vless_uuid}
+    network: tcp
+    tls: true
+    udp: true
+    flow: xtls-rprx-vision
+    servername: ${reality_sni}
+    reality-opts:
+      public-key: ${reality_pub}
+      short-id: ${reality_sid}
+    client-fingerprint: chrome
+"
+        fi
+    else
+        # 境内模式: 标准 WG 直连节点
+        local mtu=$(wg_db_get '.server.mtu // 1420')
+        all_proxy_yaml+="  - name: \"${primary_name}\"
+    type: wireguard
+    server: ${server_endpoint}
+    port: ${server_port}
+    ip: ${peer_ip}
+    private-key: \"${peer_privkey}\"
+    public-key: \"${server_pubkey}\"
+    pre-shared-key: \"${peer_psk}\"
+    reserved: [0, 0, 0]
+    udp: true
+    mtu: ${mtu}
+    remote-dns-resolve: false
+    dns:
+      - ${server_dns}
+"
+    fi
 
     # ── 构建 proxy-group ──
     local group_name="WireGuard-VPN"
@@ -7232,10 +7442,16 @@ wg_server_menu() {
     while true; do
         print_title "WireGuard 服务端管理"
         local srv_name=$(wg_get_server_name)
+        local deploy_mode=$(wg_db_get '.server.deploy_mode // "domestic"')
         if wg_is_running; then
             echo -e "  状态: ${C_GREEN}● 运行中${C_RESET}    接口: ${C_CYAN}${WG_INTERFACE}${C_RESET}    名称: ${C_CYAN}${srv_name}${C_RESET}"
         else
             echo -e "  状态: ${C_RED}● 已停止${C_RESET}    接口: ${C_CYAN}${WG_INTERFACE}${C_RESET}    名称: ${C_CYAN}${srv_name}${C_RESET}"
+        fi
+        if [[ "$deploy_mode" == "overseas" ]]; then
+            echo -e "  模式: ${C_YELLOW}境外 (VLESS-Reality)${C_RESET}"
+        else
+            echo -e "  模式: ${C_GREEN}境内 (标准 UDP)${C_RESET}"
         fi
         local peer_count=$(wg_db_get '.peers | length')
         echo -e "  设备数: ${C_CYAN}${peer_count}${C_RESET}"
@@ -7254,10 +7470,13 @@ wg_server_menu() {
   11. 修改服务器名称
   12. 卸载 WireGuard
   13. 生成 OpenWrt 清空 WG 配置命令
-  14. 服务端看门狗 (自动重启保活)
-  ── 数据管理 ──────────────────
-  15. 导出设备配置 (JSON)
-  16. 导入设备配置 (JSON)
+  14. 服务端看门狗 (自动重启保活)"
+        if [[ "$deploy_mode" == "overseas" ]]; then
+            echo "  15. VLESS-Reality 隧道管理"
+        fi
+        echo "  ── 数据管理 ──────────────────
+  16. 导出设备配置 (JSON)
+  17. 导入设备配置 (JSON)
   0. 返回上级菜单
 "
         read -e -r -p "$(echo -e "${C_CYAN}选择操作: ${C_RESET}")" choice
@@ -7276,8 +7495,15 @@ wg_server_menu() {
             12) wg_uninstall; return ;;
             13) wg_openwrt_clean_cmd ;;
             14) wg_setup_watchdog ;;
-            15) wg_export_peers ;;
-            16) wg_import_peers ;;
+            15)
+                if [[ "$deploy_mode" == "overseas" ]]; then
+                    wg_tunnel_manage
+                else
+                    print_warn "仅境外模式可用"; pause
+                fi
+                ;;
+            16) wg_export_peers ;;
+            17) wg_import_peers ;;
             0|"") return ;;
             *) print_warn "无效选项" ;;
         esac
@@ -7317,256 +7543,286 @@ wg_main_menu() {
     done
 }
 
-# 通过函数包装将 B 方案逻辑集成到 WG 主流程，无需修改 11-wireguard.sh
+# 通过 3X-UI 面板的 VLESS-Reality 入站实现 WG 流量伪装
+# 替代原有的 udp2raw (Plan B) 方案
 
 # ════════════════════════════════════════════════
-# udp2raw 工具函数
+# 3X-UI / xray 检测与配置
 # ════════════════════════════════════════════════
 
-# 安装 udp2raw 二进制
-wg_install_udp2raw() {
-    if command -v udp2raw &>/dev/null; then
-        print_info "udp2raw 已安装"
-        return 0
+# 获取 3X-UI 面板信息
+_wg_xui_get_info() {
+    local db="/etc/x-ui/x-ui.db"
+    if [[ ! -f "$db" ]]; then
+        echo ""
+        return 1
     fi
-
-    local arch bin_name
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64|amd64) bin_name="udp2raw_amd64" ;;
-        aarch64)      bin_name="udp2raw_arm_asm_aes" ;;
-        armv7*|armhf) bin_name="udp2raw_arm" ;;
-        i*86)         bin_name="udp2raw_x86" ;;
-        *) print_error "不支持的架构: $arch"; return 1 ;;
-    esac
-
-    local tmp_dir url
-    tmp_dir=$(mktemp -d)
-    url="https://github.com/wangyu-/udp2raw/releases/latest/download/udp2raw_binaries.tar.gz"
-
-    print_info "下载 udp2raw..."
-    if ! curl -fsSL -o "$tmp_dir/udp2raw.tar.gz" "$url" 2>/dev/null; then
-        curl -fsSL -o "$tmp_dir/udp2raw.tar.gz" "https://ghp.ci/$url" 2>/dev/null || {
-            print_error "下载 udp2raw 失败"
-            rm -rf "$tmp_dir"; return 1
-        }
-    fi
-
-    tar xzf "$tmp_dir/udp2raw.tar.gz" -C "$tmp_dir" 2>/dev/null || {
-        print_error "解压失败"; rm -rf "$tmp_dir"; return 1
-    }
-
-    local src="$tmp_dir/$bin_name"
-    if [[ ! -f "$src" ]]; then
-        src=$(find "$tmp_dir" -name "udp2raw_*" -type f 2>/dev/null | head -1)
-        [[ -f "$src" ]] || { print_error "未找到 udp2raw 二进制"; rm -rf "$tmp_dir"; return 1; }
-    fi
-
-    cp "$src" /usr/local/bin/udp2raw
-    chmod +x /usr/local/bin/udp2raw
-    rm -rf "$tmp_dir"
-    print_success "udp2raw 安装完成"
+    # 读取面板端口
+    local panel_port
+    panel_port=$(sqlite3 "$db" "SELECT value FROM settings WHERE key='webPort'" 2>/dev/null)
+    [[ -z "$panel_port" ]] && panel_port="54321"
+    echo "$panel_port"
 }
 
-# 创建并启动 udp2raw systemd 服务
-_wg_setup_udp2raw_service() {
-    local tcp_port=$1 wg_port=$2 password=$3
-
-    cat > /etc/systemd/system/udp2raw-wg.service << SVCEOF
-[Unit]
-Description=udp2raw tunnel for WireGuard (Plan B)
-After=network.target
-Before=wg-quick@${WG_INTERFACE}.service
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/udp2raw -s -l 0.0.0.0:${tcp_port} -r 127.0.0.1:${wg_port} --raw-mode faketcp -a -k "${password}"
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-
-    systemctl daemon-reload
-    systemctl enable udp2raw-wg >/dev/null 2>&1
-    systemctl restart udp2raw-wg
-
-    if systemctl is-active --quiet udp2raw-wg; then
-        print_success "udp2raw 服务已启动"
-        return 0
-    fi
-    print_error "udp2raw 服务启动失败，请检查: journalctl -u udp2raw-wg"
-    return 1
+# 从 3X-UI 数据库读取已有的 VLESS-Reality 入站
+_wg_xui_find_reality_inbound() {
+    local db="/etc/x-ui/x-ui.db"
+    [[ ! -f "$db" ]] && return 1
+    # 查找 protocol=vless 且 streamSettings 包含 reality 的入站
+    local result
+    result=$(sqlite3 "$db" "SELECT id, port, remark, settings, stream_settings FROM inbounds WHERE protocol='vless' AND stream_settings LIKE '%reality%' LIMIT 5" 2>/dev/null)
+    [[ -z "$result" ]] && return 1
+    echo "$result"
+    return 0
 }
 
-# 修正客户端 .conf 文件 Endpoint 为 127.0.0.1 (B 方案)
-_wg_fix_configs_for_plan_b() {
-    local ep port conf_dir="/etc/wireguard/clients"
-    ep=$(wg_db_get '.server.endpoint')
-    port=$(wg_db_get '.server.port')
-    [[ -d "$conf_dir" ]] || return 0
-    for f in "$conf_dir"/*.conf; do
-        [[ -f "$f" ]] || continue
-        sed -i "s|Endpoint = ${ep}:${port}|Endpoint = 127.0.0.1:${port}|g" "$f" 2>/dev/null
-    done
-}
+# 生成 xray VLESS-Reality 入站配置 (用于 3X-UI 手动添加参考)
+wg_tunnel_generate_xray_inbound() {
+    local wg_port=$1 vless_port=$2 dest_server=$3 dest_port=$4
+    local server_name=${dest_server%%:*}
 
-# 打印客户端 udp2raw 连接指南
-_wg_print_udp2raw_guide() {
-    local ep=$1 tcp_port=$2 wg_port=$3 password=$4
-    echo -e "  ${C_YELLOW}[客户端连接方式 - B 方案]${C_RESET}"
-    echo -e "  1. 下载 udp2raw: ${C_CYAN}https://github.com/wangyu-/udp2raw/releases${C_RESET}"
-    echo -e "  2. 客户端先启动 udp2raw:"
-    echo -e "     ${C_GREEN}udp2raw -c -l 127.0.0.1:${wg_port} -r ${ep}:${tcp_port} --raw-mode faketcp -a -k \"${password}\"${C_RESET}"
-    echo -e "  3. 再启动 WireGuard (Endpoint 已设为 127.0.0.1:${wg_port})"
-}
-
-# B 方案部署入口 (WG 安装完成后调用)
-_wg_post_install_plan_b() {
-    print_title "部署 B 方案: UDP over TCP (udp2raw)"
-
-    local wg_port
-    wg_port=$(wg_db_get '.server.port')
-
-    # 选择 udp2raw TCP 端口 (默认与 WG UDP 端口相同，TCP/UDP 不冲突)
-    local udp2raw_port
-    while true; do
-        read -e -r -p "udp2raw TCP 端口 [${wg_port}]: " udp2raw_port
-        udp2raw_port=${udp2raw_port:-$wg_port}
-        if validate_port "$udp2raw_port"; then break; fi
-        print_warn "端口无效 (1-65535)"
-    done
-
-    # [B-1/3] 安装 udp2raw
-    print_info "[B-1/3] 安装 udp2raw..."
-    wg_install_udp2raw || return 1
-
-    # 生成随机密码
-    local password
-    password=$(head -c 16 /dev/urandom | base64 | tr -d '/+=' | head -c 16)
-
-    # [B-2/3] 配置并启动服务
-    print_info "[B-2/3] 配置 udp2raw 服务..."
-    _wg_setup_udp2raw_service "$udp2raw_port" "$wg_port" "$password" || return 1
-
-    # [B-3/3] 保存到数据库
-    print_info "[B-3/3] 保存 B 方案配置..."
-    wg_db_set --arg plan "B" --arg p "$udp2raw_port" --arg pw "$password" \
-        '.server.deploy_plan = $plan | .server.udp2raw_port = ($p | tonumber) | .server.udp2raw_password = $pw'
-
-    # 防火墙放行 TCP 端口
-    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw allow "${udp2raw_port}/tcp" comment "udp2raw for WireGuard" >/dev/null 2>&1
-        print_success "UFW 已放行 ${udp2raw_port}/tcp"
-    fi
-
-    # 修正已有客户端配置的 Endpoint
-    _wg_fix_configs_for_plan_b
-
-    # 显示摘要
-    local ep
-    ep=$(wg_db_get '.server.endpoint')
-    draw_line
-    print_success "B 方案部署完成！"
-    echo -e "  udp2raw 端口: ${C_GREEN}${udp2raw_port}/tcp (faketcp)${C_RESET}"
-    echo -e "  连接密码:     ${C_CYAN}${password}${C_RESET}"
-    echo ""
-    _wg_print_udp2raw_guide "$ep" "$udp2raw_port" "$wg_port" "$password"
-    draw_line
-    pause
-}
-
-# 显示 udp2raw 连接信息 (供 peer 操作后调用)
-_wg_show_udp2raw_info() {
-    local plan
-    plan=$(wg_db_get '.server.deploy_plan // empty')
-    [[ "$plan" == "B" ]] || return 0
-
-    local ep tcp_port wg_port password
-    ep=$(wg_db_get '.server.endpoint')
-    tcp_port=$(wg_db_get '.server.udp2raw_port')
-    wg_port=$(wg_db_get '.server.port')
-    password=$(wg_db_get '.server.udp2raw_password')
-
-    echo ""
-    _wg_print_udp2raw_guide "$ep" "$tcp_port" "$wg_port" "$password"
-}
-
-# ════════════════════════════════════════════════
-# 函数包装: 将 B 方案透明集成到 WG 主流程
-# ════════════════════════════════════════════════
-
-# ── 包装 wg_server_install: 前置检测 + 后置 B 方案部署 ──
-eval "$(declare -f wg_server_install | sed '1s/wg_server_install/_wg_server_install_orig/')"
-
-wg_server_install() {
-    # 已安装为服务端则跳过检测，直接走原逻辑
-    if wg_is_installed && [[ "$(wg_get_role)" == "server" ]]; then
-        _wg_server_install_orig "$@"
-        return $?
-    fi
-
-    # 已安装为客户端也跳过检测
-    if wg_is_installed && [[ "$(wg_get_role)" == "client" ]]; then
-        _wg_server_install_orig "$@"
-        return $?
-    fi
-
-    # 网络资质检测 → 设置 WG_DEPLOY_PLAN
-    wg_net_qualify_server || return 1
-
-    # 执行原始安装流程
-    _wg_server_install_orig "$@"
-    local rc=$?
-
-    # 安装成功后处理部署方案
-    if [[ $rc -eq 0 ]] && wg_is_installed; then
-        if [[ "$WG_DEPLOY_PLAN" == "B" ]]; then
-            _wg_post_install_plan_b
-        else
-            wg_db_set --arg plan "A" '.server.deploy_plan = $plan' 2>/dev/null
+    # 生成 Reality 密钥对
+    local reality_keys
+    reality_keys=$(xray x25519 2>/dev/null)
+    if [[ -z "$reality_keys" ]]; then
+        # xray 不在 PATH 中，尝试 3X-UI 自带的
+        local xray_bin=""
+        for p in /usr/local/x-ui/bin/xray-linux-* /usr/local/x-ui/xray-linux-*; do
+            [[ -x "$p" ]] && { xray_bin="$p"; break; }
+        done
+        if [[ -n "$xray_bin" ]]; then
+            reality_keys=$("$xray_bin" x25519 2>/dev/null)
         fi
     fi
 
-    return $rc
-}
-
-# ── 包装 wg_add_peer: B 方案时临时替换 Endpoint ──
-eval "$(declare -f wg_add_peer | sed '1s/wg_add_peer/_wg_add_peer_orig/')"
-
-wg_add_peer() {
-    local _plan _saved_ep=""
-    _plan=$(wg_db_get '.server.deploy_plan // empty')
-
-    # B 方案: 临时将 endpoint 设为 127.0.0.1，使生成的配置和 QR 码正确
-    if [[ "$_plan" == "B" ]]; then
-        _saved_ep=$(wg_db_get '.server.endpoint')
-        wg_db_set --arg ep "127.0.0.1" '.server.endpoint = $ep'
+    local reality_private_key="" reality_public_key=""
+    if [[ -n "$reality_keys" ]]; then
+        reality_private_key=$(echo "$reality_keys" | grep 'Private' | awk '{print $NF}')
+        reality_public_key=$(echo "$reality_keys" | grep 'Public' | awk '{print $NF}')
     fi
 
-    _wg_add_peer_orig "$@"
-    local rc=$?
+    # 生成 shortId
+    local short_id
+    short_id=$(openssl rand -hex 4 2>/dev/null || head -c 8 /dev/urandom | xxd -p)
 
-    # 恢复真实 endpoint
-    if [[ -n "$_saved_ep" ]]; then
-        wg_db_set --arg ep "$_saved_ep" '.server.endpoint = $ep'
-    fi
+    # 生成 UUID
+    local uuid
+    uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null)
 
-    # 添加成功后显示 udp2raw 连接说明
-    [[ $rc -eq 0 && "$_plan" == "B" ]] && _wg_show_udp2raw_info
+    # 保存到 DB
+    wg_db_set \
+        --arg tt "vless-reality" \
+        --arg vp "$vless_port" \
+        --arg uuid "$uuid" \
+        --arg rpub "$reality_public_key" \
+        --arg rpriv "$reality_private_key" \
+        --arg sid "$short_id" \
+        --arg dest "${dest_server}:${dest_port}" \
+        --arg sni "$server_name" \
+    '.server.tunnel_type = $tt |
+     .server.vless_port = ($vp | tonumber) |
+     .server.vless_uuid = $uuid |
+     .server.reality_public_key = $rpub |
+     .server.reality_private_key = $rpriv |
+     .server.reality_short_id = $sid |
+     .server.reality_dest = $dest |
+     .server.reality_sni = $sni'
 
-    return $rc
+    # 输出配置摘要
+    echo ""
+    print_success "VLESS-Reality 隧道参数已生成"
+    draw_line
+    echo -e "  VLESS 端口:    ${C_CYAN}${vless_port}${C_RESET}"
+    echo -e "  UUID:          ${C_CYAN}${uuid}${C_RESET}"
+    echo -e "  Reality SNI:   ${C_CYAN}${server_name}${C_RESET}"
+    echo -e "  Reality Dest:  ${C_CYAN}${dest_server}:${dest_port}${C_RESET}"
+    echo -e "  Short ID:      ${C_CYAN}${short_id}${C_RESET}"
+    echo -e "  Public Key:    ${C_CYAN}${reality_public_key}${C_RESET}"
+    echo -e "  WG 转发端口:   ${C_CYAN}127.0.0.1:${wg_port} (UDP)${C_RESET}"
+    draw_line
 }
 
-# ── 包装 wg_regenerate_client_confs: B 方案时修正 Endpoint ──
+# 交互式配置 VLESS-Reality 隧道
+wg_tunnel_setup() {
+    local wg_port=$1
+    print_title "配置 VLESS-Reality 隧道"
+
+    echo -e "${C_CYAN}架构说明:${C_RESET}"
+    echo "  客户端 → VLESS-Reality (伪装TLS) → 本机 xray → WG Server (127.0.0.1:${wg_port})"
+    echo "  GFW 看到的是正常的 TLS 1.3 流量"
+    echo ""
+
+    # 检测已有的 Reality 入站
+    local existing_inbounds
+    existing_inbounds=$(_wg_xui_find_reality_inbound 2>/dev/null)
+    if [[ -n "$existing_inbounds" ]]; then
+        echo -e "${C_GREEN}检测到已有 VLESS-Reality 入站:${C_RESET}"
+        echo "$existing_inbounds" | while IFS='|' read -r id port remark _settings _stream; do
+            echo -e "  ID=${id} 端口=${C_CYAN}${port}${C_RESET} 备注=${remark}"
+        done
+        echo ""
+    fi
+
+    # VLESS 监听端口
+    local vless_port
+    local default_vless_port=""
+    if [[ -n "$existing_inbounds" ]]; then
+        default_vless_port=$(echo "$existing_inbounds" | head -1 | cut -d'|' -f2)
+    fi
+    while true; do
+        if [[ -n "$default_vless_port" ]]; then
+            read -e -r -p "VLESS-Reality 监听端口 [${default_vless_port}]: " vless_port
+            vless_port=${vless_port:-$default_vless_port}
+        else
+            read -e -r -p "VLESS-Reality 监听端口: " vless_port
+        fi
+        if validate_port "$vless_port"; then break; fi
+        print_warn "端口无效 (1-65535)"
+    done
+
+    # Reality 伪装目标
+    local dest_server dest_port
+    echo ""
+    echo "Reality 伪装目标 (SNI 目标网站):"
+    echo -e "  推荐: ${C_CYAN}www.microsoft.com${C_RESET}, ${C_CYAN}www.apple.com${C_RESET}, ${C_CYAN}www.samsung.com${C_RESET}"
+    read -e -r -p "伪装目标域名 [www.microsoft.com]: " dest_server
+    dest_server=${dest_server:-www.microsoft.com}
+    read -e -r -p "伪装目标端口 [443]: " dest_port
+    dest_port=${dest_port:-443}
+
+    # 生成配置
+    wg_tunnel_generate_xray_inbound "$wg_port" "$vless_port" "$dest_server" "$dest_port"
+
+    # 提供 3X-UI 配置指引
+    echo ""
+    echo -e "${C_YELLOW}[下一步] 在 3X-UI 面板中添加入站:${C_RESET}"
+    echo "  1. 登录 3X-UI 面板"
+    echo "  2. 入站列表 → 添加入站"
+    echo "  3. 协议: vless"
+    echo "  4. 端口: ${vless_port}"
+    echo "  5. 传输: xhttp (或 httpupgrade)"
+    echo "  6. 安全: reality"
+    echo "  7. SNI / Dest: ${dest_server}:${dest_port}"
+    echo "  8. 在 Fallback 或路由中将流量转发到 127.0.0.1:${wg_port} (UDP)"
+    echo ""
+    echo -e "${C_CYAN}或者使用 dokodemo-door 入站直接转发:${C_RESET}"
+    echo "  添加一个 dokodemo-door 入站，目标 127.0.0.1:${wg_port}，协议 UDP"
+    echo "  然后在 VLESS-Reality 的路由规则中将 WG 流量转发到此入站"
+
+    log_action "WireGuard tunnel: VLESS-Reality configured (vless_port=${vless_port} sni=${dest_server})"
+}
+
+# 生成客户端 xray 配置 (用于连接 VLESS-Reality 隧道)
+wg_tunnel_generate_client_xray() {
+    local peer_idx=$1
+    local server_ip=$(wg_db_get '.server.endpoint')
+    local vless_port=$(wg_db_get '.server.vless_port')
+    local uuid=$(wg_db_get '.server.vless_uuid')
+    local reality_pub=$(wg_db_get '.server.reality_public_key')
+    local short_id=$(wg_db_get '.server.reality_short_id')
+    local sni=$(wg_db_get '.server.reality_sni')
+    local wg_port=$(wg_db_get '.server.port')
+
+    if [[ -z "$uuid" || -z "$reality_pub" ]]; then
+        print_error "VLESS-Reality 隧道未配置，请先运行隧道配置"
+        return 1
+    fi
+
+    local peer_name=$(wg_db_get ".peers[$peer_idx].name")
+    local output_dir="/etc/wireguard/clients"
+    mkdir -p "$output_dir"
+
+    # 生成 xray 客户端 JSON
+    local xray_conf="${output_dir}/${peer_name}-xray.json"
+    cat > "$xray_conf" << XRAYEOF
+{
+  "log": {"loglevel": "warning"},
+  "inbounds": [
+    {
+      "tag": "wg-in",
+      "port": ${wg_port},
+      "listen": "127.0.0.1",
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": ${wg_port},
+        "network": "udp"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "vless-reality",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "${server_ip}",
+            "port": ${vless_port},
+            "users": [
+              {
+                "id": "${uuid}",
+                "encryption": "none",
+                "flow": ""
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "reality",
+        "realitySettings": {
+          "fingerprint": "chrome",
+          "serverName": "${sni}",
+          "publicKey": "${reality_pub}",
+          "shortId": "${short_id}",
+          "spiderX": ""
+        }
+      }
+    }
+  ]
+}
+XRAYEOF
+    chmod 600 "$xray_conf"
+    echo "$xray_conf"
+}
+
+# 显示客户端隧道连接指引
+wg_tunnel_show_client_guide() {
+    local peer_idx=$1
+    local peer_name=$(wg_db_get ".peers[$peer_idx].name")
+    local xray_conf="/etc/wireguard/clients/${peer_name}-xray.json"
+    local server_ip=$(wg_db_get '.server.endpoint')
+    local wg_port=$(wg_db_get '.server.port')
+
+    echo ""
+    echo -e "${C_CYAN}=== 境外模式客户端连接指引 (${peer_name}) ===${C_RESET}"
+    draw_line
+    echo "客户端需要两个组件配合工作:"
+    echo ""
+    echo -e "  ${C_GREEN}1. xray 客户端${C_RESET} (负责 VLESS-Reality 隧道)"
+    echo "     配置文件: ${xray_conf}"
+    echo "     作用: 将本地 UDP:${wg_port} 通过 VLESS-Reality 转发到服务端"
+    echo ""
+    echo -e "  ${C_GREEN}2. WireGuard 客户端${C_RESET} (标准 WG 配置)"
+    echo "     配置文件: /etc/wireguard/clients/${peer_name}.conf"
+    echo "     Endpoint 指向: 127.0.0.1:${wg_port} (本地 xray 入口)"
+    echo ""
+    echo -e "${C_YELLOW}启动顺序:${C_RESET}"
+    echo "  1. 先启动 xray: xray run -c ${xray_conf}"
+    echo "  2. 再启动 WireGuard: wg-quick up wg0"
+    draw_line
+}
+
+# ── 包装 wg_regenerate_client_confs: 境外模式时 Endpoint 指向本地 xray ──
 eval "$(declare -f wg_regenerate_client_confs | sed '1s/wg_regenerate_client_confs/_wg_regenerate_client_confs_orig/')"
 
 wg_regenerate_client_confs() {
-    local _plan _saved_ep=""
-    _plan=$(wg_db_get '.server.deploy_plan // empty')
+    local _mode _saved_ep=""
+    _mode=$(wg_db_get '.server.deploy_mode // empty')
 
-    if [[ "$_plan" == "B" ]]; then
+    if [[ "$_mode" == "overseas" ]]; then
         _saved_ep=$(wg_db_get '.server.endpoint')
         wg_db_set --arg ep "127.0.0.1" '.server.endpoint = $ep'
     fi
@@ -7576,16 +7832,26 @@ wg_regenerate_client_confs() {
     if [[ -n "$_saved_ep" ]]; then
         wg_db_set --arg ep "$_saved_ep" '.server.endpoint = $ep'
     fi
+
+    # 境外模式: 额外生成 xray 客户端配置
+    if [[ "$_mode" == "overseas" ]]; then
+        local pc=$(wg_db_get '.peers | length')
+        local i=0
+        while [[ $i -lt $pc ]]; do
+            wg_tunnel_generate_client_xray "$i" >/dev/null 2>&1
+            i=$((i + 1))
+        done
+    fi
 }
 
-# ── 包装 wg_uninstall: 清理 udp2raw 残留 ──
+# ── 包装 wg_uninstall: 清理隧道残留 ──
 eval "$(declare -f wg_uninstall | sed '1s/wg_uninstall/_wg_uninstall_orig/')"
 
 wg_uninstall() {
-    # 清理 udp2raw 服务和二进制
+    # 清理旧版 udp2raw 服务 (兼容升级)
     if systemctl is-active --quiet udp2raw-wg 2>/dev/null || \
        systemctl is-enabled --quiet udp2raw-wg 2>/dev/null; then
-        print_info "清理 udp2raw 服务..."
+        print_info "清理 udp2raw 服务 (旧版残留)..."
         systemctl stop udp2raw-wg 2>/dev/null
         systemctl disable udp2raw-wg 2>/dev/null
         rm -f /etc/systemd/system/udp2raw-wg.service
@@ -7594,7 +7860,84 @@ wg_uninstall() {
     fi
     [[ -f /usr/local/bin/udp2raw ]] && rm -f /usr/local/bin/udp2raw
 
+    # 清理 xray 客户端配置文件
+    local clients_dir="/etc/wireguard/clients"
+    if [[ -d "$clients_dir" ]]; then
+        rm -f "$clients_dir"/*-xray.json 2>/dev/null
+    fi
+
     _wg_uninstall_orig "$@"
+}
+
+# ════════════════════════════════════════════════
+# 隧道管理菜单
+# ════════════════════════════════════════════════
+wg_tunnel_manage() {
+    wg_check_server || return 1
+    local deploy_mode=$(wg_db_get '.server.deploy_mode // "domestic"')
+    if [[ "$deploy_mode" != "overseas" ]]; then
+        print_warn "当前为境内模式，无需隧道管理"
+        pause; return
+    fi
+
+    print_title "VLESS-Reality 隧道管理"
+    local vless_port=$(wg_db_get '.server.vless_port // empty')
+    local vless_uuid=$(wg_db_get '.server.vless_uuid // empty')
+    local reality_sni=$(wg_db_get '.server.reality_sni // empty')
+    local reality_pub=$(wg_db_get '.server.reality_public_key // empty')
+    local reality_sid=$(wg_db_get '.server.reality_short_id // empty')
+    local wg_port=$(wg_db_get '.server.port')
+
+    if [[ -n "$vless_uuid" && "$vless_uuid" != "null" ]]; then
+        echo -e "  VLESS 端口:  ${C_GREEN}${vless_port}${C_RESET}"
+        echo -e "  UUID:        ${C_CYAN}${vless_uuid}${C_RESET}"
+        echo -e "  Reality SNI: ${C_CYAN}${reality_sni}${C_RESET}"
+        echo -e "  Short ID:    ${C_CYAN}${reality_sid}${C_RESET}"
+        echo -e "  Public Key:  ${C_CYAN}${reality_pub}${C_RESET}"
+        echo -e "  WG 转发:    ${C_CYAN}127.0.0.1:${wg_port}/udp${C_RESET}"
+    else
+        echo -e "  ${C_YELLOW}隧道参数未配置${C_RESET}"
+    fi
+    draw_line
+    echo "  1. 重新配置隧道参数
+  2. 查看客户端 xray 配置
+  3. 查看 3X-UI 配置指引
+  0. 返回"
+    read -e -r -p "选择: " c
+    case $c in
+        1)
+            wg_tunnel_setup "$wg_port"
+            pause
+            ;;
+        2)
+            local pc=$(wg_db_get '.peers | length')
+            if [[ "$pc" -eq 0 ]]; then
+                print_warn "暂无设备"; pause; return
+            fi
+            echo "选择设备:"
+            local i=0
+            while [[ $i -lt $pc ]]; do
+                echo "  $((i+1)). $(wg_db_get ".peers[$i].name")"
+                i=$((i+1))
+            done
+            read -e -r -p "选择: " idx
+            if [[ "$idx" =~ ^[0-9]+$ && "$idx" -ge 1 && "$idx" -le "$pc" ]]; then
+                wg_tunnel_generate_client_xray "$((idx-1))"
+                pause
+            fi
+            ;;
+        3)
+            echo ""
+            echo -e "${C_YELLOW}[3X-UI 配置指引]${C_RESET}"
+            echo "  1. 登录 3X-UI 面板"
+            echo "  2. 入站列表 → 添加入站"
+            echo "  3. 协议: vless, 端口: ${vless_port:-自定义}"
+            echo "  4. 传输: xhttp, 安全: reality"
+            echo "  5. SNI/Dest: ${reality_sni:-www.microsoft.com}:443"
+            echo "  6. 添加 dokodemo-door 入站转发到 127.0.0.1:${wg_port} (UDP)"
+            pause
+            ;;
+    esac
 }
 backup_create() {
     print_title "创建备份"

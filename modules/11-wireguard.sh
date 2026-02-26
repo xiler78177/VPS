@@ -1,12 +1,12 @@
 # modules/11-wireguard.sh - WireGuard 完整模块
 # Sub-modules (loaded via build.sh concatenation):
-#   11a -> netcheck
+#   11a -> netcheck (部署模式选择: domestic/overseas)
 #   11  -> constants + db + utilities (this file)
 #   11c -> server install/control/uninstall
 #   11d -> peer management
 #   11e -> Clash/OpenClash config
 #   11g -> watchdog + import/export + menus
-#   11b -> UDP2RAW tunnel
+#   11b -> VLESS-Reality tunnel (境外模式)
 readonly WG_INTERFACE="wg0"
 readonly WG_DB_DIR="/etc/wireguard/db"
 readonly WG_DB_FILE="${WG_DB_DIR}/wg-data.json"
@@ -215,11 +215,21 @@ wg_rebuild_conf() {
         print_warn "未检测到默认网关接口，NAT 转发可能无法工作"
         main_iface="eth0"
     fi
+    local listen_addr mtu deploy_mode
+    deploy_mode=$(wg_db_get '.server.deploy_mode // "domestic"')
+    listen_addr=$(wg_db_get '.server.listen_address // "0.0.0.0"')
+    mtu=$(wg_db_get '.server.mtu // empty')
+    [[ -z "$mtu" || "$mtu" == "null" ]] && {
+        [[ "$deploy_mode" == "overseas" ]] && mtu=$WG_MTU_TUNNEL || mtu=$WG_MTU_DIRECT
+    }
     {
         echo "[Interface]"
         echo "PrivateKey = ${priv_key}"
         echo "Address = ${server_ip}/${mask}"
         echo "ListenPort = ${port}"
+        echo "MTU = ${mtu}"
+        # 境外模式仅监听本地回环
+        [[ "$deploy_mode" == "overseas" ]] && echo "# deploy_mode=overseas: listen on localhost only"
         echo "PostUp = iptables -C FORWARD -i %i -j ACCEPT 2>/dev/null || iptables -A FORWARD -i %i -j ACCEPT; iptables -C FORWARD -o %i -j ACCEPT 2>/dev/null || iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -C POSTROUTING -s ${subnet} -o ${main_iface} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s ${subnet} -o ${main_iface} -j MASQUERADE"
         echo "PostDown = iptables -D FORWARD -i %i -j ACCEPT 2>/dev/null; iptables -D FORWARD -o %i -j ACCEPT 2>/dev/null; iptables -t nat -D POSTROUTING -s ${subnet} -o ${main_iface} -j MASQUERADE 2>/dev/null"
         local pc=$(wg_db_get '.peers | length') i=0
@@ -246,21 +256,26 @@ wg_rebuild_conf() {
 wg_regenerate_client_confs() {
     local pc=$(wg_db_get '.peers | length')
     [[ "$pc" -eq 0 ]] && return
-    local spub sep sport sdns mask
+    local spub sep sport sdns mask mtu deploy_mode
     spub=$(wg_db_get '.server.public_key')
     sep=$(wg_db_get '.server.endpoint')
     sport=$(wg_db_get '.server.port')
     sdns=$(wg_db_get '.server.dns')
     mask=$(echo "$(wg_db_get '.server.subnet')" | cut -d'/' -f2)
+    deploy_mode=$(wg_db_get '.server.deploy_mode // "domestic"')
+    mtu=$(wg_db_get '.server.mtu // empty')
+    [[ -z "$mtu" || "$mtu" == "null" ]] && {
+        [[ "$deploy_mode" == "overseas" ]] && mtu=$WG_MTU_TUNNEL || mtu=$WG_MTU_DIRECT
+    }
     mkdir -p /etc/wireguard/clients
     local i=0
     while [[ $i -lt $pc ]]; do
         local name=$(wg_db_get ".peers[$i].name")
         local is_gw=$(wg_db_get ".peers[$i].is_gateway // false")
-        # 条件拼接避免空行问题
         local conf_content="[Interface]
 PrivateKey = $(wg_db_get ".peers[$i].private_key")
-Address = $(wg_db_get ".peers[$i].ip")/${mask}"
+Address = $(wg_db_get ".peers[$i].ip")/${mask}
+MTU = ${mtu}"
         [[ "$is_gw" != "true" ]] && conf_content+=$'\n'"DNS = ${sdns}"
         conf_content+="
 [Peer]

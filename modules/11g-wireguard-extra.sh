@@ -288,10 +288,16 @@ wg_server_menu() {
     while true; do
         print_title "WireGuard 服务端管理"
         local srv_name=$(wg_get_server_name)
+        local deploy_mode=$(wg_db_get '.server.deploy_mode // "domestic"')
         if wg_is_running; then
             echo -e "  状态: ${C_GREEN}● 运行中${C_RESET}    接口: ${C_CYAN}${WG_INTERFACE}${C_RESET}    名称: ${C_CYAN}${srv_name}${C_RESET}"
         else
             echo -e "  状态: ${C_RED}● 已停止${C_RESET}    接口: ${C_CYAN}${WG_INTERFACE}${C_RESET}    名称: ${C_CYAN}${srv_name}${C_RESET}"
+        fi
+        if [[ "$deploy_mode" == "overseas" ]]; then
+            echo -e "  模式: ${C_YELLOW}境外 (VLESS-Reality)${C_RESET}"
+        else
+            echo -e "  模式: ${C_GREEN}境内 (标准 UDP)${C_RESET}"
         fi
         local peer_count=$(wg_db_get '.peers | length')
         echo -e "  设备数: ${C_CYAN}${peer_count}${C_RESET}"
@@ -310,10 +316,13 @@ wg_server_menu() {
   11. 修改服务器名称
   12. 卸载 WireGuard
   13. 生成 OpenWrt 清空 WG 配置命令
-  14. 服务端看门狗 (自动重启保活)
-  ── 数据管理 ──────────────────
-  15. 导出设备配置 (JSON)
-  16. 导入设备配置 (JSON)
+  14. 服务端看门狗 (自动重启保活)"
+        if [[ "$deploy_mode" == "overseas" ]]; then
+            echo "  15. VLESS-Reality 隧道管理"
+        fi
+        echo "  ── 数据管理 ──────────────────
+  16. 导出设备配置 (JSON)
+  17. 导入设备配置 (JSON)
   0. 返回上级菜单
 "
         read -e -r -p "$(echo -e "${C_CYAN}选择操作: ${C_RESET}")" choice
@@ -332,8 +341,15 @@ wg_server_menu() {
             12) wg_uninstall; return ;;
             13) wg_openwrt_clean_cmd ;;
             14) wg_setup_watchdog ;;
-            15) wg_export_peers ;;
-            16) wg_import_peers ;;
+            15)
+                if [[ "$deploy_mode" == "overseas" ]]; then
+                    wg_tunnel_manage
+                else
+                    print_warn "仅境外模式可用"; pause
+                fi
+                ;;
+            16) wg_export_peers ;;
+            17) wg_import_peers ;;
             0|"") return ;;
             *) print_warn "无效选项" ;;
         esac

@@ -59,11 +59,24 @@ wg_generate_clash_config() {
     # ── 构建 proxy 节点列表 ──
     local all_proxy_names=()
     local all_proxy_yaml=""
+    local deploy_mode=$(wg_db_get '.server.deploy_mode // "domestic"')
 
     # 主机节点
     local primary_name="WG-$(wg_get_server_name)"
     all_proxy_names+=("$primary_name")
-    all_proxy_yaml+="  - name: \"${primary_name}\"
+
+    if [[ "$deploy_mode" == "overseas" ]]; then
+        # 境外模式: 生成 VLESS-Reality 节点 (WG 流量通过 VLESS 隧道承载)
+        local vless_port=$(wg_db_get '.server.vless_port // empty')
+        local vless_uuid=$(wg_db_get '.server.vless_uuid // empty')
+        local reality_pub=$(wg_db_get '.server.reality_public_key // empty')
+        local reality_sid=$(wg_db_get '.server.reality_short_id // empty')
+        local reality_sni=$(wg_db_get '.server.reality_sni // empty')
+
+        if [[ -z "$vless_uuid" || -z "$reality_pub" ]]; then
+            print_warn "VLESS-Reality 隧道参数不完整，请先配置隧道"
+            print_warn "回退为 WG 直连节点"
+            all_proxy_yaml+="  - name: \"${primary_name}\"
     type: wireguard
     server: ${server_endpoint}
     port: ${server_port}
@@ -78,6 +91,42 @@ wg_generate_clash_config() {
     dns:
       - ${server_dns}
 "
+        else
+            all_proxy_yaml+="  - name: \"${primary_name}\"
+    type: vless
+    server: ${server_endpoint}
+    port: ${vless_port}
+    uuid: ${vless_uuid}
+    network: tcp
+    tls: true
+    udp: true
+    flow: xtls-rprx-vision
+    servername: ${reality_sni}
+    reality-opts:
+      public-key: ${reality_pub}
+      short-id: ${reality_sid}
+    client-fingerprint: chrome
+"
+        fi
+    else
+        # 境内模式: 标准 WG 直连节点
+        local mtu=$(wg_db_get '.server.mtu // 1420')
+        all_proxy_yaml+="  - name: \"${primary_name}\"
+    type: wireguard
+    server: ${server_endpoint}
+    port: ${server_port}
+    ip: ${peer_ip}
+    private-key: \"${peer_privkey}\"
+    public-key: \"${server_pubkey}\"
+    pre-shared-key: \"${peer_psk}\"
+    reserved: [0, 0, 0]
+    udp: true
+    mtu: ${mtu}
+    remote-dns-resolve: false
+    dns:
+      - ${server_dns}
+"
+    fi
 
     # ── 构建 proxy-group ──
     local group_name="WireGuard-VPN"
