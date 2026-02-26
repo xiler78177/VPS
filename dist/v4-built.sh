@@ -6892,6 +6892,8 @@ wg_generate_clash_config() {
         local reality_pub=$(wg_db_get '.server.reality_public_key // empty')
         local reality_sid=$(wg_db_get '.server.reality_short_id // empty')
         local reality_sni=$(wg_db_get '.server.reality_sni // empty')
+        local vless_net=$(wg_db_get '.server.vless_network // "tcp"')
+        local vless_flow=$(wg_db_get '.server.vless_flow // "xtls-rprx-vision"')
 
         if [[ -z "$vless_uuid" || -z "$reality_pub" ]]; then
             print_warn "VLESS-Reality 隧道参数不完整，请先配置隧道"
@@ -6918,11 +6920,13 @@ wg_generate_clash_config() {
     server: ${server_endpoint}
     port: ${vless_port}
     uuid: ${vless_uuid}
-    network: tcp
+    network: ${vless_net}
     tls: true
     udp: true
-    flow: xtls-rprx-vision
-    servername: ${reality_sni}
+"
+            [[ -n "$vless_flow" ]] && all_proxy_yaml+="    flow: ${vless_flow}
+"
+            all_proxy_yaml+="    servername: ${reality_sni}
     reality-opts:
       public-key: ${reality_pub}
       short-id: ${reality_sid}
@@ -7595,7 +7599,7 @@ _wg_xui_find_reality_inbound() {
 
 # 生成 xray VLESS-Reality 入站配置 (用于 3X-UI 手动添加参考)
 wg_tunnel_generate_xray_inbound() {
-    local wg_port=$1 vless_port=$2 dest_server=$3 dest_port=$4
+    local wg_port=$1 vless_port=$2 vless_network=$3 vless_flow=$4 dest_server=$5 dest_port=$6
     local server_name=${dest_server%%:*}
 
     # 生成 Reality 密钥对
@@ -7628,17 +7632,21 @@ wg_tunnel_generate_xray_inbound() {
 
     # 保存到 DB
     wg_db_set \
-        --arg tt "vless-reality" \
+        --arg dt "vless-reality" \
         --arg vp "$vless_port" \
         --arg uuid "$uuid" \
+        --arg net "$vless_network" \
+        --arg flow "$vless_flow" \
         --arg rpub "$reality_public_key" \
         --arg rpriv "$reality_private_key" \
         --arg sid "$short_id" \
         --arg dest "${dest_server}:${dest_port}" \
         --arg sni "$server_name" \
-    '.server.tunnel_type = $tt |
+    '.server.tunnel_type = $dt |
      .server.vless_port = ($vp | tonumber) |
      .server.vless_uuid = $uuid |
+     .server.vless_network = $net |
+     .server.vless_flow = $flow |
      .server.reality_public_key = $rpub |
      .server.reality_private_key = $rpriv |
      .server.reality_short_id = $sid |
@@ -7697,6 +7705,22 @@ wg_tunnel_setup() {
         print_warn "端口无效 (1-65535)"
     done
 
+    # 传输层配置 (network & flow)
+    echo ""
+    echo "获取 3X-UI 端的传输层配置:"
+    local vless_network vless_flow
+    read -e -r -p "Transmission (Network) (tcp/xhttp/grpc 等) [tcp]: " vless_network
+    vless_network=${vless_network:-tcp}
+    
+    if [[ "$vless_network" == "tcp" ]]; then
+        read -e -r -p "Flow 控制选项 (无则留空) [xtls-rprx-vision]: " vless_flow
+        # 用户直接回车默认用 vision，如果明确输入 空格/none/表示为空，就不设置
+        [[ -z "$vless_flow" ]] && vless_flow="xtls-rprx-vision"
+        [[ "$vless_flow" == "none" || "$vless_flow" == "null" ]] && vless_flow=""
+    else
+        read -e -r -p "Flow 控制选项 (非 tcp 一般留空): " vless_flow
+    fi
+
     # Reality 伪装目标
     local dest_server dest_port
     echo ""
@@ -7708,7 +7732,7 @@ wg_tunnel_setup() {
     dest_port=${dest_port:-443}
 
     # 生成配置
-    wg_tunnel_generate_xray_inbound "$wg_port" "$vless_port" "$dest_server" "$dest_port"
+    wg_tunnel_generate_xray_inbound "$wg_port" "$vless_port" "$vless_network" "$vless_flow" "$dest_server" "$dest_port"
 
     # 提供 3X-UI 配置指引
     echo ""
@@ -7717,23 +7741,29 @@ wg_tunnel_setup() {
     echo "  2. 入站列表 → 添加入站"
     echo "  3. 协议: vless"
     echo "  4. 端口: ${vless_port}"
-    echo "  5. 传输: xhttp (或 httpupgrade), 安全: reality"
-    echo "  6. SNI / Dest: ${dest_server}:${dest_port}"
-    echo "  7. (无需额外处理) 客户端直接请求服务端公网 IP，流量自动回环到 WG 端口"
+    echo "  5. 传输: ${vless_network}"
+    if [[ -n "$vless_flow" ]]; then
+        echo "     xtls 设置 (Flow): ${vless_flow}"
+    fi
+    echo "  6. 安全: reality"
+    echo "  7. SNI / Dest: ${dest_server}:${dest_port}"
+    echo "  8. (无需额外处理) 客户端直接请求服务端公网 IP，流量自动回环到 WG 端口"
     echo ""
 
-    log_action "WireGuard tunnel: VLESS-Reality configured (vless_port=${vless_port} sni=${dest_server})"
+    log_action "WireGuard tunnel: VLESS-Reality configured (port=${vless_port} net=${vless_network} flow=${vless_flow} sni=${dest_server})"
 }
 
 # 生成客户端 xray 配置 (用于连接 VLESS-Reality 隧道)
 wg_tunnel_generate_client_xray() {
     local peer_idx=$1
     local server_ip=$(wg_db_get '.server.endpoint')
-    local vless_port=$(wg_db_get '.server.vless_port')
-    local uuid=$(wg_db_get '.server.vless_uuid')
-    local reality_pub=$(wg_db_get '.server.reality_public_key')
-    local short_id=$(wg_db_get '.server.reality_short_id')
-    local sni=$(wg_db_get '.server.reality_sni')
+    local vless_port=$(wg_db_get '.server.vless_port // empty')
+    local uuid=$(wg_db_get '.server.vless_uuid // empty')
+    local network=$(wg_db_get '.server.vless_network // "tcp"')
+    local flow=$(wg_db_get '.server.vless_flow // "xtls-rprx-vision"')
+    local reality_pub=$(wg_db_get '.server.reality_public_key // empty')
+    local short_id=$(wg_db_get '.server.reality_short_id // empty')
+    local sni=$(wg_db_get '.server.reality_sni // empty')
     local wg_port=$(wg_db_get '.server.port')
 
     if [[ -z "$uuid" || -z "$reality_pub" ]]; then
@@ -7776,14 +7806,14 @@ wg_tunnel_generate_client_xray() {
               {
                 "id": "${uuid}",
                 "encryption": "none",
-                "flow": ""
+                "flow": "${flow}"
               }
             ]
           }
         ]
       },
       "streamSettings": {
-        "network": "xhttp",
+        "network": "${network}",
         "security": "reality",
         "realitySettings": {
           "fingerprint": "chrome",
@@ -7896,15 +7926,18 @@ wg_tunnel_manage() {
     print_title "VLESS-Reality 隧道管理"
     local vless_port=$(wg_db_get '.server.vless_port // empty')
     local vless_uuid=$(wg_db_get '.server.vless_uuid // empty')
-    local reality_sni=$(wg_db_get '.server.reality_sni // empty')
+    local reality_jni=$(wg_db_get '.server.reality_sni // empty')
     local reality_pub=$(wg_db_get '.server.reality_public_key // empty')
     local reality_sid=$(wg_db_get '.server.reality_short_id // empty')
+    local vless_net=$(wg_db_get '.server.vless_network // "tcp"')
+    local vless_flow=$(wg_db_get '.server.vless_flow // "xtls-rprx-vision"')
     local wg_port=$(wg_db_get '.server.port')
 
     if [[ -n "$vless_uuid" && "$vless_uuid" != "null" ]]; then
         echo -e "  VLESS 端口:  ${C_GREEN}${vless_port}${C_RESET}"
+        echo -e "  传输设定:    ${C_CYAN}${vless_net}${C_RESET} ${vless_flow:+(flow: $vless_flow)}"
         echo -e "  UUID:        ${C_CYAN}${vless_uuid}${C_RESET}"
-        echo -e "  Reality SNI: ${C_CYAN}${reality_sni}${C_RESET}"
+        echo -e "  Reality SNI: ${C_CYAN}${reality_jni}${C_RESET}"
         echo -e "  Short ID:    ${C_CYAN}${reality_sid}${C_RESET}"
         echo -e "  Public Key:  ${C_CYAN}${reality_pub}${C_RESET}"
         echo -e "  WG 本地监听: ${C_CYAN}0.0.0.0:${wg_port}/udp${C_RESET}"
@@ -7945,9 +7978,10 @@ wg_tunnel_manage() {
             echo "  1. 登录 3X-UI 面板"
             echo "  2. 入站列表 → 添加入站"
             echo "  3. 协议: vless, 端口: ${vless_port:-自定义}"
-            echo "  4. 传输: xhttp, 安全: reality"
-            echo "  5. SNI/Dest: ${reality_sni:-www.microsoft.com}:443"
-            echo "  6. 面板无需特殊设置（客户端直连公网 IP 环回）"
+            echo "  4. 传输: ${vless_net}, 安全: reality"
+            [[ -n "$vless_flow" ]] && echo "  5. xtls 设置 (Flow): ${vless_flow}"
+            echo "  6. SNI/Dest: ${reality_jni:-www.microsoft.com}:443"
+            echo "  7. 面板无需特殊设置（客户端直连公网 IP 环回）"
             pause
             ;;
     esac

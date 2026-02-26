@@ -72,6 +72,8 @@ wg_generate_clash_config() {
         local reality_pub=$(wg_db_get '.server.reality_public_key // empty')
         local reality_sid=$(wg_db_get '.server.reality_short_id // empty')
         local reality_sni=$(wg_db_get '.server.reality_sni // empty')
+        local vless_net=$(wg_db_get '.server.vless_network // "tcp"')
+        local vless_flow=$(wg_db_get '.server.vless_flow // "xtls-rprx-vision"')
 
         if [[ -z "$vless_uuid" || -z "$reality_pub" ]]; then
             print_warn "VLESS-Reality 隧道参数不完整，请先配置隧道"
@@ -98,11 +100,13 @@ wg_generate_clash_config() {
     server: ${server_endpoint}
     port: ${vless_port}
     uuid: ${vless_uuid}
-    network: tcp
+    network: ${vless_net}
     tls: true
     udp: true
-    flow: xtls-rprx-vision
-    servername: ${reality_sni}
+"
+            [[ -n "$vless_flow" ]] && all_proxy_yaml+="    flow: ${vless_flow}
+"
+            all_proxy_yaml+="    servername: ${reality_sni}
     reality-opts:
       public-key: ${reality_pub}
       short-id: ${reality_sid}
