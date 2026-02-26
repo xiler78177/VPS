@@ -14,10 +14,10 @@ show_main_menu() {
     printf "${C_CYAN}%${W}s${C_RESET}\n" | tr ' ' '='
     echo -e " ${C_CYAN}[ 安全防护 ]${C_RESET}"
     if [[ "$PLATFORM" == "openwrt" ]]; then
-        printf "  %-36s %-36s\n" "$(echo -e "${C_GRAY}1. 基础依赖安装 [不可用]${C_RESET}")" "$(echo -e "${C_GRAY}2. UFW 防火墙 [不可用]${C_RESET}")"
+        printf "  %-36s %-36s\n" "$(echo -e "${C_GRAY}1. 依赖检查与修复 [不可用]${C_RESET}")" "$(echo -e "${C_GRAY}2. UFW 防火墙 [不可用]${C_RESET}")"
         printf "  %-36s %-36s\n" "$(echo -e "${C_GRAY}3. Fail2ban [不可用]${C_RESET}")"       "$(echo -e "${C_GRAY}4. SSH 管理 [不可用]${C_RESET}")"
     else
-        printf "  %-36s %-36s\n" "1. 基础依赖安装" "2. UFW 防火墙管理"
+        printf "  %-36s %-36s\n" "1. 依赖检查与修复" "2. UFW 防火墙管理"
         printf "  %-36s %-36s\n" "3. Fail2ban 入侵防御" "4. SSH 安全配置"
     fi
     echo -e " ${C_CYAN}[ 系统优化 ]${C_RESET}"
@@ -103,7 +103,7 @@ main() {
         case $choice in
             1)
                 if [[ "$PLATFORM" == "openwrt" ]]; then
-                    feature_blocked "基础依赖安装 (apt-get)"
+                    feature_blocked "依赖检查与修复 (apt-get)"
                 else
                     menu_update
                 fi

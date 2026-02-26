@@ -513,6 +513,161 @@ WDEOF
         echo "  • 其他 VPN 设备如需访问此网关的 LAN，路由模式选 3 即可
 "
     fi
+    if confirm "是否显示 Debian/Ubuntu 一键部署命令?"; then
+        local _conf_content
+        _conf_content=$(cat "$conf_file")
+        draw_line
+        echo -e "${C_CYAN}=== Debian/Ubuntu 部署命令 ===${C_RESET}"
+        echo -e "${C_YELLOW}在目标 Debian/Ubuntu 服务器 SSH 终端执行以下命令:${C_RESET}"
+        draw_line
+        cat << DEBIAN_EOF
+
+# ===================================================================
+# WireGuard Debian/Ubuntu 一键部署脚本
+# ===================================================================
+
+set -e
+
+# === [强制] 基础依赖安装 ===
+echo '[*] 检查并安装基础依赖...'
+apt-get update -qq
+for pkg in wireguard-tools qrencode; do
+    if ! dpkg -l "\$pkg" 2>/dev/null | grep -q '^ii'; then
+        echo "[+] 安装 \$pkg ..."
+        apt-get install -y "\$pkg" || { echo "[!] 安装 \$pkg 失败，终止部署"; exit 1; }
+    else
+        echo "[✓] \$pkg 已安装"
+    fi
+done
+# 验证关键命令可用
+for cmd in wg wg-quick; do
+    command -v "\$cmd" >/dev/null || { echo "[!] \$cmd 命令不可用，终止部署"; exit 1; }
+done
+echo '[✓] 依赖检查通过'
+
+# === 清理旧配置 ===
+if systemctl is-active wg-quick@wg0 &>/dev/null; then
+    echo '[*] 停止现有 wg0 接口...'
+    systemctl stop wg-quick@wg0
+fi
+
+# === 写入配置文件 ===
+mkdir -p /etc/wireguard
+cat > /etc/wireguard/wg0.conf << 'WGCONF'
+${_conf_content}
+WGCONF
+chmod 600 /etc/wireguard/wg0.conf
+
+# 保存配置校验和 (用于自检防篡改)
+sha256sum /etc/wireguard/wg0.conf > /etc/wireguard/.wg0.sha256
+chmod 600 /etc/wireguard/.wg0.sha256
+echo '[✓] 配置文件已写入并保存校验和'
+
+# === 启用 IP 转发 ===
+if ! sysctl -n net.ipv4.ip_forward 2>/dev/null | grep -q '1'; then
+    sed -i '/^#\?net.ipv4.ip_forward/d' /etc/sysctl.conf
+    echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+    sysctl -w net.ipv4.ip_forward=1
+    echo '[✓] IP 转发已启用'
+fi
+
+# === 启动 WireGuard ===
+systemctl enable wg-quick@wg0
+systemctl start wg-quick@wg0
+
+# === 安装看门狗 (自动定时自检 + 手动自检) ===
+cat > /usr/local/bin/wg-check << 'WGCHECK'
+#!/bin/bash
+# WireGuard 自检脚本 - 检查接口状态 + 配置完整性
+LOG_TAG="wg-check"
+MANUAL=false
+[ "\$1" = "--manual" ] && MANUAL=true
+
+log() { logger -t "\$LOG_TAG" "\$1"; \$MANUAL && echo "\$1"; }
+
+# 1. 检查依赖
+MISSING=0
+for cmd in wg wg-quick; do
+    if ! command -v "\$cmd" >/dev/null 2>&1; then
+        log "[!] 缺少命令: \$cmd"
+        MISSING=1
+    fi
+done
+if [ \$MISSING -eq 1 ]; then
+    log "[*] 尝试重新安装依赖..."
+    apt-get update -qq && apt-get install -y wireguard-tools 2>/dev/null
+    for cmd in wg wg-quick; do
+        command -v "\$cmd" >/dev/null || { log "[!] 修复失败: \$cmd 仍不可用"; exit 1; }
+    done
+    log "[✓] 依赖已修复"
+fi
+
+# 2. 检查配置文件完整性
+if [ -f /etc/wireguard/.wg0.sha256 ]; then
+    if ! sha256sum -c /etc/wireguard/.wg0.sha256 &>/dev/null; then
+        log "[!] 配置文件校验失败! 可能被篡改!"
+        log "[!] 预期: \$(cat /etc/wireguard/.wg0.sha256)"
+        log "[!] 实际: \$(sha256sum /etc/wireguard/wg0.conf)"
+        \$MANUAL && exit 1
+    else
+        log "[✓] 配置文件校验通过"
+    fi
+else
+    log "[*] 无校验和文件，跳过完整性检查"
+fi
+
+# 3. 检查接口状态
+if ! ip link show wg0 &>/dev/null; then
+    log "[!] wg0 接口不存在，正在重启..."
+    systemctl restart wg-quick@wg0
+    sleep 2
+    if ip link show wg0 &>/dev/null; then
+        log "[✓] wg0 接口恢复成功"
+    else
+        log "[!] wg0 接口恢复失败"
+    fi
+else
+    log "[✓] wg0 接口正常"
+fi
+
+# 4. 检查握手状态 (超过5分钟无握手则告警)
+LAST_HS=\$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print \$2}' | head -1)
+if [ -n "\$LAST_HS" ] && [ "\$LAST_HS" != "0" ]; then
+    NOW=\$(date +%s)
+    DIFF=\$(( NOW - LAST_HS ))
+    if [ \$DIFF -gt 300 ]; then
+        log "[*] 最近握手: \${DIFF}s 前 (超过5分钟)"
+    else
+        log "[✓] 最近握手: \${DIFF}s 前"
+    fi
+fi
+
+\$MANUAL && echo "" && wg show wg0
+WGCHECK
+chmod +x /usr/local/bin/wg-check
+
+# 注册 cron 定时自检 (每分钟)
+(crontab -l 2>/dev/null | grep -v 'wg-check'; echo '* * * * * /usr/local/bin/wg-check') | crontab -
+echo '[✓] 看门狗已安装 (每分钟自检接口+配置完整性)'
+echo '[*] 手动自检命令: wg-check --manual'
+
+# === 验证 ===
+sleep 2
+if ip link show wg0 &>/dev/null; then
+    echo '[✓] wg0 接口启动成功!'
+    wg show wg0
+else
+    echo '[!] wg0 接口启动失败，请检查: journalctl -u wg-quick@wg0'
+fi
+
+DEBIAN_EOF
+        draw_line
+        echo -e "${C_GREEN}复制以上全部命令到目标服务器 SSH 终端执行即可。${C_RESET}"
+        echo -e "${C_CYAN}验证方法:${C_RESET}"
+        echo "  1. 执行: wg show"
+        echo "  2. 执行: ping $(wg_db_get '.server.ip')"
+        draw_line
+    fi
     if confirm "是否显示客户端二维码 (手机扫码导入)?"; then
         echo -e "${C_CYAN}=== ${peer_name} 二维码 ===${C_RESET}"
         qrencode -t ansiutf8 < "$conf_file"
@@ -1007,6 +1162,161 @@ WDEOF
             echo "  3. LAN 设备 ping VPN 服务端: ping $(wg_db_get '.server.ip')"
             draw_line
         fi
+    fi
+    if confirm "显示 Debian/Ubuntu 一键部署命令?"; then
+        local _conf_content
+        _conf_content=$(cat "$conf_file")
+        draw_line
+        echo -e "${C_CYAN}=== Debian/Ubuntu 部署命令 ===${C_RESET}"
+        echo -e "${C_YELLOW}在目标 Debian/Ubuntu 服务器 SSH 终端执行以下命令:${C_RESET}"
+        draw_line
+        cat << DEBIAN_EOF
+
+# ===================================================================
+# WireGuard Debian/Ubuntu 一键部署脚本
+# ===================================================================
+
+set -e
+
+# === [强制] 基础依赖安装 ===
+echo '[*] 检查并安装基础依赖...'
+apt-get update -qq
+for pkg in wireguard-tools qrencode; do
+    if ! dpkg -l "\$pkg" 2>/dev/null | grep -q '^ii'; then
+        echo "[+] 安装 \$pkg ..."
+        apt-get install -y "\$pkg" || { echo "[!] 安装 \$pkg 失败，终止部署"; exit 1; }
+    else
+        echo "[✓] \$pkg 已安装"
+    fi
+done
+# 验证关键命令可用
+for cmd in wg wg-quick; do
+    command -v "\$cmd" >/dev/null || { echo "[!] \$cmd 命令不可用，终止部署"; exit 1; }
+done
+echo '[✓] 依赖检查通过'
+
+# === 清理旧配置 ===
+if systemctl is-active wg-quick@wg0 &>/dev/null; then
+    echo '[*] 停止现有 wg0 接口...'
+    systemctl stop wg-quick@wg0
+fi
+
+# === 写入配置文件 ===
+mkdir -p /etc/wireguard
+cat > /etc/wireguard/wg0.conf << 'WGCONF'
+${_conf_content}
+WGCONF
+chmod 600 /etc/wireguard/wg0.conf
+
+# 保存配置校验和 (用于自检防篡改)
+sha256sum /etc/wireguard/wg0.conf > /etc/wireguard/.wg0.sha256
+chmod 600 /etc/wireguard/.wg0.sha256
+echo '[✓] 配置文件已写入并保存校验和'
+
+# === 启用 IP 转发 ===
+if ! sysctl -n net.ipv4.ip_forward 2>/dev/null | grep -q '1'; then
+    sed -i '/^#\?net.ipv4.ip_forward/d' /etc/sysctl.conf
+    echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+    sysctl -w net.ipv4.ip_forward=1
+    echo '[✓] IP 转发已启用'
+fi
+
+# === 启动 WireGuard ===
+systemctl enable wg-quick@wg0
+systemctl start wg-quick@wg0
+
+# === 安装看门狗 (自动定时自检 + 手动自检) ===
+cat > /usr/local/bin/wg-check << 'WGCHECK'
+#!/bin/bash
+# WireGuard 自检脚本 - 检查接口状态 + 配置完整性
+LOG_TAG="wg-check"
+MANUAL=false
+[ "\$1" = "--manual" ] && MANUAL=true
+
+log() { logger -t "\$LOG_TAG" "\$1"; \$MANUAL && echo "\$1"; }
+
+# 1. 检查依赖
+MISSING=0
+for cmd in wg wg-quick; do
+    if ! command -v "\$cmd" >/dev/null 2>&1; then
+        log "[!] 缺少命令: \$cmd"
+        MISSING=1
+    fi
+done
+if [ \$MISSING -eq 1 ]; then
+    log "[*] 尝试重新安装依赖..."
+    apt-get update -qq && apt-get install -y wireguard-tools 2>/dev/null
+    for cmd in wg wg-quick; do
+        command -v "\$cmd" >/dev/null || { log "[!] 修复失败: \$cmd 仍不可用"; exit 1; }
+    done
+    log "[✓] 依赖已修复"
+fi
+
+# 2. 检查配置文件完整性
+if [ -f /etc/wireguard/.wg0.sha256 ]; then
+    if ! sha256sum -c /etc/wireguard/.wg0.sha256 &>/dev/null; then
+        log "[!] 配置文件校验失败! 可能被篡改!"
+        log "[!] 预期: \$(cat /etc/wireguard/.wg0.sha256)"
+        log "[!] 实际: \$(sha256sum /etc/wireguard/wg0.conf)"
+        \$MANUAL && exit 1
+    else
+        log "[✓] 配置文件校验通过"
+    fi
+else
+    log "[*] 无校验和文件，跳过完整性检查"
+fi
+
+# 3. 检查接口状态
+if ! ip link show wg0 &>/dev/null; then
+    log "[!] wg0 接口不存在，正在重启..."
+    systemctl restart wg-quick@wg0
+    sleep 2
+    if ip link show wg0 &>/dev/null; then
+        log "[✓] wg0 接口恢复成功"
+    else
+        log "[!] wg0 接口恢复失败"
+    fi
+else
+    log "[✓] wg0 接口正常"
+fi
+
+# 4. 检查握手状态 (超过5分钟无握手则告警)
+LAST_HS=\$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print \$2}' | head -1)
+if [ -n "\$LAST_HS" ] && [ "\$LAST_HS" != "0" ]; then
+    NOW=\$(date +%s)
+    DIFF=\$(( NOW - LAST_HS ))
+    if [ \$DIFF -gt 300 ]; then
+        log "[*] 最近握手: \${DIFF}s 前 (超过5分钟)"
+    else
+        log "[✓] 最近握手: \${DIFF}s 前"
+    fi
+fi
+
+\$MANUAL && echo "" && wg show wg0
+WGCHECK
+chmod +x /usr/local/bin/wg-check
+
+# 注册 cron 定时自检 (每分钟)
+(crontab -l 2>/dev/null | grep -v 'wg-check'; echo '* * * * * /usr/local/bin/wg-check') | crontab -
+echo '[✓] 看门狗已安装 (每分钟自检接口+配置完整性)'
+echo '[*] 手动自检命令: wg-check --manual'
+
+# === 验证 ===
+sleep 2
+if ip link show wg0 &>/dev/null; then
+    echo '[✓] wg0 接口启动成功!'
+    wg show wg0
+else
+    echo '[!] wg0 接口启动失败，请检查: journalctl -u wg-quick@wg0'
+fi
+
+DEBIAN_EOF
+        draw_line
+        echo -e "${C_GREEN}复制以上全部命令到目标服务器 SSH 终端执行即可。${C_RESET}"
+        echo -e "${C_CYAN}验证方法:${C_RESET}"
+        echo "  1. 执行: wg show"
+        echo "  2. 执行: ping $(wg_db_get '.server.ip')"
+        draw_line
     fi
     echo -e "配置文件路径: ${C_CYAN}${conf_file}${C_RESET}"
     echo -e "下载命令: ${C_GRAY}scp root@服务器IP:${conf_file} ./${C_RESET}"

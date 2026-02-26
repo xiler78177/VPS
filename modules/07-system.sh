@@ -1,7 +1,8 @@
 # modules/07-system.sh - 系统更新、优化、包管理
 menu_update() {
-    print_title "基础依赖安装"
-    print_info "正在检查并安装基础依赖..."
+    print_title "依赖检查与修复"
+    print_info "强制重新检查所有依赖包..."
+    local FULL_DEPS="curl wget jq unzip openssl ca-certificates ufw fail2ban ipset iproute2 net-tools procps"
     local ufw_was_active=0
     local f2b_was_active=0
     if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
@@ -14,22 +15,21 @@ menu_update() {
     if apt-get update >/dev/null 2>&1; then
         print_success "软件源更新完成"
     else
-        print_warn "软件源更新失败，但继续安装"
+        print_warn "软件源更新失败，但继续检查"
     fi
-    print_info "2/2 安装基础依赖包..."
-    local deps="curl wget jq unzip openssl ca-certificates ufw fail2ban ipset iproute2 net-tools procps"
+    print_info "2/2 检查并修复依赖包..."
     local installed=0
     local failed=0
-    local new_packages=""
-    for pkg in $deps; do
+    local ok_count=0
+    for pkg in $FULL_DEPS; do
         if dpkg -s "$pkg" &>/dev/null; then
-            echo "  ✓ $pkg (已安装)"
+            echo -e "  ${C_GREEN}✓${C_RESET} $pkg (正常)"
+            ((ok_count++)) || true
         else
             echo -n "  → 正在安装 $pkg ... "
             if (DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" >/dev/null 2>&1); then
                 echo -e "${C_GREEN}成功${C_RESET}"
                 ((installed++)) || true
-                new_packages="$new_packages $pkg"
             else
                 echo -e "${C_RED}失败${C_RESET}"
                 ((failed++)) || true
@@ -37,14 +37,12 @@ menu_update() {
         fi
     done
     echo "================================================================================"
-    print_success "基础依赖安装完成"
-    echo "  新安装: $installed 个"
+    print_success "依赖检查完成"
+    echo "  正常: $ok_count 个 | 新安装: $installed 个"
     [[ $failed -gt 0 ]] && echo -e "  ${C_RED}失败: $failed 个${C_RESET}"
-    if [[ "$new_packages" == *"ufw"* ]] || [[ "$new_packages" == *"fail2ban"* ]]; then
-        echo -e "${C_YELLOW}提示:${C_RESET} 检测到新安装的安全服务"
-        [[ "$new_packages" == *"ufw"* ]] && echo "  - UFW 防火墙: 请通过菜单 [2] 配置后启用"
-        [[ "$new_packages" == *"fail2ban"* ]] && echo "  - Fail2ban: 请通过菜单 [3] 配置后启用"
-    fi
+    # 更新状态文件
+    _deps_save_state "$FULL_DEPS"
+    # 恢复之前的服务状态
     if [[ $ufw_was_active -eq 1 ]]; then
         ufw --force enable >/dev/null 2>&1 || true
     fi
@@ -52,8 +50,84 @@ menu_update() {
         systemctl start fail2ban >/dev/null 2>&1 || true
     fi
     echo "================================================================================"
-    log_action "Basic dependencies installed/checked"
+    log_action "Dependencies checked/repaired manually"
     pause
+}
+
+_deps_save_state() {
+    local deps="$1"
+    local state_dir="/etc/server-manage"
+    mkdir -p "$state_dir"
+    # 记录包列表签名和时间
+    local pkg_hash
+    pkg_hash=$(echo "$deps" | md5sum | awk '{print $1}')
+    echo "checked=$(date '+%Y-%m-%d %H:%M:%S')|hash=$pkg_hash" > "$state_dir/.deps-ok"
+    chmod 600 "$state_dir/.deps-ok"
+}
+
+auto_deps() {
+    local FULL_DEPS="curl wget jq unzip openssl ca-certificates ufw fail2ban ipset iproute2 net-tools procps"
+    local state_file="/etc/server-manage/.deps-ok"
+
+    # 快速路径: 状态文件存在时只做轻量级验证
+    if [[ -f "$state_file" ]]; then
+        local missing=0
+        for pkg in $FULL_DEPS; do
+            if ! dpkg -s "$pkg" &>/dev/null; then
+                missing=1
+                break
+            fi
+        done
+        [[ $missing -eq 0 ]] && return 0
+        # 有缺失则进入修复流程
+        print_warn "检测到依赖缺失，正在自动修复..."
+    fi
+
+    # 完整安装/修复流程
+    print_info "正在检查并安装基础依赖..."
+    local ufw_was_active=0
+    local f2b_was_active=0
+    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw_was_active=1
+    fi
+    if systemctl is-active fail2ban &>/dev/null; then
+        f2b_was_active=1
+    fi
+    apt-get update >/dev/null 2>&1 || true
+    local installed=0
+    local failed=0
+    for pkg in $FULL_DEPS; do
+        if dpkg -s "$pkg" &>/dev/null; then
+            echo "  ✓ $pkg (已安装)"
+        else
+            echo -n "  → 正在安装 $pkg ... "
+            if (DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" >/dev/null 2>&1); then
+                echo -e "${C_GREEN}成功${C_RESET}"
+                ((installed++)) || true
+            else
+                echo -e "${C_RED}失败${C_RESET}"
+                ((failed++)) || true
+            fi
+        fi
+    done
+    if [[ $installed -gt 0 || $failed -gt 0 ]]; then
+        print_success "依赖安装完成 (新安装: $installed 个)"
+        [[ $failed -gt 0 ]] && print_warn "失败: $failed 个"
+        if [[ $installed -gt 0 ]]; then
+            echo -e "${C_YELLOW}提示:${C_RESET} 安全服务 (UFW/Fail2ban) 已安装但未自动启用"
+            echo "  请通过菜单 [2] 配置 UFW、菜单 [3] 配置 Fail2ban"
+        fi
+    fi
+    # 恢复之前的服务状态
+    if [[ $ufw_was_active -eq 1 ]]; then
+        ufw --force enable >/dev/null 2>&1 || true
+    fi
+    if [[ $f2b_was_active -eq 1 ]]; then
+        systemctl start fail2ban >/dev/null 2>&1 || true
+    fi
+    # 保存状态
+    _deps_save_state "$FULL_DEPS"
+    log_action "Dependencies auto-checked (installed=$installed failed=$failed)"
 }
 
 update_apt_cache() {
@@ -101,12 +175,6 @@ install_package() {
     [[ "$silent" != "silent" ]] && print_success "$pkg 安装成功。"
     log_action "Installed package: $pkg"
     return 0
-}
-auto_deps() {
-    local deps="curl wget jq unzip openssl ca-certificates iproute2 net-tools procps"
-    for p in $deps; do
-        dpkg -s "$p" &> /dev/null || install_package "$p" "silent"
-    done
 }
 
 check_port_usage() {

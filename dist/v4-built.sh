@@ -1421,8 +1421,9 @@ menu_ssh() {
     done
 }
 menu_update() {
-    print_title "基础依赖安装"
-    print_info "正在检查并安装基础依赖..."
+    print_title "依赖检查与修复"
+    print_info "强制重新检查所有依赖包..."
+    local FULL_DEPS="curl wget jq unzip openssl ca-certificates ufw fail2ban ipset iproute2 net-tools procps"
     local ufw_was_active=0
     local f2b_was_active=0
     if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
@@ -1435,22 +1436,21 @@ menu_update() {
     if apt-get update >/dev/null 2>&1; then
         print_success "软件源更新完成"
     else
-        print_warn "软件源更新失败，但继续安装"
+        print_warn "软件源更新失败，但继续检查"
     fi
-    print_info "2/2 安装基础依赖包..."
-    local deps="curl wget jq unzip openssl ca-certificates ufw fail2ban ipset iproute2 net-tools procps"
+    print_info "2/2 检查并修复依赖包..."
     local installed=0
     local failed=0
-    local new_packages=""
-    for pkg in $deps; do
+    local ok_count=0
+    for pkg in $FULL_DEPS; do
         if dpkg -s "$pkg" &>/dev/null; then
-            echo "  ✓ $pkg (已安装)"
+            echo -e "  ${C_GREEN}✓${C_RESET} $pkg (正常)"
+            ((ok_count++)) || true
         else
             echo -n "  → 正在安装 $pkg ... "
             if (DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" >/dev/null 2>&1); then
                 echo -e "${C_GREEN}成功${C_RESET}"
                 ((installed++)) || true
-                new_packages="$new_packages $pkg"
             else
                 echo -e "${C_RED}失败${C_RESET}"
                 ((failed++)) || true
@@ -1458,14 +1458,12 @@ menu_update() {
         fi
     done
     echo "================================================================================"
-    print_success "基础依赖安装完成"
-    echo "  新安装: $installed 个"
+    print_success "依赖检查完成"
+    echo "  正常: $ok_count 个 | 新安装: $installed 个"
     [[ $failed -gt 0 ]] && echo -e "  ${C_RED}失败: $failed 个${C_RESET}"
-    if [[ "$new_packages" == *"ufw"* ]] || [[ "$new_packages" == *"fail2ban"* ]]; then
-        echo -e "${C_YELLOW}提示:${C_RESET} 检测到新安装的安全服务"
-        [[ "$new_packages" == *"ufw"* ]] && echo "  - UFW 防火墙: 请通过菜单 [2] 配置后启用"
-        [[ "$new_packages" == *"fail2ban"* ]] && echo "  - Fail2ban: 请通过菜单 [3] 配置后启用"
-    fi
+    # 更新状态文件
+    _deps_save_state "$FULL_DEPS"
+    # 恢复之前的服务状态
     if [[ $ufw_was_active -eq 1 ]]; then
         ufw --force enable >/dev/null 2>&1 || true
     fi
@@ -1473,8 +1471,84 @@ menu_update() {
         systemctl start fail2ban >/dev/null 2>&1 || true
     fi
     echo "================================================================================"
-    log_action "Basic dependencies installed/checked"
+    log_action "Dependencies checked/repaired manually"
     pause
+}
+
+_deps_save_state() {
+    local deps="$1"
+    local state_dir="/etc/server-manage"
+    mkdir -p "$state_dir"
+    # 记录包列表签名和时间
+    local pkg_hash
+    pkg_hash=$(echo "$deps" | md5sum | awk '{print $1}')
+    echo "checked=$(date '+%Y-%m-%d %H:%M:%S')|hash=$pkg_hash" > "$state_dir/.deps-ok"
+    chmod 600 "$state_dir/.deps-ok"
+}
+
+auto_deps() {
+    local FULL_DEPS="curl wget jq unzip openssl ca-certificates ufw fail2ban ipset iproute2 net-tools procps"
+    local state_file="/etc/server-manage/.deps-ok"
+
+    # 快速路径: 状态文件存在时只做轻量级验证
+    if [[ -f "$state_file" ]]; then
+        local missing=0
+        for pkg in $FULL_DEPS; do
+            if ! dpkg -s "$pkg" &>/dev/null; then
+                missing=1
+                break
+            fi
+        done
+        [[ $missing -eq 0 ]] && return 0
+        # 有缺失则进入修复流程
+        print_warn "检测到依赖缺失，正在自动修复..."
+    fi
+
+    # 完整安装/修复流程
+    print_info "正在检查并安装基础依赖..."
+    local ufw_was_active=0
+    local f2b_was_active=0
+    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw_was_active=1
+    fi
+    if systemctl is-active fail2ban &>/dev/null; then
+        f2b_was_active=1
+    fi
+    apt-get update >/dev/null 2>&1 || true
+    local installed=0
+    local failed=0
+    for pkg in $FULL_DEPS; do
+        if dpkg -s "$pkg" &>/dev/null; then
+            echo "  ✓ $pkg (已安装)"
+        else
+            echo -n "  → 正在安装 $pkg ... "
+            if (DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" >/dev/null 2>&1); then
+                echo -e "${C_GREEN}成功${C_RESET}"
+                ((installed++)) || true
+            else
+                echo -e "${C_RED}失败${C_RESET}"
+                ((failed++)) || true
+            fi
+        fi
+    done
+    if [[ $installed -gt 0 || $failed -gt 0 ]]; then
+        print_success "依赖安装完成 (新安装: $installed 个)"
+        [[ $failed -gt 0 ]] && print_warn "失败: $failed 个"
+        if [[ $installed -gt 0 ]]; then
+            echo -e "${C_YELLOW}提示:${C_RESET} 安全服务 (UFW/Fail2ban) 已安装但未自动启用"
+            echo "  请通过菜单 [2] 配置 UFW、菜单 [3] 配置 Fail2ban"
+        fi
+    fi
+    # 恢复之前的服务状态
+    if [[ $ufw_was_active -eq 1 ]]; then
+        ufw --force enable >/dev/null 2>&1 || true
+    fi
+    if [[ $f2b_was_active -eq 1 ]]; then
+        systemctl start fail2ban >/dev/null 2>&1 || true
+    fi
+    # 保存状态
+    _deps_save_state "$FULL_DEPS"
+    log_action "Dependencies auto-checked (installed=$installed failed=$failed)"
 }
 
 update_apt_cache() {
@@ -1522,12 +1596,6 @@ install_package() {
     [[ "$silent" != "silent" ]] && print_success "$pkg 安装成功。"
     log_action "Installed package: $pkg"
     return 0
-}
-auto_deps() {
-    local deps="curl wget jq unzip openssl ca-certificates iproute2 net-tools procps"
-    for p in $deps; do
-        dpkg -s "$p" &> /dev/null || install_package "$p" "silent"
-    done
 }
 
 check_port_usage() {
@@ -5768,6 +5836,161 @@ WDEOF
         echo "  • 其他 VPN 设备如需访问此网关的 LAN，路由模式选 3 即可
 "
     fi
+    if confirm "是否显示 Debian/Ubuntu 一键部署命令?"; then
+        local _conf_content
+        _conf_content=$(cat "$conf_file")
+        draw_line
+        echo -e "${C_CYAN}=== Debian/Ubuntu 部署命令 ===${C_RESET}"
+        echo -e "${C_YELLOW}在目标 Debian/Ubuntu 服务器 SSH 终端执行以下命令:${C_RESET}"
+        draw_line
+        cat << DEBIAN_EOF
+
+# ===================================================================
+# WireGuard Debian/Ubuntu 一键部署脚本
+# ===================================================================
+
+set -e
+
+# === [强制] 基础依赖安装 ===
+echo '[*] 检查并安装基础依赖...'
+apt-get update -qq
+for pkg in wireguard-tools qrencode; do
+    if ! dpkg -l "\$pkg" 2>/dev/null | grep -q '^ii'; then
+        echo "[+] 安装 \$pkg ..."
+        apt-get install -y "\$pkg" || { echo "[!] 安装 \$pkg 失败，终止部署"; exit 1; }
+    else
+        echo "[✓] \$pkg 已安装"
+    fi
+done
+# 验证关键命令可用
+for cmd in wg wg-quick; do
+    command -v "\$cmd" >/dev/null || { echo "[!] \$cmd 命令不可用，终止部署"; exit 1; }
+done
+echo '[✓] 依赖检查通过'
+
+# === 清理旧配置 ===
+if systemctl is-active wg-quick@wg0 &>/dev/null; then
+    echo '[*] 停止现有 wg0 接口...'
+    systemctl stop wg-quick@wg0
+fi
+
+# === 写入配置文件 ===
+mkdir -p /etc/wireguard
+cat > /etc/wireguard/wg0.conf << 'WGCONF'
+${_conf_content}
+WGCONF
+chmod 600 /etc/wireguard/wg0.conf
+
+# 保存配置校验和 (用于自检防篡改)
+sha256sum /etc/wireguard/wg0.conf > /etc/wireguard/.wg0.sha256
+chmod 600 /etc/wireguard/.wg0.sha256
+echo '[✓] 配置文件已写入并保存校验和'
+
+# === 启用 IP 转发 ===
+if ! sysctl -n net.ipv4.ip_forward 2>/dev/null | grep -q '1'; then
+    sed -i '/^#\?net.ipv4.ip_forward/d' /etc/sysctl.conf
+    echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+    sysctl -w net.ipv4.ip_forward=1
+    echo '[✓] IP 转发已启用'
+fi
+
+# === 启动 WireGuard ===
+systemctl enable wg-quick@wg0
+systemctl start wg-quick@wg0
+
+# === 安装看门狗 (自动定时自检 + 手动自检) ===
+cat > /usr/local/bin/wg-check << 'WGCHECK'
+#!/bin/bash
+# WireGuard 自检脚本 - 检查接口状态 + 配置完整性
+LOG_TAG="wg-check"
+MANUAL=false
+[ "\$1" = "--manual" ] && MANUAL=true
+
+log() { logger -t "\$LOG_TAG" "\$1"; \$MANUAL && echo "\$1"; }
+
+# 1. 检查依赖
+MISSING=0
+for cmd in wg wg-quick; do
+    if ! command -v "\$cmd" >/dev/null 2>&1; then
+        log "[!] 缺少命令: \$cmd"
+        MISSING=1
+    fi
+done
+if [ \$MISSING -eq 1 ]; then
+    log "[*] 尝试重新安装依赖..."
+    apt-get update -qq && apt-get install -y wireguard-tools 2>/dev/null
+    for cmd in wg wg-quick; do
+        command -v "\$cmd" >/dev/null || { log "[!] 修复失败: \$cmd 仍不可用"; exit 1; }
+    done
+    log "[✓] 依赖已修复"
+fi
+
+# 2. 检查配置文件完整性
+if [ -f /etc/wireguard/.wg0.sha256 ]; then
+    if ! sha256sum -c /etc/wireguard/.wg0.sha256 &>/dev/null; then
+        log "[!] 配置文件校验失败! 可能被篡改!"
+        log "[!] 预期: \$(cat /etc/wireguard/.wg0.sha256)"
+        log "[!] 实际: \$(sha256sum /etc/wireguard/wg0.conf)"
+        \$MANUAL && exit 1
+    else
+        log "[✓] 配置文件校验通过"
+    fi
+else
+    log "[*] 无校验和文件，跳过完整性检查"
+fi
+
+# 3. 检查接口状态
+if ! ip link show wg0 &>/dev/null; then
+    log "[!] wg0 接口不存在，正在重启..."
+    systemctl restart wg-quick@wg0
+    sleep 2
+    if ip link show wg0 &>/dev/null; then
+        log "[✓] wg0 接口恢复成功"
+    else
+        log "[!] wg0 接口恢复失败"
+    fi
+else
+    log "[✓] wg0 接口正常"
+fi
+
+# 4. 检查握手状态 (超过5分钟无握手则告警)
+LAST_HS=\$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print \$2}' | head -1)
+if [ -n "\$LAST_HS" ] && [ "\$LAST_HS" != "0" ]; then
+    NOW=\$(date +%s)
+    DIFF=\$(( NOW - LAST_HS ))
+    if [ \$DIFF -gt 300 ]; then
+        log "[*] 最近握手: \${DIFF}s 前 (超过5分钟)"
+    else
+        log "[✓] 最近握手: \${DIFF}s 前"
+    fi
+fi
+
+\$MANUAL && echo "" && wg show wg0
+WGCHECK
+chmod +x /usr/local/bin/wg-check
+
+# 注册 cron 定时自检 (每分钟)
+(crontab -l 2>/dev/null | grep -v 'wg-check'; echo '* * * * * /usr/local/bin/wg-check') | crontab -
+echo '[✓] 看门狗已安装 (每分钟自检接口+配置完整性)'
+echo '[*] 手动自检命令: wg-check --manual'
+
+# === 验证 ===
+sleep 2
+if ip link show wg0 &>/dev/null; then
+    echo '[✓] wg0 接口启动成功!'
+    wg show wg0
+else
+    echo '[!] wg0 接口启动失败，请检查: journalctl -u wg-quick@wg0'
+fi
+
+DEBIAN_EOF
+        draw_line
+        echo -e "${C_GREEN}复制以上全部命令到目标服务器 SSH 终端执行即可。${C_RESET}"
+        echo -e "${C_CYAN}验证方法:${C_RESET}"
+        echo "  1. 执行: wg show"
+        echo "  2. 执行: ping $(wg_db_get '.server.ip')"
+        draw_line
+    fi
     if confirm "是否显示客户端二维码 (手机扫码导入)?"; then
         echo -e "${C_CYAN}=== ${peer_name} 二维码 ===${C_RESET}"
         qrencode -t ansiutf8 < "$conf_file"
@@ -6262,6 +6485,161 @@ WDEOF
             echo "  3. LAN 设备 ping VPN 服务端: ping $(wg_db_get '.server.ip')"
             draw_line
         fi
+    fi
+    if confirm "显示 Debian/Ubuntu 一键部署命令?"; then
+        local _conf_content
+        _conf_content=$(cat "$conf_file")
+        draw_line
+        echo -e "${C_CYAN}=== Debian/Ubuntu 部署命令 ===${C_RESET}"
+        echo -e "${C_YELLOW}在目标 Debian/Ubuntu 服务器 SSH 终端执行以下命令:${C_RESET}"
+        draw_line
+        cat << DEBIAN_EOF
+
+# ===================================================================
+# WireGuard Debian/Ubuntu 一键部署脚本
+# ===================================================================
+
+set -e
+
+# === [强制] 基础依赖安装 ===
+echo '[*] 检查并安装基础依赖...'
+apt-get update -qq
+for pkg in wireguard-tools qrencode; do
+    if ! dpkg -l "\$pkg" 2>/dev/null | grep -q '^ii'; then
+        echo "[+] 安装 \$pkg ..."
+        apt-get install -y "\$pkg" || { echo "[!] 安装 \$pkg 失败，终止部署"; exit 1; }
+    else
+        echo "[✓] \$pkg 已安装"
+    fi
+done
+# 验证关键命令可用
+for cmd in wg wg-quick; do
+    command -v "\$cmd" >/dev/null || { echo "[!] \$cmd 命令不可用，终止部署"; exit 1; }
+done
+echo '[✓] 依赖检查通过'
+
+# === 清理旧配置 ===
+if systemctl is-active wg-quick@wg0 &>/dev/null; then
+    echo '[*] 停止现有 wg0 接口...'
+    systemctl stop wg-quick@wg0
+fi
+
+# === 写入配置文件 ===
+mkdir -p /etc/wireguard
+cat > /etc/wireguard/wg0.conf << 'WGCONF'
+${_conf_content}
+WGCONF
+chmod 600 /etc/wireguard/wg0.conf
+
+# 保存配置校验和 (用于自检防篡改)
+sha256sum /etc/wireguard/wg0.conf > /etc/wireguard/.wg0.sha256
+chmod 600 /etc/wireguard/.wg0.sha256
+echo '[✓] 配置文件已写入并保存校验和'
+
+# === 启用 IP 转发 ===
+if ! sysctl -n net.ipv4.ip_forward 2>/dev/null | grep -q '1'; then
+    sed -i '/^#\?net.ipv4.ip_forward/d' /etc/sysctl.conf
+    echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+    sysctl -w net.ipv4.ip_forward=1
+    echo '[✓] IP 转发已启用'
+fi
+
+# === 启动 WireGuard ===
+systemctl enable wg-quick@wg0
+systemctl start wg-quick@wg0
+
+# === 安装看门狗 (自动定时自检 + 手动自检) ===
+cat > /usr/local/bin/wg-check << 'WGCHECK'
+#!/bin/bash
+# WireGuard 自检脚本 - 检查接口状态 + 配置完整性
+LOG_TAG="wg-check"
+MANUAL=false
+[ "\$1" = "--manual" ] && MANUAL=true
+
+log() { logger -t "\$LOG_TAG" "\$1"; \$MANUAL && echo "\$1"; }
+
+# 1. 检查依赖
+MISSING=0
+for cmd in wg wg-quick; do
+    if ! command -v "\$cmd" >/dev/null 2>&1; then
+        log "[!] 缺少命令: \$cmd"
+        MISSING=1
+    fi
+done
+if [ \$MISSING -eq 1 ]; then
+    log "[*] 尝试重新安装依赖..."
+    apt-get update -qq && apt-get install -y wireguard-tools 2>/dev/null
+    for cmd in wg wg-quick; do
+        command -v "\$cmd" >/dev/null || { log "[!] 修复失败: \$cmd 仍不可用"; exit 1; }
+    done
+    log "[✓] 依赖已修复"
+fi
+
+# 2. 检查配置文件完整性
+if [ -f /etc/wireguard/.wg0.sha256 ]; then
+    if ! sha256sum -c /etc/wireguard/.wg0.sha256 &>/dev/null; then
+        log "[!] 配置文件校验失败! 可能被篡改!"
+        log "[!] 预期: \$(cat /etc/wireguard/.wg0.sha256)"
+        log "[!] 实际: \$(sha256sum /etc/wireguard/wg0.conf)"
+        \$MANUAL && exit 1
+    else
+        log "[✓] 配置文件校验通过"
+    fi
+else
+    log "[*] 无校验和文件，跳过完整性检查"
+fi
+
+# 3. 检查接口状态
+if ! ip link show wg0 &>/dev/null; then
+    log "[!] wg0 接口不存在，正在重启..."
+    systemctl restart wg-quick@wg0
+    sleep 2
+    if ip link show wg0 &>/dev/null; then
+        log "[✓] wg0 接口恢复成功"
+    else
+        log "[!] wg0 接口恢复失败"
+    fi
+else
+    log "[✓] wg0 接口正常"
+fi
+
+# 4. 检查握手状态 (超过5分钟无握手则告警)
+LAST_HS=\$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print \$2}' | head -1)
+if [ -n "\$LAST_HS" ] && [ "\$LAST_HS" != "0" ]; then
+    NOW=\$(date +%s)
+    DIFF=\$(( NOW - LAST_HS ))
+    if [ \$DIFF -gt 300 ]; then
+        log "[*] 最近握手: \${DIFF}s 前 (超过5分钟)"
+    else
+        log "[✓] 最近握手: \${DIFF}s 前"
+    fi
+fi
+
+\$MANUAL && echo "" && wg show wg0
+WGCHECK
+chmod +x /usr/local/bin/wg-check
+
+# 注册 cron 定时自检 (每分钟)
+(crontab -l 2>/dev/null | grep -v 'wg-check'; echo '* * * * * /usr/local/bin/wg-check') | crontab -
+echo '[✓] 看门狗已安装 (每分钟自检接口+配置完整性)'
+echo '[*] 手动自检命令: wg-check --manual'
+
+# === 验证 ===
+sleep 2
+if ip link show wg0 &>/dev/null; then
+    echo '[✓] wg0 接口启动成功!'
+    wg show wg0
+else
+    echo '[!] wg0 接口启动失败，请检查: journalctl -u wg-quick@wg0'
+fi
+
+DEBIAN_EOF
+        draw_line
+        echo -e "${C_GREEN}复制以上全部命令到目标服务器 SSH 终端执行即可。${C_RESET}"
+        echo -e "${C_CYAN}验证方法:${C_RESET}"
+        echo "  1. 执行: wg show"
+        echo "  2. 执行: ping $(wg_db_get '.server.ip')"
+        draw_line
     fi
     echo -e "配置文件路径: ${C_CYAN}${conf_file}${C_RESET}"
     echo -e "下载命令: ${C_GRAY}scp root@服务器IP:${conf_file} ./${C_RESET}"
@@ -7961,10 +8339,10 @@ show_main_menu() {
     printf "${C_CYAN}%${W}s${C_RESET}\n" | tr ' ' '='
     echo -e " ${C_CYAN}[ 安全防护 ]${C_RESET}"
     if [[ "$PLATFORM" == "openwrt" ]]; then
-        printf "  %-36s %-36s\n" "$(echo -e "${C_GRAY}1. 基础依赖安装 [不可用]${C_RESET}")" "$(echo -e "${C_GRAY}2. UFW 防火墙 [不可用]${C_RESET}")"
+        printf "  %-36s %-36s\n" "$(echo -e "${C_GRAY}1. 依赖检查与修复 [不可用]${C_RESET}")" "$(echo -e "${C_GRAY}2. UFW 防火墙 [不可用]${C_RESET}")"
         printf "  %-36s %-36s\n" "$(echo -e "${C_GRAY}3. Fail2ban [不可用]${C_RESET}")"       "$(echo -e "${C_GRAY}4. SSH 管理 [不可用]${C_RESET}")"
     else
-        printf "  %-36s %-36s\n" "1. 基础依赖安装" "2. UFW 防火墙管理"
+        printf "  %-36s %-36s\n" "1. 依赖检查与修复" "2. UFW 防火墙管理"
         printf "  %-36s %-36s\n" "3. Fail2ban 入侵防御" "4. SSH 安全配置"
     fi
     echo -e " ${C_CYAN}[ 系统优化 ]${C_RESET}"
@@ -8050,7 +8428,7 @@ main() {
         case $choice in
             1)
                 if [[ "$PLATFORM" == "openwrt" ]]; then
-                    feature_blocked "基础依赖安装 (apt-get)"
+                    feature_blocked "依赖检查与修复 (apt-get)"
                 else
                     menu_update
                 fi
