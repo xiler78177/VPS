@@ -171,28 +171,40 @@ wg_tunnel_setup() {
 
     # 生成 3X-UI 可导入的 JSON 模板
     local xui_template
+    local subid=$(openssl rand -hex 8 2>/dev/null || head -c 16 /dev/urandom | xxd -p)
     # 首先构建内层的 settings (转义JSON)
     local inner_settings=$(jq -n -c \
         --arg uuid "$uuid" \
         --arg flow "${vless_flow}" \
+        --arg subid "$subid" \
         '{
            "clients": [
              {
                "id": $uuid,
+               "security": "",
+               "password": "",
                "flow": $flow,
                "email": "WG-Tunnel",
-               "enable": true,
-               "expiryTime": 0,
                "limitIp": 0,
+               "totalGB": 0,
+               "expiryTime": 0,
+               "enable": true,
+               "tgId": "",
+               "subId": $subid,
+               "comment": "",
                "reset": 0,
-               "totalGB": 0
+               "created_at": 0,
+               "updated_at": 0
              }
            ],
            "decryption": "none",
+           "encryption": "none",
+           "testseed": [ 900, 500, 900, 256 ],
            "fallbacks": []
          }')
     
     # 构建内层的 streamSettings (转义JSON)
+    # 注意 3x-ui 的 realitySettings 中目标字段名为 target
     local inner_stream=$(jq -n -c \
         --arg net "$vless_network" \
         --arg sni "$server_name" \
@@ -206,7 +218,7 @@ wg_tunnel_setup() {
            "realitySettings": {
              "show": false,
              "xver": 0,
-             "dest": $dest,
+             "target": $dest,
              "serverNames": [ $sni ],
              "privateKey": $priv,
              "minClientVer": "",
@@ -237,25 +249,50 @@ wg_tunnel_setup() {
            "routeOnly": false
          }')
 
-    # 包装外层 JSON
+    # 包装外层 JSON (包含 clientStats)
     xui_template=$(jq -n \
         --arg vp "$vless_port" \
+        --arg uuid "$uuid" \
+        --arg subid "$subid" \
         --arg set "$inner_settings" \
         --arg sset "$inner_stream" \
         --arg snif "$inner_sniffing" \
         '{
+           "id": 1,
+           "userId": 0,
            "up": 0,
            "down": 0,
            "total": 0,
+           "allTime": 0,
            "remark": "WG-Tunnel",
            "enable": true,
+           "expiryTime": 0,
+           "trafficReset": "never",
+           "lastTrafficResetTime": 0,
            "listen": "",
            "port": ($vp | tonumber),
            "protocol": "vless",
            "settings": $set,
            "streamSettings": $sset,
            "tag": ("inbound-" + $vp),
-           "sniffing": $snif
+           "sniffing": $snif,
+           "clientStats": [
+             {
+               "id": 1,
+               "inboundId": 1,
+               "enable": true,
+               "email": "WG-Tunnel",
+               "uuid": $uuid,
+               "subId": $subid,
+               "up": 0,
+               "down": 0,
+               "allTime": 0,
+               "expiryTime": 0,
+               "total": 0,
+               "reset": 0,
+               "lastOnline": 0
+             }
+           ]
          }')
 
     # 提供 3X-UI 配置指引
