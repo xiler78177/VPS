@@ -6895,7 +6895,7 @@ wg_generate_clash_config() {
         local vless_net=$(wg_db_get '.server.vless_network // "tcp"')
         local vless_flow=$(wg_db_get '.server.vless_flow // "xtls-rprx-vision"')
 
-        if [[ -z "$vless_uuid" || -z "$reality_pub" ]]; then
+        if [[ -z "$vless_uuid" || "$vless_uuid" == "null" || -z "$reality_pub" || "$reality_pub" == "null" ]]; then
             print_warn "VLESS-Reality 隧道参数不完整，请先配置隧道"
             print_warn "回退为 WG 直连节点"
             all_proxy_yaml+="  - name: \"${primary_name}\"
@@ -7630,28 +7630,24 @@ wg_tunnel_generate_xray_inbound() {
     local uuid
     uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null)
 
-    # 保存到 DB
-    wg_db_set \
-        --arg dt "vless-reality" \
-        --arg vp "$vless_port" \
-        --arg uuid "$uuid" \
-        --arg net "$vless_network" \
-        --arg flow "$vless_flow" \
-        --arg rpub "$reality_public_key" \
-        --arg rpriv "$reality_private_key" \
-        --arg sid "$short_id" \
-        --arg dest "${dest_server}:${dest_port}" \
-        --arg sni "$server_name" \
-    '.server.tunnel_type = $dt |
-     .server.vless_port = ($vp | tonumber) |
-     .server.vless_uuid = $uuid |
-     .server.vless_network = $net |
-     .server.vless_flow = $flow |
-     .server.reality_public_key = $rpub |
-     .server.reality_private_key = $rpriv |
-     .server.reality_short_id = $sid |
-     .server.reality_dest = $dest |
-     .server.reality_sni = $sni'
+    # 分支写入避免 jq 解析过长导致异常或截断
+    wg_db_set --arg dt "vless-reality" '.server.tunnel_type = $dt'
+    wg_db_set --arg vp "$vless_port" '.server.vless_port = ($vp | tonumber)'
+    wg_db_set --arg uuid "$uuid" '.server.vless_uuid = $uuid'
+    wg_db_set --arg net "$vless_network" '.server.vless_network = $net'
+    
+    # flow 可能为空
+    if [[ -n "$vless_flow" ]]; then
+        wg_db_set --arg flow "$vless_flow" '.server.vless_flow = $flow'
+    else
+        wg_db_set '.server.vless_flow = ""'
+    fi
+    
+    wg_db_set --arg rpub "$reality_public_key" '.server.reality_public_key = $rpub'
+    wg_db_set --arg rpriv "$reality_private_key" '.server.reality_private_key = $rpriv'
+    wg_db_set --arg sid "$short_id" '.server.reality_short_id = $sid'
+    wg_db_set --arg dest "${dest_server}:${dest_port}" '.server.reality_dest = $dest'
+    wg_db_set --arg sni "$server_name" '.server.reality_sni = $sni'
 
     # 输出配置摘要
     echo ""
@@ -7819,7 +7815,7 @@ wg_tunnel_generate_client_xray() {
     local sni=$(wg_db_get '.server.reality_sni // empty')
     local wg_port=$(wg_db_get '.server.port')
 
-    if [[ -z "$uuid" || -z "$reality_pub" ]]; then
+    if [[ -z "$uuid" || "$uuid" == "null" || -z "$reality_pub" || "$reality_pub" == "null" ]]; then
         print_error "VLESS-Reality 隧道未配置，请先运行隧道配置"
         return 1
     fi

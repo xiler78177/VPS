@@ -75,7 +75,7 @@ wg_generate_clash_config() {
         local vless_net=$(wg_db_get '.server.vless_network // "tcp"')
         local vless_flow=$(wg_db_get '.server.vless_flow // "xtls-rprx-vision"')
 
-        if [[ -z "$vless_uuid" || -z "$reality_pub" ]]; then
+        if [[ -z "$vless_uuid" || "$vless_uuid" == "null" || -z "$reality_pub" || "$reality_pub" == "null" ]]; then
             print_warn "VLESS-Reality 隧道参数不完整，请先配置隧道"
             print_warn "回退为 WG 直连节点"
             all_proxy_yaml+="  - name: \"${primary_name}\"
