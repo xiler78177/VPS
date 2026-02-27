@@ -6506,7 +6506,7 @@ wg_generate_clash_config() {
 
   - name: \"${primary_name}\"
     type: wireguard
-    server: ${server_endpoint}
+    server: 127.0.0.1
     port: ${server_port}
     dialer-proxy: \"${vless_node_name}\"
     ip: ${peer_ip}
@@ -6596,6 +6596,13 @@ wg_generate_clash_config() {
             fi
                         echo -e "${C_YELLOW}要求: Clash Meta (mihomo) 内核 1.14.0+${C_RESET}"
             echo -e "${C_YELLOW}OpenClash 请在设置中切换到 Meta 内核${C_RESET}"
+            if [[ "$deploy_mode" == "overseas" ]]; then
+                echo -e "${C_YELLOW}[重要！3X-UI 必须放行局域网IP]${C_RESET}"
+                echo -e "  为解决云服务商不支持公网IP回环问题，WireGuard请求已指向 127.0.0.1。"
+                echo -e "  ● 请务必登录 3X-UI 面板 -> 面板设置 -> Xray 设置 -> 路由规则"
+                echo -e "  ● 找到诸如 ${C_CYAN}\"ip\": [\"geoip:private\"]${C_RESET} -> ${C_RED}block${C_RESET} 的规则并${C_CYAN}删除${C_RESET}"
+                echo -e "  否则 3X-UI 会拦截所有去往本机的 WireGuard 流量，导致完全连不上！"
+            fi
             echo ""
             echo -e "${C_YELLOW}[DNS 提示] 如果使用 proxy-providers 订阅，请在 dns.nameserver-policy 中添加:${C_RESET}"
             echo -e "  nameserver-policy:"
