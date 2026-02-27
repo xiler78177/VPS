@@ -3,41 +3,69 @@
 # 替代原有的 udp2raw (Plan B) 方案
 
 # ════════════════════════════════════════════════
-# VLESS-Reality 隧道配置 (手动录入模式)
+# VLESS-Reality 隧道配置
 # ════════════════════════════════════════════════
 
-# 交互式配置 VLESS-Reality 隧道 (需用户先在 3X-UI 面板手动创建入站)
-wg_tunnel_setup() {
-    local wg_port=$1
-    print_title "配置 VLESS-Reality 隧道"
+# 解析 3X-UI 导出的 JSON，提取隧道参数
+# 输入: JSON 字符串 (3X-UI 入站导出格式)
+# 输出: 设置变量 _p_port _p_uuid _p_pub _p_sid _p_sni _p_net _p_flow
+_wg_parse_xui_json() {
+    local json="$1"
 
-    echo -e "${C_CYAN}架构说明:${C_RESET}"
-    echo "  客户端 → VLESS-Reality (伪装TLS) → 本机 xray → WG Server (0.0.0.0:${wg_port})"
-    echo "  GFW 看到的是正常的 TLS 1.3 流量"
-    echo ""
+    # 验证是合法 JSON
+    if ! echo "$json" | jq empty 2>/dev/null; then
+        print_error "JSON 格式无效"
+        return 1
+    fi
 
-    echo -e "${C_YELLOW}请先在您的 3X-UI 面板创建一个包含 Reality 的 VLESS 入站，然后获取以下信息:${C_RESET}"
+    # 提取 port
+    _p_port=$(echo "$json" | jq -r '.port // empty')
 
-    local vless_port vless_uuid reality_pub reality_sid reality_sni vless_net vless_flow
+    # settings 和 streamSettings 可能是嵌套 JSON 字符串，也可能是对象
+    local settings stream
+    settings=$(echo "$json" | jq -r 'if (.settings | type) == "string" then (.settings | fromjson) else .settings end' 2>/dev/null)
+    stream=$(echo "$json" | jq -r 'if (.streamSettings | type) == "string" then (.streamSettings | fromjson) else .streamSettings end' 2>/dev/null)
 
-    while true; do
-        read -e -r -p "VLESS 监听端口 (Port): " vless_port
-        if validate_port "$vless_port"; then break; fi
-        print_warn "端口无效 (1-65535)"
-    done
+    if [[ -z "$settings" || "$settings" == "null" || -z "$stream" || "$stream" == "null" ]]; then
+        print_error "JSON 中缺少 settings 或 streamSettings 字段"
+        return 1
+    fi
 
-    read -e -r -p "客户端 UUID (Client ID): " vless_uuid
-    echo -e "${C_RED}注意: 是 Reality 对应的 Public Key(公钥), 千万不要填 Private Key(私钥)!${C_RESET}"
-    read -e -r -p "Reality 公钥 (Public Key): " reality_pub
-    read -e -r -p "Reality Short ID: " reality_sid
-    read -e -r -p "Reality 伪装 SNI 域名 (如 www.microsoft.com): " reality_sni
-    read -e -r -p "网络传输方式 (如 tcp / grpc) [tcp]: " vless_net
-    vless_net=${vless_net:-tcp}
-    read -e -r -p "Flow 控制项 [xtls-rprx-vision]: " vless_flow
-    [[ -z "$vless_flow" ]] && vless_flow="xtls-rprx-vision"
-    [[ "$vless_flow" == "none" || "$vless_flow" == "null" ]] && vless_flow=""
+    # 从 settings 提取 UUID 和 flow
+    _p_uuid=$(echo "$settings" | jq -r '.clients[0].id // empty')
+    _p_flow=$(echo "$settings" | jq -r '.clients[0].flow // empty')
 
-    # 写入数据库
+    # 从 streamSettings 提取 reality 参数
+    _p_net=$(echo "$stream" | jq -r '.network // "tcp"')
+    local reality
+    reality=$(echo "$stream" | jq -r '.realitySettings // empty')
+    if [[ -z "$reality" || "$reality" == "null" ]]; then
+        print_error "JSON 中未找到 realitySettings (不是 Reality 入站?)"
+        return 1
+    fi
+
+    _p_sni=$(echo "$reality" | jq -r '.serverNames[0] // empty')
+    _p_sid=$(echo "$reality" | jq -r '.shortIds[0] // empty')
+    # 公钥在 realitySettings.settings.publicKey 中
+    _p_pub=$(echo "$reality" | jq -r '.settings.publicKey // empty')
+    # privateKey 在导出 JSON 里存在，但我们只需要 publicKey 给客户端
+    # 如果 publicKey 为空，提示用户手动补充
+    local priv_key
+    priv_key=$(echo "$reality" | jq -r '.privateKey // empty')
+
+    # dest 格式一般是 "domain:port"
+    local dest
+    dest=$(echo "$reality" | jq -r '.target // empty')
+    [[ -z "$_p_sni" && -n "$dest" ]] && _p_sni="${dest%%:*}"
+
+    return 0
+}
+
+# 将隧道参数写入数据库
+_wg_save_tunnel_params() {
+    local vless_port="$1" vless_uuid="$2" reality_pub="$3" reality_sid="$4"
+    local reality_sni="$5" vless_net="$6" vless_flow="$7"
+
     wg_db_set --arg dt "vless-reality" '.server.tunnel_type = $dt'
     wg_db_set --arg vp "$vless_port" '.server.vless_port = ($vp | tonumber)'
     wg_db_set --arg uuid "$vless_uuid" '.server.vless_uuid = $uuid'
@@ -52,15 +80,138 @@ wg_tunnel_setup() {
     wg_db_set --arg sid "$reality_sid" '.server.reality_short_id = $sid'
     wg_db_set --arg sni "$reality_sni" '.server.reality_sni = $sni'
     wg_db_set --arg dest "${reality_sni}:443" '.server.reality_dest = $dest'
+}
 
-    print_success "VLESS-Reality 参数录入完成！您现在的节点已经与远端配置对齐了。"
+# 交互式配置 VLESS-Reality 隧道
+wg_tunnel_setup() {
+    local wg_port=$1
+    print_title "配置 VLESS-Reality 隧道"
 
+    echo -e "${C_CYAN}架构说明:${C_RESET}"
+    echo "  客户端 → VLESS-Reality (伪装TLS) → 本机 xray → WG Server (0.0.0.0:${wg_port})"
+    echo "  GFW 看到的是正常的 TLS 1.3 流量"
     echo ""
-    read -e -r -p "是否立即生成 Clash/mihomo 客户端配置? [Y/n]: " _gen_clash
-    _gen_clash=${_gen_clash:-Y}
-    if [[ "$_gen_clash" =~ ^[Yy]$ ]]; then
-        wg_generate_clash_config
+
+    echo -e "${C_YELLOW}请选择配置方式:${C_RESET}"
+    echo "  1. 粘贴 3X-UI 导出的 JSON 自动解析 (推荐)"
+    echo "  2. 手动逐项输入参数"
+    local setup_mode
+    read -e -r -p "选择 [1]: " setup_mode
+    setup_mode=${setup_mode:-1}
+
+    if [[ "$setup_mode" == "1" ]]; then
+        # ── 模式 1: 粘贴 JSON 自动解析 ──
+        echo ""
+        echo -e "${C_CYAN}请从 3X-UI 面板导出入站 JSON，然后粘贴到下方:${C_RESET}"
+        echo -e "${C_YELLOW}(提示: 3X-UI → 入站列表 → 对应入站右侧 ⋮ → 导出 → 复制 JSON)${C_RESET}"
+        echo -e "${C_YELLOW}粘贴后系统会自动识别。若无响应，请在新的一行输入 EOF 结束:${C_RESET}"
+        
+        local raw_json=""
+        local line
+        while IFS= read -r line; do
+            [[ "$line" == "EOF" ]] && break
+            raw_json="${raw_json}${line}"$'\n'
+            # 尝试解析，如果是完整的 JSON 则退出循环
+            if echo "$raw_json" | jq empty 2>/dev/null; then
+                break
+            fi
+        done
+        
+        # 清空输入缓冲区中可能的残留回车或多余字符
+        while read -t 0.1 -r _discard; do :; done
+
+        if [[ -z "$(echo "$raw_json" | tr -d ' \n')" ]]; then
+            print_error "未输入任何内容"
+            return 1
+        fi
+
+        # 解析 JSON
+        local _p_port _p_uuid _p_pub _p_sid _p_sni _p_net _p_flow
+        if ! _wg_parse_xui_json "$raw_json"; then
+            print_error "JSON 解析失败，请检查粘贴的内容是否完整"
+            return 1
+        fi
+
+        # 验证关键字段
+        if [[ -z "$_p_port" || -z "$_p_uuid" ]]; then
+            print_error "JSON 中缺少端口或 UUID 信息"
+            return 1
+        fi
+
+        # 显示解析结果供确认
+        echo ""
+        print_success "JSON 解析成功，提取到以下参数:"
+        draw_line
+        echo -e "  VLESS 端口:  ${C_CYAN}${_p_port}${C_RESET}"
+        echo -e "  UUID:        ${C_CYAN}${_p_uuid}${C_RESET}"
+        echo -e "  传输方式:    ${C_CYAN}${_p_net}${C_RESET}"
+        echo -e "  Flow:        ${C_CYAN}${_p_flow:-（无）}${C_RESET}"
+        echo -e "  Reality SNI: ${C_CYAN}${_p_sni:-（未提取到）}${C_RESET}"
+        echo -e "  Short ID:    ${C_CYAN}${_p_sid:-（未提取到）}${C_RESET}"
+        echo -e "  Public Key:  ${C_CYAN}${_p_pub:-${C_RED}（空，需手动补充）}${C_RESET}"
+        draw_line
+
+        # Public Key 在导出 JSON 中通常为空（属于客户端侧参数），需要手动补充
+        if [[ -z "$_p_pub" ]]; then
+            echo -e "${C_RED}注意: 3X-UI 导出 JSON 中通常不包含 Public Key (公钥)${C_RESET}"
+            echo -e "${C_YELLOW}请从 3X-UI 面板的 Reality 设置中复制 Public Key:${C_RESET}"
+            read -e -r -p "Reality 公钥 (Public Key): " _p_pub
+            if [[ -z "$_p_pub" ]]; then
+                print_error "Public Key 不能为空"
+                return 1
+            fi
+        fi
+
+        # SNI 为空时补充
+        if [[ -z "$_p_sni" ]]; then
+            read -e -r -p "Reality 伪装 SNI 域名 (如 www.microsoft.com): " _p_sni
+        fi
+
+        # Short ID 为空时补充
+        if [[ -z "$_p_sid" ]]; then
+            read -e -r -p "Reality Short ID: " _p_sid
+        fi
+
+        # 确认并保存
+        echo ""
+        read -e -r -p "确认使用以上参数? [Y/n]: " _confirm
+        _confirm=${_confirm:-Y}
+        if [[ ! "$_confirm" =~ ^[Yy]$ ]]; then
+            print_warn "已取消"
+            return 0
+        fi
+
+        _wg_save_tunnel_params "$_p_port" "$_p_uuid" "$_p_pub" "$_p_sid" "$_p_sni" "$_p_net" "$_p_flow"
+        print_success "VLESS-Reality 参数已从 JSON 导入完成！"
+
+    else
+        # ── 模式 2: 手动逐项输入 ──
+        echo ""
+        echo -e "${C_YELLOW}请先在您的 3X-UI 面板创建一个包含 Reality 的 VLESS 入站，然后获取以下信息:${C_RESET}"
+
+        local vless_port vless_uuid reality_pub reality_sid reality_sni vless_net vless_flow
+
+        while true; do
+            read -e -r -p "VLESS 监听端口 (Port): " vless_port
+            if validate_port "$vless_port"; then break; fi
+            print_warn "端口无效 (1-65535)"
+        done
+
+        read -e -r -p "客户端 UUID (Client ID): " vless_uuid
+        echo -e "${C_RED}注意: 是 Reality 对应的 Public Key(公钥), 千万不要填 Private Key(私钥)!${C_RESET}"
+        read -e -r -p "Reality 公钥 (Public Key): " reality_pub
+        read -e -r -p "Reality Short ID: " reality_sid
+        read -e -r -p "Reality 伪装 SNI 域名 (如 www.microsoft.com): " reality_sni
+        read -e -r -p "网络传输方式 (如 tcp / grpc) [tcp]: " vless_net
+        vless_net=${vless_net:-tcp}
+        read -e -r -p "Flow 控制项 [xtls-rprx-vision]: " vless_flow
+        [[ -z "$vless_flow" ]] && vless_flow="xtls-rprx-vision"
+        [[ "$vless_flow" == "none" || "$vless_flow" == "null" ]] && vless_flow=""
+
+        _wg_save_tunnel_params "$vless_port" "$vless_uuid" "$reality_pub" "$reality_sid" "$reality_sni" "$vless_net" "$vless_flow"
+        print_success "VLESS-Reality 参数录入完成！"
     fi
+
 }
 
 # 生成客户端 xray 配置 (用于连接 VLESS-Reality 隧道)
