@@ -53,8 +53,8 @@ wg_tunnel_generate_xray_inbound() {
 
     local reality_private_key="" reality_public_key=""
     if [[ -n "$reality_keys" ]]; then
-        reality_private_key=$(echo "$reality_keys" | grep 'Private' | awk '{print $NF}')
-        reality_public_key=$(echo "$reality_keys" | grep 'Public' | awk '{print $NF}')
+        reality_private_key=$(echo "$reality_keys" | grep -iE 'Private( )?Key' | awk '{print $NF}')
+        reality_public_key=$(echo "$reality_keys" | grep -iE 'Public( )?Key|Password' | awk '{print $NF}')
     fi
 
     # 生成 shortId
