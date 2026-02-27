@@ -166,10 +166,10 @@ wg_tunnel_setup() {
     wg_tunnel_generate_xray_inbound "$wg_port" "$vless_port" "$vless_network" "$vless_flow" "$dest_server" "$dest_port"
 
     # 生成 3X-UI 可导入的 JSON 模板: 需先从数据库中重新提取生成的关键参数
-    local uuid=$(wg_db_get '.server.vless_uuid')
-    local reality_private_key=$(wg_db_get '.server.reality_private_key')
-    local short_id=$(wg_db_get '.server.reality_short_id')
-    local server_name=$(wg_db_get '.server.reality_sni')
+    local uuid=$(wg_db_get '.server.vless_uuid' | tr -d '"')
+    local reality_private_key=$(wg_db_get '.server.reality_private_key' | tr -d '"')
+    local short_id=$(wg_db_get '.server.reality_short_id' | tr -d '"')
+    local server_name=$(wg_db_get '.server.reality_sni' | tr -d '"')
     local c_time=$(date +%s000)
 
     local subid
