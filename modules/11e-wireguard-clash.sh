@@ -38,12 +38,14 @@ wg_generate_clash_config() {
     local server_dns=$(wg_db_get '.server.dns' | cut -d',' -f1 | xargs)
     local mask=$(echo "$server_subnet" | cut -d'/' -f2)
 
-    # 收集所有 VPN 路由网段
+    # 收集所有 VPN 路由网段 (含服务端 LAN)
     local vpn_cidrs=("$server_subnet")
+    local server_lan=$(wg_db_get '.server.server_lan_subnet // empty')
+    [[ -n "$server_lan" && "$server_lan" != "null" ]] && vpn_cidrs+=("$server_lan")
     local pi=0
     while [[ $pi -lt $peer_count ]]; do
         local pls=$(wg_db_get ".peers[$pi].lan_subnets // empty")
-        if [[ -n "$pls" ]]; then
+        if [[ -n "$pls" && "$pls" != "null" ]]; then
             local IFS_BAK="$IFS"; IFS=','
             for cidr in $pls; do
                 cidr=$(echo "$cidr" | xargs)
@@ -59,80 +61,13 @@ wg_generate_clash_config() {
     # ── 构建 proxy 节点列表 ──
     local all_proxy_names=()
     local all_proxy_yaml=""
-    local deploy_mode=$(wg_db_get '.server.deploy_mode // "domestic"')
 
     # 主机节点
     local primary_name="WG-$(wg_get_server_name)"
     all_proxy_names+=("$primary_name")
 
-    if [[ "$deploy_mode" == "overseas" ]]; then
-        # 境外模式: 生成 VLESS-Reality 节点 (WG 流量通过 VLESS 隧道承载)
-        local vless_port=$(wg_db_get '.server.vless_port // empty')
-        local vless_uuid=$(wg_db_get '.server.vless_uuid // empty')
-        local reality_pub=$(wg_db_get '.server.reality_public_key // empty')
-        local reality_sid=$(wg_db_get '.server.reality_short_id // empty')
-        local reality_sni=$(wg_db_get '.server.reality_sni // empty')
-        local vless_net=$(wg_db_get '.server.vless_network // "tcp"')
-        local vless_flow=$(wg_db_get '.server.vless_flow // "xtls-rprx-vision"')
-
-        if [[ -z "$vless_uuid" || "$vless_uuid" == "null" || -z "$reality_pub" || "$reality_pub" == "null" ]]; then
-            print_warn "VLESS-Reality 隧道参数不完整，请先配置隧道"
-            print_warn "回退为 WG 直连节点"
-            all_proxy_yaml+="  - name: \"${primary_name}\"
-    type: wireguard
-    server: ${server_endpoint}
-    port: ${server_port}
-    ip: ${peer_ip}
-    private-key: \"${peer_privkey}\"
-    public-key: \"${server_pubkey}\"
-    pre-shared-key: \"${peer_psk}\"
-    reserved: [0, 0, 0]
-    udp: true
-    mtu: 1280
-    remote-dns-resolve: false
-    dns:
-      - ${server_dns}
-"
-        else
-            local vless_node_name="${primary_name}-VLESS"
-            all_proxy_yaml+="  - name: \"${vless_node_name}\"
-    type: vless
-    server: ${server_endpoint}
-    port: ${vless_port}
-    uuid: ${vless_uuid}
-    network: ${vless_net}
-    tls: true
-    udp: true
-"
-            [[ -n "$vless_flow" ]] && all_proxy_yaml+="    flow: ${vless_flow}
-"
-            all_proxy_yaml+="    servername: ${reality_sni}
-    reality-opts:
-      public-key: ${reality_pub}
-      short-id: ${reality_sid}
-    client-fingerprint: chrome
-
-  - name: \"${primary_name}\"
-    type: wireguard
-    server: 127.0.0.1
-    port: ${server_port}
-    dialer-proxy: \"${vless_node_name}\"
-    ip: ${peer_ip}
-    private-key: \"${peer_privkey}\"
-    public-key: \"${server_pubkey}\"
-    pre-shared-key: \"${peer_psk}\"
-    reserved: [0, 0, 0]
-    udp: true
-    mtu: 1280
-    remote-dns-resolve: false
-    dns:
-      - ${server_dns}
-"
-        fi
-    else
-        # 境内模式: 标准 WG 直连节点
-        local mtu=$(wg_db_get '.server.mtu // 1420')
-        all_proxy_yaml+="  - name: \"${primary_name}\"
+    local mtu=$(wg_db_get '.server.mtu // 1420')
+    all_proxy_yaml+="  - name: \"${primary_name}\"
     type: wireguard
     server: ${server_endpoint}
     port: ${server_port}
@@ -147,7 +82,6 @@ wg_generate_clash_config() {
     dns:
       - ${server_dns}
 "
-    fi
 
     # ── 构建 proxy-group ──
     local group_name="WireGuard-VPN"
@@ -202,15 +136,8 @@ wg_generate_clash_config() {
                 echo "  • 服务器 Endpoint 全部走 DIRECT 防止死循环
 "
             fi
-                        echo -e "${C_YELLOW}要求: Clash Meta (mihomo) 内核 1.14.0+${C_RESET}"
+            echo -e "${C_YELLOW}要求: Clash Meta (mihomo) 内核 1.14.0+${C_RESET}"
             echo -e "${C_YELLOW}OpenClash 请在设置中切换到 Meta 内核${C_RESET}"
-            if [[ "$deploy_mode" == "overseas" ]]; then
-                echo -e "${C_YELLOW}[重要！3X-UI 必须放行局域网IP]${C_RESET}"
-                echo -e "  为解决云服务商不支持公网IP回环问题，WireGuard请求已指向 127.0.0.1。"
-                echo -e "  ● 请务必登录 3X-UI 面板 -> 面板设置 -> Xray 设置 -> 路由规则"
-                echo -e "  ● 找到诸如 ${C_CYAN}\"ip\": [\"geoip:private\"]${C_RESET} -> ${C_RED}block${C_RESET} 的规则并${C_CYAN}删除${C_RESET}"
-                echo -e "  否则 3X-UI 会拦截所有去往本机的 WireGuard 流量，导致完全连不上！"
-            fi
             echo ""
             echo -e "${C_YELLOW}[DNS 提示] 如果使用 proxy-providers 订阅，请在 dns.nameserver-policy 中添加:${C_RESET}"
             echo -e "  nameserver-policy:"

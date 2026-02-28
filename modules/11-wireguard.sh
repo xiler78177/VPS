@@ -1,12 +1,11 @@
-# modules/11-wireguard.sh - WireGuard 完整模块
+# modules/11-wireguard.sh - WireGuard 完整模块 (OpenWrt 专用)
 # Sub-modules (loaded via build.sh concatenation):
-#   11a -> netcheck (部署模式选择: domestic/overseas)
+#   11a -> OpenWrt 环境兼容性检测
 #   11  -> constants + db + utilities (this file)
 #   11c -> server install/control/uninstall
 #   11d -> peer management
 #   11e -> Clash/OpenClash config
 #   11g -> watchdog + import/export + menus
-#   11b -> VLESS-Reality tunnel (境外模式)
 readonly WG_INTERFACE="wg0"
 readonly WG_DB_DIR="/etc/wireguard/db"
 readonly WG_DB_FILE="${WG_DB_DIR}/wg-data.json"
@@ -25,6 +24,40 @@ wg_db_init() {
 }
 WGEOF
     chmod 600 "$WG_DB_FILE"
+}
+
+wg_db_migrate() {
+    [[ ! -f "$WG_DB_FILE" ]] && return 0
+    local ver
+    ver=$(wg_db_get '.schema_version // 0')
+    [[ "$ver" -ge 2 ]] && return 0
+    print_info "数据库迁移: v${ver} → v2 ..."
+    # 删除 overseas 相关字段
+    wg_db_set 'del(.server.deploy_mode, .server.tunnel_type,
+        .server.vless_port, .server.vless_uuid, .server.vless_network,
+        .server.vless_flow, .server.reality_public_key,
+        .server.reality_private_key, .server.reality_short_id,
+        .server.reality_sni, .server.reality_dest)' 2>/dev/null || true
+    # 为每个 peer 补充 peer_type
+    local pc i=0
+    pc=$(wg_db_get '.peers | length')
+    while [[ $i -lt ${pc:-0} ]]; do
+        local existing_type
+        existing_type=$(wg_db_get ".peers[$i].peer_type // empty")
+        if [[ -z "$existing_type" || "$existing_type" == "null" ]]; then
+            local is_gw
+            is_gw=$(wg_db_get ".peers[$i].is_gateway // false")
+            if [[ "$is_gw" == "true" ]]; then
+                wg_db_set --argjson idx "$i" '.peers[$idx].peer_type = "gateway"'
+            else
+                wg_db_set --argjson idx "$i" '.peers[$idx].peer_type = "standard"'
+            fi
+        fi
+        i=$((i + 1))
+    done
+    # 设置版本号
+    wg_db_set '.schema_version = 2'
+    print_success "数据库迁移完成"
 }
 
 wg_db_get() { jq -r "$@" "$WG_DB_FILE" 2>/dev/null; }
@@ -154,17 +187,17 @@ wg_select_peer() {
 
 wg_install_packages() {
     print_info "安装 WireGuard 软件包..."
-    if [[ "$PLATFORM" == "openwrt" ]]; then
-        opkg update >/dev/null 2>&1
-        for pkg in wireguard-tools qrencode; do
-            install_package "$pkg" "silent" || { print_error "安装 $pkg 失败"; return 1; }
-        done
-    else
-        update_apt_cache
-        for pkg in wireguard wireguard-tools qrencode; do
-            install_package "$pkg" "silent" || { print_error "安装 $pkg 失败"; return 1; }
-        done
-    fi
+    opkg update >/dev/null 2>&1
+    local essential_pkgs=(wireguard-tools kmod-wireguard luci-proto-wireguard jq)
+    local optional_pkgs=(qrencode)
+    for pkg in "${essential_pkgs[@]}"; do
+        install_package "$pkg" "silent" || { print_error "安装 $pkg 失败"; return 1; }
+    done
+    for pkg in "${optional_pkgs[@]}"; do
+        install_package "$pkg" "silent" || print_warn "安装 $pkg 失败（不影响核心功能）"
+    done
+    # 重启 rpcd 使 LuCI 识别 wireguard 协议
+    /etc/init.d/rpcd restart 2>/dev/null || true
     print_success "软件包安装完成"
     return 0
 }
@@ -196,52 +229,115 @@ wg_format_bytes() {
 }
 
 
-wg_rebuild_conf() {
+wg_rebuild_uci_conf() {
     [[ "$(wg_get_role)" != "server" ]] && return 1
-    local priv_key port subnet server_ip mask main_iface
+    local priv_key port subnet server_ip mask mtu
     priv_key=$(wg_db_get '.server.private_key')
     port=$(wg_db_get '.server.port')
     subnet=$(wg_db_get '.server.subnet')
     server_ip=$(wg_db_get '.server.ip')
-    # 关键字段校验
     if [[ -z "$priv_key" || -z "$port" || -z "$subnet" || -z "$server_ip" ]]; then
         print_error "WireGuard 数据库关键字段缺失，无法生成配置"
-        log_action "wg_rebuild_conf failed: missing fields (key=${#priv_key} port=$port subnet=$subnet ip=$server_ip)" "ERROR"
         return 1
     fi
     mask=$(echo "$subnet" | cut -d'/' -f2)
-    main_iface=$(ip route show default | awk '{print $5; exit}')
-    if [[ -z "$main_iface" ]]; then
-        print_warn "未检测到默认网关接口，NAT 转发可能无法工作"
-        main_iface="eth0"
-    fi
-    local listen_addr mtu deploy_mode
-    deploy_mode=$(wg_db_get '.server.deploy_mode // "domestic"')
-    listen_addr=$(wg_db_get '.server.listen_address // "0.0.0.0"')
     mtu=$(wg_db_get '.server.mtu // empty')
-    [[ -z "$mtu" || "$mtu" == "null" ]] && {
-        [[ "$deploy_mode" == "overseas" ]] && mtu=$WG_MTU_TUNNEL || mtu=$WG_MTU_DIRECT
-    }
+    [[ -z "$mtu" || "$mtu" == "null" ]] && mtu=$WG_MTU_DIRECT
+
+    # --- 清除旧 uci peer 条目 ---
+    while uci -q get network.@wireguard_wg0[0] >/dev/null 2>&1; do
+        uci delete network.@wireguard_wg0[0]
+    done
+
+    # --- 设置 wg0 接口基本参数 ---
+    uci set network.wg0=interface
+    uci set network.wg0.proto='wireguard'
+    uci set network.wg0.private_key="$priv_key"
+    uci -q delete network.wg0.addresses 2>/dev/null
+    uci add_list network.wg0.addresses="${server_ip}/${mask}"
+    uci set network.wg0.listen_port="$port"
+    uci set network.wg0.mtu="$mtu"
+
+    # --- 遍历 enabled peers，创建 uci wireguard_wg0 section ---
+    local pc=$(wg_db_get '.peers | length') i=0
+    while [[ $i -lt $pc ]]; do
+        if [[ "$(wg_db_get ".peers[$i].enabled")" == "true" ]]; then
+            local peer_name=$(wg_db_get ".peers[$i].name")
+            local pub_key=$(wg_db_get ".peers[$i].public_key")
+            local psk=$(wg_db_get ".peers[$i].preshared_key")
+            local peer_ip=$(wg_db_get ".peers[$i].ip")
+            local is_gw=$(wg_db_get ".peers[$i].is_gateway // false")
+            local lan_sub=$(wg_db_get ".peers[$i].lan_subnets // empty")
+
+            uci add network wireguard_wg0 >/dev/null
+            local idx_uci
+            # 获取刚添加的 section 索引（最后一个）
+            idx_uci=$(( $(uci show network | grep -c 'wireguard_wg0') / 5 - 1 ))
+            [[ $idx_uci -lt 0 ]] && idx_uci=0
+
+            uci set network.@wireguard_wg0[-1].description="$peer_name"
+            uci set network.@wireguard_wg0[-1].public_key="$pub_key"
+            uci set network.@wireguard_wg0[-1].preshared_key="$psk"
+            uci set network.@wireguard_wg0[-1].persistent_keepalive='25'
+
+            # AllowedIPs
+            uci -q delete network.@wireguard_wg0[-1].allowed_ips 2>/dev/null
+            uci add_list network.@wireguard_wg0[-1].allowed_ips="${peer_ip}/32"
+            if [[ "$is_gw" == "true" && -n "$lan_sub" && "$lan_sub" != "null" ]]; then
+                local IFS=','
+                for sub in $lan_sub; do
+                    sub=$(echo "$sub" | xargs)
+                    [[ -n "$sub" ]] && uci add_list network.@wireguard_wg0[-1].allowed_ips="$sub"
+                done
+                unset IFS
+            fi
+        fi
+        i=$((i + 1))
+    done
+
+    uci commit network
+
+    # --- 如果 wg0 正在运行，热重载配置 ---
+    if wg_is_running; then
+        ifdown wg0 2>/dev/null
+        sleep 1
+        ifup wg0 2>/dev/null
+    fi
+}
+
+# 生成 wg0.conf 只读快照（供导出/备份/查看用，不用于运行）
+wg_rebuild_conf() {
+    [[ "$(wg_get_role)" != "server" ]] && return 1
+    local priv_key port subnet server_ip mask mtu
+    priv_key=$(wg_db_get '.server.private_key')
+    port=$(wg_db_get '.server.port')
+    subnet=$(wg_db_get '.server.subnet')
+    server_ip=$(wg_db_get '.server.ip')
+    if [[ -z "$priv_key" || -z "$port" || -z "$subnet" || -z "$server_ip" ]]; then
+        print_error "WireGuard 数据库关键字段缺失，无法生成配置"
+        log_action "wg_rebuild_conf failed: missing fields" "ERROR"
+        return 1
+    fi
+    mask=$(echo "$subnet" | cut -d'/' -f2)
+    mtu=$(wg_db_get '.server.mtu // empty')
+    [[ -z "$mtu" || "$mtu" == "null" ]] && mtu=$WG_MTU_DIRECT
     {
         echo "[Interface]"
         echo "PrivateKey = ${priv_key}"
         echo "Address = ${server_ip}/${mask}"
         echo "ListenPort = ${port}"
         echo "MTU = ${mtu}"
-        # 境外模式仅监听本地回环
-        [[ "$deploy_mode" == "overseas" ]] && echo "# deploy_mode=overseas: listen on localhost only"
-        echo "PostUp = iptables -C FORWARD -i %i -j ACCEPT 2>/dev/null || iptables -A FORWARD -i %i -j ACCEPT; iptables -C FORWARD -o %i -j ACCEPT 2>/dev/null || iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -C POSTROUTING -s ${subnet} -o ${main_iface} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s ${subnet} -o ${main_iface} -j MASQUERADE"
-        echo "PostDown = iptables -D FORWARD -i %i -j ACCEPT 2>/dev/null; iptables -D FORWARD -o %i -j ACCEPT 2>/dev/null; iptables -t nat -D POSTROUTING -s ${subnet} -o ${main_iface} -j MASQUERADE 2>/dev/null"
         local pc=$(wg_db_get '.peers | length') i=0
         while [[ $i -lt $pc ]]; do
             if [[ "$(wg_db_get ".peers[$i].enabled")" == "true" ]]; then
+                echo ""
                 echo "[Peer]"
                 echo "PublicKey = $(wg_db_get ".peers[$i].public_key")"
                 echo "PresharedKey = $(wg_db_get ".peers[$i].preshared_key")"
                 local peer_ip=$(wg_db_get ".peers[$i].ip")
                 local is_gw=$(wg_db_get ".peers[$i].is_gateway // false")
                 local lan_sub=$(wg_db_get ".peers[$i].lan_subnets // empty")
-                if [[ "$is_gw" == "true" && -n "$lan_sub" ]]; then
+                if [[ "$is_gw" == "true" && -n "$lan_sub" && "$lan_sub" != "null" ]]; then
                     echo "AllowedIPs = ${peer_ip}/32, ${lan_sub}"
                 else
                     echo "AllowedIPs = ${peer_ip}/32"
@@ -256,17 +352,14 @@ wg_rebuild_conf() {
 wg_regenerate_client_confs() {
     local pc=$(wg_db_get '.peers | length')
     [[ "$pc" -eq 0 ]] && return
-    local spub sep sport sdns mask mtu deploy_mode
+    local spub sep sport sdns mask mtu
     spub=$(wg_db_get '.server.public_key')
     sep=$(wg_db_get '.server.endpoint')
     sport=$(wg_db_get '.server.port')
     sdns=$(wg_db_get '.server.dns')
     mask=$(echo "$(wg_db_get '.server.subnet')" | cut -d'/' -f2)
-    deploy_mode=$(wg_db_get '.server.deploy_mode // "domestic"')
     mtu=$(wg_db_get '.server.mtu // empty')
-    [[ -z "$mtu" || "$mtu" == "null" ]] && {
-        [[ "$deploy_mode" == "overseas" ]] && mtu=$WG_MTU_TUNNEL || mtu=$WG_MTU_DIRECT
-    }
+    [[ -z "$mtu" || "$mtu" == "null" ]] && mtu=$WG_MTU_DIRECT
     mkdir -p /etc/wireguard/clients
     local i=0
     while [[ $i -lt $pc ]]; do

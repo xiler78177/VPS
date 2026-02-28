@@ -10,7 +10,6 @@ readonly CACHE_TTL=300
 readonly CERT_HOOKS_DIR="/root/cert-hooks"
 readonly WG_DEFAULT_PORT=50000
 readonly WG_MTU_DIRECT=1420
-readonly WG_MTU_TUNNEL=1280
 readonly BACKUP_LOCAL_DIR="/root/${SCRIPT_NAME}-backups"
 readonly BACKUP_CONFIG_FILE="/etc/${SCRIPT_NAME}-backup.conf"
 PLATFORM="debian"
@@ -4376,10 +4375,6 @@ menu_docker() {
         esac
     done
 }
-# 替代原有的自动网络检测，改为用户交互式选择部署场景
-
-# 部署模式全局变量: domestic=境内直连, overseas=境外隧道
-WG_DEPLOY_MODE=""
 
 # 判断一个 IPv4 是否属于私有/CGNAT 地址段
 _wg_is_private_ip() {
@@ -4419,86 +4414,169 @@ wg_check_public_ip() {
     $found_public && return 0 || return 1
 }
 
-# 检测 3X-UI 是否已安装并运行
-wg_check_xui_installed() {
-    if [[ -f /usr/local/x-ui/x-ui ]] || systemctl is-active --quiet x-ui 2>/dev/null; then
-        return 0
-    fi
-    if [[ -f /etc/x-ui/x-ui.db ]]; then
-        return 0
-    fi
-    return 1
-}
-
-# 交互式部署模式选择
-# 设置 WG_DEPLOY_MODE: domestic (境内) 或 overseas (境外)
-# 返回 0 = 允许继续安装，返回 1 = 用户取消
-wg_select_deploy_mode() {
-    echo -e "\n${C_CYAN}[部署模式选择]${C_RESET}"
+# OpenWrt 环境兼容性全面检测
+# 返回 0 = 全部通过，返回 1 = 有致命项失败
+wg_check_openwrt_compat() {
+    echo -e "\n${C_CYAN}[OpenWrt 环境兼容性检测]${C_RESET}"
     draw_line
-    echo -e "  ${C_CYAN}检测本机网络环境...${C_RESET}"
+
+    local fatal=0 warn=0
+
+    # ── [必须] 平台确认 ──
+    if [[ "$PLATFORM" == "openwrt" ]]; then
+        echo -e "  ${C_GREEN}[OK]${C_RESET}   平台: OpenWrt"
+    else
+        echo -e "  ${C_RED}[FAIL]${C_RESET} 平台: ${PLATFORM} (当前仅支持 OpenWrt)"
+        fatal=$((fatal + 1))
+    fi
+
+    # ── [信息] 发行版详情 ──
+    if [[ -f /etc/openwrt_release ]]; then
+        local distro version
+        distro=$(grep 'DISTRIB_DESCRIPTION' /etc/openwrt_release 2>/dev/null | cut -d"'" -f2)
+        version=$(grep 'DISTRIB_RELEASE' /etc/openwrt_release 2>/dev/null | cut -d"'" -f2)
+        echo -e "  ${C_CYAN}[INFO]${C_RESET} 发行版: ${distro:-未知}"
+        echo -e "  ${C_CYAN}[INFO]${C_RESET} 版本号: ${version:-未知}"
+    else
+        echo -e "  ${C_YELLOW}[WARN]${C_RESET} 未找到 /etc/openwrt_release"
+        warn=$((warn + 1))
+    fi
+
+    # ── [必须] opkg 包管理器 ──
+    if command -v opkg &>/dev/null; then
+        echo -e "  ${C_GREEN}[OK]${C_RESET}   opkg 包管理器可用"
+    else
+        echo -e "  ${C_RED}[FAIL]${C_RESET} opkg 不可用 (无法安装软件包)"
+        fatal=$((fatal + 1))
+    fi
+
+    # ── [必须] uci 命令 ──
+    if command -v uci &>/dev/null; then
+        echo -e "  ${C_GREEN}[OK]${C_RESET}   uci 配置系统可用"
+    else
+        echo -e "  ${C_RED}[FAIL]${C_RESET} uci 不可用 (无法管理网络/防火墙配置)"
+        fatal=$((fatal + 1))
+    fi
+
+    # ── [必须] nft 命令 + 权限 ──
+    if command -v nft &>/dev/null; then
+        if nft list tables &>/dev/null; then
+            echo -e "  ${C_GREEN}[OK]${C_RESET}   nftables 可用且有权限"
+        else
+            echo -e "  ${C_RED}[FAIL]${C_RESET} nft 命令存在但无执行权限 (需要 root)"
+            fatal=$((fatal + 1))
+        fi
+    else
+        echo -e "  ${C_RED}[FAIL]${C_RESET} nft 不可用 (防火墙规则依赖 nftables)"
+        fatal=$((fatal + 1))
+    fi
+
+    # ── [检测] fw4 mangle_prerouting 链 ──
+    if nft list chain inet fw4 mangle_prerouting &>/dev/null; then
+        echo -e "  ${C_GREEN}[OK]${C_RESET}   fw4 mangle_prerouting 链存在"
+    else
+        echo -e "  ${C_YELLOW}[WARN]${C_RESET} fw4 mangle_prerouting 链不存在 (Mihomo bypass 将在其运行后自动配置)"
+        warn=$((warn + 1))
+    fi
+
+    # ── [检测] 内核 WireGuard 支持 ──
+    local wg_kernel=false
+    if [[ -d /sys/module/wireguard ]]; then
+        echo -e "  ${C_GREEN}[OK]${C_RESET}   内核 WireGuard 模块已加载"
+        wg_kernel=true
+    elif lsmod 2>/dev/null | grep -q wireguard; then
+        echo -e "  ${C_GREEN}[OK]${C_RESET}   内核 WireGuard 模块已加载"
+        wg_kernel=true
+    fi
+    if [[ "$wg_kernel" != "true" ]]; then
+        # 尝试检测是否可安装
+        if opkg list 2>/dev/null | grep -q 'kmod-wireguard'; then
+            echo -e "  ${C_YELLOW}[WARN]${C_RESET} 内核 WireGuard 模块未加载 (kmod-wireguard 可从 feeds 安装)"
+            warn=$((warn + 1))
+        elif opkg list-installed 2>/dev/null | grep -q 'kmod-wireguard'; then
+            echo -e "  ${C_YELLOW}[WARN]${C_RESET} kmod-wireguard 已安装但模块未加载 (可能需要重启)"
+            warn=$((warn + 1))
+        else
+            echo -e "  ${C_RED}[FAIL]${C_RESET} 内核不支持 WireGuard 且 kmod-wireguard 不在可用包列表中"
+            echo -e "         可能的原因: 自定义固件未编译 WireGuard 支持或 feeds 不匹配"
+            fatal=$((fatal + 1))
+        fi
+    fi
+
+    # ── [推荐] jq ──
+    if command -v jq &>/dev/null; then
+        echo -e "  ${C_GREEN}[OK]${C_RESET}   jq 已安装"
+    else
+        if opkg list 2>/dev/null | grep -q '^jq '; then
+            echo -e "  ${C_YELLOW}[WARN]${C_RESET} jq 未安装 (将在安装阶段自动安装)"
+            warn=$((warn + 1))
+        else
+            echo -e "  ${C_RED}[FAIL]${C_RESET} jq 未安装且不在可用包列表中 (JSON 数据库操作依赖)"
+            fatal=$((fatal + 1))
+        fi
+    fi
+
+    # ── [推荐] qrencode ──
+    if command -v qrencode &>/dev/null; then
+        echo -e "  ${C_GREEN}[OK]${C_RESET}   qrencode 已安装"
+    else
+        echo -e "  ${C_YELLOW}[WARN]${C_RESET} qrencode 未安装 (二维码功能不可用，不影响核心功能)"
+        warn=$((warn + 1))
+    fi
+
+    # ── [推荐] wg 工具 ──
+    if command -v wg &>/dev/null; then
+        echo -e "  ${C_GREEN}[OK]${C_RESET}   wireguard-tools 已安装"
+    else
+        echo -e "  ${C_YELLOW}[WARN]${C_RESET} wireguard-tools 未安装 (将在安装阶段自动安装)"
+        warn=$((warn + 1))
+    fi
+
+    # ── [信息] IP 转发状态 ──
+    local ipfwd
+    ipfwd=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
+    if [[ "$ipfwd" == "1" ]]; then
+        echo -e "  ${C_GREEN}[OK]${C_RESET}   IP 转发已启用"
+    else
+        echo -e "  ${C_CYAN}[INFO]${C_RESET} IP 转发未启用 (安装时将自动开启)"
+    fi
+
+    # ── [信息] br-lan 网段 ──
+    local br_lan_addr
+    br_lan_addr=$(ip -4 addr show br-lan 2>/dev/null | grep -oP 'inet \K[0-9.]+/[0-9]+' | head -1)
+    if [[ -n "$br_lan_addr" ]]; then
+        echo -e "  ${C_CYAN}[INFO]${C_RESET} br-lan 网段: ${br_lan_addr}"
+    else
+        echo -e "  ${C_YELLOW}[WARN]${C_RESET} 未检测到 br-lan 接口 (服务端 LAN 映射需要手动指定)"
+        warn=$((warn + 1))
+    fi
+
+    # ── [信息] 本机网络 ──
+    echo -e "\n${C_CYAN}  本机网络地址:${C_RESET}"
     wg_check_public_ip
-    draw_line
-    echo ""
-    echo "请选择 WireGuard 部署场景:"
-    echo ""
-    echo -e "  ${C_GREEN}1. 境内部署${C_RESET} (家庭NAS/内网设备/境内VPS)"
-    echo "     WireGuard 标准 UDP 直连，可配合 DDNS"
-    echo "     MTU=${WG_MTU_DIRECT}，无额外封装开销"
-    echo ""
-    echo -e "  ${C_YELLOW}2. 境外部署${C_RESET} (翻墙/境外VPS)"
-    echo "     WireGuard 仅监听本地，通过 VLESS-Reality 隧道对外"
-    echo "     MTU=${WG_MTU_TUNNEL}，需要已安装 3X-UI 面板"
-    echo ""
-    echo "  0. 取消安装"
-    echo ""
 
-    local choice
-    while true; do
-        read -e -r -p "选择部署模式 [1]: " choice
-        choice=${choice:-1}
-        case "$choice" in
-            1)
-                WG_DEPLOY_MODE="domestic"
-                print_success "已选择: 境内部署 (标准 UDP 直连)"
-                log_action "WireGuard: deploy_mode=domestic selected"
-                return 0
-                ;;
-            2)
-                if [[ "$PLATFORM" == "openwrt" ]]; then
-                    print_error "OpenWrt 暂不支持境外隧道模式"
-                    continue
-                fi
-                if ! wg_check_xui_installed; then
-                    print_warn "未检测到 3X-UI 面板"
-                    echo -e "  境外模式需要 3X-UI 提供 VLESS-Reality 隧道"
-                    if ! confirm "是否仍要继续？(需要后续手动安装 3X-UI)"; then
-                        continue
-                    fi
-                fi
-                WG_DEPLOY_MODE="overseas"
-                print_success "已选择: 境外部署 (VLESS-Reality 隧道)"
-                log_action "WireGuard: deploy_mode=overseas selected"
-                return 0
-                ;;
-            0)
-                print_info "安装已取消"
-                return 1
-                ;;
-            *)
-                print_warn "无效选项"
-                ;;
-        esac
-    done
+    # ── 汇总 ──
+    draw_line
+    if [[ $fatal -gt 0 ]]; then
+        echo -e "  ${C_RED}检测结果: ${fatal} 项致命错误, ${warn} 项警告${C_RESET}"
+        print_error "环境不满足安装条件，请先解决上述 [FAIL] 项"
+        return 1
+    elif [[ $warn -gt 0 ]]; then
+        echo -e "  ${C_YELLOW}检测结果: 全部通过, ${warn} 项警告${C_RESET}"
+        print_success "环境检测通过 (存在警告但不影响安装)"
+    else
+        echo -e "  ${C_GREEN}检测结果: 全部通过${C_RESET}"
+        print_success "OpenWrt 环境完全兼容"
+    fi
+    return 0
 }
 # Sub-modules (loaded via build.sh concatenation):
-#   11a -> netcheck (部署模式选择: domestic/overseas)
+#   11a -> OpenWrt 环境兼容性检测
 #   11  -> constants + db + utilities (this file)
 #   11c -> server install/control/uninstall
 #   11d -> peer management
 #   11e -> Clash/OpenClash config
 #   11g -> watchdog + import/export + menus
-#   11b -> VLESS-Reality tunnel (境外模式)
 readonly WG_INTERFACE="wg0"
 readonly WG_DB_DIR="/etc/wireguard/db"
 readonly WG_DB_FILE="${WG_DB_DIR}/wg-data.json"
@@ -4517,6 +4595,40 @@ wg_db_init() {
 }
 WGEOF
     chmod 600 "$WG_DB_FILE"
+}
+
+wg_db_migrate() {
+    [[ ! -f "$WG_DB_FILE" ]] && return 0
+    local ver
+    ver=$(wg_db_get '.schema_version // 0')
+    [[ "$ver" -ge 2 ]] && return 0
+    print_info "数据库迁移: v${ver} → v2 ..."
+    # 删除 overseas 相关字段
+    wg_db_set 'del(.server.deploy_mode, .server.tunnel_type,
+        .server.vless_port, .server.vless_uuid, .server.vless_network,
+        .server.vless_flow, .server.reality_public_key,
+        .server.reality_private_key, .server.reality_short_id,
+        .server.reality_sni, .server.reality_dest)' 2>/dev/null || true
+    # 为每个 peer 补充 peer_type
+    local pc i=0
+    pc=$(wg_db_get '.peers | length')
+    while [[ $i -lt ${pc:-0} ]]; do
+        local existing_type
+        existing_type=$(wg_db_get ".peers[$i].peer_type // empty")
+        if [[ -z "$existing_type" || "$existing_type" == "null" ]]; then
+            local is_gw
+            is_gw=$(wg_db_get ".peers[$i].is_gateway // false")
+            if [[ "$is_gw" == "true" ]]; then
+                wg_db_set --argjson idx "$i" '.peers[$idx].peer_type = "gateway"'
+            else
+                wg_db_set --argjson idx "$i" '.peers[$idx].peer_type = "standard"'
+            fi
+        fi
+        i=$((i + 1))
+    done
+    # 设置版本号
+    wg_db_set '.schema_version = 2'
+    print_success "数据库迁移完成"
 }
 
 wg_db_get() { jq -r "$@" "$WG_DB_FILE" 2>/dev/null; }
@@ -4646,17 +4758,17 @@ wg_select_peer() {
 
 wg_install_packages() {
     print_info "安装 WireGuard 软件包..."
-    if [[ "$PLATFORM" == "openwrt" ]]; then
-        opkg update >/dev/null 2>&1
-        for pkg in wireguard-tools qrencode; do
-            install_package "$pkg" "silent" || { print_error "安装 $pkg 失败"; return 1; }
-        done
-    else
-        update_apt_cache
-        for pkg in wireguard wireguard-tools qrencode; do
-            install_package "$pkg" "silent" || { print_error "安装 $pkg 失败"; return 1; }
-        done
-    fi
+    opkg update >/dev/null 2>&1
+    local essential_pkgs=(wireguard-tools kmod-wireguard luci-proto-wireguard jq)
+    local optional_pkgs=(qrencode)
+    for pkg in "${essential_pkgs[@]}"; do
+        install_package "$pkg" "silent" || { print_error "安装 $pkg 失败"; return 1; }
+    done
+    for pkg in "${optional_pkgs[@]}"; do
+        install_package "$pkg" "silent" || print_warn "安装 $pkg 失败（不影响核心功能）"
+    done
+    # 重启 rpcd 使 LuCI 识别 wireguard 协议
+    /etc/init.d/rpcd restart 2>/dev/null || true
     print_success "软件包安装完成"
     return 0
 }
@@ -4688,52 +4800,115 @@ wg_format_bytes() {
 }
 
 
-wg_rebuild_conf() {
+wg_rebuild_uci_conf() {
     [[ "$(wg_get_role)" != "server" ]] && return 1
-    local priv_key port subnet server_ip mask main_iface
+    local priv_key port subnet server_ip mask mtu
     priv_key=$(wg_db_get '.server.private_key')
     port=$(wg_db_get '.server.port')
     subnet=$(wg_db_get '.server.subnet')
     server_ip=$(wg_db_get '.server.ip')
-    # 关键字段校验
     if [[ -z "$priv_key" || -z "$port" || -z "$subnet" || -z "$server_ip" ]]; then
         print_error "WireGuard 数据库关键字段缺失，无法生成配置"
-        log_action "wg_rebuild_conf failed: missing fields (key=${#priv_key} port=$port subnet=$subnet ip=$server_ip)" "ERROR"
         return 1
     fi
     mask=$(echo "$subnet" | cut -d'/' -f2)
-    main_iface=$(ip route show default | awk '{print $5; exit}')
-    if [[ -z "$main_iface" ]]; then
-        print_warn "未检测到默认网关接口，NAT 转发可能无法工作"
-        main_iface="eth0"
-    fi
-    local listen_addr mtu deploy_mode
-    deploy_mode=$(wg_db_get '.server.deploy_mode // "domestic"')
-    listen_addr=$(wg_db_get '.server.listen_address // "0.0.0.0"')
     mtu=$(wg_db_get '.server.mtu // empty')
-    [[ -z "$mtu" || "$mtu" == "null" ]] && {
-        [[ "$deploy_mode" == "overseas" ]] && mtu=$WG_MTU_TUNNEL || mtu=$WG_MTU_DIRECT
-    }
+    [[ -z "$mtu" || "$mtu" == "null" ]] && mtu=$WG_MTU_DIRECT
+
+    # --- 清除旧 uci peer 条目 ---
+    while uci -q get network.@wireguard_wg0[0] >/dev/null 2>&1; do
+        uci delete network.@wireguard_wg0[0]
+    done
+
+    # --- 设置 wg0 接口基本参数 ---
+    uci set network.wg0=interface
+    uci set network.wg0.proto='wireguard'
+    uci set network.wg0.private_key="$priv_key"
+    uci -q delete network.wg0.addresses 2>/dev/null
+    uci add_list network.wg0.addresses="${server_ip}/${mask}"
+    uci set network.wg0.listen_port="$port"
+    uci set network.wg0.mtu="$mtu"
+
+    # --- 遍历 enabled peers，创建 uci wireguard_wg0 section ---
+    local pc=$(wg_db_get '.peers | length') i=0
+    while [[ $i -lt $pc ]]; do
+        if [[ "$(wg_db_get ".peers[$i].enabled")" == "true" ]]; then
+            local peer_name=$(wg_db_get ".peers[$i].name")
+            local pub_key=$(wg_db_get ".peers[$i].public_key")
+            local psk=$(wg_db_get ".peers[$i].preshared_key")
+            local peer_ip=$(wg_db_get ".peers[$i].ip")
+            local is_gw=$(wg_db_get ".peers[$i].is_gateway // false")
+            local lan_sub=$(wg_db_get ".peers[$i].lan_subnets // empty")
+
+            uci add network wireguard_wg0 >/dev/null
+            local idx_uci
+            # 获取刚添加的 section 索引（最后一个）
+            idx_uci=$(( $(uci show network | grep -c 'wireguard_wg0') / 5 - 1 ))
+            [[ $idx_uci -lt 0 ]] && idx_uci=0
+
+            uci set network.@wireguard_wg0[-1].description="$peer_name"
+            uci set network.@wireguard_wg0[-1].public_key="$pub_key"
+            uci set network.@wireguard_wg0[-1].preshared_key="$psk"
+            uci set network.@wireguard_wg0[-1].persistent_keepalive='25'
+
+            # AllowedIPs
+            uci -q delete network.@wireguard_wg0[-1].allowed_ips 2>/dev/null
+            uci add_list network.@wireguard_wg0[-1].allowed_ips="${peer_ip}/32"
+            if [[ "$is_gw" == "true" && -n "$lan_sub" && "$lan_sub" != "null" ]]; then
+                local IFS=','
+                for sub in $lan_sub; do
+                    sub=$(echo "$sub" | xargs)
+                    [[ -n "$sub" ]] && uci add_list network.@wireguard_wg0[-1].allowed_ips="$sub"
+                done
+                unset IFS
+            fi
+        fi
+        i=$((i + 1))
+    done
+
+    uci commit network
+
+    # --- 如果 wg0 正在运行，热重载配置 ---
+    if wg_is_running; then
+        ifdown wg0 2>/dev/null
+        sleep 1
+        ifup wg0 2>/dev/null
+    fi
+}
+
+# 生成 wg0.conf 只读快照（供导出/备份/查看用，不用于运行）
+wg_rebuild_conf() {
+    [[ "$(wg_get_role)" != "server" ]] && return 1
+    local priv_key port subnet server_ip mask mtu
+    priv_key=$(wg_db_get '.server.private_key')
+    port=$(wg_db_get '.server.port')
+    subnet=$(wg_db_get '.server.subnet')
+    server_ip=$(wg_db_get '.server.ip')
+    if [[ -z "$priv_key" || -z "$port" || -z "$subnet" || -z "$server_ip" ]]; then
+        print_error "WireGuard 数据库关键字段缺失，无法生成配置"
+        log_action "wg_rebuild_conf failed: missing fields" "ERROR"
+        return 1
+    fi
+    mask=$(echo "$subnet" | cut -d'/' -f2)
+    mtu=$(wg_db_get '.server.mtu // empty')
+    [[ -z "$mtu" || "$mtu" == "null" ]] && mtu=$WG_MTU_DIRECT
     {
         echo "[Interface]"
         echo "PrivateKey = ${priv_key}"
         echo "Address = ${server_ip}/${mask}"
         echo "ListenPort = ${port}"
         echo "MTU = ${mtu}"
-        # 境外模式仅监听本地回环
-        [[ "$deploy_mode" == "overseas" ]] && echo "# deploy_mode=overseas: listen on localhost only"
-        echo "PostUp = iptables -C FORWARD -i %i -j ACCEPT 2>/dev/null || iptables -A FORWARD -i %i -j ACCEPT; iptables -C FORWARD -o %i -j ACCEPT 2>/dev/null || iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -C POSTROUTING -s ${subnet} -o ${main_iface} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s ${subnet} -o ${main_iface} -j MASQUERADE"
-        echo "PostDown = iptables -D FORWARD -i %i -j ACCEPT 2>/dev/null; iptables -D FORWARD -o %i -j ACCEPT 2>/dev/null; iptables -t nat -D POSTROUTING -s ${subnet} -o ${main_iface} -j MASQUERADE 2>/dev/null"
         local pc=$(wg_db_get '.peers | length') i=0
         while [[ $i -lt $pc ]]; do
             if [[ "$(wg_db_get ".peers[$i].enabled")" == "true" ]]; then
+                echo ""
                 echo "[Peer]"
                 echo "PublicKey = $(wg_db_get ".peers[$i].public_key")"
                 echo "PresharedKey = $(wg_db_get ".peers[$i].preshared_key")"
                 local peer_ip=$(wg_db_get ".peers[$i].ip")
                 local is_gw=$(wg_db_get ".peers[$i].is_gateway // false")
                 local lan_sub=$(wg_db_get ".peers[$i].lan_subnets // empty")
-                if [[ "$is_gw" == "true" && -n "$lan_sub" ]]; then
+                if [[ "$is_gw" == "true" && -n "$lan_sub" && "$lan_sub" != "null" ]]; then
                     echo "AllowedIPs = ${peer_ip}/32, ${lan_sub}"
                 else
                     echo "AllowedIPs = ${peer_ip}/32"
@@ -4748,17 +4923,14 @@ wg_rebuild_conf() {
 wg_regenerate_client_confs() {
     local pc=$(wg_db_get '.peers | length')
     [[ "$pc" -eq 0 ]] && return
-    local spub sep sport sdns mask mtu deploy_mode
+    local spub sep sport sdns mask mtu
     spub=$(wg_db_get '.server.public_key')
     sep=$(wg_db_get '.server.endpoint')
     sport=$(wg_db_get '.server.port')
     sdns=$(wg_db_get '.server.dns')
     mask=$(echo "$(wg_db_get '.server.subnet')" | cut -d'/' -f2)
-    deploy_mode=$(wg_db_get '.server.deploy_mode // "domestic"')
     mtu=$(wg_db_get '.server.mtu // empty')
-    [[ -z "$mtu" || "$mtu" == "null" ]] && {
-        [[ "$deploy_mode" == "overseas" ]] && mtu=$WG_MTU_TUNNEL || mtu=$WG_MTU_DIRECT
-    }
+    [[ -z "$mtu" || "$mtu" == "null" ]] && mtu=$WG_MTU_DIRECT
     mkdir -p /etc/wireguard/clients
     local i=0
     while [[ $i -lt $pc ]]; do
@@ -4786,8 +4958,6 @@ wg_server_install() {
     if wg_is_installed && [[ "$(wg_get_role)" == "server" ]]; then
         print_warn "WireGuard 服务端已安装。"
         wg_is_running && echo -e "  状态: ${C_GREEN}● 运行中${C_RESET}" || echo -e "  状态: ${C_RED}● 已停止${C_RESET}"
-        local dm=$(wg_db_get '.server.deploy_mode // "unknown"')
-        echo -e "  模式: ${C_CYAN}${dm}${C_RESET}"
         pause; return 0
     fi
     if wg_is_installed && [[ "$(wg_get_role)" == "client" ]]; then
@@ -4795,27 +4965,30 @@ wg_server_install() {
         pause; return 1
     fi
 
-    # ── 步骤 1: 选择部署模式 ──
-    wg_select_deploy_mode || return 1
+    # ── [1/7] OpenWrt 环境检测 ──
+    print_info "[1/7] OpenWrt 环境检测..."
+    wg_check_openwrt_compat || { pause; return 1; }
 
-    # ── 步骤 2: 安装软件包 ──
-    print_info "[1/5] 安装软件包..."
+    # ── [2/7] 安装软件包 ──
+    print_info "[2/7] 安装软件包..."
     wg_install_packages || { pause; return 1; }
 
-    # ── 步骤 3: 配置 IP 转发 ──
-    print_info "[2/5] 配置 IP 转发..."
+    # ── [3/7] 配置 IP 转发 ──
+    print_info "[3/7] 配置 IP 转发..."
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
     if ! grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null; then
-        sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf
+        sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf 2>/dev/null
         echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
     fi
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
     print_success "IP 转发已开启"
 
-    # ── 步骤 4: 配置服务端参数 (根据模式分支) ──
-    print_info "[3/5] 配置服务端参数..."
+    # ── [4/7] 配置服务端参数 ──
+    print_info "[4/7] 配置服务端参数..."
 
     local wg_port listen_addr mtu wg_dns wg_endpoint
     local wg_subnet="10.66.66.0/24"
+    listen_addr="0.0.0.0"
+    mtu=$WG_MTU_DIRECT
 
     # WG 监听端口
     while true; do
@@ -4841,75 +5014,67 @@ wg_server_install() {
     prefix=$(echo "$wg_subnet" | cut -d'.' -f1-3)
     server_ip="${prefix}.1"
 
-    # ── 根据部署模式设置参数 ──
-    if [[ "$WG_DEPLOY_MODE" == "domestic" ]]; then
-        # === 境内模式 ===
-        listen_addr="0.0.0.0"
-        mtu=$WG_MTU_DIRECT
+    # 客户端 DNS
+    read -e -r -p "客户端 DNS [223.5.5.5, 114.114.114.114]: " wg_dns
+    wg_dns=${wg_dns:-"223.5.5.5, 114.114.114.114"}
 
-        # DNS (境内默认)
-        read -e -r -p "客户端 DNS [223.5.5.5, 114.114.114.114]: " wg_dns
-        wg_dns=${wg_dns:-"223.5.5.5, 114.114.114.114"}
-
-        # Endpoint: 优先使用 DDNS 域名
-        local ddns_domain=""
-        if [[ -d "$DDNS_CONFIG_DIR" ]] && ls "$DDNS_CONFIG_DIR"/*.conf &>/dev/null 2>&1; then
-            echo ""
-            echo -e "${C_CYAN}检测到已配置的 DDNS 域名:${C_RESET}"
-            local idx=1 ddns_domains=()
-            for conf in "$DDNS_CONFIG_DIR"/*.conf; do
-                [[ -f "$conf" ]] || continue
-                local d=$(grep '^DDNS_DOMAIN=' "$conf" | cut -d'"' -f2)
-                [[ -n "$d" ]] && { ddns_domains+=("$d"); echo "  ${idx}. ${d}"; idx=$((idx+1)); }
-            done
-            if [[ ${#ddns_domains[@]} -gt 0 ]]; then
-                echo "  0. 不使用 DDNS，手动输入 IP/域名"
-                local ddns_choice
-                read -e -r -p "选择 DDNS 域名 [1]: " ddns_choice
-                ddns_choice=${ddns_choice:-1}
-                if [[ "$ddns_choice" != "0" && "$ddns_choice" =~ ^[0-9]+$ && "$ddns_choice" -ge 1 && "$ddns_choice" -le ${#ddns_domains[@]} ]]; then
-                    ddns_domain="${ddns_domains[$((ddns_choice-1))]}"
-                    wg_endpoint="$ddns_domain"
-                    print_success "Endpoint 将使用 DDNS 域名: ${ddns_domain}"
-                fi
-            fi
-        fi
-        if [[ -z "$wg_endpoint" ]]; then
-            local default_ip
-            default_ip=$(get_public_ipv4 || echo "")
-            if [[ -n "$default_ip" ]]; then
-                read -e -r -p "公网端点 IP/域名 [${default_ip}]: " wg_endpoint
-                wg_endpoint=${wg_endpoint:-$default_ip}
-            else
-                while [[ -z "$wg_endpoint" ]]; do
-                    read -e -r -p "公网端点 IP/域名: " wg_endpoint
-                done
-            fi
-        fi
+    # 服务端 LAN 子网 (自动检测 br-lan)
+    local server_lan_subnet=""
+    local br_lan_addr
+    br_lan_addr=$(ip -4 addr show br-lan 2>/dev/null | grep -oP 'inet \K[0-9.]+/[0-9]+' | head -1)
+    if [[ -n "$br_lan_addr" ]]; then
+        # 从 br-lan 地址推算网段 (如 10.10.100.1/24 → 10.10.100.0/24)
+        local lan_ip lan_mask lan_prefix
+        lan_ip=$(echo "$br_lan_addr" | cut -d'/' -f1)
+        lan_mask=$(echo "$br_lan_addr" | cut -d'/' -f2)
+        lan_prefix=$(echo "$lan_ip" | cut -d'.' -f1-3)
+        local default_lan="${lan_prefix}.0/${lan_mask}"
+        echo -e "  检测到 br-lan 网段: ${C_CYAN}${default_lan}${C_RESET}"
+        read -e -r -p "服务端 LAN 子网 (映射到 WG 网络) [${default_lan}]: " server_lan_subnet
+        server_lan_subnet=${server_lan_subnet:-$default_lan}
     else
-        # === 境外模式 ===
-        listen_addr="0.0.0.0"
-        mtu=$WG_MTU_TUNNEL
+        echo -e "  ${C_YELLOW}未检测到 br-lan 接口${C_RESET}"
+        read -e -r -p "服务端 LAN 子网 (留空跳过): " server_lan_subnet
+    fi
 
-        # DNS (境外默认)
-        read -e -r -p "客户端 DNS [1.1.1.1, 8.8.8.8]: " wg_dns
-        wg_dns=${wg_dns:-"1.1.1.1, 8.8.8.8"}
-
-        # Endpoint: 使用公网 IP (客户端通过 VLESS 连接，但 WG 配置仍需记录)
+    # Endpoint: 优先使用 DDNS 域名
+    local ddns_domain=""
+    if [[ -d "$DDNS_CONFIG_DIR" ]] && ls "$DDNS_CONFIG_DIR"/*.conf &>/dev/null 2>&1; then
+        echo ""
+        echo -e "${C_CYAN}检测到已配置的 DDNS 域名:${C_RESET}"
+        local idx=1 ddns_domains=()
+        for conf in "$DDNS_CONFIG_DIR"/*.conf; do
+            [[ -f "$conf" ]] || continue
+            local d=$(grep '^DDNS_DOMAIN=' "$conf" | cut -d'"' -f2)
+            [[ -n "$d" ]] && { ddns_domains+=("$d"); echo "  ${idx}. ${d}"; idx=$((idx+1)); }
+        done
+        if [[ ${#ddns_domains[@]} -gt 0 ]]; then
+            echo "  0. 不使用 DDNS，手动输入 IP/域名"
+            local ddns_choice
+            read -e -r -p "选择 DDNS 域名 [1]: " ddns_choice
+            ddns_choice=${ddns_choice:-1}
+            if [[ "$ddns_choice" != "0" && "$ddns_choice" =~ ^[0-9]+$ && "$ddns_choice" -ge 1 && "$ddns_choice" -le ${#ddns_domains[@]} ]]; then
+                ddns_domain="${ddns_domains[$((ddns_choice-1))]}"
+                wg_endpoint="$ddns_domain"
+                print_success "Endpoint 将使用 DDNS 域名: ${ddns_domain}"
+            fi
+        fi
+    fi
+    if [[ -z "$wg_endpoint" ]]; then
         local default_ip
-        default_ip=$(get_public_ipv4 || echo "")
+        default_ip=$(get_public_ipv4 2>/dev/null || echo "")
         if [[ -n "$default_ip" ]]; then
-            read -e -r -p "VPS 公网 IP [${default_ip}]: " wg_endpoint
+            read -e -r -p "公网端点 IP/域名 [${default_ip}]: " wg_endpoint
             wg_endpoint=${wg_endpoint:-$default_ip}
         else
             while [[ -z "$wg_endpoint" ]]; do
-                read -e -r -p "VPS 公网 IP: " wg_endpoint
+                read -e -r -p "公网端点 IP/域名: " wg_endpoint
             done
         fi
     fi
 
-    # ── 步骤 5: 生成密钥 ──
-    print_info "[4/5] 生成服务端密钥..."
+    # ── [5/7] 生成密钥 ──
+    print_info "[5/7] 生成服务端密钥..."
     local server_privkey server_pubkey
     server_privkey=$(wg genkey)
     server_pubkey=$(echo "$server_privkey" | wg pubkey)
@@ -4922,8 +5087,8 @@ wg_server_install() {
     read -e -r -p "服务器名称 [${default_name}]: " server_name
     server_name=${server_name:-$default_name}
 
-    # ── 步骤 6: 写入配置并启动 ──
-    print_info "[5/5] 写入配置并启动..."
+    # ── [6/7] 写入数据库 + 配置 OpenWrt 网络和防火墙 ──
+    print_info "[6/7] 写入配置..."
     wg_db_init
     wg_set_role "server"
     wg_db_set --arg sname "$server_name" \
@@ -4934,10 +5099,10 @@ wg_server_install() {
               --arg port "$wg_port" \
               --arg dns "$wg_dns" \
               --arg ep "$wg_endpoint" \
-              --arg mode "$WG_DEPLOY_MODE" \
               --arg laddr "$listen_addr" \
               --argjson mtu "$mtu" \
               --arg ddns "${ddns_domain:-}" \
+              --arg lan "${server_lan_subnet:-}" \
     '.server = {
         name: $sname,
         private_key: $pk,
@@ -4947,27 +5112,55 @@ wg_server_install() {
         port: ($port | tonumber),
         dns: $dns,
         endpoint: $ep,
-        deploy_mode: $mode,
         listen_address: $laddr,
         mtu: $mtu,
-        ddns_domain: $ddns
-    }'
+        ddns_domain: $ddns,
+        server_lan_subnet: $lan
+    } | .schema_version = 2'
+
+    # 配置 uci 网络接口
+    print_info "配置 OpenWrt 网络接口..."
+    local wg_mask
+    wg_mask=$(echo "$wg_subnet" | cut -d'/' -f2)
+    uci set network.wg0=interface
+    uci set network.wg0.proto='wireguard'
+    uci set network.wg0.private_key="$server_privkey"
+    uci -q delete network.wg0.addresses 2>/dev/null
+    uci add_list network.wg0.addresses="${server_ip}/${wg_mask}"
+    uci set network.wg0.listen_port="$wg_port"
+    uci set network.wg0.mtu="$mtu"
+
+    # 配置 uci 防火墙 zone + forwarding
+    print_info "配置 OpenWrt 防火墙..."
+    uci set firewall.wg_zone=zone
+    uci set firewall.wg_zone.name='wg'
+    uci set firewall.wg_zone.input='ACCEPT'
+    uci set firewall.wg_zone.output='ACCEPT'
+    uci set firewall.wg_zone.forward='ACCEPT'
+    uci set firewall.wg_zone.masq='1'
+    uci -q delete firewall.wg_zone.network 2>/dev/null
+    uci add_list firewall.wg_zone.network='wg0'
+    uci set firewall.wg_fwd_lan=forwarding
+    uci set firewall.wg_fwd_lan.src='lan'
+    uci set firewall.wg_fwd_lan.dest='wg'
+    uci set firewall.wg_fwd_wg=forwarding
+    uci set firewall.wg_fwd_wg.src='wg'
+    uci set firewall.wg_fwd_wg.dest='lan'
+
+    uci commit network
+    uci commit firewall
+
+    # nft 实时放行 WG UDP 端口 (不重启防火墙)
+    nft add rule inet fw4 input_wan udp dport "$wg_port" counter accept comment \"wg_allow_port\" 2>/dev/null || true
+
+    # 生成只读快照 wg0.conf
     wg_rebuild_conf
 
-    if [[ "$PLATFORM" == "openwrt" ]]; then
-        wg-quick up "$WG_INTERFACE" 2>/dev/null || true
-    elif is_systemd; then
-        systemctl enable "wg-quick@${WG_INTERFACE}" >/dev/null 2>&1
-        wg-quick up "$WG_INTERFACE" 2>/dev/null
-    fi
-
-    # 防火墙: 境内模式开放 WG 端口，境外模式不开放 (仅本地监听)
-    if [[ "$WG_DEPLOY_MODE" == "domestic" ]]; then
-        if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
-            ufw allow "${wg_port}/udp" comment "WireGuard" >/dev/null 2>&1
-            print_success "UFW 已放行端口 ${wg_port}/udp"
-        fi
-    fi
+    # ── [7/7] Mihomo bypass + 启动 ──
+    print_info "[7/7] 配置 Mihomo bypass 并启动..."
+    wg_setup_mihomo_bypass "$wg_subnet"
+    ifup wg0 2>/dev/null
+    sleep 2
 
     # ── 安装结果展示 ──
     draw_line
@@ -4976,30 +5169,20 @@ wg_server_install() {
     else
         print_warn "WireGuard 已安装，但启动可能失败，请检查日志"
     fi
-    echo -e "  角色:     ${C_GREEN}服务端 (Server)${C_RESET}"
-    echo -e "  部署模式: ${C_GREEN}${WG_DEPLOY_MODE}${C_RESET}"
-    echo -e "  监听地址: ${C_GREEN}${listen_addr}:${wg_port}/udp${C_RESET}"
-    echo -e "  MTU:      ${C_GREEN}${mtu}${C_RESET}"
-    echo -e "  内网子网: ${C_GREEN}${wg_subnet}${C_RESET}"
-    echo -e "  服务端 IP: ${C_GREEN}${server_ip}${C_RESET}"
-    if [[ "$WG_DEPLOY_MODE" == "domestic" ]]; then
-        if [[ -n "${ddns_domain:-}" ]]; then
-            echo -e "  公网端点: ${C_GREEN}${ddns_domain}:${wg_port}${C_RESET} (DDNS)"
-        else
-            echo -e "  公网端点: ${C_GREEN}${wg_endpoint}:${wg_port}${C_RESET}"
-        fi
+    echo -e "  角色:       ${C_GREEN}服务端 (Server)${C_RESET}"
+    echo -e "  监听地址:   ${C_GREEN}${listen_addr}:${wg_port}/udp${C_RESET}"
+    echo -e "  MTU:        ${C_GREEN}${mtu}${C_RESET}"
+    echo -e "  内网子网:   ${C_GREEN}${wg_subnet}${C_RESET}"
+    echo -e "  服务端 IP:  ${C_GREEN}${server_ip}${C_RESET}"
+    [[ -n "$server_lan_subnet" ]] && echo -e "  服务端 LAN: ${C_GREEN}${server_lan_subnet}${C_RESET}"
+    if [[ -n "${ddns_domain:-}" ]]; then
+        echo -e "  公网端点:   ${C_GREEN}${ddns_domain}:${wg_port}${C_RESET} (DDNS)"
     else
-        echo -e "  公网端点: ${C_GREEN}${wg_endpoint}${C_RESET} (客户端通过 VLESS-Reality 连接)"
+        echo -e "  公网端点:   ${C_GREEN}${wg_endpoint}:${wg_port}${C_RESET}"
     fi
     draw_line
 
-    # ── 境外模式: 配置 VLESS-Reality 隧道 ──
-    if [[ "$WG_DEPLOY_MODE" == "overseas" ]]; then
-        echo ""
-        wg_tunnel_setup "$wg_port"
-    fi
-
-    log_action "WireGuard server installed: mode=$WG_DEPLOY_MODE port=$wg_port subnet=$wg_subnet endpoint=$wg_endpoint mtu=$mtu"
+    log_action "WireGuard server installed: port=$wg_port subnet=$wg_subnet endpoint=$wg_endpoint mtu=$mtu lan=${server_lan_subnet:-none}"
 
     # 自动安装服务端看门狗
     echo ""
@@ -5011,14 +5194,17 @@ wg_server_install() {
 wg_modify_server() {
     wg_check_server || return 1
     print_title "修改 WireGuard 服务端配置"
-    local cur_port cur_dns cur_ep
+    local cur_port cur_dns cur_ep cur_lan
     cur_port=$(wg_db_get '.server.port')
     cur_dns=$(wg_db_get '.server.dns')
     cur_ep=$(wg_db_get '.server.endpoint')
+    cur_lan=$(wg_db_get '.server.server_lan_subnet // empty')
     echo -e "  当前端口:   ${C_GREEN}${cur_port}${C_RESET}"
     echo -e "  当前 DNS:   ${C_GREEN}${cur_dns}${C_RESET}"
     echo -e "  当前端点:   ${C_GREEN}${cur_ep}${C_RESET}"
+    [[ -n "$cur_lan" && "$cur_lan" != "null" ]] && echo -e "  当前 LAN:   ${C_GREEN}${cur_lan}${C_RESET}"
     local changed=false
+
     read -e -r -p "新监听端口 [${cur_port}]: " new_port
     new_port=${new_port:-$cur_port}
     if [[ "$new_port" != "$cur_port" ]]; then
@@ -5028,8 +5214,10 @@ wg_modify_server() {
             print_info "端口将更改为 ${new_port}"
         else
             print_warn "端口无效，保持原值"
+            new_port="$cur_port"
         fi
     fi
+
     read -e -r -p "新客户端 DNS [${cur_dns}]: " new_dns
     new_dns=${new_dns:-$cur_dns}
     if [[ "$new_dns" != "$cur_dns" ]]; then
@@ -5037,6 +5225,7 @@ wg_modify_server() {
         changed=true
         print_info "DNS 将更改为 ${new_dns}"
     fi
+
     read -e -r -p "新公网端点 [${cur_ep}]: " new_ep
     new_ep=${new_ep:-$cur_ep}
     if [[ "$new_ep" != "$cur_ep" ]]; then
@@ -5044,72 +5233,106 @@ wg_modify_server() {
         changed=true
         print_info "端点将更改为 ${new_ep}"
     fi
+
+    read -e -r -p "新服务端 LAN 子网 [${cur_lan:-无}]: " new_lan
+    new_lan=${new_lan:-$cur_lan}
+    if [[ "$new_lan" != "$cur_lan" ]]; then
+        wg_db_set --arg l "$new_lan" '.server.server_lan_subnet = $l'
+        changed=true
+        print_info "LAN 子网将更改为 ${new_lan}"
+    fi
+
     if [[ "$changed" != "true" ]]; then
         print_info "未做任何更改"
         pause; return
     fi
+
+    wg_rebuild_uci_conf
     wg_rebuild_conf
     wg_regenerate_client_confs
-    if wg_is_running; then
-        wg-quick down "$WG_INTERFACE" 2>/dev/null
-        wg-quick up "$WG_INTERFACE" 2>/dev/null
-    fi
+
+    # 端口变更: 更新 nft 防火墙规则
     if [[ "$new_port" != "$cur_port" ]]; then
-        if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
-            ufw delete allow "${cur_port}/udp" 2>/dev/null || true
-            ufw allow "${new_port}/udp" comment "WireGuard" >/dev/null 2>&1
-        fi
+        # 删除旧端口规则
+        local h
+        for h in $(nft -a list chain inet fw4 input_wan 2>/dev/null | grep 'wg_allow_port' | awk '{print $NF}'); do
+            nft delete rule inet fw4 input_wan handle "$h" 2>/dev/null || true
+        done
+        # 添加新端口规则
+        nft add rule inet fw4 input_wan udp dport "$new_port" counter accept comment \"wg_allow_port\" 2>/dev/null || true
+        # 更新 /etc/rc.local
+        sed -i '/wg_allow_port/d' /etc/rc.local 2>/dev/null || true
+        sed -i "/^exit 0/i nft add rule inet fw4 input_wan udp dport $new_port counter accept comment \\\"wg_allow_port\\\" 2>/dev/null || true" \
+            /etc/rc.local 2>/dev/null || true
+        # 重建 bypass 规则
+        wg_mihomo_bypass_rebuild
     fi
+
     print_success "服务端配置已更新"
-    log_action "WireGuard server config modified: port=${new_port} dns=${new_dns} endpoint=${new_ep}"
+    log_action "WireGuard server config modified: port=${new_port} dns=${new_dns} endpoint=${new_ep} lan=${new_lan:-none}"
     pause
 }
 
 wg_server_status() {
     wg_check_server || return 1
     print_title "WireGuard 服务端状态"
-    local port subnet endpoint dns deploy_mode mtu
+    local port subnet endpoint dns mtu server_lan
     port=$(wg_db_get '.server.port')
     subnet=$(wg_db_get '.server.subnet')
     endpoint=$(wg_db_get '.server.endpoint')
     dns=$(wg_db_get '.server.dns')
-    deploy_mode=$(wg_db_get '.server.deploy_mode // "domestic"')
     mtu=$(wg_db_get '.server.mtu // empty')
+    server_lan=$(wg_db_get '.server.server_lan_subnet // empty')
     echo -e "  角色:     ${C_GREEN}服务端 (Server)${C_RESET}"
     if wg_is_running; then
         echo -e "  状态:     ${C_GREEN}● 运行中${C_RESET}"
     else
         echo -e "  状态:     ${C_RED}● 已停止${C_RESET}"
     fi
-    if [[ "$deploy_mode" == "overseas" ]]; then
-        echo -e "  部署模式: ${C_YELLOW}境外 (VLESS-Reality 隧道)${C_RESET}"
-    else
-        echo -e "  部署模式: ${C_GREEN}境内 (标准 UDP 直连)${C_RESET}"
-    fi
     echo -e "  端口:     ${port}/udp"
     [[ -n "$mtu" && "$mtu" != "null" ]] && echo -e "  MTU:      ${mtu}"
     echo -e "  子网:     ${subnet}"
     echo -e "  端点:     ${endpoint}"
     echo -e "  DNS:      ${dns}"
+    [[ -n "$server_lan" && "$server_lan" != "null" ]] && echo -e "  服务端 LAN: ${C_CYAN}${server_lan}${C_RESET}"
     local ddns_domain=$(wg_db_get '.server.ddns_domain // empty')
-    [[ -n "$ddns_domain" ]] && echo -e "  DDNS:     ${C_CYAN}${ddns_domain}${C_RESET}"
+    [[ -n "$ddns_domain" && "$ddns_domain" != "null" ]] && echo -e "  DDNS:     ${C_CYAN}${ddns_domain}${C_RESET}"
+
+    # Mihomo bypass 状态
+    echo ""
+    local bypass_ok=true
+    if nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep -q 'wg_bypass'; then
+        echo -e "  Mihomo bypass: ${C_GREEN}已启用${C_RESET}"
+    else
+        echo -e "  Mihomo bypass: ${C_YELLOW}未检测到规则${C_RESET}"
+        bypass_ok=false
+    fi
+
+    echo ""
     local peer_count
     peer_count=$(wg_db_get '.peers | length')
     echo -e "${C_CYAN}设备列表 (${peer_count} 个):${C_RESET}"
     draw_line
     if [[ "$peer_count" -gt 0 ]]; then
-        printf "${C_CYAN}%-4s %-16s %-18s %-8s %-20s %-16s${C_RESET}\n" \
-            "#" "名称" "IP" "状态" "最近握手" "流量"
+        printf "${C_CYAN}%-4s %-16s %-18s %-8s %-8s %-20s %-16s${C_RESET}\n" \
+            "#" "名称" "IP" "类型" "状态" "最近握手" "流量"
         draw_line
         local wg_dump=""
         wg_is_running && wg_dump=$(wg show "$WG_INTERFACE" dump 2>/dev/null | tail -n +2)
         local i=0
         while [[ $i -lt $peer_count ]]; do
-            local name ip pubkey enabled
+            local name ip pubkey enabled peer_type
             name=$(wg_db_get ".peers[$i].name")
             ip=$(wg_db_get ".peers[$i].ip")
             pubkey=$(wg_db_get ".peers[$i].public_key")
             enabled=$(wg_db_get ".peers[$i].enabled")
+            peer_type=$(wg_db_get ".peers[$i].peer_type // \"standard\"")
+            local type_str
+            case "$peer_type" in
+                gateway) type_str="${C_YELLOW}网关${C_RESET}" ;;
+                clash)   type_str="${C_CYAN}Clash${C_RESET}" ;;
+                *)       type_str="标准" ;;
+            esac
             local status_str handshake_str transfer_str
             if [[ "$enabled" != "true" ]]; then
                 status_str="${C_RED}禁用${C_RESET}"
@@ -5156,8 +5379,8 @@ wg_server_status() {
                 handshake_str="-"
                 transfer_str="-"
             fi
-            printf "%-4s %-16s %-18s %-8b %-20s %-16s\n" \
-                "$((i + 1))" "$name" "$ip" "$status_str" "$handshake_str" "$transfer_str"
+            printf "%-4s %-16s %-18s %-8b %-8b %-20s %-16s\n" \
+                "$((i + 1))" "$name" "$ip" "$type_str" "$status_str" "$handshake_str" "$transfer_str"
             i=$((i + 1))
         done
     else
@@ -5172,21 +5395,16 @@ wg_start() {
         print_warn "WireGuard 已在运行"
         return 0
     fi
-    if [[ ! -f "$WG_CONF" ]]; then
-        print_error "配置文件不存在: ${WG_CONF}"
-        return 1
-    fi
     print_info "正在启动 WireGuard..."
-    wg-quick up "$WG_INTERFACE" 2>/dev/null
-    if is_systemd; then
-        systemctl enable "wg-quick@${WG_INTERFACE}" >/dev/null 2>&1
-    fi
-    sleep 1
+    ifup wg0 2>/dev/null
+    sleep 2
     if wg_is_running; then
+        # 启动后确保 bypass 规则存在
+        wg_mihomo_bypass_rebuild 2>/dev/null
         print_success "WireGuard 已启动"
         log_action "WireGuard started"
     else
-        print_error "启动失败"
+        print_error "启动失败，请检查 logread | grep netifd"
         log_action "WireGuard start failed"
     fi
 }
@@ -5197,7 +5415,7 @@ wg_stop() {
         return 0
     fi
     print_info "正在停止 WireGuard..."
-    wg-quick down "$WG_INTERFACE" 2>/dev/null
+    ifdown wg0 2>/dev/null
     sleep 1
     if ! wg_is_running; then
         print_success "WireGuard 已停止"
@@ -5209,11 +5427,12 @@ wg_stop() {
 
 wg_restart() {
     print_info "正在重启 WireGuard..."
-    wg_is_running && wg-quick down "$WG_INTERFACE" 2>/dev/null
+    wg_is_running && ifdown wg0 2>/dev/null
     sleep 1
-    wg-quick up "$WG_INTERFACE" 2>/dev/null
-    sleep 1
+    ifup wg0 2>/dev/null
+    sleep 2
     if wg_is_running; then
+        wg_mihomo_bypass_rebuild 2>/dev/null
         print_success "WireGuard 已重启"
         log_action "WireGuard restarted"
     else
@@ -5222,6 +5441,128 @@ wg_restart() {
     fi
 }
 
+# ── Mihomo bypass 函数 ──
+
+wg_setup_mihomo_bypass() {
+    local wg_subnet="${1:-$(wg_db_get '.server.subnet')}"
+    [[ -z "$wg_subnet" || "$wg_subnet" == "null" ]] && return 1
+
+    # 检查 mangle_prerouting 链是否存在 (Mihomo 未运行时可能没有)
+    if ! nft list chain inet fw4 mangle_prerouting &>/dev/null; then
+        print_warn "fw4 mangle_prerouting 链不存在 (Mihomo 可能未运行)，跳过 bypass 配置"
+        return 0
+    fi
+
+    # 先清理旧规则
+    wg_mihomo_bypass_clean 2>/dev/null
+
+    # wg0 接口流量跳过 Mihomo tproxy
+    nft insert rule inet fw4 mangle_prerouting iifname \"wg0\" counter return comment \"wg_bypass_iface\" 2>/dev/null || true
+    # 目标为 WG 子网的包跳过 Mihomo
+    nft insert rule inet fw4 mangle_prerouting ip daddr "$wg_subnet" counter return comment \"wg_bypass_subnet\" 2>/dev/null || true
+
+    # 持久化到 /etc/rc.local
+    sed -i '/wg_bypass/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null || true
+    # 在 exit 0 之前插入
+    if grep -q "^exit 0" /etc/rc.local 2>/dev/null; then
+        sed -i "/^exit 0/i\\
+# WireGuard bypass Mihomo\\
+nft insert rule inet fw4 mangle_prerouting iifname \\\"wg0\\\" counter return comment \\\"wg_bypass_iface\\\" 2>/dev/null || true\\
+nft insert rule inet fw4 mangle_prerouting ip daddr \\\"$wg_subnet\\\" counter return comment \\\"wg_bypass_subnet\\\" 2>/dev/null || true" \
+            /etc/rc.local 2>/dev/null || true
+    else
+        cat >> /etc/rc.local << RCEOF
+# WireGuard bypass Mihomo
+nft insert rule inet fw4 mangle_prerouting iifname "wg0" counter return comment "wg_bypass_iface" 2>/dev/null || true
+nft insert rule inet fw4 mangle_prerouting ip daddr "$wg_subnet" counter return comment "wg_bypass_subnet" 2>/dev/null || true
+RCEOF
+    fi
+
+    print_success "Mihomo bypass 规则已配置"
+}
+
+wg_mihomo_bypass_status() {
+    print_title "Mihomo bypass 规则状态"
+    local ok=true
+    echo ""
+
+    # 检查 nft 规则
+    if nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep -q 'wg_bypass_iface'; then
+        echo -e "  ${C_GREEN}[OK]${C_RESET} mangle_prerouting: wg_bypass_iface (wg0 接口跳过)"
+    else
+        echo -e "  ${C_RED}[缺失]${C_RESET} mangle_prerouting: wg_bypass_iface"
+        ok=false
+    fi
+
+    if nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep -q 'wg_bypass_subnet'; then
+        echo -e "  ${C_GREEN}[OK]${C_RESET} mangle_prerouting: wg_bypass_subnet (WG 子网跳过)"
+    else
+        echo -e "  ${C_RED}[缺失]${C_RESET} mangle_prerouting: wg_bypass_subnet"
+        ok=false
+    fi
+
+    if nft list chain inet fw4 input_wan 2>/dev/null | grep -q 'wg_allow_port'; then
+        echo -e "  ${C_GREEN}[OK]${C_RESET} input_wan: wg_allow_port (WG UDP 端口放行)"
+    else
+        echo -e "  ${C_YELLOW}[缺失]${C_RESET} input_wan: wg_allow_port"
+        ok=false
+    fi
+
+    # 检查 /etc/rc.local 持久化
+    echo ""
+    if grep -q 'wg_bypass' /etc/rc.local 2>/dev/null; then
+        echo -e "  ${C_GREEN}[OK]${C_RESET} /etc/rc.local: bypass 持久化规则存在"
+    else
+        echo -e "  ${C_RED}[缺失]${C_RESET} /etc/rc.local: 无 bypass 持久化规则"
+        ok=false
+    fi
+
+    echo ""
+    if [[ "$ok" == "true" ]]; then
+        print_success "所有 bypass 规则正常"
+    else
+        print_warn "部分规则缺失，可选择重建"
+        if confirm "是否立即重建 bypass 规则?"; then
+            wg_mihomo_bypass_rebuild
+        fi
+    fi
+    pause
+}
+
+wg_mihomo_bypass_clean() {
+    # 清理 nft 中所有 wg_bypass 相关规则
+    local h
+    for h in $(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print $NF}'); do
+        nft delete rule inet fw4 mangle_prerouting handle "$h" 2>/dev/null || true
+    done
+    # 清理 wg_allow_port
+    for h in $(nft -a list chain inet fw4 input_wan 2>/dev/null | grep 'wg_allow_port' | awk '{print $NF}'); do
+        nft delete rule inet fw4 input_wan handle "$h" 2>/dev/null || true
+    done
+    # 清理 /etc/rc.local 中的持久化条目
+    sed -i '/wg_bypass/d; /wg_allow_port/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null || true
+}
+
+wg_mihomo_bypass_rebuild() {
+    local wg_subnet wg_port
+    wg_subnet=$(wg_db_get '.server.subnet')
+    wg_port=$(wg_db_get '.server.port')
+    [[ -z "$wg_subnet" || "$wg_subnet" == "null" ]] && return 1
+
+    wg_setup_mihomo_bypass "$wg_subnet"
+
+    # 重建端口放行规则
+    if [[ -n "$wg_port" && "$wg_port" != "null" ]]; then
+        # 先清理旧的
+        local h
+        for h in $(nft -a list chain inet fw4 input_wan 2>/dev/null | grep 'wg_allow_port' | awk '{print $NF}'); do
+            nft delete rule inet fw4 input_wan handle "$h" 2>/dev/null || true
+        done
+        nft add rule inet fw4 input_wan udp dport "$wg_port" counter accept comment \"wg_allow_port\" 2>/dev/null || true
+    fi
+}
+
+# ── 卸载 ──
 
 wg_uninstall() {
     print_title "卸载 WireGuard"
@@ -5239,15 +5580,15 @@ wg_uninstall() {
     if ! confirm "再次确认: 所有配置将被永久删除，是否继续?"; then
         return
     fi
+
     print_info "[1/6] 停止并删除所有 WireGuard 接口..."
-    # 枚举所有 WireGuard 类型的网络接口并逐一清理
+    ifdown wg0 2>/dev/null || true
+    ifdown wg_mesh 2>/dev/null || true
     local _wg_ifaces
     _wg_ifaces=$(ip -o link show type wireguard 2>/dev/null | awk -F': ' '{print $2}' | tr -d ' ')
     if [[ -z "$_wg_ifaces" ]]; then
-        # fallback: 查找名称匹配的接口
         _wg_ifaces=$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^wg[0-9_-]|^wg_' | tr -d ' ')
     fi
-    # 始终确保 wg0 和 wg_mesh 在清理列表中
     for _must in "$WG_INTERFACE" wg_mesh wg-mesh; do
         if ip link show "$_must" &>/dev/null && ! echo "$_wg_ifaces" | grep -qw "$_must"; then
             _wg_ifaces="${_wg_ifaces:+$_wg_ifaces $_must}"
@@ -5256,46 +5597,52 @@ wg_uninstall() {
     done
     for _iface in $_wg_ifaces; do
         print_info "  清理接口: $_iface"
-        # 尝试 wg-quick down
-        wg-quick down "$_iface" 2>/dev/null || true
-        # 如果接口仍存在，强制用 ip link 删除
-        if ip link show "$_iface" &>/dev/null; then
-            ip link set "$_iface" down 2>/dev/null || true
-            ip link delete "$_iface" 2>/dev/null || true
-        fi
-        # 禁用对应的 systemd 服务
-        if is_systemd; then
-            systemctl disable "wg-quick@${_iface}" >/dev/null 2>&1 || true
-            systemctl stop "wg-quick@${_iface}" >/dev/null 2>&1 || true
-        fi
+        ip link set "$_iface" down 2>/dev/null || true
+        ip link delete "$_iface" 2>/dev/null || true
     done
-    # 二次确认: 检查是否还有残留的 wireguard 接口
-    local _remaining
-    _remaining=$(ip -o link show type wireguard 2>/dev/null | awk -F': ' '{print $2}' | tr -d ' ')
-    if [[ -n "$_remaining" ]]; then
-        print_warn "仍有残留接口，强制删除: $_remaining"
-        for _r in $_remaining; do
-            ip link delete "$_r" 2>/dev/null || true
-        done
-    fi
-    print_info "[2/5] 清理防火墙规则..."
-    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
-        if [[ "$role" == "server" ]]; then
-            local port
-            port=$(wg_db_get '.server.port' 2>/dev/null)
-            [[ -n "$port" ]] && ufw delete allow "${port}/udp" 2>/dev/null || true
-        fi
 
-    fi
-    print_info "[3/5] 清理所有看门狗和定时任务..."
-    # 主看门狗
+    print_info "[2/6] 清理 OpenWrt 网络和防火墙配置..."
+    # 删除所有 wireguard peer 配置段
+    while uci -q get network.@wireguard_wg0[0] >/dev/null 2>&1; do
+        uci delete network.@wireguard_wg0[0] 2>/dev/null || true
+    done
+    while uci -q get network.@wireguard_wg_mesh[0] >/dev/null 2>&1; do
+        uci delete network.@wireguard_wg_mesh[0] 2>/dev/null || true
+    done
+    uci delete network.wg_server 2>/dev/null || true
+    uci delete network.wg0 2>/dev/null || true
+    uci delete network.wg_mesh 2>/dev/null || true
+    # 删除防火墙配置
+    uci delete firewall.wg_zone 2>/dev/null || true
+    uci delete firewall.wg_fwd_lan 2>/dev/null || true
+    uci delete firewall.wg_fwd_wg 2>/dev/null || true
+    uci delete firewall.wg_mesh_zone 2>/dev/null || true
+    uci delete firewall.wg_mesh_fwd 2>/dev/null || true
+    uci delete firewall.wg_mesh_fwd_lan 2>/dev/null || true
+    local _fwi=0
+    while uci get firewall.@zone[$_fwi] &>/dev/null 2>&1; do
+        local _fname=$(uci get firewall.@zone[$_fwi].name 2>/dev/null)
+        if [[ "$_fname" == "wg" || "$_fname" == "wireguard" || "$_fname" == "wg_mesh" ]]; then
+            uci delete "firewall.@zone[$_fwi]" 2>/dev/null || true
+            continue
+        fi
+        _fwi=$((_fwi + 1))
+    done
+    uci commit network 2>/dev/null || true
+    uci commit firewall 2>/dev/null || true
+
+    print_info "[3/6] 清理 Mihomo bypass 和 nft 规则..."
+    wg_mihomo_bypass_clean
+    # 清理策略路由
+    ip rule del lookup main prio 100 2>/dev/null || true
+
+    print_info "[4/6] 清理看门狗和定时任务..."
     if crontab -l 2>/dev/null | grep -q "wg-watchdog.sh"; then
         cron_remove_job "wg-watchdog.sh"
     fi
-    rm -f /usr/local/bin/wg-watchdog.sh /var/log/wg-watchdog.log 2>/dev/null || true
-    # OpenWrt 看门狗（不同路径）
-    rm -f /usr/bin/wg-watchdog.sh 2>/dev/null || true
-    print_info "[4/5] 删除配置文件和临时文件..."
+    rm -f /usr/bin/wg-watchdog.sh /usr/local/bin/wg-watchdog.sh /var/log/wg-watchdog.log 2>/dev/null || true
+
+    print_info "[5/6] 删除配置文件..."
     rm -f "$WG_CONF" 2>/dev/null || true
     rm -rf /etc/wireguard/clients 2>/dev/null || true
     rm -f "$WG_DB_FILE" 2>/dev/null || true
@@ -5303,97 +5650,26 @@ wg_uninstall() {
     rm -f "$WG_ROLE_FILE" 2>/dev/null || true
     rm -f /etc/wireguard/*.key 2>/dev/null || true
     rmdir /etc/wireguard 2>/dev/null || true
-    # 清理所有 /tmp 临时文件
     rm -rf /tmp/.wg-wd-fail /tmp/.wg-watchdog-ping-fail \
            /tmp/.wg-db-tmp.json /tmp/clash-wg-*.yaml \
            /tmp/.wg-watchdog-stale 2>/dev/null || true
-    # OpenWrt: 自动清理 uci 配置
-    if [[ "$PLATFORM" == "openwrt" ]]; then
-        print_info "清理 OpenWrt 网络和防火墙配置..."
-        ifdown wg0 2>/dev/null || true
-        ifdown wg_mesh 2>/dev/null || true
-        # 删除所有 wireguard peer 配置段
-        while uci -q get network.@wireguard_wg0[0] >/dev/null 2>&1; do
-            uci delete network.@wireguard_wg0[0] 2>/dev/null || true
-        done
-        while uci -q get network.@wireguard_wg_mesh[0] >/dev/null 2>&1; do
-            uci delete network.@wireguard_wg_mesh[0] 2>/dev/null || true
-        done
-        uci delete network.wg_server 2>/dev/null || true
-        uci delete network.wg0 2>/dev/null || true
-        uci delete network.wg_mesh 2>/dev/null || true
-        # 删除防火墙配置
-        uci delete firewall.wg_zone 2>/dev/null || true
-        uci delete firewall.wg_fwd_lan 2>/dev/null || true
-        uci delete firewall.wg_fwd_wg 2>/dev/null || true
-        uci delete firewall.wg_mesh_zone 2>/dev/null || true
-        uci delete firewall.wg_mesh_fwd 2>/dev/null || true
-        uci delete firewall.wg_mesh_fwd_lan 2>/dev/null || true
-        local _fwi=0
-        while uci get firewall.@zone[$_fwi] &>/dev/null 2>&1; do
-            local _fname=$(uci get firewall.@zone[$_fwi].name 2>/dev/null)
-            if [[ "$_fname" == "wg" || "$_fname" == "wireguard" || "$_fname" == "wg_mesh" ]]; then
-                uci delete "firewall.@zone[$_fwi]" 2>/dev/null || true
-                continue
-            fi
-            _fwi=$((_fwi + 1))
-        done
-        # 清理 OpenClash 绕过规则
-        ip rule del lookup main prio 100 2>/dev/null || true
-        for h in $(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print $NF}'); do
-            nft delete rule inet fw4 mangle_prerouting handle "$h" 2>/dev/null || true
-        done
-        sed -i '/wg_bypass/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null || true
-        uci commit network 2>/dev/null || true
-        uci commit firewall 2>/dev/null || true
-    fi
-    print_info "[5/5] 卸载软件包..."
-    local remove_pkg=true
+
+    print_info "[6/6] 卸载软件包..."
     if confirm "是否卸载 WireGuard 软件包? (选 N 仅删除配置)"; then
-        case $PLATFORM in
-            debian|ubuntu)
-                apt-get remove -y wireguard wireguard-tools >/dev/null 2>&1 || true
-                apt-get autoremove -y >/dev/null 2>&1 || true
-                ;;
-            centos|rhel|rocky|alma|fedora)
-                if command_exists dnf; then
-                    dnf remove -y wireguard-tools >/dev/null 2>&1 || true
-                else
-                    yum remove -y wireguard-tools >/dev/null 2>&1 || true
-                fi
-                ;;
-            alpine)
-                apk del wireguard-tools >/dev/null 2>&1 || true
-                ;;
-            arch|manjaro)
-                pacman -Rns --noconfirm wireguard-tools >/dev/null 2>&1 || true
-                ;;
-            openwrt)
-                opkg remove wireguard-tools luci-proto-wireguard >/dev/null 2>&1 || true
-                ;;
-        esac
-    else
-        remove_pkg=false
+        opkg remove wireguard-tools luci-proto-wireguard kmod-wireguard 2>/dev/null || true
     fi
-    # 清理可能残留的 WireGuard iptables 规则
-    if command_exists iptables; then
-        iptables -S 2>/dev/null | grep -i "wg\|wireguard\|${WG_INTERFACE}" | while read -r rule; do
-            iptables $(echo "$rule" | sed 's/^-A/-D/') 2>/dev/null || true
-        done
-        iptables -t nat -S 2>/dev/null | grep -i "wg\|wireguard\|${WG_INTERFACE}" | while read -r rule; do
-            iptables -t nat $(echo "$rule" | sed 's/^-A/-D/') 2>/dev/null || true
-        done
-    fi
+
     if [[ "$role" == "server" ]]; then
         if confirm "是否恢复 IP 转发设置? (如果其他服务需要转发请选 N)"; then
             sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf 2>/dev/null || true
             sysctl -w net.ipv4.ip_forward=0 >/dev/null 2>&1 || true
         fi
     fi
+
     draw_line
-    print_success "WireGuard 已完全卸载 (所有配置、脚本、定时任务已清理)"
+    print_success "WireGuard 已完全卸载"
     draw_line
-    log_action "WireGuard uninstalled: role=${role} pkg_removed=${remove_pkg}"
+    log_action "WireGuard uninstalled: role=${role}"
     pause
 }
 
@@ -5405,13 +5681,11 @@ wg_openwrt_clean_cmd() {
 # === 停止所有 WireGuard 接口 ===
 ifdown wg0 2>/dev/null; true
 ifdown wg_mesh 2>/dev/null; true
-# 强制删除内核接口 (确保不残留)
 for iface in $(ip -o link show type wireguard 2>/dev/null | awk -F': ' '{print $2}'); do
     ip link set "$iface" down 2>/dev/null; true
     ip link delete "$iface" 2>/dev/null; true
     echo "[+] 已删除接口: $iface"
 done
-# 兜底: 按名称匹配
 for iface in wg0 wg_mesh wg-mesh; do
     if ip link show "$iface" >/dev/null 2>&1; then
         ip link set "$iface" down 2>/dev/null; true
@@ -5426,7 +5700,7 @@ rm -f /usr/bin/wg-watchdog.sh 2>/dev/null; true
 /etc/init.d/cron restart 2>/dev/null; true
 echo '[+] 看门狗已清理'
 
-# === 删除所有 wireguard peer 配置段 (含匿名段) ===
+# === 删除所有 wireguard peer 配置段 ===
 while uci -q get network.@wireguard_wg0[0] >/dev/null 2>&1; do
     uci delete network.@wireguard_wg0[0]
 done
@@ -5434,19 +5708,16 @@ while uci -q get network.@wireguard_wg_mesh[0] >/dev/null 2>&1; do
     uci delete network.@wireguard_wg_mesh[0]
 done
 uci delete network.wg_server 2>/dev/null; true
-
-# === 删除网络接口 ===
 uci delete network.wg0 2>/dev/null; true
 uci delete network.wg_mesh 2>/dev/null; true
 
-# === 删除防火墙配置 (命名段 + 匿名段) ===
+# === 删除防火墙配置 ===
 uci delete firewall.wg_zone 2>/dev/null; true
 uci delete firewall.wg_fwd_lan 2>/dev/null; true
 uci delete firewall.wg_fwd_wg 2>/dev/null; true
 uci delete firewall.wg_mesh_zone 2>/dev/null; true
 uci delete firewall.wg_mesh_fwd 2>/dev/null; true
 uci delete firewall.wg_mesh_fwd_lan 2>/dev/null; true
-# 清理匿名 zone (名称为 wg/wireguard/wg_mesh 的)
 i=0
 while uci get firewall.@zone[$i] >/dev/null 2>&1; do
     zname=$(uci get firewall.@zone[$i].name 2>/dev/null)
@@ -5454,12 +5725,11 @@ while uci get firewall.@zone[$i] >/dev/null 2>&1; do
         wg|wireguard|wg_mesh)
             uci delete "firewall.@zone[$i]" 2>/dev/null; true
             echo "[+] 已删除匿名防火墙 zone: $zname"
-            continue  # index 不变因为后面的元素前移了
+            continue
             ;;
     esac
     i=$((i + 1))
 done
-# 清理匿名 forwarding (src/dest 包含 wg 的)
 i=0
 while uci get firewall.@forwarding[$i] >/dev/null 2>&1; do
     fsrc=$(uci get firewall.@forwarding[$i].src 2>/dev/null)
@@ -5469,18 +5739,19 @@ while uci get firewall.@forwarding[$i] >/dev/null 2>&1; do
     echo "[+] 已删除匿名防火墙 forwarding: $fsrc -> $fdest"
 done
 
-# === 清理 OpenClash 绕过规则 ===
+# === 清理 Mihomo bypass 和 nft 规则 ===
 ip rule del lookup main prio 100 2>/dev/null; true
 for h in $(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print $NF}'); do
     nft delete rule inet fw4 mangle_prerouting handle "$h" 2>/dev/null; true
 done
-sed -i '/wg_bypass/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null; true
+for h in $(nft -a list chain inet fw4 input_wan 2>/dev/null | grep 'wg_allow_port' | awk '{print $NF}'); do
+    nft delete rule inet fw4 input_wan handle "$h" 2>/dev/null; true
+done
+sed -i '/wg_bypass/d; /wg_allow_port/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null; true
 
-# === 提交并重载 ===
+# === 提交配置 ===
 uci commit network
 uci commit firewall
-/etc/init.d/firewall restart 2>/dev/null; true
-/etc/init.d/network restart 2>/dev/null; true
 
 # === 最终验证 ===
 echo ''
@@ -5494,7 +5765,6 @@ CLEANEOF
     echo -e "${C_CYAN}执行后可在 LuCI -> Network -> Interfaces 确认 wg0 已消失${C_RESET}"
     pause
 }
-
 wg_add_peer() {
     wg_check_server || return 1
     print_title "添加 WireGuard 设备 (Peer)"
@@ -5515,115 +5785,136 @@ wg_add_peer() {
     peer_privkey=$(wg genkey)
     peer_pubkey=$(echo "$peer_privkey" | wg pubkey)
     psk=$(wg genpsk)
+
+    # ── 设备类型选择 (三种) ──
+    local peer_type="standard"
     local is_gateway="false"
     local lan_subnets=""
     echo ""
-    echo "设备类型:
-  1. 普通设备 (手机/电脑/服务器)
-  2. 网关设备 (路由器/OpenWrt，需要让其 LAN 内所有设备接入 VPN)"
+    echo "设备类型:"
+    echo -e "  1. ${C_CYAN}Clash 客户端${C_RESET} (手机/电脑，通过 FlClash/FClash 规则接入)"
+    echo -e "  2. ${C_YELLOW}网关设备${C_RESET} (OpenWrt 路由器，暴露自身 LAN 子网)"
+    echo -e "  3. 标准 WireGuard 客户端 (原生 .conf 配置)"
     read -e -r -p "选择 [1]: " device_type
     device_type=${device_type:-1}
-    if [[ "$device_type" == "2" ]]; then
-        is_gateway="true"
-        echo ""
-        print_guide "请输入该网关后面的 LAN 网段 (将被路由到 VPN 中)"
-        print_guide "示例: 192.168.1.0/24 或 10.10.100.0/24"
-        print_guide "多个网段用逗号分隔: 192.168.1.0/24, 192.168.2.0/24"
-        while [[ -z "$lan_subnets" ]]; do
-            read -e -r -p "LAN 网段: " lan_subnets
-            if [[ -z "$lan_subnets" ]]; then
-                print_warn "网关设备必须指定 LAN 网段"
-            elif ! echo "$lan_subnets" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+'; then
-                print_warn "格式无效，示例: 10.10.100.0/24"
-                lan_subnets=""
-            fi
-        done
-    fi
-    echo "客户端路由模式:
-  1. 全局代理 (所有流量走 VPN) - 0.0.0.0/0
-  2. 仅 VPN 内网 (只访问 VPN 内部设备)"
-    if [[ "$is_gateway" == "true" ]]; then
-        echo "  3. VPN 内网 + 所有网关 LAN 网段 (推荐网关设备)"
-    else
-        echo "  3. VPN 内网 + 指定 LAN 网段 (访问远程内网设备)"
-    fi
-    echo "  4. 自定义路由"
-    read -e -r -p "选择 [1]: " route_mode
-    route_mode=${route_mode:-1}
-    local client_allowed_ips server_subnet
-    server_subnet=$(wg_db_get '.server.subnet')
-        case $route_mode in
-        1) client_allowed_ips="0.0.0.0/0, ::/0" ;;
-        2) client_allowed_ips="$server_subnet" ;;
-        3)
-            # 收集所有已有网关的 LAN 网段
-            local all_lan_subnets=""
-            local pc=$(wg_db_get '.peers | length')
-            local pi=0
-            while [[ $pi -lt $pc ]]; do
-                local pls=$(wg_db_get ".peers[$pi].lan_subnets // empty")
-                if [[ -n "$pls" ]]; then
-                    [[ -n "$all_lan_subnets" ]] && all_lan_subnets="${all_lan_subnets}, "
-                    all_lan_subnets="${all_lan_subnets}${pls}"
+
+    case "$device_type" in
+        1)
+            peer_type="clash"
+            is_gateway="false"
+            ;;
+        2)
+            peer_type="gateway"
+            is_gateway="true"
+            echo ""
+            print_guide "请输入该网关后面的 LAN 网段 (将被路由到 VPN 中)"
+            print_guide "示例: 192.168.123.0/24"
+            print_guide "多个网段用逗号分隔: 192.168.1.0/24, 192.168.2.0/24"
+            while [[ -z "$lan_subnets" ]]; do
+                read -e -r -p "LAN 网段: " lan_subnets
+                if [[ -z "$lan_subnets" ]]; then
+                    print_warn "网关设备必须指定 LAN 网段"
+                elif ! echo "$lan_subnets" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+'; then
+                    print_warn "格式无效，示例: 192.168.123.0/24"
+                    lan_subnets=""
                 fi
-                pi=$((pi + 1))
             done
-            # 当前新设备自己的 LAN 也加入（如果是网关）
-            if [[ "$is_gateway" == "true" && -n "$lan_subnets" ]]; then
-                [[ -n "$all_lan_subnets" ]] && all_lan_subnets="${all_lan_subnets}, "
-                all_lan_subnets="${all_lan_subnets}${lan_subnets}"
-            fi
-            # 去掉自己的 LAN（网关不需要路由自己的 LAN 回隧道）
-            if [[ "$is_gateway" == "true" && -n "$lan_subnets" ]]; then
-                local other_lans=""
-                local IFS_BAK="$IFS"; IFS=','
-                for cidr in $all_lan_subnets; do
-                    cidr=$(echo "$cidr" | xargs)
-                    [[ -z "$cidr" ]] && continue
-                    local dominated=false
-                    local IFS2_BAK="$IFS"; IFS=','
-                    for own in $lan_subnets; do
-                        own=$(echo "$own" | xargs)
-                        [[ "$cidr" == "$own" ]] && { dominated=true; break; }
-                    done
-                    IFS="$IFS2_BAK"
-                    if [[ "$dominated" != "true" ]]; then
-                        [[ -n "$other_lans" ]] && other_lans="${other_lans}, "
-                        other_lans="${other_lans}${cidr}"
-                    fi
-                done
-                IFS="$IFS_BAK"
-                if [[ -n "$other_lans" ]]; then
-                    client_allowed_ips="${server_subnet}, ${other_lans}"
-                else
-                    client_allowed_ips="$server_subnet"
-                fi
-            else
-                if [[ -n "$all_lan_subnets" ]]; then
-                    client_allowed_ips="${server_subnet}, ${all_lan_subnets}"
-                else
-                    print_warn "当前无网关设备注册 LAN 网段，仅路由 VPN 内网"
-                    client_allowed_ips="$server_subnet"
-                fi
-            fi
             ;;
-        4)
-            read -e -r -p "输入允许的 IP 范围 (逗号分隔): " client_allowed_ips
-            [[ -z "$client_allowed_ips" ]] && client_allowed_ips="0.0.0.0/0, ::/0"
+        3)
+            peer_type="standard"
+            is_gateway="false"
             ;;
-        *) client_allowed_ips="0.0.0.0/0, ::/0" ;;
+        *)
+            peer_type="clash"
+            is_gateway="false"
+            ;;
     esac
-    local spub sep sport sdns
+
+    # ── 路由模式 ──
+    local client_allowed_ips server_subnet server_lan
+    server_subnet=$(wg_db_get '.server.subnet')
+    server_lan=$(wg_db_get '.server.server_lan_subnet // empty')
+
+    # 收集所有网关 LAN 网段 (含当前新设备)
+    local all_lan_subnets=""
+    local pc=$(wg_db_get '.peers | length') pi=0
+    while [[ $pi -lt $pc ]]; do
+        local pls=$(wg_db_get ".peers[$pi].lan_subnets // empty")
+        if [[ -n "$pls" && "$pls" != "null" ]]; then
+            [[ -n "$all_lan_subnets" ]] && all_lan_subnets="${all_lan_subnets}, "
+            all_lan_subnets="${all_lan_subnets}${pls}"
+        fi
+        pi=$((pi + 1))
+    done
+    if [[ "$is_gateway" == "true" && -n "$lan_subnets" ]]; then
+        [[ -n "$all_lan_subnets" ]] && all_lan_subnets="${all_lan_subnets}, "
+        all_lan_subnets="${all_lan_subnets}${lan_subnets}"
+    fi
+
+    if [[ "$peer_type" == "clash" ]]; then
+        # Clash 客户端: 路由 VPN 子网 + 服务端 LAN + 所有网关 LAN
+        client_allowed_ips="$server_subnet"
+        [[ -n "$server_lan" && "$server_lan" != "null" ]] && client_allowed_ips="${client_allowed_ips}, ${server_lan}"
+        [[ -n "$all_lan_subnets" ]] && client_allowed_ips="${client_allowed_ips}, ${all_lan_subnets}"
+        echo -e "  Clash 路由模式: ${C_CYAN}VPN 子网 + 所有 LAN 子网${C_RESET}"
+        echo -e "  AllowedIPs: ${client_allowed_ips}"
+    elif [[ "$peer_type" == "gateway" ]]; then
+        # 网关设备: VPN 子网 + 服务端 LAN + 其他网关 LAN (排除自己的 LAN)
+        local other_lans=""
+        local IFS_BAK="$IFS"; IFS=','
+        for cidr in $all_lan_subnets; do
+            cidr=$(echo "$cidr" | xargs)
+            [[ -z "$cidr" ]] && continue
+            local dominated=false
+            local IFS2_BAK="$IFS"; IFS=','
+            for own in $lan_subnets; do
+                own=$(echo "$own" | xargs)
+                [[ "$cidr" == "$own" ]] && { dominated=true; break; }
+            done
+            IFS="$IFS2_BAK"
+            [[ "$dominated" != "true" ]] && { [[ -n "$other_lans" ]] && other_lans="${other_lans}, "; other_lans="${other_lans}${cidr}"; }
+        done
+        IFS="$IFS_BAK"
+        client_allowed_ips="$server_subnet"
+        [[ -n "$server_lan" && "$server_lan" != "null" ]] && client_allowed_ips="${client_allowed_ips}, ${server_lan}"
+        [[ -n "$other_lans" ]] && client_allowed_ips="${client_allowed_ips}, ${other_lans}"
+        echo -e "  网关路由模式: ${C_YELLOW}VPN 子网 + 服务端 LAN + 其他网关 LAN${C_RESET}"
+        echo -e "  AllowedIPs: ${client_allowed_ips}"
+    else
+        # 标准客户端: 交互选择
+        echo ""
+        echo "客户端路由模式:"
+        echo "  1. 全局代理 (所有流量走 VPN) - 0.0.0.0/0"
+        echo "  2. 仅 VPN 内网 (只访问 VPN 内部设备)"
+        echo "  3. VPN 内网 + 所有 LAN 网段 (访问远程内网设备)"
+        echo "  4. 自定义路由"
+        read -e -r -p "选择 [1]: " route_mode
+        route_mode=${route_mode:-1}
+        case $route_mode in
+            1) client_allowed_ips="0.0.0.0/0, ::/0" ;;
+            2) client_allowed_ips="$server_subnet" ;;
+            3)
+                client_allowed_ips="$server_subnet"
+                [[ -n "$server_lan" && "$server_lan" != "null" ]] && client_allowed_ips="${client_allowed_ips}, ${server_lan}"
+                [[ -n "$all_lan_subnets" ]] && client_allowed_ips="${client_allowed_ips}, ${all_lan_subnets}"
+                ;;
+            4)
+                read -e -r -p "输入允许的 IP 范围 (逗号分隔): " client_allowed_ips
+                [[ -z "$client_allowed_ips" ]] && client_allowed_ips="0.0.0.0/0, ::/0"
+                ;;
+            *) client_allowed_ips="0.0.0.0/0, ::/0" ;;
+        esac
+    fi
+
+    # ── 生成客户端配置文件 ──
+    local spub sep sport sdns mask
     spub=$(wg_db_get '.server.public_key')
     sep=$(wg_db_get '.server.endpoint')
     sport=$(wg_db_get '.server.port')
     sdns=$(wg_db_get '.server.dns')
-    local mask
     mask=$(echo "$server_subnet" | cut -d'/' -f2)
     local dns_line=""
-    if [[ "$is_gateway" != "true" ]]; then
-        dns_line="DNS = ${sdns}"
-    fi
+    [[ "$is_gateway" != "true" ]] && dns_line="DNS = ${sdns}"
     local client_conf="[Interface]
 PrivateKey = ${peer_privkey}
 Address = ${peer_ip}/${mask}
@@ -5639,6 +5930,8 @@ PersistentKeepalive = 25"
     local conf_file="/etc/wireguard/clients/${peer_name}.conf"
     write_file_atomic "$conf_file" "$client_conf"
     chmod 600 "$conf_file"
+
+    # ── 写入数据库 ──
     local now; now=$(date '+%Y-%m-%d %H:%M:%S')
     wg_db_set --arg name "$peer_name" \
               --arg ip "$peer_ip" \
@@ -5649,6 +5942,7 @@ PersistentKeepalive = 25"
               --arg created "$now" \
               --arg gw "$is_gateway" \
               --arg lans "$lan_subnets" \
+              --arg ptype "$peer_type" \
     '.peers += [{
         name: $name,
         ip: $ip,
@@ -5659,96 +5953,109 @@ PersistentKeepalive = 25"
         enabled: true,
         created: $created,
         is_gateway: ($gw == "true"),
-        lan_subnets: $lans
+        lan_subnets: $lans,
+        peer_type: $ptype
     }]'
+
+    # ── 网关设备: 联动更新其他 peer 的 allowed_ips ──
     if [[ "$is_gateway" == "true" && -n "$lan_subnets" ]]; then
-        local _pc=$(wg_db_get '.peers | length')
-        local _all_lans="" _pi=0
-        while [[ $_pi -lt $_pc ]]; do
-            local _pls=$(wg_db_get ".peers[$_pi].lan_subnets // empty")
-            [[ -n "$_pls" ]] && { [[ -n "$_all_lans" ]] && _all_lans="${_all_lans}, "; _all_lans="${_all_lans}${_pls}"; }
-            _pi=$((_pi + 1))
-        done
-        _pi=0
-        while [[ $_pi -lt $_pc ]]; do
-            local _pname=$(wg_db_get ".peers[$_pi].name")
-            [[ "$_pname" == "$peer_name" ]] && { _pi=$((_pi + 1)); continue; }
-            local _cur_allowed=$(wg_db_get ".peers[$_pi].client_allowed_ips")
-            [[ "$_cur_allowed" == *"0.0.0.0/0"* ]] && { _pi=$((_pi + 1)); continue; }
-            local _is_gw=$(wg_db_get ".peers[$_pi].is_gateway // false")
-            local _own_lans=$(wg_db_get ".peers[$_pi].lan_subnets // empty")
-            if [[ "$_is_gw" != "true" && "$_cur_allowed" == "$server_subnet" ]]; then
-                _pi=$((_pi + 1)); continue
-            fi
-            if [[ "$_is_gw" == "true" ]]; then
-                local _other="" _IFS_BAK="$IFS"; IFS=','
-                for _c in $_all_lans; do
-                    _c=$(echo "$_c" | xargs); [[ -z "$_c" ]] && continue
-                    local _skip=false _IFS2="$IFS"; IFS=','
-                    for _o in $_own_lans; do _o=$(echo "$_o" | xargs); [[ "$_c" == "$_o" ]] && { _skip=true; break; }; done
-                    IFS="$_IFS2"
-                    [[ "$_skip" != "true" ]] && { [[ -n "$_other" ]] && _other="${_other}, "; _other="${_other}${_c}"; }
-                done; IFS="$_IFS_BAK"
-                local _new="${server_subnet}"
-                [[ -n "$_other" ]] && _new="${server_subnet}, ${_other}"
-                wg_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a'
-            else
-                local _new="${server_subnet}, ${_all_lans}"
-                wg_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a'
-            fi
-            _pi=$((_pi + 1))
-        done
+        _wg_update_peer_routes
     fi
+
+    # ── 重建配置并应用 ──
+    wg_rebuild_uci_conf
     wg_rebuild_conf
-    if wg_is_running; then
-        wg syncconf "$WG_INTERFACE" <(wg-quick strip "$WG_INTERFACE") 2>/dev/null || {
-            print_warn "热加载失败，尝试重启接口..."
-            wg-quick down "$WG_INTERFACE" 2>/dev/null
-            wg-quick up "$WG_INTERFACE" 2>/dev/null
-        }
-        if [[ "$is_gateway" == "true" && -n "$lan_subnets" ]]; then
-            local IFS_BAK="$IFS"; IFS=','
-            for cidr in $lan_subnets; do
-                cidr=$(echo "$cidr" | xargs)
-                [[ -n "$cidr" ]] && ip route replace "$cidr" dev "$WG_INTERFACE" 2>/dev/null && \
-                    print_info "已添加路由: $cidr -> $WG_INTERFACE"
-            done
-            IFS="$IFS_BAK"
-        fi
-    fi
     wg_regenerate_client_confs
+
+    # ── 结果展示 ──
     draw_line
     print_success "设备 '${peer_name}' 添加成功！"
     draw_line
     echo -e "  名称: ${C_GREEN}${peer_name}${C_RESET}"
     echo -e "  IP:   ${C_GREEN}${peer_ip}${C_RESET}"
-    if [[ "$is_gateway" == "true" ]]; then
-        echo -e "  类型: ${C_YELLOW}网关设备${C_RESET}"
-        echo -e "  LAN:  ${C_CYAN}${lan_subnets}${C_RESET}"
-    else
-        echo -e "  类型: 普通设备"
-    fi
+    case "$peer_type" in
+        clash)   echo -e "  类型: ${C_CYAN}Clash 客户端${C_RESET}" ;;
+        gateway) echo -e "  类型: ${C_YELLOW}网关设备${C_RESET}"; echo -e "  LAN:  ${C_CYAN}${lan_subnets}${C_RESET}" ;;
+        *)       echo -e "  类型: 标准客户端" ;;
+    esac
     echo -e "  路由: ${C_CYAN}${client_allowed_ips}${C_RESET}"
     echo -e "  配置: ${C_CYAN}${conf_file}${C_RESET}"
     draw_line
-    if [[ "$is_gateway" == "true" ]]; then
-        echo -e "${C_YELLOW}[通过 Mihomo/Clash Meta 接管网关流量]${C_RESET}"
+
+    # ── 后续操作提示 ──
+    if [[ "$peer_type" == "clash" ]]; then
+        echo ""
+        read -e -r -p "是否立即生成 Clash/Mihomo 客户端配置? [Y/n]: " _gen_clash
+        _gen_clash=${_gen_clash:-Y}
+        [[ "$_gen_clash" =~ ^[Yy]$ ]] && wg_generate_clash_config
+    elif [[ "$peer_type" == "gateway" ]]; then
+        echo -e "\n${C_YELLOW}[网关设备部署提示]${C_RESET}"
         echo "  • LAN 内设备无需安装任何 VPN 客户端，网关自动代理"
-        echo "  • 生成 Mihomo 配置并导入 OpenClash 即可"
-        echo "  • 确保 VPN 子网 ($(wg_db_get '.server.subnet')) 与 LAN 子网 (${lan_subnets}) 不冲突"
-        echo "  • 其他 VPN 设备如需访问此网关的 LAN，路由模式选 3 即可"
-        draw_line
+        echo "  • 确保 VPN 子网 (${server_subnet}) 与 LAN 子网 (${lan_subnets}) 不冲突"
+        echo ""
+        read -e -r -p "是否立即显示 OpenWrt 部署命令? [Y/n]: " _show_cmd
+        _show_cmd=${_show_cmd:-Y}
+        [[ "$_show_cmd" =~ ^[Yy]$ ]] && _wg_show_openwrt_deploy "$target_idx"
     fi
 
-    echo ""
-    read -e -r -p "是否立即生成 Clash/mihomo 客户端配置? [Y/n]: " _gen_clash
-    _gen_clash=${_gen_clash:-Y}
-    if [[ "$_gen_clash" =~ ^[Yy]$ ]]; then
-        wg_generate_clash_config
-    fi
-
-    log_action "WireGuard peer added: ${peer_name} (${peer_ip}) gateway=${is_gateway} lan=${lan_subnets}"
+    log_action "WireGuard peer added: ${peer_name} (${peer_ip}) type=${peer_type} gateway=${is_gateway} lan=${lan_subnets}"
     pause
+}
+
+# 内部函数: 联动更新所有 peer 的 allowed_ips (当网关 LAN 变动时)
+_wg_update_peer_routes() {
+    local server_subnet=$(wg_db_get '.server.subnet')
+    local server_lan=$(wg_db_get '.server.server_lan_subnet // empty')
+    local _pc=$(wg_db_get '.peers | length')
+
+    # 收集所有网关的 LAN 网段
+    local _all_lans="" _pi=0
+    while [[ $_pi -lt $_pc ]]; do
+        local _pls=$(wg_db_get ".peers[$_pi].lan_subnets // empty")
+        [[ -n "$_pls" && "$_pls" != "null" ]] && { [[ -n "$_all_lans" ]] && _all_lans="${_all_lans}, "; _all_lans="${_all_lans}${_pls}"; }
+        _pi=$((_pi + 1))
+    done
+
+    _pi=0
+    while [[ $_pi -lt $_pc ]]; do
+        local _cur=$(wg_db_get ".peers[$_pi].client_allowed_ips")
+        # 跳过全局代理和仅 VPN 内网的
+        [[ "$_cur" == *"0.0.0.0/0"* ]] && { _pi=$((_pi + 1)); continue; }
+        [[ "$_cur" == "$server_subnet" ]] && { _pi=$((_pi + 1)); continue; }
+
+        local _is_gw=$(wg_db_get ".peers[$_pi].is_gateway // false")
+        local _own=$(wg_db_get ".peers[$_pi].lan_subnets // empty")
+        local _ptype=$(wg_db_get ".peers[$_pi].peer_type // \"standard\"")
+
+        if [[ "$_is_gw" == "true" ]]; then
+            # 网关: VPN 子网 + 服务端 LAN + 其他网关 LAN (排除自己)
+            local _other="" _IFS_BAK="$IFS"; IFS=','
+            for _c in $_all_lans; do
+                _c=$(echo "$_c" | xargs); [[ -z "$_c" ]] && continue
+                local _skip=false _IFS2="$IFS"; IFS=','
+                for _o in $_own; do _o=$(echo "$_o" | xargs); [[ "$_c" == "$_o" ]] && { _skip=true; break; }; done
+                IFS="$_IFS2"
+                [[ "$_skip" != "true" ]] && { [[ -n "$_other" ]] && _other="${_other}, "; _other="${_other}${_c}"; }
+            done; IFS="$_IFS_BAK"
+            local _new="$server_subnet"
+            [[ -n "$server_lan" && "$server_lan" != "null" ]] && _new="${_new}, ${server_lan}"
+            [[ -n "$_other" ]] && _new="${_new}, ${_other}"
+            wg_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a'
+        elif [[ "$_ptype" == "clash" ]]; then
+            # Clash: VPN 子网 + 服务端 LAN + 所有网关 LAN
+            local _new="$server_subnet"
+            [[ -n "$server_lan" && "$server_lan" != "null" ]] && _new="${_new}, ${server_lan}"
+            [[ -n "$_all_lans" ]] && _new="${_new}, ${_all_lans}"
+            wg_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a'
+        else
+            # 标准: VPN 子网 + 服务端 LAN + 所有网关 LAN
+            local _new="$server_subnet"
+            [[ -n "$server_lan" && "$server_lan" != "null" ]] && _new="${_new}, ${server_lan}"
+            [[ -n "$_all_lans" ]] && _new="${_new}, ${_all_lans}"
+            wg_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a'
+        fi
+        _pi=$((_pi + 1))
+    done
 }
 
 wg_list_peers() {
@@ -5762,19 +6069,23 @@ wg_list_peers() {
     fi
     local wg_dump=""
     wg_is_running && wg_dump=$(wg show "$WG_INTERFACE" dump 2>/dev/null | tail -n +2)
-    printf "${C_CYAN}%-4s %-14s %-14s %-6s %-8s %-10s %-10s %s${C_RESET}\n" \
+    printf "${C_CYAN}%-4s %-14s %-14s %-8s %-8s %-10s %-10s %s${C_RESET}\n" \
         "#" "名称" "IP" "类型" "状态" "↓接收" "↑发送" "最近握手"
     draw_line
     local i=0
     while [[ $i -lt $peer_count ]]; do
-        local name ip pubkey enabled is_gw lan_sub
+        local name ip pubkey enabled peer_type
         name=$(wg_db_get ".peers[$i].name")
         ip=$(wg_db_get ".peers[$i].ip")
         pubkey=$(wg_db_get ".peers[$i].public_key")
         enabled=$(wg_db_get ".peers[$i].enabled")
-        is_gw=$(wg_db_get ".peers[$i].is_gateway // false")
-        local type_str="普通"
-        [[ "$is_gw" == "true" ]] && type_str="${C_YELLOW}网关${C_RESET}"
+        peer_type=$(wg_db_get ".peers[$i].peer_type // \"standard\"")
+        local type_str
+        case "$peer_type" in
+            clash)   type_str="${C_CYAN}Clash${C_RESET}" ;;
+            gateway) type_str="${C_YELLOW}网关${C_RESET}" ;;
+            *)       type_str="标准" ;;
+        esac
         local status_str
         if [[ "$enabled" != "true" ]]; then
             status_str="${C_GRAY}禁用${C_RESET}"
@@ -5807,21 +6118,18 @@ wg_list_peers() {
                 fi
             fi
         fi
-        printf "%-4s %-14s %-14s %-6b %-8b %-10s %-10s %s\n" \
+        printf "%-4s %-14s %-14s %-8b %-8b %-10s %-10s %s\n" \
             "$((i + 1))" "$name" "$ip" "$type_str" "$status_str" \
             "$(wg_format_bytes "$rx_bytes")" "$(wg_format_bytes "$tx_bytes")" "$last_handshake"
         i=$((i + 1))
     done
     echo -e "${C_CYAN}共 ${peer_count} 个设备${C_RESET}"
-    local gw_found=0
-    local gi=0
+    # 显示网关 LAN 信息
+    local gw_found=0 gi=0
     while [[ $gi -lt $peer_count ]]; do
         local gw_check=$(wg_db_get ".peers[$gi].is_gateway // false")
         if [[ "$gw_check" == "true" ]]; then
-            if [[ $gw_found -eq 0 ]]; then
-                echo -e "${C_CYAN}网关设备 LAN 网段:${C_RESET}"
-                gw_found=1
-            fi
+            [[ $gw_found -eq 0 ]] && { echo -e "${C_CYAN}网关设备 LAN 网段:${C_RESET}"; gw_found=1; }
             local gw_name=$(wg_db_get ".peers[$gi].name")
             local gw_lans=$(wg_db_get ".peers[$gi].lan_subnets // empty")
             echo -e "  ${gw_name}: ${C_GREEN}${gw_lans:-未设置}${C_RESET}"
@@ -5846,6 +6154,7 @@ wg_toggle_peer() {
             if wg_is_running; then
                 wg set "$WG_INTERFACE" peer "$target_pubkey" remove 2>/dev/null || true
             fi
+            wg_rebuild_uci_conf
             wg_rebuild_conf
             print_success "设备 '${target_name}' 已禁用"
             log_action "WireGuard peer disabled: ${target_name}"
@@ -5853,13 +6162,8 @@ wg_toggle_peer() {
     else
         if confirm "确认启用设备 '${target_name}'？"; then
             wg_db_set --argjson idx "$target_idx" '.peers[$idx].enabled = true'
+            wg_rebuild_uci_conf
             wg_rebuild_conf
-            if wg_is_running; then
-                wg syncconf "$WG_INTERFACE" <(wg-quick strip "$WG_INTERFACE") 2>/dev/null || {
-                    wg-quick down "$WG_INTERFACE" 2>/dev/null
-                    wg-quick up "$WG_INTERFACE" 2>/dev/null
-                }
-            fi
             print_success "设备 '${target_name}' 已启用"
             log_action "WireGuard peer enabled: ${target_name}"
         fi
@@ -5878,51 +6182,20 @@ wg_delete_peer() {
     if ! confirm "确认删除设备 '${target_name}'？"; then
         return
     fi
-        if wg_is_running; then
+    if wg_is_running; then
         wg set "$WG_INTERFACE" peer "$target_pubkey" remove 2>/dev/null || true
     fi
     local _del_gw=$(wg_db_get ".peers[$target_idx].is_gateway // false")
     local _del_lans=$(wg_db_get ".peers[$target_idx].lan_subnets // empty")
     wg_db_set --argjson idx "$target_idx" 'del(.peers[$idx])'
-    if [[ "$_del_gw" == "true" && -n "$_del_lans" ]]; then
-        local _pc=$(wg_db_get '.peers | length')
-        local _all_lans="" _pi=0
-        while [[ $_pi -lt $_pc ]]; do
-            local _pls=$(wg_db_get ".peers[$_pi].lan_subnets // empty")
-            [[ -n "$_pls" ]] && { [[ -n "$_all_lans" ]] && _all_lans="${_all_lans}, "; _all_lans="${_all_lans}${_pls}"; }
-            _pi=$((_pi + 1))
-        done
-        local server_subnet=$(wg_db_get '.server.subnet')
-        _pi=0
-        while [[ $_pi -lt $_pc ]]; do
-            local _cur=$(wg_db_get ".peers[$_pi].client_allowed_ips")
-            [[ "$_cur" == *"0.0.0.0/0"* ]] && { _pi=$((_pi + 1)); continue; }
-            [[ "$_cur" == "$server_subnet" ]] && { _pi=$((_pi + 1)); continue; }
-            local _is_gw=$(wg_db_get ".peers[$_pi].is_gateway // false")
-            local _own=$(wg_db_get ".peers[$_pi].lan_subnets // empty")
-            if [[ "$_is_gw" == "true" ]]; then
-                local _other="" _IFS_BAK="$IFS"; IFS=','
-                for _c in $_all_lans; do
-                    _c=$(echo "$_c" | xargs); [[ -z "$_c" ]] && continue
-                    local _skip=false _IFS2="$IFS"; IFS=','
-                    for _o in $_own; do _o=$(echo "$_o" | xargs); [[ "$_c" == "$_o" ]] && { _skip=true; break; }; done
-                    IFS="$_IFS2"
-                    [[ "$_skip" != "true" ]] && { [[ -n "$_other" ]] && _other="${_other}, "; _other="${_other}${_c}"; }
-                done; IFS="$_IFS_BAK"
-                local _new="$server_subnet"
-                [[ -n "$_other" ]] && _new="${server_subnet}, ${_other}"
-                wg_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a'
-            else
-                if [[ -n "$_all_lans" ]]; then
-                    wg_db_set --argjson idx "$_pi" --arg a "${server_subnet}, ${_all_lans}" '.peers[$idx].client_allowed_ips = $a'
-                else
-                    wg_db_set --argjson idx "$_pi" --arg a "$server_subnet" '.peers[$idx].client_allowed_ips = $a'
-                fi
-            fi
-            _pi=$((_pi + 1))
-        done
+
+    # 网关删除后联动更新其他 peer
+    if [[ "$_del_gw" == "true" && -n "$_del_lans" && "$_del_lans" != "null" ]]; then
+        _wg_update_peer_routes
     fi
+
     rm -f "/etc/wireguard/clients/${target_name}.conf"
+    wg_rebuild_uci_conf
     wg_rebuild_conf
     wg_regenerate_client_confs
 
@@ -5933,181 +6206,131 @@ wg_delete_peer() {
 
 wg_show_peer_conf() {
     wg_check_server || return 1
-    print_title "查看设备配置 / 二维码"
+    print_title "查看设备配置"
     wg_select_peer "选择设备序号" true || return
     local target_idx=$REPLY
-    local target_name
+    local target_name peer_type
     target_name=$(wg_db_get ".peers[$target_idx].name")
+    peer_type=$(wg_db_get ".peers[$target_idx].peer_type // \"standard\"")
     local conf_file="/etc/wireguard/clients/${target_name}.conf"
+
+    # 确保配置文件存在
     if [[ ! -f "$conf_file" ]]; then
         print_warn "配置文件不存在，正在从数据库重新生成..."
-        local peer_privkey peer_ip peer_psk client_allowed_ips
-        peer_privkey=$(wg_db_get ".peers[$target_idx].private_key")
-        peer_ip=$(wg_db_get ".peers[$target_idx].ip")
-        peer_psk=$(wg_db_get ".peers[$target_idx].preshared_key")
-        client_allowed_ips=$(wg_db_get ".peers[$target_idx].client_allowed_ips")
-        local spub sep sport sdns ssub mask
-        spub=$(wg_db_get '.server.public_key')
-        sep=$(wg_db_get '.server.endpoint')
-        sport=$(wg_db_get '.server.port')
-        sdns=$(wg_db_get '.server.dns')
-        ssub=$(wg_db_get '.server.subnet')
-        mask=$(echo "$ssub" | cut -d'/' -f2)
-        local is_gw_check=$(wg_db_get ".peers[$target_idx].is_gateway // false")
-        local dns_line="DNS = ${sdns}"
-        [[ "$is_gw_check" == "true" ]] && dns_line=""
-        local regen_content="[Interface]
-PrivateKey = ${peer_privkey}
-Address = ${peer_ip}/${mask}
-${dns_line}
-[Peer]
-PublicKey = ${spub}
-PresharedKey = ${peer_psk}
-Endpoint = ${sep}:${sport}
-AllowedIPs = ${client_allowed_ips}
-PersistentKeepalive = 25"
-        regen_content=$(echo "$regen_content" | sed '/^$/N;/^\n$/d')
-        mkdir -p /etc/wireguard/clients
-        write_file_atomic "$conf_file" "$regen_content"
-        chmod 600 "$conf_file"
+        wg_regenerate_client_confs
+        [[ ! -f "$conf_file" ]] && { print_error "配置文件生成失败"; pause; return; }
         print_success "配置文件已重新生成"
     fi
-    draw_line
-    echo -e "${C_CYAN}=== ${target_name} 客户端配置 ===${C_RESET}"
-    draw_line
-    cat "$conf_file"
-    draw_line
-    if command_exists qrencode; then
-        if confirm "显示二维码 (手机扫码导入)?"; then
-            echo -e "${C_CYAN}=== ${target_name} 二维码 ===${C_RESET}"
-            qrencode -t ansiutf8 < "$conf_file"
-            echo ""
+
+    if [[ "$peer_type" == "clash" ]]; then
+        # ── Clash 客户端: 只显示生成 Clash 配置的选项 ──
+        echo -e "  设备类型: ${C_CYAN}Clash 客户端${C_RESET}"
+        echo -e "  (Clash 客户端不使用 .conf 文件，请生成 Clash YAML 配置)"
+        echo ""
+        if confirm "是否生成 Clash/Mihomo 配置?"; then
+            wg_generate_clash_config
+        fi
+    elif [[ "$peer_type" == "gateway" ]]; then
+        # ── 网关设备: 显示 .conf + OpenWrt 部署命令 ──
+        draw_line
+        echo -e "${C_CYAN}=== ${target_name} 客户端配置 (网关) ===${C_RESET}"
+        draw_line
+        cat "$conf_file"
+        draw_line
+        echo ""
+        if confirm "显示 OpenWrt uci 部署命令?"; then
+            _wg_show_openwrt_deploy "$target_idx"
+        fi
+    else
+        # ── 标准客户端: 显示 .conf + 二维码 ──
+        draw_line
+        echo -e "${C_CYAN}=== ${target_name} 客户端配置 ===${C_RESET}"
+        draw_line
+        cat "$conf_file"
+        draw_line
+        if command_exists qrencode; then
+            if confirm "显示二维码 (手机扫码导入)?"; then
+                echo -e "${C_CYAN}=== ${target_name} 二维码 ===${C_RESET}"
+                qrencode -t ansiutf8 < "$conf_file"
+                echo ""
+            fi
         fi
     fi
-    local is_gateway
-    is_gateway=$(wg_db_get ".peers[$target_idx].is_gateway // false")
-    if [[ "$is_gateway" == "true" ]]; then
-        if confirm "显示 OpenWrt uci 部署命令?"; then
-            local peer_privkey peer_ip psk client_allowed_ips
-            peer_privkey=$(wg_db_get ".peers[$target_idx].private_key")
-            peer_ip=$(wg_db_get ".peers[$target_idx].ip")
-            psk=$(wg_db_get ".peers[$target_idx].preshared_key")
-            client_allowed_ips=$(wg_db_get ".peers[$target_idx].client_allowed_ips")
-            local spub sep sport ssub mask
-            spub=$(wg_db_get '.server.public_key')
-            sep=$(wg_db_get '.server.endpoint')
-            sport=$(wg_db_get '.server.port')
-            ssub=$(wg_db_get '.server.subnet')
-            mask=$(echo "$ssub" | cut -d'/' -f2)
-            local ep_host="$sep"
-            local uci_allowed_lines=""
-            local IFS_BAK="$IFS"; IFS=','
-            for cidr in $client_allowed_ips; do
-                cidr=$(echo "$cidr" | xargs)
-                [[ -n "$cidr" ]] && uci_allowed_lines="${uci_allowed_lines}uci add_list network.wg_server.allowed_ips='${cidr}'
+
+    echo -e "配置文件路径: ${C_CYAN}${conf_file}${C_RESET}"
+    echo -e "下载命令: ${C_GRAY}scp root@服务器IP:${conf_file} ./${C_RESET}"
+    pause
+}
+
+# 生成网关 peer 的 OpenWrt uci 一键部署命令
+_wg_show_openwrt_deploy() {
+    local target_idx="$1"
+    [[ -z "$target_idx" ]] && { target_idx=$REPLY; }
+
+    local peer_privkey peer_ip psk client_allowed_ips
+    peer_privkey=$(wg_db_get ".peers[$target_idx].private_key")
+    peer_ip=$(wg_db_get ".peers[$target_idx].ip")
+    psk=$(wg_db_get ".peers[$target_idx].preshared_key")
+    client_allowed_ips=$(wg_db_get ".peers[$target_idx].client_allowed_ips")
+
+    local spub sep sport ssub mask
+    spub=$(wg_db_get '.server.public_key')
+    sep=$(wg_db_get '.server.endpoint')
+    sport=$(wg_db_get '.server.port')
+    ssub=$(wg_db_get '.server.subnet')
+    mask=$(echo "$ssub" | cut -d'/' -f2)
+    local ep_host="$sep"
+
+    local uci_allowed_lines=""
+    local IFS_BAK="$IFS"; IFS=','
+    for cidr in $client_allowed_ips; do
+        cidr=$(echo "$cidr" | xargs)
+        [[ -n "$cidr" ]] && uci_allowed_lines="${uci_allowed_lines}uci add_list network.wg_server.allowed_ips='${cidr}'
 "
-            done
-            IFS="$IFS_BAK"
-            draw_line
-            echo -e "${C_CYAN}=== OpenWrt 部署命令 ===${C_RESET}"
-            echo -e "${C_YELLOW}在 OpenWrt SSH 终端依次执行以下命令:${C_RESET}"
-            draw_line
-            cat << OPENWRT_EOF
+    done
+    IFS="$IFS_BAK"
+
+    draw_line
+    echo -e "${C_CYAN}=== OpenWrt 部署命令 ===${C_RESET}"
+    echo -e "${C_YELLOW}在目标 OpenWrt SSH 终端依次执行以下命令:${C_RESET}"
+    draw_line
+    cat << OPENWRT_EOF
 
 # === 清理旧配置 ===
-# 停止所有 WireGuard 接口
 ifdown wg0 2>/dev/null; true
-ifdown wg_mesh 2>/dev/null; true
-# 强制删除内核接口 (确保不残留)
 for iface in \$(ip -o link show type wireguard 2>/dev/null | awk -F': ' '{print \$2}'); do
     ip link set "\$iface" down 2>/dev/null; true
     ip link delete "\$iface" 2>/dev/null; true
-    echo "[+] 已删除接口: \$iface"
 done
 for iface in wg0 wg_mesh wg-mesh; do
-    if ip link show "\$iface" >/dev/null 2>&1; then
-        ip link set "\$iface" down 2>/dev/null; true
-        ip link delete "\$iface" 2>/dev/null; true
-        echo "[+] 已删除接口: \$iface"
-    fi
+    ip link show "\$iface" >/dev/null 2>&1 && { ip link set "\$iface" down; ip link delete "\$iface"; } 2>/dev/null; true
 done
-
-# 清理看门狗
 rm -f /usr/bin/wg-watchdog.sh 2>/dev/null; true
 (crontab -l 2>/dev/null | grep -v wg-watchdog) | crontab - 2>/dev/null; true
-/etc/init.d/cron restart 2>/dev/null; true
-
-# 删除所有 wireguard peer 配置段 (含匿名段)
-while uci -q get network.@wireguard_wg0[0] >/dev/null 2>&1; do
-    uci delete network.@wireguard_wg0[0]
-done
-while uci -q get network.@wireguard_wg_mesh[0] >/dev/null 2>&1; do
-    uci delete network.@wireguard_wg_mesh[0]
-done
+while uci -q get network.@wireguard_wg0[0] >/dev/null 2>&1; do uci delete network.@wireguard_wg0[0]; done
 uci delete network.wg_server 2>/dev/null; true
-
-# 删除网络接口
 uci delete network.wg0 2>/dev/null; true
-uci delete network.wg_mesh 2>/dev/null; true
-
-# 删除防火墙配置 (命名段 + 匿名段)
 uci delete firewall.wg_zone 2>/dev/null; true
 uci delete firewall.wg_fwd_lan 2>/dev/null; true
 uci delete firewall.wg_fwd_wg 2>/dev/null; true
-uci delete firewall.wg_mesh_zone 2>/dev/null; true
-uci delete firewall.wg_mesh_fwd 2>/dev/null; true
-uci delete firewall.wg_mesh_fwd_lan 2>/dev/null; true
-# 清理匿名 zone
-i=0
-while uci get firewall.@zone[\$i] >/dev/null 2>&1; do
+i=0; while uci get firewall.@zone[\$i] >/dev/null 2>&1; do
     zname=\$(uci get firewall.@zone[\$i].name 2>/dev/null)
-    case "\$zname" in
-        wg|wireguard|wg_mesh) uci delete "firewall.@zone[\$i]" 2>/dev/null; true; continue ;;
-    esac
+    case "\$zname" in wg|wireguard) uci delete "firewall.@zone[\$i]" 2>/dev/null; true; continue ;; esac
     i=\$((i + 1))
 done
-# 清理匿名 forwarding
-i=0
-while uci get firewall.@forwarding[\$i] >/dev/null 2>&1; do
-    fsrc=\$(uci get firewall.@forwarding[\$i].src 2>/dev/null)
-    fdest=\$(uci get firewall.@forwarding[\$i].dest 2>/dev/null)
-    case "\$fsrc" in wg|wg_mesh) ;; *) case "\$fdest" in wg|wg_mesh) ;; *) i=\$((i+1)); continue ;; esac ;; esac
-    uci delete "firewall.@forwarding[\$i]" 2>/dev/null; true
-done
-
-# 清理 OpenClash 绕过规则
 ip rule del lookup main prio 100 2>/dev/null; true
 for h in \$(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print \$NF}'); do
     nft delete rule inet fw4 mangle_prerouting handle "\$h" 2>/dev/null; true
 done
 sed -i '/wg_bypass/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null; true
-
 uci commit network 2>/dev/null; true
 uci commit firewall 2>/dev/null; true
-/etc/init.d/firewall restart 2>/dev/null; true
 
 # === 安装 WireGuard 组件 ===
 WG_KERNEL=0
-if [ -d /sys/module/wireguard ] || lsmod 2>/dev/null | grep -q wireguard; then
-    echo '[+] 内核已支持 WireGuard'
-    WG_KERNEL=1
-fi
-
+[ -d /sys/module/wireguard ] || lsmod 2>/dev/null | grep -q wireguard && WG_KERNEL=1
 opkg update || echo '[!] opkg update 失败，尝试继续...'
-
-if [ "\$WG_KERNEL" = "0" ]; then
-    if opkg install kmod-wireguard 2>/dev/null; then
-        echo '[+] kmod-wireguard 安装成功'
-    else
-        if [ -d /sys/module/wireguard ] || ip link add wg_test type wireguard 2>/dev/null; then
-            ip link del wg_test 2>/dev/null; true
-            echo '[+] 内核已内置 WireGuard，无需 kmod'
-        else
-            echo '[!] WireGuard 内核模块不可用，请检查固件是否支持'
-        fi
-    fi
-fi
-
+[ "\$WG_KERNEL" = "0" ] && { opkg install kmod-wireguard 2>/dev/null || echo '[!] kmod-wireguard 安装失败'; }
 opkg install wireguard-tools 2>/dev/null || echo '[!] wireguard-tools 安装失败'
 opkg install luci-proto-wireguard 2>/dev/null || echo '[!] luci-proto-wireguard 安装失败'
 /etc/init.d/rpcd restart 2>/dev/null; true
@@ -6127,6 +6350,7 @@ uci set network.wg_server.endpoint_port='${sport}'
 uci set network.wg_server.persistent_keepalive='25'
 uci set network.wg_server.route_allowed_ips='1'
 ${uci_allowed_lines}
+# === 配置防火墙 ===
 uci set firewall.wg_zone=zone
 uci set firewall.wg_zone.name='wg'
 uci set firewall.wg_zone.input='ACCEPT'
@@ -6134,40 +6358,38 @@ uci set firewall.wg_zone.output='ACCEPT'
 uci set firewall.wg_zone.forward='ACCEPT'
 uci set firewall.wg_zone.masq='1'
 uci add_list firewall.wg_zone.network='wg0'
-
-# LAN -> WG 转发 (LAN 设备访问 VPN 网络)
 uci set firewall.wg_fwd_lan=forwarding
 uci set firewall.wg_fwd_lan.src='lan'
 uci set firewall.wg_fwd_lan.dest='wg'
-
-# WG -> LAN 转发 (VPN 对端访问本地 LAN 设备)
 uci set firewall.wg_fwd_wg=forwarding
 uci set firewall.wg_fwd_wg.src='wg'
 uci set firewall.wg_fwd_wg.dest='lan'
 uci commit network
 uci commit firewall
-/etc/init.d/firewall reload
 
-# === OpenClash 绕过: 让 WireGuard 流量直连不走代理 ===
+# === Mihomo bypass: WG endpoint 流量直连 ===
 EP_IP='${ep_host}'
-echo "\${EP_IP}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\$' || \
+echo "\${EP_IP}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\$' || \\
     EP_IP=\$(nslookup '${ep_host}' 2>/dev/null | awk '/^Address:/{a=\$2} END{if(a) print a}')
 if [ -n "\${EP_IP}" ]; then
-    # 添加策略路由: VPS IP 走主路由表，绕过 OpenClash 的路由表 354
     ip rule del to "\${EP_IP}" lookup main prio 100 2>/dev/null; true
     ip rule add to "\${EP_IP}" lookup main prio 100
-    # nftables: 标记发往 VPS 的包跳过 OpenClash
     nft list chain inet fw4 mangle_prerouting &>/dev/null && {
-        nft delete rule inet fw4 mangle_prerouting handle \$(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print \$NF}') 2>/dev/null; true
         nft insert rule inet fw4 mangle_prerouting ip daddr "\${EP_IP}" udp dport ${sport} counter return comment \"wg_bypass\" 2>/dev/null; true
+        nft insert rule inet fw4 mangle_prerouting iifname \"wg0\" counter return comment \"wg_bypass_iface\" 2>/dev/null; true
     }
-    # 持久化: 写入 /etc/rc.local
+    # 持久化到 /etc/rc.local
     sed -i '/wg_bypass/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null; true
-    sed -i "/^exit 0/i # WireGuard bypass OpenClash\nip rule add to \${EP_IP} lookup main prio 100 2>/dev/null; true" /etc/rc.local 2>/dev/null; true
-    echo "[+] OpenClash 绕过规则已添加: \${EP_IP}"
+    sed -i "/^exit 0/i # WireGuard bypass Mihomo\\
+ip rule add to \${EP_IP} lookup main prio 100 2>/dev/null; true\\
+nft insert rule inet fw4 mangle_prerouting ip daddr \\\"\${EP_IP}\\\" udp dport ${sport} counter return comment \\\"wg_bypass\\\" 2>/dev/null; true\\
+nft insert rule inet fw4 mangle_prerouting iifname \\\"wg0\\\" counter return comment \\\"wg_bypass_iface\\\" 2>/dev/null; true" \\
+        /etc/rc.local 2>/dev/null; true
+    echo "[+] Mihomo bypass 规则已添加: \${EP_IP}"
 fi
 
-/etc/init.d/network reload
+# === 启动接口 ===
+ifup wg0
 
 # === 验证 ===
 sleep 3
@@ -6179,17 +6401,18 @@ fi
 
 OPENWRT_EOF
 
-            # 如果 endpoint 是域名，追加看门狗
-            if [[ ! "$ep_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                cat << 'WDEOF'
+    # 如果 endpoint 是域名，追加看门狗
+    if [[ ! "$ep_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        cat << 'WDEOF'
 
-# === WireGuard 看门狗 (DNS重解析 + 连通性保活) ===
+# === WireGuard 看门狗 (DNS重解析 + 连通性保活 + bypass规则自恢复) ===
 cat > /usr/bin/wg-watchdog.sh << 'WDSCRIPT'
 #!/bin/sh
 LOG="logger -t wg-watchdog"
 if ! ifstatus wg0 &>/dev/null; then
     $LOG "wg0 down, restarting"; ifup wg0; exit 0
 fi
+# DNS 重解析
 EP_HOST=$(uci get network.wg_server.endpoint_host 2>/dev/null)
 echo "$EP_HOST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && EP_HOST=""
 if [ -n "$EP_HOST" ]; then
@@ -6200,8 +6423,22 @@ if [ -n "$EP_HOST" ]; then
         PUB=$(wg show wg0 endpoints | awk '{print $1}' | head -1)
         PORT=$(uci get network.wg_server.endpoint_port 2>/dev/null)
         wg set wg0 peer "$PUB" endpoint "${RESOLVED}:${PORT}"
+        # 更新 bypass 规则
+        for h in $(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | grep -v 'iface' | awk '{print $NF}'); do
+            nft delete rule inet fw4 mangle_prerouting handle "$h" 2>/dev/null; true
+        done
+        nft insert rule inet fw4 mangle_prerouting ip daddr "$RESOLVED" udp dport "$PORT" counter return comment "wg_bypass" 2>/dev/null; true
+        ip rule del to "$CURRENT" lookup main prio 100 2>/dev/null; true
+        ip rule add to "$RESOLVED" lookup main prio 100 2>/dev/null; true
+        $LOG "bypass rules updated: $CURRENT -> $RESOLVED"
     fi
 fi
+# bypass 规则自恢复
+if ! nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep -q 'wg_bypass_iface'; then
+    nft insert rule inet fw4 mangle_prerouting iifname "wg0" counter return comment "wg_bypass_iface" 2>/dev/null; true
+    $LOG "restored wg_bypass_iface rule"
+fi
+# 连通性检测
 VIP=$(uci get network.wg_server.allowed_ips 2>/dev/null | awk '{print $1}' | cut -d/ -f1)
 VIP=$(echo "$VIP" | awk -F. '{print $1"."$2"."$3".1"}')
 if [ -n "$VIP" ] && ! ping -c 2 -W 3 "$VIP" &>/dev/null; then
@@ -6219,178 +6456,18 @@ WDSCRIPT
 chmod +x /usr/bin/wg-watchdog.sh
 (crontab -l 2>/dev/null | grep -v wg-watchdog; echo '* * * * * /usr/bin/wg-watchdog.sh') | crontab -
 /etc/init.d/cron restart
-echo '[+] WireGuard 看门狗已安装 (每分钟检测DNS+连通性)'
+echo '[+] WireGuard 看门狗已安装 (DNS重解析 + bypass自恢复 + 连通性保活)'
 WDEOF
-            fi
-            draw_line
-            echo -e "${C_GREEN}复制以上全部命令到 OpenWrt SSH 终端执行即可。${C_RESET}"
-            echo -e "${C_CYAN}验证方法:${C_RESET}"
-            echo "  1. OpenWrt 上执行: wg show
-  2. LuCI 界面: Network -> Interfaces 查看 wg0 状态"
-            echo "  3. LAN 设备 ping VPN 服务端: ping $(wg_db_get '.server.ip')"
-            draw_line
-        fi
     fi
-    if confirm "显示 Debian/Ubuntu 一键部署命令?"; then
-        local _conf_content
-        _conf_content=$(cat "$conf_file")
-        draw_line
-        echo -e "${C_CYAN}=== Debian/Ubuntu 部署命令 ===${C_RESET}"
-        echo -e "${C_YELLOW}在目标 Debian/Ubuntu 服务器 SSH 终端执行以下命令:${C_RESET}"
-        draw_line
-        cat << DEBIAN_EOF
 
-# ===================================================================
-# WireGuard Debian/Ubuntu 一键部署脚本
-# ===================================================================
-
-set -e
-
-# === [强制] 基础依赖安装 ===
-echo '[*] 检查并安装基础依赖...'
-apt-get update -qq
-for pkg in wireguard-tools qrencode; do
-    if ! dpkg -l "\$pkg" 2>/dev/null | grep -q '^ii'; then
-        echo "[+] 安装 \$pkg ..."
-        apt-get install -y "\$pkg" || { echo "[!] 安装 \$pkg 失败，终止部署"; exit 1; }
-    else
-        echo "[✓] \$pkg 已安装"
-    fi
-done
-# 验证关键命令可用
-for cmd in wg wg-quick; do
-    command -v "\$cmd" >/dev/null || { echo "[!] \$cmd 命令不可用，终止部署"; exit 1; }
-done
-echo '[✓] 依赖检查通过'
-
-# === 清理旧配置 ===
-if systemctl is-active wg-quick@wg0 &>/dev/null; then
-    echo '[*] 停止现有 wg0 接口...'
-    systemctl stop wg-quick@wg0
-fi
-
-# === 写入配置文件 ===
-mkdir -p /etc/wireguard
-cat > /etc/wireguard/wg0.conf << 'WGCONF'
-${_conf_content}
-WGCONF
-chmod 600 /etc/wireguard/wg0.conf
-
-# 保存配置校验和 (用于自检防篡改)
-sha256sum /etc/wireguard/wg0.conf > /etc/wireguard/.wg0.sha256
-chmod 600 /etc/wireguard/.wg0.sha256
-echo '[✓] 配置文件已写入并保存校验和'
-
-# === 启用 IP 转发 ===
-if ! sysctl -n net.ipv4.ip_forward 2>/dev/null | grep -q '1'; then
-    sed -i '/^#\?net.ipv4.ip_forward/d' /etc/sysctl.conf
-    echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
-    sysctl -w net.ipv4.ip_forward=1
-    echo '[✓] IP 转发已启用'
-fi
-
-# === 启动 WireGuard ===
-systemctl enable wg-quick@wg0
-systemctl start wg-quick@wg0
-
-# === 安装看门狗 (自动定时自检 + 手动自检) ===
-cat > /usr/local/bin/wg-check << 'WGCHECK'
-#!/bin/bash
-# WireGuard 自检脚本 - 检查接口状态 + 配置完整性
-LOG_TAG="wg-check"
-MANUAL=false
-[ "\$1" = "--manual" ] && MANUAL=true
-
-log() { logger -t "\$LOG_TAG" "\$1"; \$MANUAL && echo "\$1"; }
-
-# 1. 检查依赖
-MISSING=0
-for cmd in wg wg-quick; do
-    if ! command -v "\$cmd" >/dev/null 2>&1; then
-        log "[!] 缺少命令: \$cmd"
-        MISSING=1
-    fi
-done
-if [ \$MISSING -eq 1 ]; then
-    log "[*] 尝试重新安装依赖..."
-    apt-get update -qq && apt-get install -y wireguard-tools 2>/dev/null
-    for cmd in wg wg-quick; do
-        command -v "\$cmd" >/dev/null || { log "[!] 修复失败: \$cmd 仍不可用"; exit 1; }
-    done
-    log "[✓] 依赖已修复"
-fi
-
-# 2. 检查配置文件完整性
-if [ -f /etc/wireguard/.wg0.sha256 ]; then
-    if ! sha256sum -c /etc/wireguard/.wg0.sha256 &>/dev/null; then
-        log "[!] 配置文件校验失败! 可能被篡改!"
-        log "[!] 预期: \$(cat /etc/wireguard/.wg0.sha256)"
-        log "[!] 实际: \$(sha256sum /etc/wireguard/wg0.conf)"
-        \$MANUAL && exit 1
-    else
-        log "[✓] 配置文件校验通过"
-    fi
-else
-    log "[*] 无校验和文件，跳过完整性检查"
-fi
-
-# 3. 检查接口状态
-if ! ip link show wg0 &>/dev/null; then
-    log "[!] wg0 接口不存在，正在重启..."
-    systemctl restart wg-quick@wg0
-    sleep 2
-    if ip link show wg0 &>/dev/null; then
-        log "[✓] wg0 接口恢复成功"
-    else
-        log "[!] wg0 接口恢复失败"
-    fi
-else
-    log "[✓] wg0 接口正常"
-fi
-
-# 4. 检查握手状态 (超过5分钟无握手则告警)
-LAST_HS=\$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print \$2}' | head -1)
-if [ -n "\$LAST_HS" ] && [ "\$LAST_HS" != "0" ]; then
-    NOW=\$(date +%s)
-    DIFF=\$(( NOW - LAST_HS ))
-    if [ \$DIFF -gt 300 ]; then
-        log "[*] 最近握手: \${DIFF}s 前 (超过5分钟)"
-    else
-        log "[✓] 最近握手: \${DIFF}s 前"
-    fi
-fi
-
-\$MANUAL && echo "" && wg show wg0
-WGCHECK
-chmod +x /usr/local/bin/wg-check
-
-# 注册 cron 定时自检 (每分钟)
-(crontab -l 2>/dev/null | grep -v 'wg-check'; echo '* * * * * /usr/local/bin/wg-check') | crontab -
-echo '[✓] 看门狗已安装 (每分钟自检接口+配置完整性)'
-echo '[*] 手动自检命令: wg-check --manual'
-
-# === 验证 ===
-sleep 2
-if ip link show wg0 &>/dev/null; then
-    echo '[✓] wg0 接口启动成功!'
-    wg show wg0
-else
-    echo '[!] wg0 接口启动失败，请检查: journalctl -u wg-quick@wg0'
-fi
-
-DEBIAN_EOF
-        draw_line
-        echo -e "${C_GREEN}复制以上全部命令到目标服务器 SSH 终端执行即可。${C_RESET}"
-        echo -e "${C_CYAN}验证方法:${C_RESET}"
-        echo "  1. 执行: wg show"
-        echo "  2. 执行: ping $(wg_db_get '.server.ip')"
-        draw_line
-    fi
-    echo -e "配置文件路径: ${C_CYAN}${conf_file}${C_RESET}"
-    echo -e "下载命令: ${C_GRAY}scp root@服务器IP:${conf_file} ./${C_RESET}"
-    pause
+    draw_line
+    echo -e "${C_GREEN}复制以上全部命令到目标 OpenWrt SSH 终端执行即可。${C_RESET}"
+    echo -e "${C_CYAN}验证方法:${C_RESET}"
+    echo "  1. OpenWrt: wg show"
+    echo "  2. LuCI: Network -> Interfaces 查看 wg0 状态"
+    echo "  3. LAN 设备 ping VPN 服务端: ping $(wg_db_get '.server.ip')"
+    draw_line
 }
-
 wg_generate_clash_config() {
     wg_check_server || return 1
     print_title "生成 Clash (OpenClash) WireGuard 配置"
@@ -6430,12 +6507,14 @@ wg_generate_clash_config() {
     local server_dns=$(wg_db_get '.server.dns' | cut -d',' -f1 | xargs)
     local mask=$(echo "$server_subnet" | cut -d'/' -f2)
 
-    # 收集所有 VPN 路由网段
+    # 收集所有 VPN 路由网段 (含服务端 LAN)
     local vpn_cidrs=("$server_subnet")
+    local server_lan=$(wg_db_get '.server.server_lan_subnet // empty')
+    [[ -n "$server_lan" && "$server_lan" != "null" ]] && vpn_cidrs+=("$server_lan")
     local pi=0
     while [[ $pi -lt $peer_count ]]; do
         local pls=$(wg_db_get ".peers[$pi].lan_subnets // empty")
-        if [[ -n "$pls" ]]; then
+        if [[ -n "$pls" && "$pls" != "null" ]]; then
             local IFS_BAK="$IFS"; IFS=','
             for cidr in $pls; do
                 cidr=$(echo "$cidr" | xargs)
@@ -6451,80 +6530,13 @@ wg_generate_clash_config() {
     # ── 构建 proxy 节点列表 ──
     local all_proxy_names=()
     local all_proxy_yaml=""
-    local deploy_mode=$(wg_db_get '.server.deploy_mode // "domestic"')
 
     # 主机节点
     local primary_name="WG-$(wg_get_server_name)"
     all_proxy_names+=("$primary_name")
 
-    if [[ "$deploy_mode" == "overseas" ]]; then
-        # 境外模式: 生成 VLESS-Reality 节点 (WG 流量通过 VLESS 隧道承载)
-        local vless_port=$(wg_db_get '.server.vless_port // empty')
-        local vless_uuid=$(wg_db_get '.server.vless_uuid // empty')
-        local reality_pub=$(wg_db_get '.server.reality_public_key // empty')
-        local reality_sid=$(wg_db_get '.server.reality_short_id // empty')
-        local reality_sni=$(wg_db_get '.server.reality_sni // empty')
-        local vless_net=$(wg_db_get '.server.vless_network // "tcp"')
-        local vless_flow=$(wg_db_get '.server.vless_flow // "xtls-rprx-vision"')
-
-        if [[ -z "$vless_uuid" || "$vless_uuid" == "null" || -z "$reality_pub" || "$reality_pub" == "null" ]]; then
-            print_warn "VLESS-Reality 隧道参数不完整，请先配置隧道"
-            print_warn "回退为 WG 直连节点"
-            all_proxy_yaml+="  - name: \"${primary_name}\"
-    type: wireguard
-    server: ${server_endpoint}
-    port: ${server_port}
-    ip: ${peer_ip}
-    private-key: \"${peer_privkey}\"
-    public-key: \"${server_pubkey}\"
-    pre-shared-key: \"${peer_psk}\"
-    reserved: [0, 0, 0]
-    udp: true
-    mtu: 1280
-    remote-dns-resolve: false
-    dns:
-      - ${server_dns}
-"
-        else
-            local vless_node_name="${primary_name}-VLESS"
-            all_proxy_yaml+="  - name: \"${vless_node_name}\"
-    type: vless
-    server: ${server_endpoint}
-    port: ${vless_port}
-    uuid: ${vless_uuid}
-    network: ${vless_net}
-    tls: true
-    udp: true
-"
-            [[ -n "$vless_flow" ]] && all_proxy_yaml+="    flow: ${vless_flow}
-"
-            all_proxy_yaml+="    servername: ${reality_sni}
-    reality-opts:
-      public-key: ${reality_pub}
-      short-id: ${reality_sid}
-    client-fingerprint: chrome
-
-  - name: \"${primary_name}\"
-    type: wireguard
-    server: 127.0.0.1
-    port: ${server_port}
-    dialer-proxy: \"${vless_node_name}\"
-    ip: ${peer_ip}
-    private-key: \"${peer_privkey}\"
-    public-key: \"${server_pubkey}\"
-    pre-shared-key: \"${peer_psk}\"
-    reserved: [0, 0, 0]
-    udp: true
-    mtu: 1280
-    remote-dns-resolve: false
-    dns:
-      - ${server_dns}
-"
-        fi
-    else
-        # 境内模式: 标准 WG 直连节点
-        local mtu=$(wg_db_get '.server.mtu // 1420')
-        all_proxy_yaml+="  - name: \"${primary_name}\"
+    local mtu=$(wg_db_get '.server.mtu // 1420')
+    all_proxy_yaml+="  - name: \"${primary_name}\"
     type: wireguard
     server: ${server_endpoint}
     port: ${server_port}
@@ -6539,7 +6551,6 @@ wg_generate_clash_config() {
     dns:
       - ${server_dns}
 "
-    fi
 
     # ── 构建 proxy-group ──
     local group_name="WireGuard-VPN"
@@ -6594,15 +6605,8 @@ wg_generate_clash_config() {
                 echo "  • 服务器 Endpoint 全部走 DIRECT 防止死循环
 "
             fi
-                        echo -e "${C_YELLOW}要求: Clash Meta (mihomo) 内核 1.14.0+${C_RESET}"
+            echo -e "${C_YELLOW}要求: Clash Meta (mihomo) 内核 1.14.0+${C_RESET}"
             echo -e "${C_YELLOW}OpenClash 请在设置中切换到 Meta 内核${C_RESET}"
-            if [[ "$deploy_mode" == "overseas" ]]; then
-                echo -e "${C_YELLOW}[重要！3X-UI 必须放行局域网IP]${C_RESET}"
-                echo -e "  为解决云服务商不支持公网IP回环问题，WireGuard请求已指向 127.0.0.1。"
-                echo -e "  ● 请务必登录 3X-UI 面板 -> 面板设置 -> Xray 设置 -> 路由规则"
-                echo -e "  ● 找到诸如 ${C_CYAN}\"ip\": [\"geoip:private\"]${C_RESET} -> ${C_RED}block${C_RESET} 的规则并${C_CYAN}删除${C_RESET}"
-                echo -e "  否则 3X-UI 会拦截所有去往本机的 WireGuard 流量，导致完全连不上！"
-            fi
             echo ""
             echo -e "${C_YELLOW}[DNS 提示] 如果使用 proxy-providers 订阅，请在 dns.nameserver-policy 中添加:${C_RESET}"
             echo -e "  nameserver-policy:"
@@ -6797,9 +6801,8 @@ wg_setup_watchdog() {
   • wg show 失败 → 重启接口"
     if ! confirm "启用看门狗?"; then pause; return; fi
 
-    # ── OpenWrt 平台: 生成专用看门狗 (#!/bin/sh + ifup/ifdown) ──
-    if [[ "$PLATFORM" == "openwrt" ]]; then
-        cat > "$watchdog_script" << 'WDEOF_OPENWRT'
+    # ── OpenWrt 看门狗 (#!/bin/sh + ifup/ifdown + Mihomo bypass 检查) ──
+    cat > "$watchdog_script" << 'WDEOF_OPENWRT'
 #!/bin/sh
 LOG="logger -t wg-watchdog"
 
@@ -6807,64 +6810,34 @@ LOG="logger -t wg-watchdog"
 if ! ifstatus wg0 &>/dev/null; then
     $LOG "wg0 down, restarting"
     ifup wg0
-    exit 0
+    sleep 2
 fi
 
 # 检测 wg show 是否正常
 if ! wg show wg0 &>/dev/null; then
     $LOG "wg show failed, restarting"
     ifdown wg0; sleep 1; ifup wg0
-    exit 0
+    sleep 2
+fi
+
+# 检测 Mihomo bypass 规则是否存在
+if nft list chain inet fw4 mangle_prerouting &>/dev/null; then
+    if ! nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep -q "wg_bypass"; then
+        $LOG "Mihomo bypass rules missing, rebuilding"
+        # 从 /etc/rc.local 中提取 bypass 规则并重新执行
+        grep "wg_bypass" /etc/rc.local 2>/dev/null | while IFS= read -r line; do
+            eval "$line" 2>/dev/null || true
+        done
+    fi
 fi
 WDEOF_OPENWRT
-        chmod +x "$watchdog_script"
-        cron_add_job "wg-watchdog.sh" "* * * * * $watchdog_script >/dev/null 2>&1"
-        echo ""
-        print_success "看门狗已启用 (每分钟检测)"
-        echo -e "  脚本: ${C_CYAN}${watchdog_script}${C_RESET}"
-        echo "  检测: 接口存活 → wg show"
-        log_action "WireGuard watchdog enabled (platform=openwrt)"
-        pause
-        return 0
-    fi
-
-    # ── 标准 Linux 平台 ──
-    cat > "$watchdog_script" << 'WDEOF_SERVER'
-#!/bin/bash
-LOG="/var/log/wg-watchdog.log"
-WG_INTERFACE="wg0"
-log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG"; }
-
-if ! ip link show "$WG_INTERFACE" &>/dev/null; then
-    log "WARN: $WG_INTERFACE missing, restarting..."
-    wg-quick up "$WG_INTERFACE" 2>>"$LOG"
-    sleep 2
-    ip link show "$WG_INTERFACE" &>/dev/null && log "OK: recovered" || log "ERROR: restart failed"
-    exit 0
-fi
-
-if ! wg show "$WG_INTERFACE" &>/dev/null; then
-    log "WARN: wg show failed, restarting..."
-    wg-quick down "$WG_INTERFACE" 2>>"$LOG"; sleep 1
-    wg-quick up "$WG_INTERFACE" 2>>"$LOG"
-    sleep 2
-    wg show "$WG_INTERFACE" &>/dev/null && log "OK: recovered" || log "ERROR: restart failed"
-    exit 0
-fi
-
-# 日志轮转
-if [[ -f "$LOG" ]] && [[ $(wc -l < "$LOG") -gt 500 ]]; then
-    tail -n 300 "$LOG" > "${LOG}.tmp" && mv "${LOG}.tmp" "$LOG"
-fi
-WDEOF_SERVER
     chmod +x "$watchdog_script"
     cron_add_job "wg-watchdog.sh" "* * * * * $watchdog_script >/dev/null 2>&1"
     echo ""
     print_success "看门狗已启用 (每分钟检测)"
     echo -e "  脚本: ${C_CYAN}${watchdog_script}${C_RESET}"
-    echo -e "  日志: ${C_CYAN}${watchdog_log}${C_RESET}"
-    echo "  检测: 接口存活 → wg show"
-    log_action "WireGuard watchdog enabled (platform=linux)"
+    echo "  检测: 接口存活 → wg show → Mihomo bypass 规则"
+    log_action "WireGuard watchdog enabled (platform=openwrt)"
     pause
 }
 
@@ -6881,14 +6854,15 @@ wg_export_peers() {
     export_file=$(mktemp "/tmp/${SCRIPT_NAME}-wg-peers-XXXXXX.json")
     chmod 600 "$export_file"
     if jq '{
-        export_version: 1,
+        export_version: 2,
         export_date: (now | todate),
         server: {
             endpoint: .server.endpoint,
             port: .server.port,
             subnet: .server.subnet,
             dns: .server.dns,
-            public_key: .server.public_key
+            public_key: .server.public_key,
+            server_lan_subnet: .server.server_lan_subnet
         },
         peers: .peers
     }' "$WG_DB_FILE" > "$export_file" 2>/dev/null; then
@@ -6965,7 +6939,7 @@ wg_import_peers() {
     local imported=0 skipped=0
     local i=0
     while [[ $i -lt $import_count ]]; do
-        local name ip privkey pubkey psk allowed enabled is_gw lans created
+        local name ip privkey pubkey psk allowed enabled is_gw lans created peer_type
         name=$(jq -r ".peers[$i].name" "$import_file")
         ip=$(jq -r ".peers[$i].ip" "$import_file")
         privkey=$(jq -r ".peers[$i].private_key" "$import_file")
@@ -6976,6 +6950,11 @@ wg_import_peers() {
         is_gw=$(jq -r ".peers[$i].is_gateway // false" "$import_file")
         lans=$(jq -r ".peers[$i].lan_subnets // empty" "$import_file")
         created=$(jq -r ".peers[$i].created // empty" "$import_file")
+        peer_type=$(jq -r ".peers[$i].peer_type // empty" "$import_file")
+        # 兼容旧版 JSON: 无 peer_type 时根据 is_gateway 推断
+        if [[ -z "$peer_type" || "$peer_type" == "null" ]]; then
+            [[ "$is_gw" == "true" ]] && peer_type="gateway" || peer_type="standard"
+        fi
 
         # 检查重名
         local exists
@@ -7010,6 +6989,7 @@ wg_import_peers() {
                   --arg created "$created" \
                   --arg gw "$is_gw" \
                   --arg lans "$lans" \
+                  --arg ptype "$peer_type" \
             '.peers += [{
                 name: $name,
                 ip: $ip,
@@ -7020,16 +7000,17 @@ wg_import_peers() {
                 enabled: $enabled,
                 created: $created,
                 is_gateway: ($gw == "true"),
-                lan_subnets: $lans
+                lan_subnets: $lans,
+                peer_type: $ptype
             }]'
         imported=$((imported + 1))
         i=$((i + 1))
     done
 
     if [[ $imported -gt 0 ]]; then
+        wg_rebuild_uci_conf
         wg_rebuild_conf
         wg_regenerate_client_confs
-        wg_is_running && wg_restart
     fi
     echo ""
     print_success "导入完成: 成功 ${imported}, 跳过 ${skipped}"
@@ -7042,16 +7023,10 @@ wg_server_menu() {
     while true; do
         print_title "WireGuard 服务端管理"
         local srv_name=$(wg_get_server_name)
-        local deploy_mode=$(wg_db_get '.server.deploy_mode // "domestic"')
         if wg_is_running; then
             echo -e "  状态: ${C_GREEN}● 运行中${C_RESET}    接口: ${C_CYAN}${WG_INTERFACE}${C_RESET}    名称: ${C_CYAN}${srv_name}${C_RESET}"
         else
             echo -e "  状态: ${C_RED}● 已停止${C_RESET}    接口: ${C_CYAN}${WG_INTERFACE}${C_RESET}    名称: ${C_CYAN}${srv_name}${C_RESET}"
-        fi
-        if [[ "$deploy_mode" == "overseas" ]]; then
-            echo -e "  模式: ${C_YELLOW}境外 (VLESS-Reality)${C_RESET}"
-        else
-            echo -e "  模式: ${C_GREEN}境内 (标准 UDP)${C_RESET}"
         fi
         local peer_count=$(wg_db_get '.peers | length')
         echo -e "  设备数: ${C_CYAN}${peer_count}${C_RESET}"
@@ -7070,11 +7045,9 @@ wg_server_menu() {
   11. 修改服务器名称
   12. 卸载 WireGuard
   13. 生成 OpenWrt 清空 WG 配置命令
-  14. 服务端看门狗 (自动重启保活)"
-        if [[ "$deploy_mode" == "overseas" ]]; then
-            echo "  15. VLESS-Reality 隧道管理"
-        fi
-        echo "  ── 数据管理 ──────────────────
+  14. 服务端看门狗 (自动重启保活)
+  15. Mihomo bypass 规则管理
+  ── 数据管理 ──────────────────
   16. 导出设备配置 (JSON)
   17. 导入设备配置 (JSON)
   0. 返回上级菜单
@@ -7095,13 +7068,7 @@ wg_server_menu() {
             12) wg_uninstall; return ;;
             13) wg_openwrt_clean_cmd ;;
             14) wg_setup_watchdog ;;
-            15)
-                if [[ "$deploy_mode" == "overseas" ]]; then
-                    wg_tunnel_manage
-                else
-                    print_warn "仅境外模式可用"; pause
-                fi
-                ;;
+            15) wg_mihomo_bypass_status ;;
             16) wg_export_peers ;;
             17) wg_import_peers ;;
             0|"") return ;;
@@ -7143,454 +7110,6 @@ wg_main_menu() {
     done
 }
 
-# 通过 3X-UI 面板的 VLESS-Reality 入站实现 WG 流量伪装
-# 替代原有的 udp2raw (Plan B) 方案
-
-# ════════════════════════════════════════════════
-# VLESS-Reality 隧道配置
-# ════════════════════════════════════════════════
-
-# 解析 3X-UI 导出的 JSON，提取隧道参数
-# 输入: JSON 字符串 (3X-UI 入站导出格式)
-# 输出: 设置变量 _p_port _p_uuid _p_pub _p_sid _p_sni _p_net _p_flow
-_wg_parse_xui_json() {
-    local json="$1"
-
-    # 验证是合法 JSON
-    if ! echo "$json" | jq empty 2>/dev/null; then
-        print_error "JSON 格式无效"
-        return 1
-    fi
-
-    # 提取 port
-    _p_port=$(echo "$json" | jq -r '.port // empty')
-
-    # settings 和 streamSettings 可能是嵌套 JSON 字符串，也可能是对象
-    local settings stream
-    settings=$(echo "$json" | jq -r 'if (.settings | type) == "string" then (.settings | fromjson) else .settings end' 2>/dev/null)
-    stream=$(echo "$json" | jq -r 'if (.streamSettings | type) == "string" then (.streamSettings | fromjson) else .streamSettings end' 2>/dev/null)
-
-    if [[ -z "$settings" || "$settings" == "null" || -z "$stream" || "$stream" == "null" ]]; then
-        print_error "JSON 中缺少 settings 或 streamSettings 字段"
-        return 1
-    fi
-
-    # 从 settings 提取 UUID 和 flow
-    _p_uuid=$(echo "$settings" | jq -r '.clients[0].id // empty')
-    _p_flow=$(echo "$settings" | jq -r '.clients[0].flow // empty')
-
-    # 从 streamSettings 提取 reality 参数
-    _p_net=$(echo "$stream" | jq -r '.network // "tcp"')
-    local reality
-    reality=$(echo "$stream" | jq -r '.realitySettings // empty')
-    if [[ -z "$reality" || "$reality" == "null" ]]; then
-        print_error "JSON 中未找到 realitySettings (不是 Reality 入站?)"
-        return 1
-    fi
-
-    _p_sni=$(echo "$reality" | jq -r '.serverNames[0] // empty')
-    _p_sid=$(echo "$reality" | jq -r '.shortIds[0] // empty')
-    # 公钥在 realitySettings.settings.publicKey 中
-    _p_pub=$(echo "$reality" | jq -r '.settings.publicKey // empty')
-    # privateKey 在导出 JSON 里存在，但我们只需要 publicKey 给客户端
-    # 如果 publicKey 为空，提示用户手动补充
-    local priv_key
-    priv_key=$(echo "$reality" | jq -r '.privateKey // empty')
-
-    # dest 格式一般是 "domain:port"
-    local dest
-    dest=$(echo "$reality" | jq -r '.target // empty')
-    [[ -z "$_p_sni" && -n "$dest" ]] && _p_sni="${dest%%:*}"
-
-    return 0
-}
-
-# 将隧道参数写入数据库
-_wg_save_tunnel_params() {
-    local vless_port="$1" vless_uuid="$2" reality_pub="$3" reality_sid="$4"
-    local reality_sni="$5" vless_net="$6" vless_flow="$7"
-
-    wg_db_set --arg dt "vless-reality" '.server.tunnel_type = $dt'
-    wg_db_set --arg vp "$vless_port" '.server.vless_port = ($vp | tonumber)'
-    wg_db_set --arg uuid "$vless_uuid" '.server.vless_uuid = $uuid'
-    wg_db_set --arg net "$vless_net" '.server.vless_network = $net'
-    if [[ -n "$vless_flow" ]]; then
-        wg_db_set --arg flow "$vless_flow" '.server.vless_flow = $flow'
-    else
-        wg_db_set '.server.vless_flow = ""'
-    fi
-    wg_db_set --arg rpub "$reality_pub" '.server.reality_public_key = $rpub'
-    wg_db_set '.server.reality_private_key = ""'
-    wg_db_set --arg sid "$reality_sid" '.server.reality_short_id = $sid'
-    wg_db_set --arg sni "$reality_sni" '.server.reality_sni = $sni'
-    wg_db_set --arg dest "${reality_sni}:443" '.server.reality_dest = $dest'
-}
-
-# 交互式配置 VLESS-Reality 隧道
-wg_tunnel_setup() {
-    local wg_port=$1
-    print_title "配置 VLESS-Reality 隧道"
-
-    echo -e "${C_CYAN}架构说明:${C_RESET}"
-    echo "  客户端 → VLESS-Reality (伪装TLS) → 本机 xray → WG Server (0.0.0.0:${wg_port})"
-    echo "  GFW 看到的是正常的 TLS 1.3 流量"
-    echo ""
-
-    echo -e "${C_YELLOW}请选择配置方式:${C_RESET}"
-    echo "  1. 粘贴 3X-UI 导出的 JSON 自动解析 (推荐)"
-    echo "  2. 手动逐项输入参数"
-    local setup_mode
-    read -e -r -p "选择 [1]: " setup_mode
-    setup_mode=${setup_mode:-1}
-
-    if [[ "$setup_mode" == "1" ]]; then
-        # ── 模式 1: 粘贴 JSON 自动解析 ──
-        echo ""
-        echo -e "${C_CYAN}请从 3X-UI 面板导出入站 JSON，然后粘贴到下方:${C_RESET}"
-        echo -e "${C_YELLOW}(提示: 3X-UI → 入站列表 → 对应入站右侧 ⋮ → 导出 → 复制 JSON)${C_RESET}"
-        echo -e "${C_YELLOW}粘贴后系统会自动识别。若无响应，请在新的一行输入 EOF 结束:${C_RESET}"
-        
-        local raw_json=""
-        local line
-        while IFS= read -r line; do
-            [[ "$line" == "EOF" ]] && break
-            raw_json="${raw_json}${line}"$'\n'
-            # 尝试解析，如果是完整的 JSON 则退出循环
-            if echo "$raw_json" | jq empty 2>/dev/null; then
-                break
-            fi
-        done
-        
-        # 清空输入缓冲区中可能的残留回车或多余字符
-        while read -t 0.1 -r _discard; do :; done
-
-        if [[ -z "$(echo "$raw_json" | tr -d ' \n')" ]]; then
-            print_error "未输入任何内容"
-            return 1
-        fi
-
-        # 解析 JSON
-        local _p_port _p_uuid _p_pub _p_sid _p_sni _p_net _p_flow
-        if ! _wg_parse_xui_json "$raw_json"; then
-            print_error "JSON 解析失败，请检查粘贴的内容是否完整"
-            return 1
-        fi
-
-        # 验证关键字段
-        if [[ -z "$_p_port" || -z "$_p_uuid" ]]; then
-            print_error "JSON 中缺少端口或 UUID 信息"
-            return 1
-        fi
-
-        # 显示解析结果供确认
-        echo ""
-        print_success "JSON 解析成功，提取到以下参数:"
-        draw_line
-        echo -e "  VLESS 端口:  ${C_CYAN}${_p_port}${C_RESET}"
-        echo -e "  UUID:        ${C_CYAN}${_p_uuid}${C_RESET}"
-        echo -e "  传输方式:    ${C_CYAN}${_p_net}${C_RESET}"
-        echo -e "  Flow:        ${C_CYAN}${_p_flow:-（无）}${C_RESET}"
-        echo -e "  Reality SNI: ${C_CYAN}${_p_sni:-（未提取到）}${C_RESET}"
-        echo -e "  Short ID:    ${C_CYAN}${_p_sid:-（未提取到）}${C_RESET}"
-        echo -e "  Public Key:  ${C_CYAN}${_p_pub:-${C_RED}（空，需手动补充）}${C_RESET}"
-        draw_line
-
-        # Public Key 在导出 JSON 中通常为空（属于客户端侧参数），需要手动补充
-        if [[ -z "$_p_pub" ]]; then
-            echo -e "${C_RED}注意: 3X-UI 导出 JSON 中通常不包含 Public Key (公钥)${C_RESET}"
-            echo -e "${C_YELLOW}请从 3X-UI 面板的 Reality 设置中复制 Public Key:${C_RESET}"
-            read -e -r -p "Reality 公钥 (Public Key): " _p_pub
-            if [[ -z "$_p_pub" ]]; then
-                print_error "Public Key 不能为空"
-                return 1
-            fi
-        fi
-
-        # SNI 为空时补充
-        if [[ -z "$_p_sni" ]]; then
-            read -e -r -p "Reality 伪装 SNI 域名 (如 www.microsoft.com): " _p_sni
-        fi
-
-        # Short ID 为空时补充
-        if [[ -z "$_p_sid" ]]; then
-            read -e -r -p "Reality Short ID: " _p_sid
-        fi
-
-        # 确认并保存
-        echo ""
-        read -e -r -p "确认使用以上参数? [Y/n]: " _confirm
-        _confirm=${_confirm:-Y}
-        if [[ ! "$_confirm" =~ ^[Yy]$ ]]; then
-            print_warn "已取消"
-            return 0
-        fi
-
-        _wg_save_tunnel_params "$_p_port" "$_p_uuid" "$_p_pub" "$_p_sid" "$_p_sni" "$_p_net" "$_p_flow"
-        print_success "VLESS-Reality 参数已从 JSON 导入完成！"
-
-    else
-        # ── 模式 2: 手动逐项输入 ──
-        echo ""
-        echo -e "${C_YELLOW}请先在您的 3X-UI 面板创建一个包含 Reality 的 VLESS 入站，然后获取以下信息:${C_RESET}"
-
-        local vless_port vless_uuid reality_pub reality_sid reality_sni vless_net vless_flow
-
-        while true; do
-            read -e -r -p "VLESS 监听端口 (Port): " vless_port
-            if validate_port "$vless_port"; then break; fi
-            print_warn "端口无效 (1-65535)"
-        done
-
-        read -e -r -p "客户端 UUID (Client ID): " vless_uuid
-        echo -e "${C_RED}注意: 是 Reality 对应的 Public Key(公钥), 千万不要填 Private Key(私钥)!${C_RESET}"
-        read -e -r -p "Reality 公钥 (Public Key): " reality_pub
-        read -e -r -p "Reality Short ID: " reality_sid
-        read -e -r -p "Reality 伪装 SNI 域名 (如 www.microsoft.com): " reality_sni
-        read -e -r -p "网络传输方式 (如 tcp / grpc) [tcp]: " vless_net
-        vless_net=${vless_net:-tcp}
-        read -e -r -p "Flow 控制项 [xtls-rprx-vision]: " vless_flow
-        [[ -z "$vless_flow" ]] && vless_flow="xtls-rprx-vision"
-        [[ "$vless_flow" == "none" || "$vless_flow" == "null" ]] && vless_flow=""
-
-        _wg_save_tunnel_params "$vless_port" "$vless_uuid" "$reality_pub" "$reality_sid" "$reality_sni" "$vless_net" "$vless_flow"
-        print_success "VLESS-Reality 参数录入完成！"
-    fi
-
-}
-
-# 生成客户端 xray 配置 (用于连接 VLESS-Reality 隧道)
-wg_tunnel_generate_client_xray() {
-    local peer_idx=$1
-    local server_ip=$(wg_db_get '.server.endpoint')
-    local vless_port=$(wg_db_get '.server.vless_port // empty')
-    local uuid=$(wg_db_get '.server.vless_uuid // empty')
-    local network=$(wg_db_get '.server.vless_network // "tcp"')
-    local flow=$(wg_db_get '.server.vless_flow // "xtls-rprx-vision"')
-    local reality_pub=$(wg_db_get '.server.reality_public_key // empty')
-    local short_id=$(wg_db_get '.server.reality_short_id // empty')
-    local sni=$(wg_db_get '.server.reality_sni // empty')
-    local wg_port=$(wg_db_get '.server.port')
-
-    if [[ -z "$uuid" || "$uuid" == "null" || -z "$reality_pub" || "$reality_pub" == "null" ]]; then
-        print_error "VLESS-Reality 隧道未配置，请先运行隧道配置"
-        return 1
-    fi
-
-    local peer_name=$(wg_db_get ".peers[$peer_idx].name")
-    local output_dir="/etc/wireguard/clients"
-    mkdir -p "$output_dir"
-
-    # 生成 xray 客户端 JSON
-    local xray_conf="${output_dir}/${peer_name}-xray.json"
-    cat > "$xray_conf" << XRAYEOF
-{
-  "log": {"loglevel": "warning"},
-  "inbounds": [
-    {
-      "tag": "wg-in",
-      "port": ${wg_port},
-      "listen": "127.0.0.1",
-      "protocol": "dokodemo-door",
-      "settings": {
-        "address": "${server_ip}",
-        "port": ${wg_port},
-        "network": "udp"
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "tag": "vless-reality",
-      "protocol": "vless",
-      "settings": {
-        "vnext": [
-          {
-            "address": "${server_ip}",
-            "port": ${vless_port},
-            "users": [
-              {
-                "id": "${uuid}",
-                "encryption": "none",
-                "flow": "${flow}"
-              }
-            ]
-          }
-        ]
-      },
-      "streamSettings": {
-        "network": "${network}",
-        "security": "reality",
-        "realitySettings": {
-          "fingerprint": "chrome",
-          "serverName": "${sni}",
-          "publicKey": "${reality_pub}",
-          "shortId": "${short_id}",
-          "spiderX": ""
-        }
-      }
-    }
-  ]
-}
-XRAYEOF
-    chmod 600 "$xray_conf"
-    echo "$xray_conf"
-}
-
-# 显示客户端隧道连接指引
-wg_tunnel_show_client_guide() {
-    local peer_idx=$1
-    local peer_name=$(wg_db_get ".peers[$peer_idx].name")
-    local xray_conf="/etc/wireguard/clients/${peer_name}-xray.json"
-    local server_ip=$(wg_db_get '.server.endpoint')
-    local wg_port=$(wg_db_get '.server.port')
-
-    echo ""
-    echo -e "${C_CYAN}=== 境外模式客户端连接指引 (${peer_name}) ===${C_RESET}"
-    draw_line
-    echo "客户端需要两个组件配合工作:"
-    echo ""
-    echo -e "  ${C_GREEN}1. xray 客户端${C_RESET} (负责 VLESS-Reality 隧道)"
-    echo "     配置文件: ${xray_conf}"
-    echo "     作用: 将本地 UDP:${wg_port} 通过 VLESS-Reality 转发到服务端"
-    echo ""
-    echo -e "  ${C_GREEN}2. WireGuard 客户端${C_RESET} (标准 WG 配置)"
-    echo "     配置文件: /etc/wireguard/clients/${peer_name}.conf"
-    echo "     Endpoint 指向: 127.0.0.1:${wg_port} (本地 xray 入口)"
-    echo ""
-    echo -e "${C_YELLOW}启动顺序:${C_RESET}"
-    echo "  1. 先启动 xray: xray run -c ${xray_conf}"
-    echo "  2. 再启动 WireGuard: wg-quick up wg0"
-    draw_line
-}
-
-# ── 包装 wg_regenerate_client_confs: 境外模式时 Endpoint 指向本地 xray ──
-eval "$(declare -f wg_regenerate_client_confs | sed '1s/wg_regenerate_client_confs/_wg_regenerate_client_confs_orig/')"
-
-wg_regenerate_client_confs() {
-    local _mode _saved_ep=""
-    _mode=$(wg_db_get '.server.deploy_mode // empty')
-
-    if [[ "$_mode" == "overseas" ]]; then
-        _saved_ep=$(wg_db_get '.server.endpoint')
-        wg_db_set --arg ep "127.0.0.1" '.server.endpoint = $ep'
-    fi
-
-    _wg_regenerate_client_confs_orig "$@"
-
-    if [[ -n "$_saved_ep" ]]; then
-        wg_db_set --arg ep "$_saved_ep" '.server.endpoint = $ep'
-    fi
-
-    # 境外模式: 额外生成 xray 客户端配置
-    if [[ "$_mode" == "overseas" ]]; then
-        local pc=$(wg_db_get '.peers | length')
-        local i=0
-        while [[ $i -lt $pc ]]; do
-            wg_tunnel_generate_client_xray "$i" >/dev/null 2>&1
-            i=$((i + 1))
-        done
-    fi
-}
-
-# ── 包装 wg_uninstall: 清理隧道残留 ──
-eval "$(declare -f wg_uninstall | sed '1s/wg_uninstall/_wg_uninstall_orig/')"
-
-wg_uninstall() {
-    # 清理旧版 udp2raw 服务 (兼容升级)
-    if systemctl is-active --quiet udp2raw-wg 2>/dev/null || \
-       systemctl is-enabled --quiet udp2raw-wg 2>/dev/null; then
-        print_info "清理 udp2raw 服务 (旧版残留)..."
-        systemctl stop udp2raw-wg 2>/dev/null
-        systemctl disable udp2raw-wg 2>/dev/null
-        rm -f /etc/systemd/system/udp2raw-wg.service
-        systemctl daemon-reload 2>/dev/null
-        print_success "udp2raw 已清理"
-    fi
-    [[ -f /usr/local/bin/udp2raw ]] && rm -f /usr/local/bin/udp2raw
-
-    # 清理 xray 客户端配置文件
-    local clients_dir="/etc/wireguard/clients"
-    if [[ -d "$clients_dir" ]]; then
-        rm -f "$clients_dir"/*-xray.json 2>/dev/null
-    fi
-
-    _wg_uninstall_orig "$@"
-}
-
-# ════════════════════════════════════════════════
-# 隧道管理菜单
-# ════════════════════════════════════════════════
-wg_tunnel_manage() {
-    wg_check_server || return 1
-    local deploy_mode=$(wg_db_get '.server.deploy_mode // "domestic"')
-    if [[ "$deploy_mode" != "overseas" ]]; then
-        print_warn "当前为境内模式，无需隧道管理"
-        pause; return
-    fi
-
-    print_title "VLESS-Reality 隧道管理"
-    local vless_port=$(wg_db_get '.server.vless_port // empty')
-    local vless_uuid=$(wg_db_get '.server.vless_uuid // empty')
-    local reality_jni=$(wg_db_get '.server.reality_sni // empty')
-    local reality_pub=$(wg_db_get '.server.reality_public_key // empty')
-    local reality_sid=$(wg_db_get '.server.reality_short_id // empty')
-    local vless_net=$(wg_db_get '.server.vless_network // "tcp"')
-    local vless_flow=$(wg_db_get '.server.vless_flow // "xtls-rprx-vision"')
-    local wg_port=$(wg_db_get '.server.port')
-
-    if [[ -n "$vless_uuid" && "$vless_uuid" != "null" ]]; then
-        echo -e "  VLESS 端口:  ${C_GREEN}${vless_port}${C_RESET}"
-        echo -e "  传输设定:    ${C_CYAN}${vless_net}${C_RESET} ${vless_flow:+(flow: $vless_flow)}"
-        echo -e "  UUID:        ${C_CYAN}${vless_uuid}${C_RESET}"
-        echo -e "  Reality SNI: ${C_CYAN}${reality_jni}${C_RESET}"
-        echo -e "  Short ID:    ${C_CYAN}${reality_sid}${C_RESET}"
-        echo -e "  Public Key:  ${C_CYAN}${reality_pub}${C_RESET}"
-        echo -e "  WG 本地监听: ${C_CYAN}0.0.0.0:${wg_port}/udp${C_RESET}"
-    else
-        echo -e "  ${C_YELLOW}隧道参数未配置${C_RESET}"
-    fi
-    draw_line
-    echo "  1. 重新配置隧道参数
-  2. 查看客户端 xray 配置
-  3. 查看 3X-UI 配置指引
-  0. 返回"
-    read -e -r -p "选择: " c
-    case $c in
-        1)
-            wg_tunnel_setup "$wg_port"
-            pause
-            ;;
-        2)
-            local pc=$(wg_db_get '.peers | length')
-            if [[ "$pc" -eq 0 ]]; then
-                print_warn "暂无设备"; pause; return
-            fi
-            echo "选择设备:"
-            local i=0
-            while [[ $i -lt $pc ]]; do
-                echo "  $((i+1)). $(wg_db_get ".peers[$i].name")"
-                i=$((i+1))
-            done
-            read -e -r -p "选择: " idx
-            if [[ "$idx" =~ ^[0-9]+$ && "$idx" -ge 1 && "$idx" -le "$pc" ]]; then
-                wg_tunnel_generate_client_xray "$((idx-1))"
-                pause
-            fi
-            ;;
-        3)
-            echo ""
-            echo -e "${C_YELLOW}[3X-UI 配置指引]${C_RESET}"
-            echo "  1. 登录 3X-UI 面板"
-            echo "  2. 入站列表 → 添加入站"
-            echo "  3. 协议: vless, 端口: ${vless_port:-自定义}"
-            echo "  4. 传输: ${vless_net}, 安全: reality"
-            [[ -n "$vless_flow" ]] && echo "  5. xtls 设置 (Flow): ${vless_flow}"
-            echo "  6. SNI/Dest: ${reality_jni:-www.microsoft.com}:443"
-            echo "  7. 面板无需特殊设置（客户端直连公网 IP 环回）"
-            pause
-            ;;
-    esac
-}
 backup_create() {
     print_title "创建备份"
     print_info "正在扫描 VPS 可备份项..."
@@ -8510,5 +8029,4 @@ main() {
         esac
     done
 }
-
 main "$@"

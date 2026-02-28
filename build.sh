@@ -32,7 +32,6 @@ MODULES=(
     "11d-wireguard-peers.sh"
     "11e-wireguard-clash.sh"
     "11g-wireguard-extra.sh"
-    "11b-wireguard-tunnel.sh"
     "12-backup.sh"
     "13-menus.sh"
 )

@@ -43,9 +43,8 @@ wg_setup_watchdog() {
   • wg show 失败 → 重启接口"
     if ! confirm "启用看门狗?"; then pause; return; fi
 
-    # ── OpenWrt 平台: 生成专用看门狗 (#!/bin/sh + ifup/ifdown) ──
-    if [[ "$PLATFORM" == "openwrt" ]]; then
-        cat > "$watchdog_script" << 'WDEOF_OPENWRT'
+    # ── OpenWrt 看门狗 (#!/bin/sh + ifup/ifdown + Mihomo bypass 检查) ──
+    cat > "$watchdog_script" << 'WDEOF_OPENWRT'
 #!/bin/sh
 LOG="logger -t wg-watchdog"
 
@@ -53,64 +52,34 @@ LOG="logger -t wg-watchdog"
 if ! ifstatus wg0 &>/dev/null; then
     $LOG "wg0 down, restarting"
     ifup wg0
-    exit 0
+    sleep 2
 fi
 
 # 检测 wg show 是否正常
 if ! wg show wg0 &>/dev/null; then
     $LOG "wg show failed, restarting"
     ifdown wg0; sleep 1; ifup wg0
-    exit 0
+    sleep 2
+fi
+
+# 检测 Mihomo bypass 规则是否存在
+if nft list chain inet fw4 mangle_prerouting &>/dev/null; then
+    if ! nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep -q "wg_bypass"; then
+        $LOG "Mihomo bypass rules missing, rebuilding"
+        # 从 /etc/rc.local 中提取 bypass 规则并重新执行
+        grep "wg_bypass" /etc/rc.local 2>/dev/null | while IFS= read -r line; do
+            eval "$line" 2>/dev/null || true
+        done
+    fi
 fi
 WDEOF_OPENWRT
-        chmod +x "$watchdog_script"
-        cron_add_job "wg-watchdog.sh" "* * * * * $watchdog_script >/dev/null 2>&1"
-        echo ""
-        print_success "看门狗已启用 (每分钟检测)"
-        echo -e "  脚本: ${C_CYAN}${watchdog_script}${C_RESET}"
-        echo "  检测: 接口存活 → wg show"
-        log_action "WireGuard watchdog enabled (platform=openwrt)"
-        pause
-        return 0
-    fi
-
-    # ── 标准 Linux 平台 ──
-    cat > "$watchdog_script" << 'WDEOF_SERVER'
-#!/bin/bash
-LOG="/var/log/wg-watchdog.log"
-WG_INTERFACE="wg0"
-log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG"; }
-
-if ! ip link show "$WG_INTERFACE" &>/dev/null; then
-    log "WARN: $WG_INTERFACE missing, restarting..."
-    wg-quick up "$WG_INTERFACE" 2>>"$LOG"
-    sleep 2
-    ip link show "$WG_INTERFACE" &>/dev/null && log "OK: recovered" || log "ERROR: restart failed"
-    exit 0
-fi
-
-if ! wg show "$WG_INTERFACE" &>/dev/null; then
-    log "WARN: wg show failed, restarting..."
-    wg-quick down "$WG_INTERFACE" 2>>"$LOG"; sleep 1
-    wg-quick up "$WG_INTERFACE" 2>>"$LOG"
-    sleep 2
-    wg show "$WG_INTERFACE" &>/dev/null && log "OK: recovered" || log "ERROR: restart failed"
-    exit 0
-fi
-
-# 日志轮转
-if [[ -f "$LOG" ]] && [[ $(wc -l < "$LOG") -gt 500 ]]; then
-    tail -n 300 "$LOG" > "${LOG}.tmp" && mv "${LOG}.tmp" "$LOG"
-fi
-WDEOF_SERVER
     chmod +x "$watchdog_script"
     cron_add_job "wg-watchdog.sh" "* * * * * $watchdog_script >/dev/null 2>&1"
     echo ""
     print_success "看门狗已启用 (每分钟检测)"
     echo -e "  脚本: ${C_CYAN}${watchdog_script}${C_RESET}"
-    echo -e "  日志: ${C_CYAN}${watchdog_log}${C_RESET}"
-    echo "  检测: 接口存活 → wg show"
-    log_action "WireGuard watchdog enabled (platform=linux)"
+    echo "  检测: 接口存活 → wg show → Mihomo bypass 规则"
+    log_action "WireGuard watchdog enabled (platform=openwrt)"
     pause
 }
 
@@ -127,14 +96,15 @@ wg_export_peers() {
     export_file=$(mktemp "/tmp/${SCRIPT_NAME}-wg-peers-XXXXXX.json")
     chmod 600 "$export_file"
     if jq '{
-        export_version: 1,
+        export_version: 2,
         export_date: (now | todate),
         server: {
             endpoint: .server.endpoint,
             port: .server.port,
             subnet: .server.subnet,
             dns: .server.dns,
-            public_key: .server.public_key
+            public_key: .server.public_key,
+            server_lan_subnet: .server.server_lan_subnet
         },
         peers: .peers
     }' "$WG_DB_FILE" > "$export_file" 2>/dev/null; then
@@ -211,7 +181,7 @@ wg_import_peers() {
     local imported=0 skipped=0
     local i=0
     while [[ $i -lt $import_count ]]; do
-        local name ip privkey pubkey psk allowed enabled is_gw lans created
+        local name ip privkey pubkey psk allowed enabled is_gw lans created peer_type
         name=$(jq -r ".peers[$i].name" "$import_file")
         ip=$(jq -r ".peers[$i].ip" "$import_file")
         privkey=$(jq -r ".peers[$i].private_key" "$import_file")
@@ -222,6 +192,11 @@ wg_import_peers() {
         is_gw=$(jq -r ".peers[$i].is_gateway // false" "$import_file")
         lans=$(jq -r ".peers[$i].lan_subnets // empty" "$import_file")
         created=$(jq -r ".peers[$i].created // empty" "$import_file")
+        peer_type=$(jq -r ".peers[$i].peer_type // empty" "$import_file")
+        # 兼容旧版 JSON: 无 peer_type 时根据 is_gateway 推断
+        if [[ -z "$peer_type" || "$peer_type" == "null" ]]; then
+            [[ "$is_gw" == "true" ]] && peer_type="gateway" || peer_type="standard"
+        fi
 
         # 检查重名
         local exists
@@ -256,6 +231,7 @@ wg_import_peers() {
                   --arg created "$created" \
                   --arg gw "$is_gw" \
                   --arg lans "$lans" \
+                  --arg ptype "$peer_type" \
             '.peers += [{
                 name: $name,
                 ip: $ip,
@@ -266,16 +242,17 @@ wg_import_peers() {
                 enabled: $enabled,
                 created: $created,
                 is_gateway: ($gw == "true"),
-                lan_subnets: $lans
+                lan_subnets: $lans,
+                peer_type: $ptype
             }]'
         imported=$((imported + 1))
         i=$((i + 1))
     done
 
     if [[ $imported -gt 0 ]]; then
+        wg_rebuild_uci_conf
         wg_rebuild_conf
         wg_regenerate_client_confs
-        wg_is_running && wg_restart
     fi
     echo ""
     print_success "导入完成: 成功 ${imported}, 跳过 ${skipped}"
@@ -288,16 +265,10 @@ wg_server_menu() {
     while true; do
         print_title "WireGuard 服务端管理"
         local srv_name=$(wg_get_server_name)
-        local deploy_mode=$(wg_db_get '.server.deploy_mode // "domestic"')
         if wg_is_running; then
             echo -e "  状态: ${C_GREEN}● 运行中${C_RESET}    接口: ${C_CYAN}${WG_INTERFACE}${C_RESET}    名称: ${C_CYAN}${srv_name}${C_RESET}"
         else
             echo -e "  状态: ${C_RED}● 已停止${C_RESET}    接口: ${C_CYAN}${WG_INTERFACE}${C_RESET}    名称: ${C_CYAN}${srv_name}${C_RESET}"
-        fi
-        if [[ "$deploy_mode" == "overseas" ]]; then
-            echo -e "  模式: ${C_YELLOW}境外 (VLESS-Reality)${C_RESET}"
-        else
-            echo -e "  模式: ${C_GREEN}境内 (标准 UDP)${C_RESET}"
         fi
         local peer_count=$(wg_db_get '.peers | length')
         echo -e "  设备数: ${C_CYAN}${peer_count}${C_RESET}"
@@ -316,11 +287,9 @@ wg_server_menu() {
   11. 修改服务器名称
   12. 卸载 WireGuard
   13. 生成 OpenWrt 清空 WG 配置命令
-  14. 服务端看门狗 (自动重启保活)"
-        if [[ "$deploy_mode" == "overseas" ]]; then
-            echo "  15. VLESS-Reality 隧道管理"
-        fi
-        echo "  ── 数据管理 ──────────────────
+  14. 服务端看门狗 (自动重启保活)
+  15. Mihomo bypass 规则管理
+  ── 数据管理 ──────────────────
   16. 导出设备配置 (JSON)
   17. 导入设备配置 (JSON)
   0. 返回上级菜单
@@ -341,13 +310,7 @@ wg_server_menu() {
             12) wg_uninstall; return ;;
             13) wg_openwrt_clean_cmd ;;
             14) wg_setup_watchdog ;;
-            15)
-                if [[ "$deploy_mode" == "overseas" ]]; then
-                    wg_tunnel_manage
-                else
-                    print_warn "仅境外模式可用"; pause
-                fi
-                ;;
+            15) wg_mihomo_bypass_status ;;
             16) wg_export_peers ;;
             17) wg_import_peers ;;
             0|"") return ;;

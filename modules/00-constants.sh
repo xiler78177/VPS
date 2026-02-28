@@ -9,7 +9,6 @@ readonly CACHE_TTL=300
 readonly CERT_HOOKS_DIR="/root/cert-hooks"
 readonly WG_DEFAULT_PORT=50000
 readonly WG_MTU_DIRECT=1420
-readonly WG_MTU_TUNNEL=1280
 readonly BACKUP_LOCAL_DIR="/root/${SCRIPT_NAME}-backups"
 readonly BACKUP_CONFIG_FILE="/etc/${SCRIPT_NAME}-backup.conf"
 PLATFORM="debian"
