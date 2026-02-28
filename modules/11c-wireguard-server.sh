@@ -197,7 +197,15 @@ wg_server_install() {
     uci commit firewall
 
     # nft 实时放行 WG UDP 端口 (不重启防火墙)
-    nft add rule inet fw4 input_wan udp dport "$wg_port" counter accept comment \"wg_allow_port\" 2>/dev/null || true
+    nft insert rule inet fw4 input_wan udp dport "$wg_port" counter accept comment \"wg_allow_port\" 2>/dev/null || true
+    # uci 持久化防火墙端口放行规则
+    uci set firewall.wg_allow_port=rule
+    uci set firewall.wg_allow_port.name='Allow-WG-UDP'
+    uci set firewall.wg_allow_port.src='wan'
+    uci set firewall.wg_allow_port.dest_port="$wg_port"
+    uci set firewall.wg_allow_port.proto='udp'
+    uci set firewall.wg_allow_port.target='ACCEPT'
+    uci commit firewall
 
     # 生成只读快照 wg0.conf
     wg_rebuild_conf
@@ -297,20 +305,30 @@ wg_modify_server() {
     wg_rebuild_conf
     wg_regenerate_client_confs
 
-    # 端口变更: 更新 nft 防火墙规则
+    # 端口变更: 更新 nft 防火墙规则 + uci 持久化
     if [[ "$new_port" != "$cur_port" ]]; then
-        # 删除旧端口规则
+        # 删除旧端口 nft 规则
         local h
         for h in $(nft -a list chain inet fw4 input_wan 2>/dev/null | grep 'wg_allow_port' | awk '{print $NF}'); do
             nft delete rule inet fw4 input_wan handle "$h" 2>/dev/null || true
         done
-        # 添加新端口规则
-        nft add rule inet fw4 input_wan udp dport "$new_port" counter accept comment \"wg_allow_port\" 2>/dev/null || true
+        # 添加新端口 nft 规则
+        nft insert rule inet fw4 input_wan udp dport "$new_port" counter accept comment \"wg_allow_port\" 2>/dev/null || true
+        # 更新 uci 持久化
+        uci set firewall.wg_allow_port.dest_port="$new_port"
+        uci commit firewall
         # 更新 /etc/rc.local
         sed -i '/wg_allow_port/d' /etc/rc.local 2>/dev/null || true
-        sed -i "/^exit 0/i nft add rule inet fw4 input_wan udp dport $new_port counter accept comment \\\"wg_allow_port\\\" 2>/dev/null || true" \
-            /etc/rc.local 2>/dev/null || true
-        # 重建 bypass 规则
+        if grep -q "^exit 0" /etc/rc.local 2>/dev/null; then
+            sed -i "/^exit 0/i nft insert rule inet fw4 input_wan udp dport $new_port counter accept comment \\\"wg_allow_port\\\" 2>/dev/null || true" \
+                /etc/rc.local 2>/dev/null || true
+        else
+            echo "nft insert rule inet fw4 input_wan udp dport $new_port counter accept comment \"wg_allow_port\" 2>/dev/null || true" >> /etc/rc.local
+        fi
+    fi
+
+    # LAN 子网或端口变更都需要重建 bypass (因为 bypass 包含所有子网)
+    if [[ "$new_port" != "$cur_port" || "${new_lan:-}" != "${cur_lan:-}" ]]; then
         wg_mihomo_bypass_rebuild
     fi
 
@@ -502,29 +520,51 @@ wg_setup_mihomo_bypass() {
     # 先清理旧规则
     wg_mihomo_bypass_clean 2>/dev/null
 
+    # ── 收集所有需要 bypass 的子网 ──
+    local -a bypass_subnets=("$wg_subnet")
+    # 服务端 LAN
+    local server_lan=$(wg_db_get '.server.server_lan_subnet // empty')
+    [[ -n "$server_lan" && "$server_lan" != "null" ]] && bypass_subnets+=("$server_lan")
+    # 所有网关 peer 的 LAN 子网
+    local pc=$(wg_db_get '.peers | length' 2>/dev/null) pi=0
+    while [[ $pi -lt ${pc:-0} ]]; do
+        local pls=$(wg_db_get ".peers[$pi].lan_subnets // empty")
+        if [[ -n "$pls" && "$pls" != "null" ]]; then
+            local IFS_BAK="$IFS"; IFS=','
+            for cidr in $pls; do
+                cidr=$(echo "$cidr" | xargs)
+                [[ -n "$cidr" ]] && bypass_subnets+=("$cidr")
+            done
+            IFS="$IFS_BAK"
+        fi
+        pi=$((pi + 1))
+    done
+    # 去重
+    local -a unique_subnets
+    mapfile -t unique_subnets < <(printf '%s\n' "${bypass_subnets[@]}" | sort -u)
+
     # wg0 接口流量跳过 Mihomo tproxy
     nft insert rule inet fw4 mangle_prerouting iifname \"wg0\" counter return comment \"wg_bypass_iface\" 2>/dev/null || true
-    # 目标为 WG 子网的包跳过 Mihomo
-    nft insert rule inet fw4 mangle_prerouting ip daddr "$wg_subnet" counter return comment \"wg_bypass_subnet\" 2>/dev/null || true
+    # 所有 VPN 相关子网跳过 Mihomo
+    local cidr
+    for cidr in "${unique_subnets[@]}"; do
+        nft insert rule inet fw4 mangle_prerouting ip daddr "$cidr" counter return comment \"wg_bypass_subnet\" 2>/dev/null || true
+    done
 
     # 持久化到 /etc/rc.local
     sed -i '/wg_bypass/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null || true
-    # 在 exit 0 之前插入
+    local rc_block="# WireGuard bypass Mihomo\nnft insert rule inet fw4 mangle_prerouting iifname \\\"wg0\\\" counter return comment \\\"wg_bypass_iface\\\" 2>/dev/null || true"
+    for cidr in "${unique_subnets[@]}"; do
+        rc_block="${rc_block}\nnft insert rule inet fw4 mangle_prerouting ip daddr \\\"${cidr}\\\" counter return comment \\\"wg_bypass_subnet\\\" 2>/dev/null || true"
+    done
     if grep -q "^exit 0" /etc/rc.local 2>/dev/null; then
         sed -i "/^exit 0/i\\
-# WireGuard bypass Mihomo\\
-nft insert rule inet fw4 mangle_prerouting iifname \\\"wg0\\\" counter return comment \\\"wg_bypass_iface\\\" 2>/dev/null || true\\
-nft insert rule inet fw4 mangle_prerouting ip daddr \\\"$wg_subnet\\\" counter return comment \\\"wg_bypass_subnet\\\" 2>/dev/null || true" \
-            /etc/rc.local 2>/dev/null || true
+${rc_block}" /etc/rc.local 2>/dev/null || true
     else
-        cat >> /etc/rc.local << RCEOF
-# WireGuard bypass Mihomo
-nft insert rule inet fw4 mangle_prerouting iifname "wg0" counter return comment "wg_bypass_iface" 2>/dev/null || true
-nft insert rule inet fw4 mangle_prerouting ip daddr "$wg_subnet" counter return comment "wg_bypass_subnet" 2>/dev/null || true
-RCEOF
+        echo -e "$rc_block" >> /etc/rc.local
     fi
 
-    print_success "Mihomo bypass 规则已配置"
+    print_success "Mihomo bypass 规则已配置 (${#unique_subnets[@]} 个子网)"
 }
 
 wg_mihomo_bypass_status() {
@@ -599,12 +639,31 @@ wg_mihomo_bypass_rebuild() {
 
     # 重建端口放行规则
     if [[ -n "$wg_port" && "$wg_port" != "null" ]]; then
-        # 先清理旧的
+        # 先清理旧的 nft 规则
         local h
         for h in $(nft -a list chain inet fw4 input_wan 2>/dev/null | grep 'wg_allow_port' | awk '{print $NF}'); do
             nft delete rule inet fw4 input_wan handle "$h" 2>/dev/null || true
         done
-        nft add rule inet fw4 input_wan udp dport "$wg_port" counter accept comment \"wg_allow_port\" 2>/dev/null || true
+        nft insert rule inet fw4 input_wan udp dport "$wg_port" counter accept comment \"wg_allow_port\" 2>/dev/null || true
+        # 持久化到 /etc/rc.local
+        sed -i '/wg_allow_port/d' /etc/rc.local 2>/dev/null || true
+        if grep -q "^exit 0" /etc/rc.local 2>/dev/null; then
+            sed -i "/^exit 0/i\\
+nft insert rule inet fw4 input_wan udp dport ${wg_port} counter accept comment \\\"wg_allow_port\\\" 2>/dev/null || true" \
+                /etc/rc.local 2>/dev/null || true
+        else
+            echo "nft insert rule inet fw4 input_wan udp dport ${wg_port} counter accept comment \"wg_allow_port\" 2>/dev/null || true" >> /etc/rc.local
+        fi
+        # uci 持久化防火墙规则
+        if ! uci -q get firewall.wg_allow_port &>/dev/null; then
+            uci set firewall.wg_allow_port=rule
+            uci set firewall.wg_allow_port.name='Allow-WG-UDP'
+            uci set firewall.wg_allow_port.src='wan'
+            uci set firewall.wg_allow_port.dest_port="$wg_port"
+            uci set firewall.wg_allow_port.proto='udp'
+            uci set firewall.wg_allow_port.target='ACCEPT'
+            uci commit firewall
+        fi
     fi
 }
 
@@ -662,6 +721,7 @@ wg_uninstall() {
     uci delete firewall.wg_zone 2>/dev/null || true
     uci delete firewall.wg_fwd_lan 2>/dev/null || true
     uci delete firewall.wg_fwd_wg 2>/dev/null || true
+    uci delete firewall.wg_allow_port 2>/dev/null || true
     uci delete firewall.wg_mesh_zone 2>/dev/null || true
     uci delete firewall.wg_mesh_fwd 2>/dev/null || true
     uci delete firewall.wg_mesh_fwd_lan 2>/dev/null || true
@@ -761,6 +821,7 @@ uci delete network.wg_mesh 2>/dev/null; true
 uci delete firewall.wg_zone 2>/dev/null; true
 uci delete firewall.wg_fwd_lan 2>/dev/null; true
 uci delete firewall.wg_fwd_wg 2>/dev/null; true
+uci delete firewall.wg_allow_port 2>/dev/null; true
 uci delete firewall.wg_mesh_zone 2>/dev/null; true
 uci delete firewall.wg_mesh_fwd 2>/dev/null; true
 uci delete firewall.wg_mesh_fwd_lan 2>/dev/null; true

@@ -201,6 +201,11 @@ PersistentKeepalive = 25"
     wg_rebuild_conf
     wg_regenerate_client_confs
 
+    # 网关 peer 添加/删除会改变 LAN 子网列表，需重建 Mihomo bypass
+    if [[ "$is_gateway" == "true" ]]; then
+        wg_mihomo_bypass_rebuild 2>/dev/null
+    fi
+
     # ── 结果展示 ──
     draw_line
     print_success "设备 '${peer_name}' 添加成功！"
@@ -432,6 +437,11 @@ wg_delete_peer() {
     wg_rebuild_uci_conf
     wg_rebuild_conf
     wg_regenerate_client_confs
+
+    # 网关 peer 删除后 LAN 子网列表变化，需重建 Mihomo bypass
+    if [[ "$_del_gw" == "true" ]]; then
+        wg_mihomo_bypass_rebuild 2>/dev/null
+    fi
 
     print_success "设备 '${target_name}' 已删除"
     log_action "WireGuard peer deleted: ${target_name}"
