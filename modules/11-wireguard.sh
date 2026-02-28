@@ -257,6 +257,7 @@ wg_rebuild_uci_conf() {
     uci add_list network.wg0.addresses="${server_ip}/${mask}"
     uci set network.wg0.listen_port="$port"
     uci set network.wg0.mtu="$mtu"
+    uci set network.wg0.route_allowed_ips='1'
 
     # --- 遍历 enabled peers，创建 uci wireguard_wg0 section ---
     local pc=$(wg_db_get '.peers | length') i=0

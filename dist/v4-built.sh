@@ -4828,6 +4828,7 @@ wg_rebuild_uci_conf() {
     uci add_list network.wg0.addresses="${server_ip}/${mask}"
     uci set network.wg0.listen_port="$port"
     uci set network.wg0.mtu="$mtu"
+    uci set network.wg0.route_allowed_ips='1'
 
     # --- 遍历 enabled peers，创建 uci wireguard_wg0 section ---
     local pc=$(wg_db_get '.peers | length') i=0
@@ -5129,6 +5130,7 @@ wg_server_install() {
     uci add_list network.wg0.addresses="${server_ip}/${wg_mask}"
     uci set network.wg0.listen_port="$wg_port"
     uci set network.wg0.mtu="$mtu"
+    uci set network.wg0.route_allowed_ips='1'
 
     # 配置 uci 防火墙 zone + forwarding
     print_info "配置 OpenWrt 防火墙..."

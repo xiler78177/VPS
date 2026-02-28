@@ -175,6 +175,7 @@ wg_server_install() {
     uci add_list network.wg0.addresses="${server_ip}/${wg_mask}"
     uci set network.wg0.listen_port="$wg_port"
     uci set network.wg0.mtu="$mtu"
+    uci set network.wg0.route_allowed_ips='1'
 
     # 配置 uci 防火墙 zone + forwarding
     print_info "配置 OpenWrt 防火墙..."
