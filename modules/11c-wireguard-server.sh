@@ -216,6 +216,7 @@ wg_server_install() {
     wg_setup_mihomo_bypass "$wg_subnet"
     ifup wg0 2>/dev/null
     sleep 2
+    wg_sync_peer_routes
 
     # ── 安装结果展示 ──
     draw_line
@@ -466,6 +467,7 @@ wg_start() {
     if wg_is_running; then
         # 启动后确保 bypass 规则存在
         wg_mihomo_bypass_rebuild 2>/dev/null
+        wg_sync_peer_routes
         print_success "WireGuard 已启动"
         log_action "WireGuard started"
     else
@@ -498,6 +500,7 @@ wg_restart() {
     sleep 2
     if wg_is_running; then
         wg_mihomo_bypass_rebuild 2>/dev/null
+        wg_sync_peer_routes
         print_success "WireGuard 已重启"
         log_action "WireGuard restarted"
     else
@@ -553,10 +556,26 @@ wg_setup_mihomo_bypass() {
     done
 
     # 持久化到 /etc/rc.local
-    sed -i '/wg_bypass/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null || true
+    sed -i '/wg_bypass/d; /WireGuard bypass/d; /wg_peer_route/d' /etc/rc.local 2>/dev/null || true
     local rc_block="# WireGuard bypass Mihomo\nnft insert rule inet fw4 mangle_prerouting iifname \\\"wg0\\\" counter return comment \\\"wg_bypass_iface\\\" 2>/dev/null || true"
     for cidr in "${unique_subnets[@]}"; do
         rc_block="${rc_block}\nnft insert rule inet fw4 mangle_prerouting ip daddr \\\"${cidr}\\\" counter return comment \\\"wg_bypass_subnet\\\" 2>/dev/null || true"
+    done
+    # 网关 peer LAN 路由持久化 (proto-wireguard 不一定自动创建)
+    local pc=$(wg_db_get '.peers | length' 2>/dev/null) pi=0
+    while [[ $pi -lt ${pc:-0} ]]; do
+        if [[ "$(wg_db_get ".peers[$pi].enabled")" == "true" && "$(wg_db_get ".peers[$pi].is_gateway // false")" == "true" ]]; then
+            local pls=$(wg_db_get ".peers[$pi].lan_subnets // empty")
+            if [[ -n "$pls" && "$pls" != "null" ]]; then
+                local IFS_BAK="$IFS"; IFS=','
+                for sub in $pls; do
+                    sub=$(echo "$sub" | xargs)
+                    [[ -n "$sub" ]] && rc_block="${rc_block}\nip route replace ${sub} dev wg0 2>/dev/null || true # wg_peer_route"
+                done
+                IFS="$IFS_BAK"
+            fi
+        fi
+        pi=$((pi + 1))
     done
     if grep -q "^exit 0" /etc/rc.local 2>/dev/null; then
         sed -i "/^exit 0/i\\
@@ -627,7 +646,7 @@ wg_mihomo_bypass_clean() {
         nft delete rule inet fw4 input_wan handle "$h" 2>/dev/null || true
     done
     # 清理 /etc/rc.local 中的持久化条目
-    sed -i '/wg_bypass/d; /wg_allow_port/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null || true
+    sed -i '/wg_bypass/d; /wg_allow_port/d; /wg_peer_route/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null || true
 }
 
 wg_mihomo_bypass_rebuild() {

@@ -4874,7 +4874,31 @@ wg_rebuild_uci_conf() {
         ifdown wg0 2>/dev/null
         sleep 1
         ifup wg0 2>/dev/null
+        sleep 1
+        wg_sync_peer_routes
     fi
+}
+
+# 同步网关 peer 的 LAN 路由到内核路由表
+# (部分 OpenWrt 固件的 proto-wireguard 不支持 route_allowed_ips，需手动添加)
+wg_sync_peer_routes() {
+    wg_is_running || return 0
+    local pc=$(wg_db_get '.peers | length') i=0
+    while [[ $i -lt ${pc:-0} ]]; do
+        if [[ "$(wg_db_get ".peers[$i].enabled")" == "true" ]]; then
+            local is_gw=$(wg_db_get ".peers[$i].is_gateway // false")
+            local lans=$(wg_db_get ".peers[$i].lan_subnets // empty")
+            if [[ "$is_gw" == "true" && -n "$lans" && "$lans" != "null" ]]; then
+                local IFS_BAK="$IFS"; IFS=','
+                for sub in $lans; do
+                    sub=$(echo "$sub" | xargs)
+                    [[ -n "$sub" ]] && ip route replace "$sub" dev "$WG_INTERFACE" 2>/dev/null || true
+                done
+                IFS="$IFS_BAK"
+            fi
+        fi
+        i=$((i + 1))
+    done
 }
 
 # 生成 wg0.conf 只读快照（供导出/备份/查看用，不用于运行）
@@ -5171,6 +5195,7 @@ wg_server_install() {
     wg_setup_mihomo_bypass "$wg_subnet"
     ifup wg0 2>/dev/null
     sleep 2
+    wg_sync_peer_routes
 
     # ── 安装结果展示 ──
     draw_line
@@ -5421,6 +5446,7 @@ wg_start() {
     if wg_is_running; then
         # 启动后确保 bypass 规则存在
         wg_mihomo_bypass_rebuild 2>/dev/null
+        wg_sync_peer_routes
         print_success "WireGuard 已启动"
         log_action "WireGuard started"
     else
@@ -5453,6 +5479,7 @@ wg_restart() {
     sleep 2
     if wg_is_running; then
         wg_mihomo_bypass_rebuild 2>/dev/null
+        wg_sync_peer_routes
         print_success "WireGuard 已重启"
         log_action "WireGuard restarted"
     else
@@ -5508,10 +5535,26 @@ wg_setup_mihomo_bypass() {
     done
 
     # 持久化到 /etc/rc.local
-    sed -i '/wg_bypass/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null || true
+    sed -i '/wg_bypass/d; /WireGuard bypass/d; /wg_peer_route/d' /etc/rc.local 2>/dev/null || true
     local rc_block="# WireGuard bypass Mihomo\nnft insert rule inet fw4 mangle_prerouting iifname \\\"wg0\\\" counter return comment \\\"wg_bypass_iface\\\" 2>/dev/null || true"
     for cidr in "${unique_subnets[@]}"; do
         rc_block="${rc_block}\nnft insert rule inet fw4 mangle_prerouting ip daddr \\\"${cidr}\\\" counter return comment \\\"wg_bypass_subnet\\\" 2>/dev/null || true"
+    done
+    # 网关 peer LAN 路由持久化 (proto-wireguard 不一定自动创建)
+    local pc=$(wg_db_get '.peers | length' 2>/dev/null) pi=0
+    while [[ $pi -lt ${pc:-0} ]]; do
+        if [[ "$(wg_db_get ".peers[$pi].enabled")" == "true" && "$(wg_db_get ".peers[$pi].is_gateway // false")" == "true" ]]; then
+            local pls=$(wg_db_get ".peers[$pi].lan_subnets // empty")
+            if [[ -n "$pls" && "$pls" != "null" ]]; then
+                local IFS_BAK="$IFS"; IFS=','
+                for sub in $pls; do
+                    sub=$(echo "$sub" | xargs)
+                    [[ -n "$sub" ]] && rc_block="${rc_block}\nip route replace ${sub} dev wg0 2>/dev/null || true # wg_peer_route"
+                done
+                IFS="$IFS_BAK"
+            fi
+        fi
+        pi=$((pi + 1))
     done
     if grep -q "^exit 0" /etc/rc.local 2>/dev/null; then
         sed -i "/^exit 0/i\\
@@ -5582,7 +5625,7 @@ wg_mihomo_bypass_clean() {
         nft delete rule inet fw4 input_wan handle "$h" 2>/dev/null || true
     done
     # 清理 /etc/rc.local 中的持久化条目
-    sed -i '/wg_bypass/d; /wg_allow_port/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null || true
+    sed -i '/wg_bypass/d; /wg_allow_port/d; /wg_peer_route/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null || true
 }
 
 wg_mihomo_bypass_rebuild() {
@@ -6874,10 +6917,11 @@ wg_setup_watchdog() {
   • wg show 失败 → 重启接口"
     if ! confirm "启用看门狗?"; then pause; return; fi
 
-    # ── OpenWrt 看门狗 (#!/bin/sh + ifup/ifdown + Mihomo bypass 检查) ──
+    # ── OpenWrt 看门狗 (#!/bin/sh + ifup/ifdown + Mihomo bypass + 路由检查) ──
     cat > "$watchdog_script" << 'WDEOF_OPENWRT'
 #!/bin/sh
 LOG="logger -t wg-watchdog"
+DB="/etc/wireguard/db/wg-data.json"
 
 # 检测接口存活
 if ! ifstatus wg0 &>/dev/null; then
@@ -6897,11 +6941,23 @@ fi
 if nft list chain inet fw4 mangle_prerouting &>/dev/null; then
     if ! nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep -q "wg_bypass"; then
         $LOG "Mihomo bypass rules missing, rebuilding"
-        # 从 /etc/rc.local 中提取 bypass 规则并重新执行
         grep "wg_bypass" /etc/rc.local 2>/dev/null | while IFS= read -r line; do
             eval "$line" 2>/dev/null || true
         done
     fi
+fi
+
+# 检测网关 peer LAN 路由是否存在
+if [ -f "$DB" ] && command -v jq >/dev/null 2>&1; then
+    jq -r '.peers[] | select(.enabled == true and .is_gateway == true) | .lan_subnets // empty' "$DB" 2>/dev/null | \
+    tr ',' '\n' | while IFS= read -r sub; do
+        sub=$(echo "$sub" | xargs)
+        [ -z "$sub" ] && continue
+        if ! ip route show "$sub" dev wg0 2>/dev/null | grep -q .; then
+            $LOG "route missing: $sub dev wg0, adding"
+            ip route replace "$sub" dev wg0 2>/dev/null || true
+        fi
+    done
 fi
 WDEOF_OPENWRT
     chmod +x "$watchdog_script"

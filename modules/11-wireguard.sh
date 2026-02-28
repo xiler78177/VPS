@@ -303,7 +303,31 @@ wg_rebuild_uci_conf() {
         ifdown wg0 2>/dev/null
         sleep 1
         ifup wg0 2>/dev/null
+        sleep 1
+        wg_sync_peer_routes
     fi
+}
+
+# 同步网关 peer 的 LAN 路由到内核路由表
+# (部分 OpenWrt 固件的 proto-wireguard 不支持 route_allowed_ips，需手动添加)
+wg_sync_peer_routes() {
+    wg_is_running || return 0
+    local pc=$(wg_db_get '.peers | length') i=0
+    while [[ $i -lt ${pc:-0} ]]; do
+        if [[ "$(wg_db_get ".peers[$i].enabled")" == "true" ]]; then
+            local is_gw=$(wg_db_get ".peers[$i].is_gateway // false")
+            local lans=$(wg_db_get ".peers[$i].lan_subnets // empty")
+            if [[ "$is_gw" == "true" && -n "$lans" && "$lans" != "null" ]]; then
+                local IFS_BAK="$IFS"; IFS=','
+                for sub in $lans; do
+                    sub=$(echo "$sub" | xargs)
+                    [[ -n "$sub" ]] && ip route replace "$sub" dev "$WG_INTERFACE" 2>/dev/null || true
+                done
+                IFS="$IFS_BAK"
+            fi
+        fi
+        i=$((i + 1))
+    done
 }
 
 # 生成 wg0.conf 只读快照（供导出/备份/查看用，不用于运行）

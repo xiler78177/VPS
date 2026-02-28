@@ -43,10 +43,11 @@ wg_setup_watchdog() {
   • wg show 失败 → 重启接口"
     if ! confirm "启用看门狗?"; then pause; return; fi
 
-    # ── OpenWrt 看门狗 (#!/bin/sh + ifup/ifdown + Mihomo bypass 检查) ──
+    # ── OpenWrt 看门狗 (#!/bin/sh + ifup/ifdown + Mihomo bypass + 路由检查) ──
     cat > "$watchdog_script" << 'WDEOF_OPENWRT'
 #!/bin/sh
 LOG="logger -t wg-watchdog"
+DB="/etc/wireguard/db/wg-data.json"
 
 # 检测接口存活
 if ! ifstatus wg0 &>/dev/null; then
@@ -66,11 +67,23 @@ fi
 if nft list chain inet fw4 mangle_prerouting &>/dev/null; then
     if ! nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep -q "wg_bypass"; then
         $LOG "Mihomo bypass rules missing, rebuilding"
-        # 从 /etc/rc.local 中提取 bypass 规则并重新执行
         grep "wg_bypass" /etc/rc.local 2>/dev/null | while IFS= read -r line; do
             eval "$line" 2>/dev/null || true
         done
     fi
+fi
+
+# 检测网关 peer LAN 路由是否存在
+if [ -f "$DB" ] && command -v jq >/dev/null 2>&1; then
+    jq -r '.peers[] | select(.enabled == true and .is_gateway == true) | .lan_subnets // empty' "$DB" 2>/dev/null | \
+    tr ',' '\n' | while IFS= read -r sub; do
+        sub=$(echo "$sub" | xargs)
+        [ -z "$sub" ] && continue
+        if ! ip route show "$sub" dev wg0 2>/dev/null | grep -q .; then
+            $LOG "route missing: $sub dev wg0, adding"
+            ip route replace "$sub" dev wg0 2>/dev/null || true
+        fi
+    done
 fi
 WDEOF_OPENWRT
     chmod +x "$watchdog_script"
