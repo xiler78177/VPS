@@ -6448,7 +6448,11 @@ uci commit firewall 2>/dev/null; true
 # === 安装 WireGuard 组件 ===
 WG_KERNEL=0
 [ -d /sys/module/wireguard ] || lsmod 2>/dev/null | grep -q wireguard && WG_KERNEL=1
-opkg update || echo '[!] opkg update 失败，尝试继续...'
+for _retry in 1 2 3; do
+    opkg update && break
+    echo "[!] opkg update 失败 (第\${_retry}次), 3秒后重试..."
+    sleep 3
+done
 [ "\$WG_KERNEL" = "0" ] && { opkg install kmod-wireguard 2>/dev/null || echo '[!] kmod-wireguard 安装失败'; }
 opkg install wireguard-tools 2>/dev/null || echo '[!] wireguard-tools 安装失败'
 opkg install luci-proto-wireguard 2>/dev/null || echo '[!] luci-proto-wireguard 安装失败'
@@ -6461,6 +6465,7 @@ uci set network.wg0.proto='wireguard'
 uci set network.wg0.private_key='${peer_privkey}'
 uci delete network.wg0.addresses 2>/dev/null; true
 uci add_list network.wg0.addresses='${peer_ip}/${mask}'
+uci set network.wg0.mtu='1420'
 uci set network.wg_server=wireguard_wg0
 uci set network.wg_server.public_key='${spub}'
 uci set network.wg_server.preshared_key='${psk}'
@@ -6533,6 +6538,56 @@ nft insert rule inet fw4 mangle_prerouting iifname "wg0" counter return comment 
 RCEOF
 fi
 
+# === 开机自恢复服务 ===
+cat > /etc/init.d/wg-client << 'INITEOF'
+#!/bin/sh /etc/rc.common
+START=99
+USE_PROCD=0
+boot() { start; }
+start() {
+    if command -v wg >/dev/null 2>&1 && uci -q get network.wg0.proto >/dev/null 2>&1; then
+        ifup wg0 2>/dev/null; return 0
+    fi
+    logger -t wg-client "WireGuard missing, restoring..."
+    for _r in 1 2 3; do opkg update && break; sleep 3; done
+    opkg install kmod-wireguard wireguard-tools luci-proto-wireguard 2>/dev/null
+    /etc/init.d/rpcd restart 2>/dev/null; sleep 1
+    uci set network.wg0=interface
+    uci set network.wg0.proto='wireguard'
+    uci set network.wg0.private_key='${peer_privkey}'
+    uci set network.wg0.mtu='1420'
+    uci delete network.wg0.addresses 2>/dev/null; true
+    uci add_list network.wg0.addresses='${peer_ip}/${mask}'
+    uci set network.wg_server=wireguard_wg0
+    uci set network.wg_server.public_key='${spub}'
+    uci set network.wg_server.preshared_key='${psk}'
+    uci set network.wg_server.endpoint_host='${ep_host}'
+    uci set network.wg_server.endpoint_port='${sport}'
+    uci set network.wg_server.persistent_keepalive='25'
+    uci set network.wg_server.route_allowed_ips='1'
+    ${uci_allowed_lines}uci set firewall.wg_zone=zone
+    uci set firewall.wg_zone.name='wg'
+    uci set firewall.wg_zone.input='ACCEPT'
+    uci set firewall.wg_zone.output='ACCEPT'
+    uci set firewall.wg_zone.forward='ACCEPT'
+    uci set firewall.wg_zone.masq='1'
+    uci add_list firewall.wg_zone.network='wg0'
+    uci set firewall.wg_fwd_lan=forwarding
+    uci set firewall.wg_fwd_lan.src='lan'
+    uci set firewall.wg_fwd_lan.dest='wg'
+    uci set firewall.wg_fwd_wg=forwarding
+    uci set firewall.wg_fwd_wg.src='wg'
+    uci set firewall.wg_fwd_wg.dest='lan'
+    uci commit network
+    uci commit firewall
+    ifup wg0
+    logger -t wg-client "WireGuard restored"
+}
+INITEOF
+chmod 0700 /etc/init.d/wg-client
+/etc/init.d/wg-client enable
+echo '[+] 开机自恢复服务已安装'
+
 # === 启动接口 ===
 ifup wg0
 
@@ -6554,12 +6609,20 @@ OPENWRT_EOF
     if [[ ! "$ep_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         cat << 'WDEOF'
 
-# === WireGuard 看门狗 (fake-ip 检测 + DNS直连解析 + bypass自恢复 + 连通性保活) ===
+# === WireGuard 看门狗 (fake-ip检测 + DNS直连解析 + 完整bypass自恢复 + 握手保活 + 日志持久化) ===
 cat > /usr/bin/wg-watchdog.sh << 'WDSCRIPT'
 #!/bin/sh
-LOG="logger -t wg-watchdog"
+LOG_FILE="/tmp/wg-watchdog.log"
+MAX_LOG_SIZE=32768
 
-# helper: resolve hostname via external DNS, skip fake-ip
+wdlog() {
+    logger -t wg-watchdog "$1"
+    echo "$(date '+%m-%d %H:%M:%S') $1" >> "$LOG_FILE"
+    if [ -f "$LOG_FILE" ] && [ $(wc -c < "$LOG_FILE" 2>/dev/null || echo 0) -gt $MAX_LOG_SIZE ]; then
+        tail -n 50 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+    fi
+}
+
 resolve_real() {
     local host="$1" ip=""
     for dns in 223.5.5.5 119.29.29.29 8.8.8.8; do
@@ -6572,61 +6635,73 @@ resolve_real() {
 }
 
 if ! ifstatus wg0 &>/dev/null; then
-    $LOG "wg0 down, restarting"; ifup wg0; exit 0
+    wdlog "wg0 down, restarting"; ifup wg0; exit 0
 fi
 
-# DNS re-resolve via external DNS (bypass OpenClash fake-ip)
+# resolve endpoint (always set RESOLVED for bypass self-heal)
 EP_HOST=$(uci get network.wg_server.endpoint_host 2>/dev/null)
-echo "$EP_HOST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && EP_HOST=""
-if [ -n "$EP_HOST" ]; then
+RESOLVED=""
+if echo "$EP_HOST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    RESOLVED="$EP_HOST"
+elif [ -n "$EP_HOST" ]; then
     RESOLVED=$(resolve_real "$EP_HOST")
+fi
+
+# DNS re-resolve + endpoint update (only for domain endpoints)
+if [ -n "$EP_HOST" ] && ! echo "$EP_HOST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
     CURRENT=$(wg show wg0 endpoints 2>/dev/null | awk '{print $2}' | cut -d: -f1 | head -1)
-    # detect fake-ip in current endpoint
     FAKE_IP=0
     case "$CURRENT" in 198.18.*|198.19.*) FAKE_IP=1 ;; esac
     if [ -n "$RESOLVED" ] && { [ "$RESOLVED" != "$CURRENT" ] || [ "$FAKE_IP" = "1" ]; }; then
-        $LOG "endpoint update: $CURRENT -> $RESOLVED (fake=$FAKE_IP)"
+        wdlog "endpoint update: $CURRENT -> $RESOLVED (fake=$FAKE_IP)"
         PUB=$(wg show wg0 endpoints | awk '{print $1}' | head -1)
         PORT=$(uci get network.wg_server.endpoint_port 2>/dev/null)
         wg set wg0 peer "$PUB" endpoint "${RESOLVED}:${PORT}"
-        # update bypass rules
         for h in $(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | grep -v 'iface' | awk '{print $NF}'); do
             nft delete rule inet fw4 mangle_prerouting handle "$h" 2>/dev/null; true
         done
         nft insert rule inet fw4 mangle_prerouting ip daddr "$RESOLVED" udp dport "$PORT" counter return comment "wg_bypass" 2>/dev/null; true
         while ip rule del prio 100 2>/dev/null; do true; done
         ip rule add to "$RESOLVED" lookup main prio 100 2>/dev/null; true
-        $LOG "bypass updated -> $RESOLVED"
+        wdlog "bypass updated -> $RESOLVED"
     fi
 fi
 
-# bypass rule self-heal
+# bypass rule self-heal (complete: iface + IP + ip rule)
 if nft list chain inet fw4 mangle_prerouting &>/dev/null; then
     if ! nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep -q 'wg_bypass_iface'; then
         nft insert rule inet fw4 mangle_prerouting iifname "wg0" counter return comment "wg_bypass_iface" 2>/dev/null; true
-        $LOG "restored wg_bypass_iface rule"
+        wdlog "restored wg_bypass_iface rule"
+    fi
+    if [ -n "$RESOLVED" ]; then
+        if ! nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep -q "daddr $RESOLVED"; then
+            PORT=$(uci get network.wg_server.endpoint_port 2>/dev/null)
+            nft insert rule inet fw4 mangle_prerouting ip daddr "$RESOLVED" udp dport "$PORT" counter return comment "wg_bypass" 2>/dev/null; true
+            wdlog "restored IP bypass -> $RESOLVED"
+        fi
     fi
 fi
+if [ -n "$RESOLVED" ] && ! ip rule show 2>/dev/null | grep -q "$RESOLVED"; then
+    ip rule add to "$RESOLVED" lookup main prio 100 2>/dev/null; true
+    wdlog "restored ip rule -> $RESOLVED"
+fi
 
-# connectivity check
-VIP=$(uci get network.wg_server.allowed_ips 2>/dev/null | awk '{print $1}' | cut -d/ -f1)
-VIP=$(echo "$VIP" | awk -F. '{print $1"."$2"."$3".1"}')
-if [ -n "$VIP" ] && ! ping -c 2 -W 3 "$VIP" &>/dev/null; then
-    if [ -f /tmp/.wg-wd-fail ]; then
-        $LOG "ping $VIP failed twice, restarting"
-        ifdown wg0; sleep 1; ifup wg0
-        rm -f /tmp/.wg-wd-fail
-    else
-        touch /tmp/.wg-wd-fail
+# connectivity check (handshake timeout + ping fallback)
+LAST_HS=$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)
+NOW=$(date +%s)
+if [ -n "$LAST_HS" ] && [ "$LAST_HS" != "0" ] && [ $((NOW - LAST_HS)) -gt 180 ]; then
+    VIP=$(uci get network.wg0.addresses 2>/dev/null | awk '{print $1}' | cut -d/ -f1)
+    VIP=$(echo "$VIP" | awk -F. '{printf "%s.%s.%s.1",$1,$2,$3}')
+    if [ -n "$VIP" ] && ! ping -c 2 -W 3 "$VIP" &>/dev/null; then
+        wdlog "no handshake for $((NOW - LAST_HS))s + ping failed, restarting"
+        ifdown wg0; sleep 2; ifup wg0
     fi
-else
-    rm -f /tmp/.wg-wd-fail 2>/dev/null
 fi
 WDSCRIPT
 chmod +x /usr/bin/wg-watchdog.sh
 (crontab -l 2>/dev/null | grep -v wg-watchdog; echo '* * * * * /usr/bin/wg-watchdog.sh') | crontab -
 /etc/init.d/cron restart
-echo '[+] 看门狗已安装 (外部DNS直连解析 + fake-ip检测 + bypass自恢复 + 连通性保活)'
+echo '[+] 看门狗已安装 (DNS直连 + fake-ip检测 + 完整bypass自恢复 + 握手保活 + 日志持久化)'
 WDEOF
     fi
 
