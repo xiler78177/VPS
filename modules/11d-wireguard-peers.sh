@@ -551,6 +551,8 @@ for iface in wg0 wg_mesh wg-mesh; do
 done
 rm -f /usr/bin/wg-watchdog.sh 2>/dev/null; true
 (crontab -l 2>/dev/null | grep -v wg-watchdog) | crontab - 2>/dev/null; true
+/etc/init.d/wg-client disable 2>/dev/null; true
+rm -f /etc/init.d/wg-client 2>/dev/null; true
 while uci -q get network.@wireguard_wg0[0] >/dev/null 2>&1; do uci delete network.@wireguard_wg0[0]; done
 uci delete network.wg_server 2>/dev/null; true
 uci delete network.wg0 2>/dev/null; true
@@ -562,11 +564,12 @@ i=0; while uci get firewall.@zone[\$i] >/dev/null 2>&1; do
     case "\$zname" in wg|wireguard) uci delete "firewall.@zone[\$i]" 2>/dev/null; true; continue ;; esac
     i=\$((i + 1))
 done
-ip rule del lookup main prio 100 2>/dev/null; true
+# clean ALL ip rules with prio 100 (old fake-ip bypass rules)
+while ip rule del prio 100 2>/dev/null; do true; done
 for h in \$(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print \$NF}'); do
     nft delete rule inet fw4 mangle_prerouting handle "\$h" 2>/dev/null; true
 done
-sed -i '/wg_bypass/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null; true
+sed -i '/wg_bypass/d; /WireGuard bypass/d; /ip rule.*prio 100/d' /etc/rc.local 2>/dev/null; true
 uci commit network 2>/dev/null; true
 uci commit firewall 2>/dev/null; true
 
@@ -611,10 +614,24 @@ uci set firewall.wg_fwd_wg.dest='lan'
 uci commit network
 uci commit firewall
 
-# === Mihomo bypass: WG endpoint 流量直连 ===
+# === Mihomo/OpenClash bypass: WG endpoint 流量直连 ===
+# 关键: 使用外部 DNS 直连解析, 绕过 OpenClash fake-ip 劫持
 EP_IP='${ep_host}'
-echo "\${EP_IP}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\$' || \\
-    EP_IP=\$(nslookup '${ep_host}' 2>/dev/null | awk '/^Address:/{a=\$2} END{if(a) print a}')
+if ! echo "\${EP_IP}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\$'; then
+    # 依次尝试多个外部 DNS 直连解析 (绕过本地 Clash/Mihomo fake-ip)
+    for DNS_SRV in 223.5.5.5 119.29.29.29 8.8.8.8; do
+        EP_IP=\$(nslookup '${ep_host}' \$DNS_SRV 2>/dev/null | awk '/^Address:/{a=\$2} END{if(a) print a}')
+        # 验证不是 fake-ip (198.18.0.0/15)
+        if [ -n "\$EP_IP" ]; then
+            case "\$EP_IP" in 198.18.*|198.19.*) EP_IP=""; continue ;; esac
+            echo "[+] endpoint 解析: ${ep_host} -> \$EP_IP (via \$DNS_SRV)"
+            break
+        fi
+    done
+fi
+if [ -z "\${EP_IP}" ]; then
+    echo '[!] 警告: 无法解析 endpoint 真实 IP, bypass 规则可能无效!'
+fi
 if [ -n "\${EP_IP}" ]; then
     ip rule del to "\${EP_IP}" lookup main prio 100 2>/dev/null; true
     ip rule add to "\${EP_IP}" lookup main prio 100
@@ -622,14 +639,26 @@ if [ -n "\${EP_IP}" ]; then
         nft insert rule inet fw4 mangle_prerouting ip daddr "\${EP_IP}" udp dport ${sport} counter return comment \"wg_bypass\" 2>/dev/null; true
         nft insert rule inet fw4 mangle_prerouting iifname \"wg0\" counter return comment \"wg_bypass_iface\" 2>/dev/null; true
     }
-    # 持久化到 /etc/rc.local
-    sed -i '/wg_bypass/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null; true
-    sed -i "/^exit 0/i # WireGuard bypass Mihomo\\
-ip rule add to \${EP_IP} lookup main prio 100 2>/dev/null; true\\
-nft insert rule inet fw4 mangle_prerouting ip daddr \\\"\${EP_IP}\\\" udp dport ${sport} counter return comment \\\"wg_bypass\\\" 2>/dev/null; true\\
-nft insert rule inet fw4 mangle_prerouting iifname \\\"wg0\\\" counter return comment \\\"wg_bypass_iface\\\" 2>/dev/null; true" \\
-        /etc/rc.local 2>/dev/null; true
     echo "[+] Mihomo bypass 规则已添加: \${EP_IP}"
+fi
+
+# 持久化: rc.local 中使用外部 DNS 动态解析 (每次开机重新解析)
+sed -i '/wg_bypass/d; /WireGuard bypass/d; /wg_ep_resolve/d; /ip rule.*prio 100/d' /etc/rc.local 2>/dev/null; true
+if grep -q "^exit 0" /etc/rc.local 2>/dev/null; then
+    sed -i "/^exit 0/i # WireGuard bypass Mihomo (dynamic resolve, bypass fake-ip) # wg_bypass\\
+WG_EP=\\\$(nslookup '${ep_host}' 223.5.5.5 2>/dev/null | awk '/^Address:/{a=\\\$2} END{if(a) print a}') # wg_ep_resolve\\
+[ -n \\\"\\\$WG_EP\\\" ] \&\& { ip rule add to \\\"\\\$WG_EP\\\" lookup main prio 100 2>/dev/null; true; } # wg_bypass\\
+[ -n \\\"\\\$WG_EP\\\" ] \&\& nft insert rule inet fw4 mangle_prerouting ip daddr \\\"\\\$WG_EP\\\" udp dport ${sport} counter return comment \\\"wg_bypass\\\" 2>/dev/null; true # wg_bypass\\
+nft insert rule inet fw4 mangle_prerouting iifname \\\"wg0\\\" counter return comment \\\"wg_bypass_iface\\\" 2>/dev/null; true # wg_bypass" \\
+        /etc/rc.local 2>/dev/null; true
+else
+    cat >> /etc/rc.local << 'RCEOF'
+# WireGuard bypass Mihomo (dynamic resolve) # wg_bypass
+WG_EP=\$(nslookup '${ep_host}' 223.5.5.5 2>/dev/null | awk '/^Address:/{a=\$2} END{if(a) print a}') # wg_ep_resolve
+[ -n "\$WG_EP" ] && { ip rule add to "\$WG_EP" lookup main prio 100 2>/dev/null; true; } # wg_bypass
+[ -n "\$WG_EP" ] && nft insert rule inet fw4 mangle_prerouting ip daddr "\$WG_EP" udp dport ${sport} counter return comment "wg_bypass" 2>/dev/null; true # wg_bypass
+nft insert rule inet fw4 mangle_prerouting iifname "wg0" counter return comment "wg_bypass_iface" 2>/dev/null; true # wg_bypass
+RCEOF
 fi
 
 # === 启动接口 ===
@@ -642,6 +671,10 @@ if ifstatus wg0 2>/dev/null | grep -q '"up": true'; then
 else
     echo '[!] wg0 接口未启动，请检查: logread | grep -i wireguard'
 fi
+if [ -n "\${EP_IP}" ]; then
+    echo "[*] 验证 endpoint: wg show wg0 endpoints"
+    wg show wg0 endpoints 2>/dev/null
+fi
 
 OPENWRT_EOF
 
@@ -649,40 +682,61 @@ OPENWRT_EOF
     if [[ ! "$ep_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         cat << 'WDEOF'
 
-# === WireGuard 看门狗 (DNS重解析 + 连通性保活 + bypass规则自恢复) ===
+# === WireGuard 看门狗 (fake-ip 检测 + DNS直连解析 + bypass自恢复 + 连通性保活) ===
 cat > /usr/bin/wg-watchdog.sh << 'WDSCRIPT'
 #!/bin/sh
 LOG="logger -t wg-watchdog"
+
+# helper: resolve hostname via external DNS, skip fake-ip
+resolve_real() {
+    local host="$1" ip=""
+    for dns in 223.5.5.5 119.29.29.29 8.8.8.8; do
+        ip=$(nslookup "$host" $dns 2>/dev/null | awk '/^Address:/{a=$2} END{if(a) print a}')
+        [ -n "$ip" ] || continue
+        case "$ip" in 198.18.*|198.19.*) ip=""; continue ;; esac
+        echo "$ip"; return 0
+    done
+    return 1
+}
+
 if ! ifstatus wg0 &>/dev/null; then
     $LOG "wg0 down, restarting"; ifup wg0; exit 0
 fi
-# DNS 重解析
+
+# DNS re-resolve via external DNS (bypass OpenClash fake-ip)
 EP_HOST=$(uci get network.wg_server.endpoint_host 2>/dev/null)
 echo "$EP_HOST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && EP_HOST=""
 if [ -n "$EP_HOST" ]; then
-    RESOLVED=$(nslookup "$EP_HOST" 2>/dev/null | awk '/^Address:/{a=$2} END{if(a) print a}')
+    RESOLVED=$(resolve_real "$EP_HOST")
     CURRENT=$(wg show wg0 endpoints 2>/dev/null | awk '{print $2}' | cut -d: -f1 | head -1)
-    if [ -n "$RESOLVED" ] && [ "$RESOLVED" != "$CURRENT" ]; then
-        $LOG "DNS changed: $CURRENT -> $RESOLVED"
+    # detect fake-ip in current endpoint
+    FAKE_IP=0
+    case "$CURRENT" in 198.18.*|198.19.*) FAKE_IP=1 ;; esac
+    if [ -n "$RESOLVED" ] && { [ "$RESOLVED" != "$CURRENT" ] || [ "$FAKE_IP" = "1" ]; }; then
+        $LOG "endpoint update: $CURRENT -> $RESOLVED (fake=$FAKE_IP)"
         PUB=$(wg show wg0 endpoints | awk '{print $1}' | head -1)
         PORT=$(uci get network.wg_server.endpoint_port 2>/dev/null)
         wg set wg0 peer "$PUB" endpoint "${RESOLVED}:${PORT}"
-        # 更新 bypass 规则
+        # update bypass rules
         for h in $(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | grep -v 'iface' | awk '{print $NF}'); do
             nft delete rule inet fw4 mangle_prerouting handle "$h" 2>/dev/null; true
         done
         nft insert rule inet fw4 mangle_prerouting ip daddr "$RESOLVED" udp dport "$PORT" counter return comment "wg_bypass" 2>/dev/null; true
-        ip rule del to "$CURRENT" lookup main prio 100 2>/dev/null; true
+        while ip rule del prio 100 2>/dev/null; do true; done
         ip rule add to "$RESOLVED" lookup main prio 100 2>/dev/null; true
-        $LOG "bypass rules updated: $CURRENT -> $RESOLVED"
+        $LOG "bypass updated -> $RESOLVED"
     fi
 fi
-# bypass 规则自恢复
-if ! nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep -q 'wg_bypass_iface'; then
-    nft insert rule inet fw4 mangle_prerouting iifname "wg0" counter return comment "wg_bypass_iface" 2>/dev/null; true
-    $LOG "restored wg_bypass_iface rule"
+
+# bypass rule self-heal
+if nft list chain inet fw4 mangle_prerouting &>/dev/null; then
+    if ! nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep -q 'wg_bypass_iface'; then
+        nft insert rule inet fw4 mangle_prerouting iifname "wg0" counter return comment "wg_bypass_iface" 2>/dev/null; true
+        $LOG "restored wg_bypass_iface rule"
+    fi
 fi
-# 连通性检测
+
+# connectivity check
 VIP=$(uci get network.wg_server.allowed_ips 2>/dev/null | awk '{print $1}' | cut -d/ -f1)
 VIP=$(echo "$VIP" | awk -F. '{print $1"."$2"."$3".1"}')
 if [ -n "$VIP" ] && ! ping -c 2 -W 3 "$VIP" &>/dev/null; then
@@ -700,15 +754,17 @@ WDSCRIPT
 chmod +x /usr/bin/wg-watchdog.sh
 (crontab -l 2>/dev/null | grep -v wg-watchdog; echo '* * * * * /usr/bin/wg-watchdog.sh') | crontab -
 /etc/init.d/cron restart
-echo '[+] WireGuard 看门狗已安装 (DNS重解析 + bypass自恢复 + 连通性保活)'
+echo '[+] 看门狗已安装 (外部DNS直连解析 + fake-ip检测 + bypass自恢复 + 连通性保活)'
 WDEOF
     fi
 
     draw_line
     echo -e "${C_GREEN}复制以上全部命令到目标 OpenWrt SSH 终端执行即可。${C_RESET}"
     echo -e "${C_CYAN}验证方法:${C_RESET}"
-    echo "  1. OpenWrt: wg show"
-    echo "  2. LuCI: Network -> Interfaces 查看 wg0 状态"
-    echo "  3. LAN 设备 ping VPN 服务端: ping $(wg_db_get '.server.ip')"
+    echo "  1. wg show (确认 endpoint 不是 198.19.x.x)"
+    echo "  2. ping $(wg_db_get '.server.ip') (从 LAN 设备 ping VPN 服务端)"
+    echo -e "${C_YELLOW}重启保护:${C_RESET}"
+    echo "  • rc.local: 开机动态解析 endpoint (绕过 fake-ip)"
+    echo "  • 看门狗: 每分钟检测 fake-ip 并自动修正"
     draw_line
 }
