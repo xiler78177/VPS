@@ -2585,331 +2585,6 @@ web_cf_dns_update() {
     sleep 2
 }
 
-# ── SaaS 优选加速 ──
-
-web_cf_saas_setup() {
-    print_title "Cloudflare SaaS 优选加速配置"
-    echo -e "${C_RED}╔════════════════════════════════════════════════════════════════╗${C_RESET}"
-    echo -e "${C_RED}║                         ⚠ 重要提示                           ║${C_RESET}"
-    echo -e "${C_RED}╠════════════════════════════════════════════════════════════════╣${C_RESET}"
-    echo -e "${C_RED}║${C_RESET} 1. 此功能利用 CF SaaS (自定义主机名) 实现 CDN 优选加速      ${C_RED}║${C_RESET}"
-    echo -e "${C_RED}║${C_RESET} 2. 可能违反 Cloudflare TOS，存在封号风险（目前罕见）        ${C_RED}║${C_RESET}"
-    echo -e "${C_RED}║${C_RESET} 3. 需先在 CF 后台绑定信用卡/PayPal 开通 SaaS 功能           ${C_RED}║${C_RESET}"
-    echo -e "${C_RED}║${C_RESET} 4. 仅支持子域名 (如 www.example.com)，不支持根域名          ${C_RED}║${C_RESET}"
-    echo -e "${C_RED}╚════════════════════════════════════════════════════════════════╝${C_RESET}"
-    echo -e "${C_CYAN}┌─ 配置流程 ──────────────────────────────────────────────────┐${C_RESET}"
-    echo -e "${C_CYAN}│${C_RESET} 步骤1: 输入 CF API Token + 域名信息                        ${C_CYAN}│${C_RESET}"
-    echo -e "${C_CYAN}│${C_RESET} 步骤2: SSL/TLS 设为 Full 模式                               ${C_CYAN}│${C_RESET}"
-    echo -e "${C_CYAN}│${C_RESET} 步骤3: 创建回源记录 origin.xxx → 服务器IP (开代理)          ${C_CYAN}│${C_RESET}"
-    echo -e "${C_CYAN}│${C_RESET} 步骤4: 设置 SaaS 回退源 (Fallback Origin)                   ${C_CYAN}│${C_RESET}"
-    echo -e "${C_CYAN}│${C_RESET} 步骤5: 添加自定义主机名 + TXT 验证                          ${C_CYAN}│${C_RESET}"
-    echo -e "${C_CYAN}│${C_RESET} 步骤6: 业务域名 CNAME → 优选域名 (关代理)                   ${C_CYAN}│${C_RESET}"
-    echo -e "${C_CYAN}│${C_RESET}                                                             ${C_CYAN}│${C_RESET}"
-    echo -e "${C_CYAN}│${C_RESET} 完成后: 用户 → 优选IP → CF高速节点 → 源服务器               ${C_CYAN}│${C_RESET}"
-    echo -e "${C_CYAN}└─────────────────────────────────────────────────────────────┘${C_RESET}"
-    if ! confirm "已了解风险并准备开始？"; then return; fi
-
-    # ── 步骤 1: 收集信息 ──
-    echo -e "${C_CYAN}━━━ 步骤 1/6: 基础信息 ━━━${C_RESET}"
-    local token="" root_domain="" biz_sub="" origin_sub="origin" zone_id="" server_ip=""
-    print_guide "输入 Cloudflare API Token"
-    echo -e "  ${C_GRAY}权限需要: Zone.DNS + Zone.SSL + Zone.Custom Hostnames${C_RESET}"
-    echo -e "  ${C_GRAY}创建: CF 后台 → My Profile → API Tokens → Create Token${C_RESET}"
-    echo -e "  ${C_GRAY}建议用 'Edit zone DNS' 模板，额外添加 SSL 和 Custom Hostnames 权限${C_RESET}"
-    while [[ -z "$token" ]]; do
-        read -s -r -p "API Token: " token; echo ""
-    done
-    print_info "验证 Token..."
-    local vr=$(_cf_api GET "/user/tokens/verify" "$token")
-    if ! _cf_api_ok "$vr"; then
-        print_error "Token 验证失败: $(_cf_api_err "$vr")"
-        pause; return
-    fi
-    print_success "Token 有效"
-    print_guide "输入根域名 (必须已托管在 Cloudflare)"
-    echo -e "  ${C_GRAY}例如: example.com${C_RESET}"
-    while [[ -z "$root_domain" ]]; do
-        read -e -r -p "根域名: " root_domain
-        validate_domain "$root_domain" || { print_error "格式无效"; root_domain=""; }
-    done
-    print_info "获取 Zone ID..."
-    zone_id=$(_cf_get_zone_id "$root_domain" "$token")
-    if [[ -z "$zone_id" ]]; then
-        print_error "未找到 $root_domain 的 Zone，请确认已托管在 CF"
-        pause; return
-    fi
-    print_success "Zone ID: $zone_id"
-    print_guide "输入要加速的子域名前缀"
-    echo -e "  ${C_GRAY}例如输入 www → 加速 www.${root_domain}${C_RESET}"
-    echo -e "  ${C_GRAY}例如输入 blog → 加速 blog.${root_domain}${C_RESET}"
-    echo -e "  ${C_YELLOW}注意: 不支持根域名，仅支持子域名${C_RESET}"
-    while [[ -z "$biz_sub" ]]; do
-        read -e -r -p "子域名前缀: " biz_sub
-        [[ -z "$biz_sub" ]] && print_warn "不能为空"
-    done
-    local biz_domain="${biz_sub}.${root_domain}"
-    if [[ -f "${SAAS_CONFIG_DIR}/${biz_domain}.conf" ]]; then
-        print_warn "${biz_domain} 已有 SaaS 配置"
-        if ! confirm "覆盖现有配置？"; then pause; return; fi
-    fi
-    print_guide "回源子域名前缀 (CF 通过此域名回源到你的服务器)"
-    echo -e "  ${C_GRAY}默认 origin → origin.${root_domain} 指向服务器IP并开启CF代理(小黄云)${C_RESET}"
-    echo -e "  ${C_GRAY}此域名仅用于 CF 内部回源，用户不会直接访问${C_RESET}"
-    read -e -r -p "回源前缀 [origin]: " origin_sub
-    origin_sub=${origin_sub:-origin}
-    local origin_domain="${origin_sub}.${root_domain}"
-    echo ""
-    print_guide "源服务器 IP (回源域名将指向此 IP)"
-    local default_ip=$(get_public_ipv4)
-    [[ -n "$default_ip" ]] && echo -e "  ${C_GRAY}检测到本机 IP: ${default_ip}${C_RESET}"
-    read -e -r -p "服务器 IP [${default_ip:-}]: " server_ip
-    server_ip=${server_ip:-$default_ip}
-    if ! validate_ip "$server_ip"; then
-        print_error "IP 格式无效"; pause; return
-    fi
-
-    # 选择优选域名
-    echo -e "${C_CYAN}选择优选域名 (CNAME 目标，提供高速 CF 节点):${C_RESET}"
-    echo -e "  ${C_GRAY}优选域名背后是经过筛选的对中国大陆友好的 CF 节点 IP${C_RESET}"
-    echo -e "  ${C_GRAY}用户访问你的业务域名时，DNS 会 CNAME 到优选域名获取最快的节点${C_RESET}"
-    local i=1 pd_arr=()
-    for d in $SAAS_PREFERRED_DOMAINS; do
-        pd_arr+=("$d")
-        echo "  $i. $d"
-        ((i++))
-    done
-    if [[ ${#pd_arr[@]} -eq 0 ]]; then
-        print_warn "未配置预设优选域名列表 (SAAS_PREFERRED_DOMAINS 为空)"
-    fi
-    echo "  $i. 自定义输入"
-    local pd_choice preferred_domain
-    read -e -r -p "选择 [${#pd_arr[@]} -gt 0 && echo 1 || echo $i]: " pd_choice
-    pd_choice=${pd_choice:-$([[ ${#pd_arr[@]} -gt 0 ]] && echo 1 || echo $i)}
-    if [[ "$pd_choice" =~ ^[0-9]+$ ]] && (( pd_choice >= 1 && pd_choice <= ${#pd_arr[@]} )); then
-        preferred_domain="${pd_arr[$((pd_choice-1))]}"
-    else
-        read -e -r -p "输入优选域名: " preferred_domain
-        validate_domain "$preferred_domain" || { print_error "域名格式无效"; pause; return; }
-    fi
-    print_success "优选域名: $preferred_domain"
-
-    # ── 配置确认 ──
-    draw_line
-    echo -e "${C_CYAN}配置确认:${C_RESET}"
-    echo -e "  根域名:     ${C_GREEN}${root_domain}${C_RESET}"
-    echo -e "  业务域名:   ${C_GREEN}${biz_domain}${C_RESET}  ← 用户访问地址"
-    echo -e "  回源域名:   ${C_GREEN}${origin_domain}${C_RESET}  ← 指向服务器(开代理)"
-    echo -e "  服务器 IP:  ${C_GREEN}${server_ip}${C_RESET}"
-    echo -e "  优选域名:   ${C_GREEN}${preferred_domain}${C_RESET}  ← CNAME 目标"
-    echo -e "  ${C_YELLOW}将自动执行:${C_RESET}"
-    echo -e "    1. SSL/TLS → Full"
-    echo -e "    2. ${origin_domain} → ${server_ip} (A记录, 开代理)"
-    echo -e "    3. 设置 SaaS 回退源 → ${origin_domain}"
-    echo -e "    4. 添加自定义主机名 ${biz_domain}"
-    echo -e "    5. 添加 TXT 验证记录并等待验证"
-    echo -e "    6. ${biz_domain} → CNAME → ${preferred_domain} (关代理)"
-    draw_line
-    if ! confirm "确认执行以上操作？"; then
-        print_warn "已取消"; pause; return
-    fi
-
-    # ── 步骤 2: SSL/TLS → Full ──
-    echo -e "${C_CYAN}━━━ 步骤 2/6: 设置 SSL/TLS 为 Full 模式 ━━━${C_RESET}"
-    echo -e "  ${C_GRAY}原因: SaaS 回源需要 Full 模式才能正确建立 HTTPS 连接${C_RESET}"
-    local ssl_resp=$(_cf_api PATCH "/zones/$zone_id/settings/ssl" "$token" \
-        --data '{"value":"full"}')
-    if _cf_api_ok "$ssl_resp"; then
-        print_success "SSL/TLS 已设为 Full"
-    else
-        print_warn "SSL 设置: $(_cf_api_err "$ssl_resp") (可能已是 Full，继续)"
-    fi
-
-    # ── 步骤 3: 创建回源 DNS 记录 ──
-    echo -e "${C_CYAN}━━━ 步骤 3/6: 创建回源记录 ━━━${C_RESET}"
-    echo -e "  ${C_GRAY}${origin_domain} → ${server_ip} (A 记录, proxied=true/开代理)${C_RESET}"
-    echo -e "  ${C_GRAY}此记录让 CF 知道你的源服务器在哪里${C_RESET}"
-    local origin_resp=$(_cf_dns_upsert "$zone_id" "$token" "A" "$origin_domain" "$server_ip" "true")
-    if _cf_api_ok "$origin_resp"; then
-        print_success "回源记录: ${origin_domain} → ${server_ip} (代理已开启)"
-    else
-        print_error "回源记录创建失败: $(_cf_api_err "$origin_resp")"
-        pause; return
-    fi
-
-    # ── 步骤 4: 设置 SaaS 回退源 ──
-    echo -e "${C_CYAN}━━━ 步骤 4/6: 设置 SaaS 回退源 ━━━${C_RESET}"
-    echo -e "  ${C_GRAY}告诉 CF SaaS: 当自定义主机名收到请求时，回源到 ${origin_domain}${C_RESET}"
-    local fb_resp=$(_cf_api PUT "/zones/$zone_id/custom_hostnames/fallback_origin" "$token" \
-        --data "{\"origin\":\"$origin_domain\"}")
-    if _cf_api_ok "$fb_resp"; then
-        print_success "回退源已设置: ${origin_domain}"
-    else
-        local fb_err=$(_cf_api_err "$fb_resp")
-        if echo "$fb_err" | grep -qi "already"; then
-            print_warn "回退源已存在，继续"
-        else
-            print_error "回退源设置失败: $fb_err"
-            echo -e "  ${C_YELLOW}请确认已在 CF 后台绑定信用卡/PayPal 开通 SaaS 功能${C_RESET}"
-            echo -e "  ${C_YELLOW}且 API Token 有 Custom Hostnames 权限${C_RESET}"
-            pause; return
-        fi
-    fi
-
-    # 等待回退源激活
-    print_info "等待回退源激活 (最长 60 秒)..."
-    local fb_active=false
-    for attempt in $(seq 1 12); do
-        sleep 5
-        local fb_st=$(_cf_api GET "/zones/$zone_id/custom_hostnames/fallback_origin" "$token")
-        local fb_status=$(echo "$fb_st" | jq -r '.result.status // empty')
-        echo -ne "\r  检测中... (${attempt}/12) 状态: ${fb_status:-pending}    "
-        [[ "$fb_status" == "active" ]] && { fb_active=true; echo ""; break; }
-    done
-    if [[ "$fb_active" == "true" ]]; then
-        print_success "回退源已激活"
-    else
-        print_warn "回退源尚未激活 (状态: ${fb_status:-unknown})，可能需要更多时间"
-        echo -e "  ${C_GRAY}脚本将继续执行，通常会在几分钟内自动激活${C_RESET}"
-    fi
-
-    # ── 步骤 5: 添加自定义主机名 + TXT 验证 ──
-    echo -e "${C_CYAN}━━━ 步骤 5/6: 添加自定义主机名并验证 ━━━${C_RESET}"
-    echo -e "  ${C_GRAY}在 CF SaaS 中注册 ${biz_domain}，并通过 TXT 记录验证所有权${C_RESET}"
-    local ch_resp=$(_cf_api POST "/zones/$zone_id/custom_hostnames" "$token" \
-        --data "{\"hostname\":\"$biz_domain\",\"ssl\":{\"method\":\"txt\",\"type\":\"dv\",\"settings\":{\"min_tls_version\":\"1.2\"}}}")
-    local ch_id=""
-    if _cf_api_ok "$ch_resp"; then
-        ch_id=$(echo "$ch_resp" | jq -r '.result.id')
-        print_success "自定义主机名已添加: ${biz_domain}"
-    else
-        local ch_err=$(_cf_api_err "$ch_resp")
-        if echo "$ch_err" | grep -qiE "already exists|duplicate"; then
-            print_warn "自定义主机名已存在，获取现有配置..."
-            local existing=$(_cf_api GET "/zones/$zone_id/custom_hostnames?hostname=$biz_domain" "$token")
-            ch_id=$(echo "$existing" | jq -r '.result[0].id // empty')
-            [[ -n "$ch_id" ]] && print_success "找到现有配置" || { print_error "无法获取"; pause; return; }
-        else
-            print_error "添加失败: $ch_err"; pause; return
-        fi
-    fi
-
-    # 获取验证信息并添加 TXT 记录
-    print_info "获取验证信息..."
-    sleep 3
-    local ch_detail=$(_cf_api GET "/zones/$zone_id/custom_hostnames/$ch_id" "$token")
-    local own_name=$(echo "$ch_detail" | jq -r '.result.ownership_verification.name // empty')
-    local own_value=$(echo "$ch_detail" | jq -r '.result.ownership_verification.value // empty')
-    local ssl_txt_name=$(echo "$ch_detail" | jq -r '.result.ssl.txt_name // empty')
-    local ssl_txt_value=$(echo "$ch_detail" | jq -r '.result.ssl.txt_value // empty')
-    local ch_status=$(echo "$ch_detail" | jq -r '.result.status // empty')
-    local ssl_status=$(echo "$ch_detail" | jq -r '.result.ssl.status // empty')
-    echo -e "  主机名状态: ${ch_status:-pending}"
-    echo -e "  SSL 状态:   ${ssl_status:-pending}"
-
-    # 添加所有权验证 TXT
-    if [[ -n "$own_name" && -n "$own_value" && "$ch_status" != "active" ]]; then
-        echo -e "${C_YELLOW}添加所有权验证 TXT 记录:${C_RESET}"
-        echo -e "  名称: ${C_GREEN}${own_name}${C_RESET}"
-        echo -e "  内容: ${C_GREEN}${own_value}${C_RESET}"
-        local txt_r=$(_cf_dns_upsert "$zone_id" "$token" "TXT" "$own_name" "$own_value" "false")
-        _cf_api_ok "$txt_r" && print_success "所有权 TXT 已添加" || print_warn "TXT 添加失败: $(_cf_api_err "$txt_r")，请手动添加"
-    fi
-
-    # 添加 SSL 验证 TXT
-    if [[ -n "$ssl_txt_name" && -n "$ssl_txt_value" && "$ssl_status" != "active" ]]; then
-        echo -e "${C_YELLOW}添加 SSL 验证 TXT 记录:${C_RESET}"
-        echo -e "  名称: ${C_GREEN}${ssl_txt_name}${C_RESET}"
-        echo -e "  内容: ${C_GREEN}${ssl_txt_value}${C_RESET}"
-        local ssl_r=$(_cf_dns_upsert "$zone_id" "$token" "TXT" "$ssl_txt_name" "$ssl_txt_value" "false")
-        _cf_api_ok "$ssl_r" && print_success "SSL TXT 已添加" || print_warn "SSL TXT 添加失败: $(_cf_api_err "$ssl_r")，请手动添加"
-    fi
-
-    # 等待验证
-    if [[ "$ch_status" != "active" ]]; then
-        print_info "等待验证通过 (最长 5 分钟)..."
-        echo -e "  ${C_GRAY}CF 需要时间传播 TXT 记录并完成验证${C_RESET}"
-        local verified=false
-        for attempt in $(seq 1 30); do
-            sleep 10
-            ch_detail=$(_cf_api GET "/zones/$zone_id/custom_hostnames/$ch_id" "$token")
-            ch_status=$(echo "$ch_detail" | jq -r '.result.status // empty')
-            ssl_status=$(echo "$ch_detail" | jq -r '.result.ssl.status // empty')
-            echo -ne "\r  检测中... (${attempt}/30) 主机名: ${ch_status} | SSL: ${ssl_status}          "
-            [[ "$ch_status" == "active" ]] && { verified=true; echo ""; break; }
-        done
-        if [[ "$verified" == "true" ]]; then
-            print_success "自定义主机名验证通过！"
-        else
-            print_warn "验证尚未完成 (主机名: ${ch_status}, SSL: ${ssl_status})"
-            echo -e "  ${C_YELLOW}CF 验证有时需要更长时间，脚本将继续配置 CNAME${C_RESET}"
-            echo -e "  ${C_YELLOW}验证通常会在几分钟内自动完成${C_RESET}"
-            if ! confirm "继续配置 CNAME？(选 N 则保存进度，稍后可查看状态)"; then
-                mkdir -p "$SAAS_CONFIG_DIR"
-                cat > "${SAAS_CONFIG_DIR}/${biz_domain}.conf" << SAASEOF
-SAAS_STATUS="pending"
-ROOT_DOMAIN="$root_domain"
-BIZ_DOMAIN="$biz_domain"
-ORIGIN_DOMAIN="$origin_domain"
-SERVER_IP="$server_ip"
-PREFERRED_DOMAIN="$preferred_domain"
-ZONE_ID="$zone_id"
-CH_ID="$ch_id"
-CREATED="$(date '+%Y-%m-%d %H:%M:%S')"
-SAASEOF
-                chmod 600 "${SAAS_CONFIG_DIR}/${biz_domain}.conf"
-                print_info "进度已保存，验证通过后可通过 '查看 SaaS 配置' 检查状态"
-                pause; return
-            fi
-        fi
-    else
-        print_success "主机名已激活，无需等待"
-    fi
-
-    # ── 步骤 6: 业务域名 CNAME 到优选域名 ──
-    echo -e "${C_CYAN}━━━ 步骤 6/6: 配置业务域名 CNAME ━━━${C_RESET}"
-    echo -e "  ${C_GRAY}${biz_domain} → CNAME → ${preferred_domain} (关闭代理/小黄云)${C_RESET}"
-    echo -e "  ${C_GRAY}关闭代理是关键: 让 DNS 直接解析到优选域名的高速 IP${C_RESET}"
-    local cname_resp=$(_cf_dns_upsert "$zone_id" "$token" "CNAME" "$biz_domain" "$preferred_domain" "false")
-    if _cf_api_ok "$cname_resp"; then
-        print_success "CNAME 已配置: ${biz_domain} → ${preferred_domain} (代理已关闭)"
-    else
-        print_error "CNAME 配置失败: $(_cf_api_err "$cname_resp")"
-        pause; return
-    fi
-
-    # 保存配置
-    mkdir -p "$SAAS_CONFIG_DIR"
-    cat > "${SAAS_CONFIG_DIR}/${biz_domain}.conf" << SAASEOF
-SAAS_STATUS="active"
-ROOT_DOMAIN="$root_domain"
-BIZ_DOMAIN="$biz_domain"
-ORIGIN_DOMAIN="$origin_domain"
-SERVER_IP="$server_ip"
-PREFERRED_DOMAIN="$preferred_domain"
-ZONE_ID="$zone_id"
-CH_ID="$ch_id"
-CREATED="$(date '+%Y-%m-%d %H:%M:%S')"
-SAASEOF
-    chmod 600 "${SAAS_CONFIG_DIR}/${biz_domain}.conf"
-    # 完成
-    draw_line
-    print_success "Cloudflare SaaS 优选加速配置完成！"
-    draw_line
-    echo -e "  ${C_CYAN}访问链路:${C_RESET}"
-    echo -e "    用户访问 ${C_GREEN}${biz_domain}${C_RESET}"
-    echo -e "      → DNS CNAME → ${C_GREEN}${preferred_domain}${C_RESET} (优选高速节点)"
-    echo -e "      → CF SaaS 匹配主机名 → 回退源 ${C_GREEN}${origin_domain}${C_RESET}"
-    echo -e "      → CF 代理回源 → 服务器 ${C_GREEN}${server_ip}${C_RESET}"
-    echo -e "  ${C_YELLOW}注意事项:${C_RESET}"
-    echo -e "    • 确保服务器上 ${biz_domain} 的网站/服务已配置并开启 SSL"
-    echo -e "    • 如果使用 Nginx，server_name 需包含 ${biz_domain}"
-    echo -e "    • 首次生效可能需要几分钟等待 DNS 传播"
-    echo -e "    • 可通过 ping ${biz_domain} 验证是否解析到优选 IP"
-    draw_line
-    log_action "SaaS CDN configured: ${biz_domain} -> ${preferred_domain} (origin: ${origin_domain})"
-    pause
-}
-
 # ── Origin Rules ──
 
 _cf_get_origin_ruleset() {
@@ -3131,93 +2806,6 @@ web_cf_origin_rule_delete() {
     pause
 }
 
-# ── SaaS 状态和删除 ──
-
-web_cf_saas_status() {
-    print_title "查看 SaaS 优选配置"
-    if [[ ! -d "$SAAS_CONFIG_DIR" ]] || [[ -z "$(ls -A "$SAAS_CONFIG_DIR" 2>/dev/null)" ]]; then
-        print_warn "暂无 SaaS 优选配置"
-        pause; return
-    fi
-    echo -e "${C_CYAN}业务域名                       状态       优选域名                       回源域名             创建时间${C_RESET}"
-    draw_line
-    for conf in "$SAAS_CONFIG_DIR"/*.conf; do
-        [[ -f "$conf" ]] || continue
-        local SAAS_STATUS="" BIZ_DOMAIN="" PREFERRED_DOMAIN="" ORIGIN_DOMAIN="" CREATED=""
-        validate_conf_file "$conf" || continue
-        _safe_source_conf "$conf"
-        local status_icon="${C_GREEN}✓${C_RESET}"
-        [[ "$SAAS_STATUS" == "pending" ]] && status_icon="${C_YELLOW}…${C_RESET}"
-        echo -e "  ${BIZ_DOMAIN}  ${status_icon} ${SAAS_STATUS}  ${PREFERRED_DOMAIN}  ${ORIGIN_DOMAIN}  ${CREATED}"
-    done
-    pause
-}
-
-web_cf_saas_delete() {
-    print_title "删除 SaaS 优选配置"
-    if [[ ! -d "$SAAS_CONFIG_DIR" ]] || [[ -z "$(ls -A "$SAAS_CONFIG_DIR" 2>/dev/null)" ]]; then
-        print_warn "暂无 SaaS 优选配置"
-        pause; return
-    fi
-    local i=1 domains=() files=()
-    for conf in "$SAAS_CONFIG_DIR"/*.conf; do
-        [[ -f "$conf" ]] || continue
-        local BIZ_DOMAIN=""
-        validate_conf_file "$conf" || continue
-        _safe_source_conf "$conf"
-        domains+=("$BIZ_DOMAIN")
-        files+=("$conf")
-        echo "$i. $BIZ_DOMAIN"
-        ((i++))
-    done
-    echo "0. 返回"
-    read -e -r -p "选择要删除的配置: " idx
-    [[ "$idx" == "0" || -z "$idx" ]] && return
-    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -gt ${#domains[@]} ]]; then
-        print_error "无效序号"; pause; return
-    fi
-    local target_conf="${files[$((idx-1))]}"
-    local SAAS_STATUS="" ROOT_DOMAIN="" BIZ_DOMAIN="" ORIGIN_DOMAIN="" SERVER_IP=""
-    local PREFERRED_DOMAIN="" ZONE_ID="" CH_ID=""
-    if ! validate_conf_file "$target_conf"; then
-        print_error "配置文件格式异常"; pause; return
-    fi
-    _safe_source_conf "$target_conf"
-    echo -e "${C_RED}即将删除 SaaS 配置: ${BIZ_DOMAIN}${C_RESET}"
-    echo "可选的清理操作:
-  1. 仅删除本地配置文件 (CF 上的记录保留)
-  2. 删除本地配置 + CF 上的自定义主机名和相关 DNS 记录
-  0. 取消
-"
-    read -e -r -p "选择: " del_mode
-    [[ "$del_mode" == "0" || -z "$del_mode" ]] && return
-    if [[ "$del_mode" == "2" ]]; then
-        read -s -r -p "Cloudflare API Token: " del_token; echo ""
-        if [[ -n "$CH_ID" && -n "$ZONE_ID" ]]; then
-            print_info "删除自定义主机名..."
-            local del_ch=$(_cf_api DELETE "/zones/$ZONE_ID/custom_hostnames/$CH_ID" "$del_token")
-            _cf_api_ok "$del_ch" && print_success "自定义主机名已删除" || print_warn "删除失败: $(_cf_api_err "$del_ch")"
-        fi
-        if [[ -n "$BIZ_DOMAIN" && -n "$ZONE_ID" ]]; then
-            print_info "删除 CNAME 记录 ${BIZ_DOMAIN}..."
-            _cf_dns_delete "$ZONE_ID" "$del_token" "CNAME" "$BIZ_DOMAIN"
-            print_success "CNAME 记录已清理"
-        fi
-        echo -e "${C_YELLOW}以下记录可能被其他配置共用，请确认是否删除:${C_RESET}"
-        if [[ -n "$ORIGIN_DOMAIN" ]] && confirm "删除回源记录 ${ORIGIN_DOMAIN}？"; then
-            _cf_dns_delete "$ZONE_ID" "$del_token" "A" "$ORIGIN_DOMAIN"
-            print_success "回源记录已删除"
-        fi
-        if confirm "删除 SaaS 回退源设置？(如有其他 SaaS 域名请选 N)"; then
-            _cf_api DELETE "/zones/$ZONE_ID/custom_hostnames/fallback_origin" "$del_token" >/dev/null 2>&1
-            print_success "回退源已删除"
-        fi
-    fi
-    rm -f "$target_conf"
-    print_success "本地配置已删除: ${BIZ_DOMAIN}"
-    log_action "SaaS config deleted: ${BIZ_DOMAIN} (mode=${del_mode})"
-    pause
-}
 
 web_add_domain() {
     print_title "添加域名配置 (SSL + Nginx)"
@@ -4159,8 +3747,7 @@ menu_web() {
         print_title "Web 服务管理 (SSL + Nginx + DDNS)"
         local cert_count=$(find "$CONFIG_DIR" -maxdepth 1 -name '*.conf' 2>/dev/null | wc -l)
         local ddns_count=$(find "$DDNS_CONFIG_DIR" -maxdepth 1 -name '*.conf' 2>/dev/null | wc -l)
-        local saas_count=$(find "$SAAS_CONFIG_DIR" -maxdepth 1 -name '*.conf' 2>/dev/null | wc -l)
-        echo -e "证书域名: ${C_GREEN}${cert_count}${C_RESET} | DDNS域名: ${C_GREEN}${ddns_count}${C_RESET} | SaaS加速: ${C_GREEN}${saas_count}${C_RESET}"
+        echo -e "证书域名: ${C_GREEN}${cert_count}${C_RESET} | DDNS域名: ${C_GREEN}${ddns_count}${C_RESET}"
         [[ $ddns_count -gt 0 ]] && crontab -l 2>/dev/null | grep -q "ddns-update.sh" && echo -e "DDNS状态: ${C_GREEN}运行中${C_RESET}"
         echo -e "${C_CYAN}--- 域名管理 ---${C_RESET}"
         echo "1. 添加域名 (申请证书 + 配置反代 + DDNS)
@@ -4177,25 +3764,20 @@ menu_web() {
         echo "8. 手动续签所有证书
 9. 查看日志 (证书/DDNS)
 "
-        echo -e "${C_CYAN}--- SaaS 优选加速 ---${C_RESET}"
-        echo "10. 配置 SaaS 优选加速 (CF CDN 优选)
-11. 查看 SaaS 优选配置
-12. 删除 SaaS 优选配置
-"
         echo -e "${C_CYAN}--- 回源规则 (解决端口封锁) ---${C_RESET}"
-        echo "13. 创建回源规则 (Origin Rules)
-14. 查看回源规则
-15. 删除回源规则
+        echo "10. 创建回源规则 (Origin Rules)
+11. 查看回源规则
+12. 删除回源规则
 "
         echo -e "${C_CYAN}--- 反向代理 ---${C_RESET}"
-        echo "16. 添加反代网站 (Emby/Jellyfin/通用)
-17. 修改反代后端地址
+        echo "13. 添加反代网站 (Emby/Jellyfin/通用)
+14. 修改反代后端地址
 "
         echo -e "${C_CYAN}--- 证书总览 ---${C_RESET}"
-        echo "18. 证书状态总览
+        echo "15. 证书状态总览
 "
         echo -e "${C_CYAN}--- 一键配置 ---${C_RESET}"
-        echo -e "19. 家宽内网服务公网暴露（一键配置）${C_GRAY} ← 需先在路由器开启端口转发${C_RESET}
+        echo -e "16. 家宽内网服务公网暴露（一键配置）${C_GRAY} ← 需先在路由器开启端口转发${C_RESET}
 0. 返回主菜单
 "
         read -e -r -p "请选择: " c
@@ -4247,22 +3829,19 @@ menu_web() {
                 esac
                 pause
                 ;;
-            10) web_cf_saas_setup ;;
-            11) web_cf_saas_status ;;
-            12) web_cf_saas_delete ;;
-            13) web_cf_origin_rule_create ;;
-            14) web_cf_origin_rule_list ;;
-            15) web_cf_origin_rule_delete ;;
-            16) web_reverse_proxy_site ;;
-            17) web_edit_reverse_proxy ;;
-            18) web_cert_overview ;;
-            19) web_home_expose ;;
+            10) web_cf_origin_rule_create ;;
+            11) web_cf_origin_rule_list ;;
+            12) web_cf_origin_rule_delete ;;
+            13) web_reverse_proxy_site ;;
+            14) web_edit_reverse_proxy ;;
+            15) web_cert_overview ;;
+            16) web_home_expose ;;
             0|q) break ;;
             *) print_error "无效选项" ;;
         esac
     done
 }
-# 整合 DNS + 证书 + Nginx + DDNS + Origin Rules + SaaS 优选为一条龙流程
+# 整合 DNS + 证书 + Nginx + DDNS + Origin Rules 为一条龙流程
 
 web_home_expose() {
     print_title "家宽内网服务公网暴露（一键配置）"
@@ -4271,7 +3850,6 @@ web_home_expose() {
     echo -e "${C_CYAN}│${C_RESET}  适用: Alist / Jellyfin / NAS / HomeAssistant 等            ${C_CYAN}│${C_RESET}"
     echo -e "${C_CYAN}│${C_RESET}                                                             ${C_CYAN}│${C_RESET}"
     echo -e "${C_CYAN}│${C_RESET}  自动完成: DNS → 证书 → Nginx → DDNS → 回源规则            ${C_CYAN}│${C_RESET}"
-    echo -e "${C_CYAN}│${C_RESET}  可选:     SaaS 优选加速 (需 CF 后台绑卡开通)               ${C_CYAN}│${C_RESET}"
     echo -e "${C_CYAN}└─────────────────────────────────────────────────────────────┘${C_RESET}"
 
     # ── 依赖检查 ──

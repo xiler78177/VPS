@@ -1,5 +1,5 @@
 # modules/09e-web-home-expose.sh - 家宽内网服务公网暴露（一键配置）
-# 整合 DNS + 证书 + Nginx + DDNS + Origin Rules + SaaS 优选为一条龙流程
+# 整合 DNS + 证书 + Nginx + DDNS + Origin Rules 为一条龙流程
 
 web_home_expose() {
     print_title "家宽内网服务公网暴露（一键配置）"
@@ -8,7 +8,6 @@ web_home_expose() {
     echo -e "${C_CYAN}│${C_RESET}  适用: Alist / Jellyfin / NAS / HomeAssistant 等            ${C_CYAN}│${C_RESET}"
     echo -e "${C_CYAN}│${C_RESET}                                                             ${C_CYAN}│${C_RESET}"
     echo -e "${C_CYAN}│${C_RESET}  自动完成: DNS → 证书 → Nginx → DDNS → 回源规则            ${C_CYAN}│${C_RESET}"
-    echo -e "${C_CYAN}│${C_RESET}  可选:     SaaS 优选加速 (需 CF 后台绑卡开通)               ${C_CYAN}│${C_RESET}"
     echo -e "${C_CYAN}└─────────────────────────────────────────────────────────────┘${C_RESET}"
 
     # ── 依赖检查 ──

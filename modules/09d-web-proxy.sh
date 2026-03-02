@@ -339,8 +339,7 @@ menu_web() {
         print_title "Web 服务管理 (SSL + Nginx + DDNS)"
         local cert_count=$(find "$CONFIG_DIR" -maxdepth 1 -name '*.conf' 2>/dev/null | wc -l)
         local ddns_count=$(find "$DDNS_CONFIG_DIR" -maxdepth 1 -name '*.conf' 2>/dev/null | wc -l)
-        local saas_count=$(find "$SAAS_CONFIG_DIR" -maxdepth 1 -name '*.conf' 2>/dev/null | wc -l)
-        echo -e "证书域名: ${C_GREEN}${cert_count}${C_RESET} | DDNS域名: ${C_GREEN}${ddns_count}${C_RESET} | SaaS加速: ${C_GREEN}${saas_count}${C_RESET}"
+        echo -e "证书域名: ${C_GREEN}${cert_count}${C_RESET} | DDNS域名: ${C_GREEN}${ddns_count}${C_RESET}"
         [[ $ddns_count -gt 0 ]] && crontab -l 2>/dev/null | grep -q "ddns-update.sh" && echo -e "DDNS状态: ${C_GREEN}运行中${C_RESET}"
         echo -e "${C_CYAN}--- 域名管理 ---${C_RESET}"
         echo "1. 添加域名 (申请证书 + 配置反代 + DDNS)
@@ -357,25 +356,20 @@ menu_web() {
         echo "8. 手动续签所有证书
 9. 查看日志 (证书/DDNS)
 "
-        echo -e "${C_CYAN}--- SaaS 优选加速 ---${C_RESET}"
-        echo "10. 配置 SaaS 优选加速 (CF CDN 优选)
-11. 查看 SaaS 优选配置
-12. 删除 SaaS 优选配置
-"
         echo -e "${C_CYAN}--- 回源规则 (解决端口封锁) ---${C_RESET}"
-        echo "13. 创建回源规则 (Origin Rules)
-14. 查看回源规则
-15. 删除回源规则
+        echo "10. 创建回源规则 (Origin Rules)
+11. 查看回源规则
+12. 删除回源规则
 "
         echo -e "${C_CYAN}--- 反向代理 ---${C_RESET}"
-        echo "16. 添加反代网站 (Emby/Jellyfin/通用)
-17. 修改反代后端地址
+        echo "13. 添加反代网站 (Emby/Jellyfin/通用)
+14. 修改反代后端地址
 "
         echo -e "${C_CYAN}--- 证书总览 ---${C_RESET}"
-        echo "18. 证书状态总览
+        echo "15. 证书状态总览
 "
         echo -e "${C_CYAN}--- 一键配置 ---${C_RESET}"
-        echo -e "19. 家宽内网服务公网暴露（一键配置）${C_GRAY} ← 需先在路由器开启端口转发${C_RESET}
+        echo -e "16. 家宽内网服务公网暴露（一键配置）${C_GRAY} ← 需先在路由器开启端口转发${C_RESET}
 0. 返回主菜单
 "
         read -e -r -p "请选择: " c
@@ -427,16 +421,13 @@ menu_web() {
                 esac
                 pause
                 ;;
-            10) web_cf_saas_setup ;;
-            11) web_cf_saas_status ;;
-            12) web_cf_saas_delete ;;
-            13) web_cf_origin_rule_create ;;
-            14) web_cf_origin_rule_list ;;
-            15) web_cf_origin_rule_delete ;;
-            16) web_reverse_proxy_site ;;
-            17) web_edit_reverse_proxy ;;
-            18) web_cert_overview ;;
-            19) web_home_expose ;;
+            10) web_cf_origin_rule_create ;;
+            11) web_cf_origin_rule_list ;;
+            12) web_cf_origin_rule_delete ;;
+            13) web_reverse_proxy_site ;;
+            14) web_edit_reverse_proxy ;;
+            15) web_cert_overview ;;
+            16) web_home_expose ;;
             0|q) break ;;
             *) print_error "无效选项" ;;
         esac
