@@ -240,13 +240,13 @@ web_home_expose() {
     if [[ "$use_saas" == "true" ]]; then
         # SaaS 模式: 先创建临时 A 记录用于证书验证（SaaS 步骤最后会改为 CNAME）
         # 重新配置时可能残留旧 CNAME，CF 不允许同名 A/CNAME 共存，需先清除
-        _cf_dns_delete "$zone_id" "$token" "CNAME" "$full_domain" 2>/dev/null
+        _cf_dns_delete "$zone_id" "$token" "CNAME" "$full_domain" >/dev/null 2>&1
         print_info "创建 A 记录: ${full_domain} → ${public_ip}"
         _cf_update_dns_record "$zone_id" "$token" "$full_domain" "A" "$public_ip" "false"
     else
         # 非 SaaS: A 记录 + 开启 CF 代理
         # 重新配置时可能残留旧 CNAME (从 SaaS 切换到非 SaaS 场景)
-        _cf_dns_delete "$zone_id" "$token" "CNAME" "$full_domain" 2>/dev/null
+        _cf_dns_delete "$zone_id" "$token" "CNAME" "$full_domain" >/dev/null 2>&1
         print_info "创建 A 记录: ${full_domain} → ${public_ip} (开启 CF 代理)"
         if ! _cf_update_dns_record "$zone_id" "$token" "$full_domain" "A" "$public_ip" "true"; then
             print_error "DNS 记录创建失败"
@@ -522,7 +522,7 @@ EOF
 
         # CNAME → 优选域名 (需先删除临时 A 记录，CF 不允许同名 A 和 CNAME 共存)
         print_info "删除临时 A 记录: ${full_domain} (为 CNAME 让路)"
-        _cf_dns_delete "$zone_id" "$token" "A" "$full_domain"
+        _cf_dns_delete "$zone_id" "$token" "A" "$full_domain" >/dev/null 2>&1
         print_info "配置 CNAME: ${full_domain} → ${preferred_domain} (关代理)"
         local cname_resp=$(_cf_dns_upsert "$zone_id" "$token" "CNAME" "$full_domain" "$preferred_domain" "false")
         if _cf_api_ok "$cname_resp"; then
