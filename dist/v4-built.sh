@@ -2935,12 +2935,7 @@ _cf_put_origin_ruleset() {
     local url="https://api.cloudflare.com/client/v4/zones/${zone_id}/rulesets/phases/http_request_origin/entrypoint"
     local payload=$(jq -n \
         --argjson rules "$rules_json" \
-        '{
-            "name": "Origin Rules",
-            "kind": "zone",
-            "phase": "http_request_origin",
-            "rules": $rules
-        }')
+        '{ "rules": $rules }')
     local resp=$(curl -s -X PUT "$url" \
         -H "Authorization: Bearer $token" \
         -H "Content-Type: application/json" \
