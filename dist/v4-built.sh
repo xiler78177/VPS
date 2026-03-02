@@ -4513,6 +4513,8 @@ web_home_expose() {
         _cf_update_dns_record "$zone_id" "$token" "$full_domain" "A" "$public_ip" "false"
     else
         # 非 SaaS: A 记录 + 开启 CF 代理
+        # 重新配置时可能残留旧 CNAME (从 SaaS 切换到非 SaaS 场景)
+        _cf_dns_delete "$zone_id" "$token" "CNAME" "$full_domain" 2>/dev/null
         print_info "创建 A 记录: ${full_domain} → ${public_ip} (开启 CF 代理)"
         if ! _cf_update_dns_record "$zone_id" "$token" "$full_domain" "A" "$public_ip" "true"; then
             print_error "DNS 记录创建失败"
@@ -4733,6 +4735,8 @@ EOF
                 [[ -n "$ch_id" ]] && print_success "找到现有配置" || print_warn "无法获取"
             else
                 print_error "添加失败: $ch_err"
+                print_warn "SaaS 配置无法完成，请检查 API Token 是否有 Custom Hostnames 权限"
+                pause; return
             fi
         fi
 
