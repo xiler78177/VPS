@@ -4110,74 +4110,50 @@ web_home_expose() {
     fi
     print_success "Token 有效"
 
-    # 2. 根域名 + Zone ID
-    local root_domain=""
-    print_guide "输入根域名 (必须已托管在 Cloudflare)"
-    echo -e "  ${C_GRAY}例如: example.com${C_RESET}"
-    while [[ -z "$root_domain" ]]; do
-        read -e -r -p "根域名: " root_domain
-        validate_domain "$root_domain" || { print_error "格式无效"; root_domain=""; }
-    done
-    print_info "获取 Zone ID..."
-    local zone_id=""
-    zone_id=$(_cf_get_zone_id "$root_domain" "$token")
-    if [[ -z "$zone_id" ]]; then
-        print_error "未找到 Zone ID，请检查 Token 权限和域名是否已托管在 CF"
+    # 2. 选择域名 (自动列出 Token 可管理的域名)
+    print_info "获取 Token 可管理的域名列表..."
+    local zones_json zone_list=() zone_ids=()
+    zones_json=$(_cf_api GET "/zones?per_page=50&status=active" "$token")
+    if ! _cf_api_ok "$zones_json"; then
+        print_error "获取域名列表失败: $(_cf_api_err "$zones_json")"
         pause; return
     fi
-    print_success "Zone ID: $zone_id"
+    while IFS='|' read -r zname zid; do
+        [[ -z "$zname" ]] && continue
+        zone_list+=("$zname")
+        zone_ids+=("$zid")
+    done < <(echo "$zones_json" | jq -r '.result[] | "\(.name)|\(.id)"')
 
-    # 3. 子域名前缀
-    local sub_prefix=""
-    print_guide "输入子域名前缀"
-    echo -e "  ${C_GRAY}例如输入 alist → 访问地址为 alist.${root_domain}${C_RESET}"
-    echo -e "  ${C_GRAY}例如输入 nas → 访问地址为 nas.${root_domain}${C_RESET}"
-    while [[ -z "$sub_prefix" ]]; do
-        read -e -r -p "子域名前缀: " sub_prefix
-        [[ -z "$sub_prefix" ]] && print_warn "不能为空"
-    done
-    local full_domain="${sub_prefix}.${root_domain}"
-
-    # 检查是否已有配置
-    if [[ -f "${CONFIG_DIR}/${full_domain}.conf" ]]; then
-        print_warn "${full_domain} 已有域名配置"
-        if ! confirm "覆盖现有配置？"; then pause; return; fi
+    if [[ ${#zone_list[@]} -eq 0 ]]; then
+        print_error "该 Token 无可管理的域名，请检查 Token 权限"
+        pause; return
     fi
 
-    # 4. 后端服务端口
-    local backend_port=""
-    print_guide "内网服务端口"
-    echo -e "  ${C_GRAY}Alist 默认 5244, Jellyfin 默认 8096, Emby 默认 8096${C_RESET}"
+    echo -e "${C_CYAN}可用域名:${C_RESET}"
+    for i in "${!zone_list[@]}"; do
+        echo "  $((i+1)). ${zone_list[$i]}"
+    done
+    local zone_choice
     while true; do
-        read -e -r -p "后端端口 [5244]: " backend_port
-        backend_port=${backend_port:-5244}
-        if [[ "$backend_port" =~ ^[0-9]+$ ]] && (( backend_port >= 1 && backend_port <= 65535 )); then
+        read -e -r -p "选择域名 [1]: " zone_choice
+        zone_choice=${zone_choice:-1}
+        if [[ "$zone_choice" =~ ^[0-9]+$ ]] && (( zone_choice >= 1 && zone_choice <= ${#zone_list[@]} )); then
             break
         fi
-        print_warn "端口无效，请输入 1-65535"
+        print_warn "请输入 1-${#zone_list[@]}"
     done
+    local root_domain="${zone_list[$((zone_choice-1))]}"
+    local zone_id="${zone_ids[$((zone_choice-1))]}"
+    print_success "已选择: ${root_domain} (Zone: ${zone_id})"
 
-    # 5. Nginx HTTPS 监听端口
-    local https_port=""
-    print_guide "Nginx HTTPS 监听端口 (对外暴露的端口)"
-    echo -e "  ${C_GRAY}家宽通常 443 被封，建议用 8443${C_RESET}"
-    echo -e "  ${C_GRAY}CF 支持的 HTTPS 端口: 443 2053 2083 2087 2096 8443${C_RESET}"
-    while true; do
-        read -e -r -p "HTTPS 端口 [8443]: " https_port
-        https_port=${https_port:-8443}
-        if [[ "$https_port" =~ ^[0-9]+$ ]] && (( https_port >= 1 && https_port <= 65535 )); then
-            break
-        fi
-        print_warn "端口无效"
-    done
-
-    # 6. SaaS 优选
+    # 3. SaaS 优选 (提前询问，避免后续步骤因权限不足而无法回退)
     local use_saas=false
     local preferred_domain=""
     echo ""
     echo -e "${C_CYAN}SaaS CDN 优选加速:${C_RESET}"
-    echo -e "  ${C_GRAY}开启 → 用户通过优选 CF 节点访问，速度更快 (需 CF 后台已绑卡开通 SaaS)${C_RESET}"
+    echo -e "  ${C_GRAY}开启 → 用户通过优选 CF 节点访问，速度更快${C_RESET}"
     echo -e "  ${C_GRAY}关闭 → 直接通过 CF CDN 代理访问，速度一般但无额外要求${C_RESET}"
+    echo -e "  ${C_YELLOW}⚠ 开启 SaaS 需要在 CF 后台对 ${root_domain} 绑卡开通 Cloudflare for SaaS${C_RESET}"
     if confirm "是否启用 SaaS 优选加速?"; then
         use_saas=true
         echo -e "${C_CYAN}选择优选域名:${C_RESET}"
@@ -4199,6 +4175,67 @@ web_home_expose() {
         fi
         print_success "优选域名: $preferred_domain"
     fi
+
+    # 4. 子域名前缀
+    local sub_prefix=""
+    print_guide "输入子域名前缀"
+    echo -e "  ${C_GRAY}例如输入 alist → 访问地址为 alist.${root_domain}${C_RESET}"
+    echo -e "  ${C_GRAY}例如输入 nas → 访问地址为 nas.${root_domain}${C_RESET}"
+    while [[ -z "$sub_prefix" ]]; do
+        read -e -r -p "子域名前缀: " sub_prefix
+        [[ -z "$sub_prefix" ]] && print_warn "不能为空"
+    done
+    local full_domain="${sub_prefix}.${root_domain}"
+
+    # 检查是否已有配置
+    if [[ -f "${CONFIG_DIR}/${full_domain}.conf" ]]; then
+        print_warn "${full_domain} 已有域名配置"
+        if ! confirm "覆盖现有配置？"; then pause; return; fi
+    fi
+
+    # 5. 后端服务地址
+    local backend_addr=""
+    print_guide "内网服务地址 (IP:端口)"
+    echo -e "  ${C_GRAY}服务在本机: 直接输入端口号即可，如 5244${C_RESET}"
+    echo -e "  ${C_GRAY}服务在其他设备: 输入 IP:端口，如 192.168.1.100:5244${C_RESET}"
+    echo -e "  ${C_GRAY}常用端口: Alist 5244, Jellyfin/Emby 8096${C_RESET}"
+    while true; do
+        read -e -r -p "后端地址 [127.0.0.1:5244]: " backend_addr
+        backend_addr=${backend_addr:-"127.0.0.1:5244"}
+        # 只输入了端口号 → 自动补 127.0.0.1
+        if [[ "$backend_addr" =~ ^[0-9]+$ ]]; then
+            if (( backend_addr >= 1 && backend_addr <= 65535 )); then
+                backend_addr="127.0.0.1:${backend_addr}"
+                break
+            fi
+            print_warn "端口无效，请输入 1-65535"
+            continue
+        fi
+        # IP:端口 格式校验
+        if [[ "$backend_addr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$ ]]; then
+            local _bport=${backend_addr##*:}
+            if (( _bport >= 1 && _bport <= 65535 )); then
+                break
+            fi
+        fi
+        print_warn "格式无效，请输入 端口号 或 IP:端口"
+    done
+    print_success "后端地址: ${backend_addr}"
+
+    # 6. Nginx HTTPS 监听端口
+    local https_port=""
+    print_guide "Nginx HTTPS 监听端口 (对外暴露的端口)"
+    echo -e "  ${C_GRAY}家宽通常 443 被封，建议用 8443${C_RESET}"
+    echo -e "  ${C_GRAY}CF 支持的 HTTPS 端口: 443 2053 2083 2087 2096 8443${C_RESET}"
+    while true; do
+        read -e -r -p "HTTPS 端口 [8443]: " https_port
+        https_port=${https_port:-8443}
+        if [[ "$https_port" =~ ^[0-9]+$ ]] && (( https_port >= 1 && https_port <= 65535 )); then
+            break
+        fi
+        print_warn "端口无效"
+    done
+
 
     # 7. DDNS 间隔
     local ddns_interval=""
@@ -4232,7 +4269,7 @@ web_home_expose() {
     echo -e "  访问域名:     ${C_GREEN}${full_domain}${C_RESET}"
     echo -e "  根域名:       ${C_GREEN}${root_domain}${C_RESET} (Zone: ${zone_id})"
     echo -e "  公网 IP:      ${C_GREEN}${public_ip}${C_RESET}"
-    echo -e "  后端端口:     ${C_GREEN}${backend_port}${C_RESET} (内网服务)"
+    echo -e "  后端地址:     ${C_GREEN}${backend_addr}${C_RESET} (内网服务)"
     echo -e "  HTTPS 端口:   ${C_GREEN}${https_port}${C_RESET} (Nginx 对外监听)"
     echo -e "  DDNS 间隔:    ${C_GREEN}${ddns_interval} 分钟${C_RESET}"
     if [[ "$use_saas" == "true" ]]; then
@@ -4247,11 +4284,18 @@ web_home_expose() {
     local auto_step=1
     echo -e "    ${auto_step}. DNS 解析 → ${full_domain} → ${public_ip}"; ((auto_step++))
     echo -e "    ${auto_step}. SSL 证书申请 (Let's Encrypt DNS 验证)"; ((auto_step++))
-    echo -e "    ${auto_step}. Nginx 反向代理 (:${https_port} → 127.0.0.1:${backend_port})"; ((auto_step++))
+    echo -e "    ${auto_step}. Nginx 反向代理 (:${https_port} → ${backend_addr})"; ((auto_step++))
     echo -e "    ${auto_step}. DDNS 自动更新 (每 ${ddns_interval} 分钟)"; ((auto_step++))
     echo -e "    ${auto_step}. 防火墙放行端口 ${https_port}"; ((auto_step++))
     [[ "$https_port" != "443" ]] && { echo -e "    ${auto_step}. CF Origin Rule (用户 :443 → 回源 :${https_port})"; ((auto_step++)); }
     [[ "$use_saas" == "true" ]] && echo -e "    ${auto_step}. SaaS 优选加速 (回源 + 自定义主机名 + CNAME)"
+    echo ""
+    echo -e "  ${C_YELLOW}[⚠ 手动操作提醒]${C_RESET}"
+    echo -e "  ${C_YELLOW}  请确保路由器 (OpenWrt/爱快等) 已做端口转发:${C_RESET}"
+    echo -e "  ${C_YELLOW}  外网 ${https_port}/TCP → 内网运行 Nginx 的设备IP:${https_port}/TCP${C_RESET}"
+    if [[ "$backend_addr" != 127.0.0.1:* ]]; then
+        echo -e "  ${C_YELLOW}  后端服务在其他设备 (${backend_addr})，请确保内网互通${C_RESET}"
+    fi
     draw_line
     if ! confirm "确认开始执行?"; then
         print_warn "已取消"; pause; return
@@ -4332,7 +4376,7 @@ server {
     include snippets/ssl-params.conf;
     client_max_body_size 128M;
     location / {
-        proxy_pass http://127.0.0.1:${backend_port};
+        proxy_pass http://${backend_addr};
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection \"upgrade\";
@@ -4347,7 +4391,7 @@ server {
     if ! _nginx_deploy_conf "$full_domain" "$nginx_conf"; then
         pause; return
     fi
-    print_success "Nginx 已部署 (:${https_port} → 127.0.0.1:${backend_port})"
+    print_success "Nginx 已部署 (:${https_port} → ${backend_addr})"
     ((step++))
 
     # ── Step: DDNS ──
@@ -4623,7 +4667,7 @@ DEPLOY_HOOK_SCRIPT="${hook_script}"
 CLOUDFLARE_CREDENTIALS="${cf_cred}"
 NGINX_HTTP_PORT="80"
 NGINX_HTTPS_PORT="${https_port}"
-LOCAL_PROXY_PASS="http://127.0.0.1:${backend_port}"
+LOCAL_PROXY_PASS="http://${backend_addr}"
 HOME_EXPOSE="true"
 CONFEOF
 
@@ -4643,12 +4687,12 @@ CONFEOF
         echo -e "      → CF SaaS → 回源 ${C_GREEN}${origin_domain}${C_RESET}"
         [[ "$https_port" != "443" ]] && \
         echo -e "      → Origin Rule :443 → :${C_GREEN}${https_port}${C_RESET}"
-        echo -e "      → 家宽路由器 → 内网 Nginx → ${C_GREEN}127.0.0.1:${backend_port}${C_RESET}"
+        echo -e "      → 家宽路由器 → 内网 Nginx → ${C_GREEN}${backend_addr}${C_RESET}"
     else
         echo -e "    用户 → ${C_GREEN}${full_domain}${C_RESET} (CF 代理)"
         [[ "$https_port" != "443" ]] && \
         echo -e "      → Origin Rule :443 → :${C_GREEN}${https_port}${C_RESET}"
-        echo -e "      → 家宽路由器 → 内网 Nginx → ${C_GREEN}127.0.0.1:${backend_port}${C_RESET}"
+        echo -e "      → 家宽路由器 → 内网 Nginx → ${C_GREEN}${backend_addr}${C_RESET}"
     fi
     echo ""
     echo -e "  ${C_CYAN}[证书]${C_RESET}"
@@ -4661,10 +4705,13 @@ CONFEOF
     echo -e "    间隔: 每 ${ddns_interval} 分钟"
     echo ""
     echo -e "  ${C_YELLOW}[⚠ 路由器操作 — 需要手动完成]${C_RESET}"
-    echo -e "    请在路由器做端口转发:"
-    echo -e "    外网 ${C_GREEN}${https_port}${C_RESET}/TCP → 内网服务器IP:${C_GREEN}${https_port}${C_RESET}/TCP"
+    echo -e "    请在路由器 (OpenWrt/爱快等) 做端口转发:"
+    echo -e "    外网 ${C_GREEN}${https_port}${C_RESET}/TCP → 运行 Nginx 的设备IP:${C_GREEN}${https_port}${C_RESET}/TCP"
+    if [[ "$backend_addr" != 127.0.0.1:* ]]; then
+        echo -e "    后端服务在 ${C_GREEN}${backend_addr}${C_RESET}，请确保内网互通"
+    fi
     draw_line
-    log_action "Home expose configured: ${full_domain} -> 127.0.0.1:${backend_port} (port=${https_port}, saas=${use_saas})"
+    log_action "Home expose configured: ${full_domain} -> ${backend_addr} (port=${https_port}, saas=${use_saas})"
     pause
 }
 docker_install() {
