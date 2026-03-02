@@ -4858,6 +4858,77 @@ CONFEOF
     fi
     draw_line
     log_action "Home expose configured: ${full_domain} -> ${backend_addr} (port=${https_port}, saas=${use_saas})"
+
+    # ── 可选: 内网 DNS 劫持 (解决 NAT 回环) ──
+    echo ""
+    echo -e "${C_CYAN}内网 DNS 劫持 (解决 NAT 回环问题):${C_RESET}"
+    echo -e "  ${C_GRAY}问题: 内网设备访问 ${full_domain} → 解析到公网 IP → 路由器 → 无法回环${C_RESET}"
+    echo -e "  ${C_GRAY}解决: 在路由器 dnsmasq 添加本地解析，内网直连不走公网${C_RESET}"
+    if confirm "是否自动配置路由器内网 DNS 劫持 (需 SSH 到 OpenWrt)?"; then
+        # 检测网关 IP
+        local gw_ip=""
+        gw_ip=$(ip route | grep '^default' | awk '{print $3}' | head -1)
+        [[ -z "$gw_ip" ]] && gw_ip="10.10.100.1"
+        read -e -r -p "路由器 SSH 地址 [root@${gw_ip}]: " router_ssh
+        router_ssh=${router_ssh:-"root@${gw_ip}"}
+
+        # 检测本机内网 IP (Nginx 所在设备)
+        local local_ip=""
+        local_ip=$(ip route get "${gw_ip}" 2>/dev/null | grep -oP 'src \K[0-9.]+' | head -1)
+        [[ -z "$local_ip" ]] && local_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+        read -e -r -p "本机内网 IP (运行 Nginx 的设备) [${local_ip}]: " nginx_ip
+        nginx_ip=${nginx_ip:-"$local_ip"}
+
+        if [[ -z "$nginx_ip" ]]; then
+            print_error "未能检测到内网 IP，请手动输入"
+            read -e -r -p "内网 IP: " nginx_ip
+            [[ -z "$nginx_ip" ]] && { print_warn "跳过 DNS 劫持配置"; pause; return; }
+        fi
+
+        echo -e "${C_CYAN}配置预览:${C_RESET}"
+        echo -e "  路由器: ${C_GREEN}${router_ssh}${C_RESET}"
+        echo -e "  规则:   ${C_GREEN}${full_domain} → ${nginx_ip}${C_RESET}"
+        echo ""
+        print_info "正在 SSH 到路由器配置 dnsmasq..."
+
+        # 通过 uci 配置 (兼容所有 OpenWrt 版本)
+        local uci_cmds="
+# 清除同名旧记录
+while uci -q delete dhcp.@domain[-1] 2>/dev/null; do
+    name=\$(uci -q get dhcp.@domain[-1].name 2>/dev/null)
+    [ \"\$name\" = '${full_domain}' ] && continue || { uci revert dhcp; break; }
+done 2>/dev/null
+# 精确清除: 遍历查找并删除匹配的 domain 条目
+idx=0
+while uci -q get dhcp.@domain[\$idx] >/dev/null 2>&1; do
+    name=\$(uci -q get dhcp.@domain[\$idx].name 2>/dev/null)
+    if [ \"\$name\" = '${full_domain}' ]; then
+        uci delete dhcp.@domain[\$idx]
+    else
+        idx=\$((idx + 1))
+    fi
+done
+# 添加新记录
+uci add dhcp domain
+uci set dhcp.@domain[-1].name='${full_domain}'
+uci set dhcp.@domain[-1].ip='${nginx_ip}'
+uci commit dhcp
+/etc/init.d/dnsmasq restart
+"
+        if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+            ${router_ssh} "${uci_cmds}" 2>&1; then
+            print_success "内网 DNS 劫持配置成功！"
+            echo -e "  ${C_GREEN}${full_domain} → ${nginx_ip}${C_RESET} (内网直连)"
+        else
+            print_warn "SSH 配置失败，请手动在路由器上执行:"
+            echo -e "  ${C_YELLOW}ssh ${router_ssh}${C_RESET}"
+            echo -e "  ${C_YELLOW}uci add dhcp domain${C_RESET}"
+            echo -e "  ${C_YELLOW}uci set dhcp.@domain[-1].name='${full_domain}'${C_RESET}"
+            echo -e "  ${C_YELLOW}uci set dhcp.@domain[-1].ip='${nginx_ip}'${C_RESET}"
+            echo -e "  ${C_YELLOW}uci commit dhcp${C_RESET}"
+            echo -e "  ${C_YELLOW}/etc/init.d/dnsmasq restart${C_RESET}"
+        fi
+    fi
     pause
 }
 docker_install() {
