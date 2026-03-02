@@ -2304,6 +2304,87 @@ web_env_check() {
     return 0
 }
 
+# ── 通用域名清理 ──
+# 一次性清除指定域名的所有关联配置
+# 用法: _web_cleanup_domain "域名" [quiet]
+# quiet 模式仅打印摘要，不打印每项细节
+_web_cleanup_domain() {
+    local domain="$1" quiet="${2:-}"
+    [[ -z "$domain" ]] && return 1
+    local cleaned=0
+
+    # Certbot 证书
+    if certbot certificates 2>/dev/null | grep -q "$domain"; then
+        certbot delete --cert-name "$domain" --non-interactive 2>/dev/null && cleaned=$((cleaned+1))
+        [[ -z "$quiet" ]] && print_success "证书已删除"
+    fi
+    # 本地证书拷贝
+    rm -rf "${CERT_PATH_PREFIX:?}/${domain}" 2>/dev/null
+
+    # Nginx 配置
+    local ng_en="/etc/nginx/sites-enabled/${domain}.conf"
+    local ng_av="/etc/nginx/sites-available/${domain}.conf"
+    if [[ -f "$ng_en" || -f "$ng_av" ]]; then
+        rm -f "$ng_en" "$ng_av"
+        nginx -t >/dev/null 2>&1 && _nginx_reload 2>/dev/null
+        cleaned=$((cleaned+1))
+        [[ -z "$quiet" ]] && print_success "Nginx 配置已删除"
+    fi
+
+    # Hook 脚本
+    local hook="${CERT_HOOKS_DIR}/renew-${domain}.sh"
+    [[ ! -f "$hook" ]] && hook="/root/cert-renew-hook-${domain}.sh"
+    if [[ -f "$hook" ]]; then
+        rm -f "$hook"; cleaned=$((cleaned+1))
+        [[ -z "$quiet" ]] && print_success "Hook 脚本已删除"
+    fi
+
+    # Cron 任务 (续签)
+    cron_remove_job "CertRenew_${domain}" 2>/dev/null
+    cron_remove_job "cert-renew-hook-${domain}.sh" 2>/dev/null
+
+    # CF 凭据
+    rm -f "/root/.cloudflare-${domain}.ini" 2>/dev/null
+
+    # DDNS 配置 (域名本身 + origin.xxx 回源域名)
+    local ddns_cleaned=false
+    for ddns_f in "${DDNS_CONFIG_DIR}/${domain}.conf" "${DDNS_CONFIG_DIR}/origin."*".conf"; do
+        if [[ -f "$ddns_f" ]]; then
+            rm -f "$ddns_f"; ddns_cleaned=true
+        fi
+    done
+    # 用域名后缀匹配回源域名 DDNS
+    local root_part="${domain#*.}"
+    if [[ -f "${DDNS_CONFIG_DIR}/origin.${root_part}.conf" ]]; then
+        rm -f "${DDNS_CONFIG_DIR}/origin.${root_part}.conf"; ddns_cleaned=true
+    fi
+    if [[ "$ddns_cleaned" == "true" ]]; then
+        cleaned=$((cleaned+1))
+        ddns_rebuild_cron 2>/dev/null
+        [[ -z "$quiet" ]] && print_success "DDNS 配置已清理"
+    fi
+
+    # SaaS 配置
+    if [[ -f "${SAAS_CONFIG_DIR}/${domain}.conf" ]]; then
+        rm -f "${SAAS_CONFIG_DIR}/${domain}.conf"
+        cleaned=$((cleaned+1))
+        [[ -z "$quiet" ]] && print_success "SaaS 配置已清理"
+    fi
+
+    # 域名管理配置
+    if [[ -f "${CONFIG_DIR}/${domain}.conf" ]]; then
+        rm -f "${CONFIG_DIR}/${domain}.conf"
+        cleaned=$((cleaned+1))
+        [[ -z "$quiet" ]] && print_success "域名管理配置已删除"
+    fi
+
+    if [[ $cleaned -gt 0 ]]; then
+        [[ -n "$quiet" ]] && print_success "已清理 ${domain} 的 ${cleaned} 项旧配置"
+        log_action "Cleanup domain: $domain ($cleaned items)"
+    fi
+    return 0
+}
+
 # ── CF API 核心 ──
 
 _cf_api() {
@@ -3670,41 +3751,7 @@ web_delete_domain() {
     echo -e "${C_RESET}"
     if ! confirm "确认彻底删除吗?"; then return; fi
     print_info "正在执行清理..."
-    if certbot delete --cert-name "$target_domain" --non-interactive 2>/dev/null; then
-        print_success "证书本地文件已删除。"
-    else
-        print_warn "Certbot 删除失败或证书不存在。"
-    fi
-    local nginx_conf="/etc/nginx/sites-enabled/${target_domain}.conf"
-    local nginx_conf_src="/etc/nginx/sites-available/${target_domain}.conf"
-    if [[ -f "$nginx_conf" || -f "$nginx_conf_src" ]]; then
-        rm -f "$nginx_conf" "$nginx_conf_src"
-        if is_systemd && command_exists nginx; then
-            systemctl reload nginx 2>/dev/null || true
-        elif command_exists nginx; then
-            nginx -s reload 2>/dev/null || true
-        fi
-        print_success "Nginx 配置已删除。"
-    fi
-    local hook_script="${CERT_HOOKS_DIR}/renew-${target_domain}.sh"
-    [[ ! -f "$hook_script" ]] && hook_script="/root/cert-renew-hook-${target_domain}.sh"
-    if [[ -f "$hook_script" ]]; then
-        rm -f "$hook_script"
-        print_success "Hook 脚本已删除。"
-    fi
-    # 清理 Cloudflare 凭据文件
-    local cf_cred="/root/.cloudflare-${target_domain}.ini"
-    if [[ -f "$cf_cred" ]]; then
-        rm -f "$cf_cred"
-        print_success "Cloudflare 凭据文件已清理。"
-    fi
-    local cron_tag="CertRenew_${target_domain}"
-    cron_remove_job "$cron_tag"
-    # 兼容旧格式：清理包含旧 hook 脚本路径的条目
-    cron_remove_job "cert-renew-hook-${target_domain}.sh"
-    print_success "自动续签任务已清理。"
-    rm -f "$target_conf"
-    print_success "管理配置已移除。"
+    _web_cleanup_domain "$target_domain"
     log_action "Deleted domain config: $target_domain"
     pause
 }
@@ -4332,9 +4379,13 @@ web_home_expose() {
     local full_domain="${sub_prefix}.${root_domain}"
 
     # 检查是否已有配置
-    if [[ -f "${CONFIG_DIR}/${full_domain}.conf" ]]; then
-        print_warn "${full_domain} 已有域名配置"
-        if ! confirm "覆盖现有配置？"; then pause; return; fi
+    if [[ -f "${CONFIG_DIR}/${full_domain}.conf" ]] || \
+       [[ -f "${SAAS_CONFIG_DIR}/${full_domain}.conf" ]] || \
+       [[ -f "/etc/nginx/sites-available/${full_domain}.conf" ]]; then
+        print_warn "${full_domain} 已有配置 (域名/Nginx/SaaS/DDNS 等)"
+        if ! confirm "自动清除旧配置并重新配置？"; then pause; return; fi
+        print_info "清理旧配置..."
+        _web_cleanup_domain "$full_domain" "quiet"
     fi
 
     # 5. 后端服务地址

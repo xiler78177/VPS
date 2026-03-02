@@ -305,3 +305,84 @@ web_env_check() {
     chmod 700 "$CONFIG_DIR"
     return 0
 }
+
+# ── 通用域名清理 ──
+# 一次性清除指定域名的所有关联配置
+# 用法: _web_cleanup_domain "域名" [quiet]
+# quiet 模式仅打印摘要，不打印每项细节
+_web_cleanup_domain() {
+    local domain="$1" quiet="${2:-}"
+    [[ -z "$domain" ]] && return 1
+    local cleaned=0
+
+    # Certbot 证书
+    if certbot certificates 2>/dev/null | grep -q "$domain"; then
+        certbot delete --cert-name "$domain" --non-interactive 2>/dev/null && cleaned=$((cleaned+1))
+        [[ -z "$quiet" ]] && print_success "证书已删除"
+    fi
+    # 本地证书拷贝
+    rm -rf "${CERT_PATH_PREFIX:?}/${domain}" 2>/dev/null
+
+    # Nginx 配置
+    local ng_en="/etc/nginx/sites-enabled/${domain}.conf"
+    local ng_av="/etc/nginx/sites-available/${domain}.conf"
+    if [[ -f "$ng_en" || -f "$ng_av" ]]; then
+        rm -f "$ng_en" "$ng_av"
+        nginx -t >/dev/null 2>&1 && _nginx_reload 2>/dev/null
+        cleaned=$((cleaned+1))
+        [[ -z "$quiet" ]] && print_success "Nginx 配置已删除"
+    fi
+
+    # Hook 脚本
+    local hook="${CERT_HOOKS_DIR}/renew-${domain}.sh"
+    [[ ! -f "$hook" ]] && hook="/root/cert-renew-hook-${domain}.sh"
+    if [[ -f "$hook" ]]; then
+        rm -f "$hook"; cleaned=$((cleaned+1))
+        [[ -z "$quiet" ]] && print_success "Hook 脚本已删除"
+    fi
+
+    # Cron 任务 (续签)
+    cron_remove_job "CertRenew_${domain}" 2>/dev/null
+    cron_remove_job "cert-renew-hook-${domain}.sh" 2>/dev/null
+
+    # CF 凭据
+    rm -f "/root/.cloudflare-${domain}.ini" 2>/dev/null
+
+    # DDNS 配置 (域名本身 + origin.xxx 回源域名)
+    local ddns_cleaned=false
+    for ddns_f in "${DDNS_CONFIG_DIR}/${domain}.conf" "${DDNS_CONFIG_DIR}/origin."*".conf"; do
+        if [[ -f "$ddns_f" ]]; then
+            rm -f "$ddns_f"; ddns_cleaned=true
+        fi
+    done
+    # 用域名后缀匹配回源域名 DDNS
+    local root_part="${domain#*.}"
+    if [[ -f "${DDNS_CONFIG_DIR}/origin.${root_part}.conf" ]]; then
+        rm -f "${DDNS_CONFIG_DIR}/origin.${root_part}.conf"; ddns_cleaned=true
+    fi
+    if [[ "$ddns_cleaned" == "true" ]]; then
+        cleaned=$((cleaned+1))
+        ddns_rebuild_cron 2>/dev/null
+        [[ -z "$quiet" ]] && print_success "DDNS 配置已清理"
+    fi
+
+    # SaaS 配置
+    if [[ -f "${SAAS_CONFIG_DIR}/${domain}.conf" ]]; then
+        rm -f "${SAAS_CONFIG_DIR}/${domain}.conf"
+        cleaned=$((cleaned+1))
+        [[ -z "$quiet" ]] && print_success "SaaS 配置已清理"
+    fi
+
+    # 域名管理配置
+    if [[ -f "${CONFIG_DIR}/${domain}.conf" ]]; then
+        rm -f "${CONFIG_DIR}/${domain}.conf"
+        cleaned=$((cleaned+1))
+        [[ -z "$quiet" ]] && print_success "域名管理配置已删除"
+    fi
+
+    if [[ $cleaned -gt 0 ]]; then
+        [[ -n "$quiet" ]] && print_success "已清理 ${domain} 的 ${cleaned} 项旧配置"
+        log_action "Cleanup domain: $domain ($cleaned items)"
+    fi
+    return 0
+}

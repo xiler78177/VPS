@@ -111,9 +111,13 @@ web_home_expose() {
     local full_domain="${sub_prefix}.${root_domain}"
 
     # 检查是否已有配置
-    if [[ -f "${CONFIG_DIR}/${full_domain}.conf" ]]; then
-        print_warn "${full_domain} 已有域名配置"
-        if ! confirm "覆盖现有配置？"; then pause; return; fi
+    if [[ -f "${CONFIG_DIR}/${full_domain}.conf" ]] || \
+       [[ -f "${SAAS_CONFIG_DIR}/${full_domain}.conf" ]] || \
+       [[ -f "/etc/nginx/sites-available/${full_domain}.conf" ]]; then
+        print_warn "${full_domain} 已有配置 (域名/Nginx/SaaS/DDNS 等)"
+        if ! confirm "自动清除旧配置并重新配置？"; then pause; return; fi
+        print_info "清理旧配置..."
+        _web_cleanup_domain "$full_domain" "quiet"
     fi
 
     # 5. 后端服务地址

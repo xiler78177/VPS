@@ -527,41 +527,7 @@ web_delete_domain() {
     echo -e "${C_RESET}"
     if ! confirm "确认彻底删除吗?"; then return; fi
     print_info "正在执行清理..."
-    if certbot delete --cert-name "$target_domain" --non-interactive 2>/dev/null; then
-        print_success "证书本地文件已删除。"
-    else
-        print_warn "Certbot 删除失败或证书不存在。"
-    fi
-    local nginx_conf="/etc/nginx/sites-enabled/${target_domain}.conf"
-    local nginx_conf_src="/etc/nginx/sites-available/${target_domain}.conf"
-    if [[ -f "$nginx_conf" || -f "$nginx_conf_src" ]]; then
-        rm -f "$nginx_conf" "$nginx_conf_src"
-        if is_systemd && command_exists nginx; then
-            systemctl reload nginx 2>/dev/null || true
-        elif command_exists nginx; then
-            nginx -s reload 2>/dev/null || true
-        fi
-        print_success "Nginx 配置已删除。"
-    fi
-    local hook_script="${CERT_HOOKS_DIR}/renew-${target_domain}.sh"
-    [[ ! -f "$hook_script" ]] && hook_script="/root/cert-renew-hook-${target_domain}.sh"
-    if [[ -f "$hook_script" ]]; then
-        rm -f "$hook_script"
-        print_success "Hook 脚本已删除。"
-    fi
-    # 清理 Cloudflare 凭据文件
-    local cf_cred="/root/.cloudflare-${target_domain}.ini"
-    if [[ -f "$cf_cred" ]]; then
-        rm -f "$cf_cred"
-        print_success "Cloudflare 凭据文件已清理。"
-    fi
-    local cron_tag="CertRenew_${target_domain}"
-    cron_remove_job "$cron_tag"
-    # 兼容旧格式：清理包含旧 hook 脚本路径的条目
-    cron_remove_job "cert-renew-hook-${target_domain}.sh"
-    print_success "自动续签任务已清理。"
-    rm -f "$target_conf"
-    print_success "管理配置已移除。"
+    _web_cleanup_domain "$target_domain"
     log_action "Deleted domain config: $target_domain"
     pause
 }
