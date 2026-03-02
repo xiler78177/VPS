@@ -4337,37 +4337,7 @@ web_home_expose() {
     local zone_id="${zone_ids[$((zone_choice-1))]}"
     print_success "已选择: ${root_domain} (Zone: ${zone_id})"
 
-    # 3. SaaS 优选 (提前询问)
-    local use_saas=false
-    local preferred_domain=""
-    echo ""
-    echo -e "${C_CYAN}SaaS CDN 优选加速:${C_RESET}"
-    echo -e "  ${C_GRAY}开启 → 用户通过优选 CF 节点访问，速度更快${C_RESET}"
-    echo -e "  ${C_GRAY}关闭 → 直接通过 CF CDN 代理访问，速度一般但无额外要求${C_RESET}"
-    echo -e "  ${C_RED}⚠ 重要限制: SaaS 优选要求域名 DNS 托管在第三方 (如 DNSPod/阿里云DNS)${C_RESET}"
-    echo -e "  ${C_RED}  如果域名直接托管在 Cloudflare (NS 接入)，请选 N 使用 CF 代理模式${C_RESET}"
-    echo -e "  ${C_RED}  CF NS 接入 + SaaS 优选会导致 Error 1000 (DNS points to prohibited IP)${C_RESET}"
-    if confirm "是否启用 SaaS 优选加速? (域名需托管在第三方 DNS)"; then
-        use_saas=true
-        echo -e "${C_CYAN}选择优选域名:${C_RESET}"
-        local i=1 pd_arr=()
-        for d in $SAAS_PREFERRED_DOMAINS; do
-            pd_arr+=("$d")
-            echo "  $i. $d"
-            ((i++))
-        done
-        echo "  $i. 自定义输入"
-        local pd_choice
-        read -e -r -p "选择 [1]: " pd_choice
-        pd_choice=${pd_choice:-1}
-        if [[ "$pd_choice" =~ ^[0-9]+$ ]] && (( pd_choice >= 1 && pd_choice <= ${#pd_arr[@]} )); then
-            preferred_domain="${pd_arr[$((pd_choice-1))]}"
-        else
-            read -e -r -p "输入优选域名: " preferred_domain
-            validate_domain "$preferred_domain" || { print_error "域名格式无效"; pause; return; }
-        fi
-        print_success "优选域名: $preferred_domain"
-    fi
+    # 3. (SaaS 优选已移除 — CF NS 接入不支持，需第三方 DNS)
 
     # 4. 子域名前缀
     local sub_prefix=""
@@ -4382,9 +4352,8 @@ web_home_expose() {
 
     # 检查是否已有配置
     if [[ -f "${CONFIG_DIR}/${full_domain}.conf" ]] || \
-       [[ -f "${SAAS_CONFIG_DIR}/${full_domain}.conf" ]] || \
        [[ -f "/etc/nginx/sites-available/${full_domain}.conf" ]]; then
-        print_warn "${full_domain} 已有配置 (域名/Nginx/SaaS/DDNS 等)"
+        print_warn "${full_domain} 已有配置 (域名/Nginx/DDNS 等)"
         if ! confirm "自动清除旧配置并重新配置？"; then pause; return; fi
         print_info "清理旧配置..."
         _web_cleanup_domain "$full_domain" "quiet"
@@ -4459,7 +4428,6 @@ web_home_expose() {
     # ══════════════════════════════════════════════════════════════
     #  配置确认
     # ══════════════════════════════════════════════════════════════
-    local origin_domain="origin.${root_domain}"
     echo ""
     draw_line
     echo -e "${C_CYAN}配置确认:${C_RESET}"
@@ -4469,23 +4437,16 @@ web_home_expose() {
     echo -e "  后端地址:     ${C_GREEN}${backend_addr}${C_RESET} (内网服务)"
     echo -e "  HTTPS 端口:   ${C_GREEN}${https_port}${C_RESET} (Nginx 对外监听)"
     echo -e "  DDNS 间隔:    ${C_GREEN}${ddns_interval} 分钟${C_RESET}"
-    if [[ "$use_saas" == "true" ]]; then
-        echo -e "  SaaS 优选:    ${C_GREEN}开启${C_RESET}"
-        echo -e "  优选域名:     ${C_GREEN}${preferred_domain}${C_RESET}"
-        echo -e "  回源域名:     ${C_GREEN}${origin_domain}${C_RESET}"
-    else
-        echo -e "  SaaS 优选:    ${C_YELLOW}关闭${C_RESET} (使用 CF 代理直连)"
-    fi
+    echo -e "  加速模式:     ${C_GREEN}CF CDN 代理${C_RESET} (A 记录 + Proxied)"
     echo ""
     echo -e "  ${C_YELLOW}将自动执行:${C_RESET}"
     local auto_step=1
-    echo -e "    ${auto_step}. DNS 解析 → ${full_domain} → ${public_ip}"; ((auto_step++))
+    echo -e "    ${auto_step}. DNS 解析 → ${full_domain} → ${public_ip} (CF 代理)"; ((auto_step++))
     echo -e "    ${auto_step}. SSL 证书申请 (Let's Encrypt DNS 验证)"; ((auto_step++))
     echo -e "    ${auto_step}. Nginx 反向代理 (:${https_port} → ${backend_addr})"; ((auto_step++))
     echo -e "    ${auto_step}. DDNS 自动更新 (每 ${ddns_interval} 分钟)"; ((auto_step++))
     echo -e "    ${auto_step}. 防火墙放行端口 ${https_port}"; ((auto_step++))
     [[ "$https_port" != "443" ]] && { echo -e "    ${auto_step}. CF Origin Rule (用户 :443 → 回源 :${https_port})"; ((auto_step++)); }
-    [[ "$use_saas" == "true" ]] && echo -e "    ${auto_step}. SaaS 优选加速 (回源 + 自定义主机名 + CNAME)"
     echo ""
     echo -e "  ${C_YELLOW}[⚠ 手动操作提醒]${C_RESET}"
     echo -e "  ${C_YELLOW}  请确保路由器 (OpenWrt/爱快等) 已做端口转发:${C_RESET}"
@@ -4503,25 +4464,15 @@ web_home_expose() {
     # ══════════════════════════════════════════════════════════════
     local step=1 total_steps=5
     [[ "$https_port" != "443" ]] && total_steps=$((total_steps + 1))
-    [[ "$use_saas" == "true" ]] && total_steps=$((total_steps + 1))
 
     # ── Step: DNS 解析 ──
     echo -e "\n${C_CYAN}━━━ [${step}/${total_steps}] DNS 解析 ━━━${C_RESET}"
-    if [[ "$use_saas" == "true" ]]; then
-        # SaaS 模式: 先创建临时 A 记录用于证书验证（SaaS 步骤最后会改为 CNAME）
-        # 重新配置时可能残留旧 CNAME，CF 不允许同名 A/CNAME 共存，需先清除
-        _cf_dns_delete "$zone_id" "$token" "CNAME" "$full_domain" >/dev/null 2>&1
-        print_info "创建 A 记录: ${full_domain} → ${public_ip}"
-        _cf_update_dns_record "$zone_id" "$token" "$full_domain" "A" "$public_ip" "false"
-    else
-        # 非 SaaS: A 记录 + 开启 CF 代理
-        # 重新配置时可能残留旧 CNAME (从 SaaS 切换到非 SaaS 场景)
-        _cf_dns_delete "$zone_id" "$token" "CNAME" "$full_domain" >/dev/null 2>&1
-        print_info "创建 A 记录: ${full_domain} → ${public_ip} (开启 CF 代理)"
-        if ! _cf_update_dns_record "$zone_id" "$token" "$full_domain" "A" "$public_ip" "true"; then
-            print_error "DNS 记录创建失败"
-            pause; return
-        fi
+    # 重新配置时可能残留旧 CNAME，CF 不允许同名 A/CNAME 共存，需先清除
+    _cf_dns_delete "$zone_id" "$token" "CNAME" "$full_domain" >/dev/null 2>&1
+    print_info "创建 A 记录: ${full_domain} → ${public_ip} (开启 CF 代理)"
+    if ! _cf_update_dns_record "$zone_id" "$token" "$full_domain" "A" "$public_ip" "true"; then
+        print_error "DNS 记录创建失败"
+        pause; return
     fi
     ((step++))
 
@@ -4599,10 +4550,6 @@ server {
     echo -e "\n${C_CYAN}━━━ [${step}/${total_steps}] DDNS 动态解析 ━━━${C_RESET}"
     local ddns_domain="$full_domain"
     local ddns_proxied="true"
-    if [[ "$use_saas" == "true" ]]; then
-        ddns_domain="$origin_domain"
-        print_info "SaaS 模式: DDNS 将更新回源域名 ${origin_domain}"
-    fi
     mkdir -p "$DDNS_CONFIG_DIR"
     cat > "$DDNS_CONFIG_DIR/${ddns_domain}.conf" << EOF
 DDNS_DOMAIN="${ddns_domain}"
@@ -4666,158 +4613,12 @@ EOF
         ((step++))
     fi
 
-    # ── Step: SaaS 优选加速 ──
-    if [[ "$use_saas" == "true" ]]; then
-        echo -e "\n${C_CYAN}━━━ [${step}/${total_steps}] SaaS 优选加速 ━━━${C_RESET}"
-
-        # SSL/TLS → Full
-        print_info "设置 SSL/TLS 为 Full 模式..."
-        local ssl_resp=$(_cf_api PATCH "/zones/$zone_id/settings/ssl" "$token" \
-            --data '{"value":"full"}')
-        _cf_api_ok "$ssl_resp" && print_success "SSL/TLS → Full" || \
-            print_warn "SSL 设置: $(_cf_api_err "$ssl_resp") (可能已是 Full)"
-
-        # 创建回源 DNS 记录
-        print_info "创建回源记录: ${origin_domain} → ${public_ip} (开代理)"
-        local origin_resp=$(_cf_dns_upsert "$zone_id" "$token" "A" "$origin_domain" "$public_ip" "true")
-        if _cf_api_ok "$origin_resp"; then
-            print_success "回源记录已创建"
-        else
-            print_error "回源记录创建失败: $(_cf_api_err "$origin_resp")"
-            print_warn "SaaS 可能无法完成，可稍后通过菜单 [10] 手动配置"
-        fi
-
-        # 设置 SaaS 回退源
-        print_info "设置 SaaS 回退源: ${origin_domain}"
-        local fb_resp=$(_cf_api PUT "/zones/$zone_id/custom_hostnames/fallback_origin" "$token" \
-            --data "{\"origin\":\"$origin_domain\"}")
-        if _cf_api_ok "$fb_resp"; then
-            print_success "回退源已设置"
-        else
-            local fb_err=$(_cf_api_err "$fb_resp")
-            if echo "$fb_err" | grep -qi "already"; then
-                print_warn "回退源已存在，继续"
-            else
-                print_error "回退源设置失败: $fb_err"
-                print_warn "请确认已在 CF 后台绑卡开通 SaaS 功能"
-            fi
-        fi
-
-        # 等待回退源激活
-        print_info "等待回退源激活 (最长 60 秒)..."
-        local fb_active=false
-        for attempt in $(seq 1 12); do
-            sleep 5
-            local fb_st=$(_cf_api GET "/zones/$zone_id/custom_hostnames/fallback_origin" "$token")
-            local fb_status=$(echo "$fb_st" | jq -r '.result.status // empty')
-            echo -ne "\r  检测中... (${attempt}/12) 状态: ${fb_status:-pending}    "
-            [[ "$fb_status" == "active" ]] && { fb_active=true; echo ""; break; }
-        done
-        if [[ "$fb_active" == "true" ]]; then
-            print_success "回退源已激活"
-        else
-            echo ""
-            print_warn "回退源尚未激活，通常几分钟内自动完成，继续执行"
-        fi
-
-        # 添加自定义主机名
-        print_info "添加自定义主机名: ${full_domain}"
-        local ch_resp=$(_cf_api POST "/zones/$zone_id/custom_hostnames" "$token" \
-            --data "{\"hostname\":\"$full_domain\",\"ssl\":{\"method\":\"txt\",\"type\":\"dv\",\"settings\":{\"min_tls_version\":\"1.2\"}}}")
-        local ch_id=""
-        if _cf_api_ok "$ch_resp"; then
-            ch_id=$(echo "$ch_resp" | jq -r '.result.id')
-            print_success "自定义主机名已添加"
-        else
-            local ch_err=$(_cf_api_err "$ch_resp")
-            if echo "$ch_err" | grep -qiE "already exists|duplicate"; then
-                print_warn "已存在，获取现有配置..."
-                local ch_existing=$(_cf_api GET "/zones/$zone_id/custom_hostnames?hostname=$full_domain" "$token")
-                ch_id=$(echo "$ch_existing" | jq -r '.result[0].id // empty')
-                [[ -n "$ch_id" ]] && print_success "找到现有配置" || print_warn "无法获取"
-            else
-                print_error "添加失败: $ch_err"
-                print_warn "SaaS 配置无法完成，请检查 API Token 是否有 Custom Hostnames 权限"
-                pause; return
-            fi
-        fi
-
-        # TXT 验证
-        if [[ -n "$ch_id" ]]; then
-            sleep 3
-            local ch_detail=$(_cf_api GET "/zones/$zone_id/custom_hostnames/$ch_id" "$token")
-            local own_name=$(echo "$ch_detail" | jq -r '.result.ownership_verification.name // empty')
-            local own_value=$(echo "$ch_detail" | jq -r '.result.ownership_verification.value // empty')
-            local ssl_txt_name=$(echo "$ch_detail" | jq -r '.result.ssl.txt_name // empty')
-            local ssl_txt_value=$(echo "$ch_detail" | jq -r '.result.ssl.txt_value // empty')
-            local ch_status=$(echo "$ch_detail" | jq -r '.result.status // empty')
-            local ssl_status=$(echo "$ch_detail" | jq -r '.result.ssl.status // empty')
-
-            # 所有权 TXT
-            if [[ -n "$own_name" && -n "$own_value" && "$ch_status" != "active" ]]; then
-                print_info "添加所有权验证 TXT..."
-                local own_r=$(_cf_dns_upsert "$zone_id" "$token" "TXT" "$own_name" "$own_value" "false")
-                _cf_api_ok "$own_r" && print_success "所有权 TXT 已添加" || print_warn "TXT 添加: $(_cf_api_err "$own_r")"
-            fi
-            # SSL TXT
-            if [[ -n "$ssl_txt_name" && -n "$ssl_txt_value" && "$ssl_status" != "active" ]]; then
-                print_info "添加 SSL 验证 TXT..."
-                local ssl_r=$(_cf_dns_upsert "$zone_id" "$token" "TXT" "$ssl_txt_name" "$ssl_txt_value" "false")
-                _cf_api_ok "$ssl_r" && print_success "SSL TXT 已添加" || print_warn "SSL TXT: $(_cf_api_err "$ssl_r")"
-            fi
-
-            # 等待验证
-            if [[ "$ch_status" != "active" ]]; then
-                print_info "等待验证通过 (最长 3 分钟)..."
-                local verified=false
-                for attempt in $(seq 1 18); do
-                    sleep 10
-                    ch_detail=$(_cf_api GET "/zones/$zone_id/custom_hostnames/$ch_id" "$token")
-                    ch_status=$(echo "$ch_detail" | jq -r '.result.status // empty')
-                    ssl_status=$(echo "$ch_detail" | jq -r '.result.ssl.status // empty')
-                    echo -ne "\r  检测中... (${attempt}/18) 主机名: ${ch_status} | SSL: ${ssl_status}          "
-                    [[ "$ch_status" == "active" ]] && { verified=true; echo ""; break; }
-                done
-                if [[ "$verified" == "true" ]]; then
-                    print_success "自定义主机名验证通过！"
-                else
-                    echo ""
-                    print_warn "验证尚未完成 (主机名: ${ch_status}, SSL: ${ssl_status})"
-                    print_warn "通常几分钟内自动完成，继续配置 CNAME"
-                fi
-            else
-                print_success "主机名已激活"
-            fi
-        fi
-
-        # CNAME → 优选域名 (需先删除临时 A 记录，CF 不允许同名 A 和 CNAME 共存)
-        print_info "删除临时 A 记录: ${full_domain} (为 CNAME 让路)"
-        _cf_dns_delete "$zone_id" "$token" "A" "$full_domain" >/dev/null 2>&1
-        print_info "配置 CNAME: ${full_domain} → ${preferred_domain} (关代理)"
-        local cname_resp=$(_cf_dns_upsert "$zone_id" "$token" "CNAME" "$full_domain" "$preferred_domain" "false")
-        if _cf_api_ok "$cname_resp"; then
-            print_success "CNAME 已配置: ${full_domain} → ${preferred_domain}"
-        else
-            print_warn "CNAME 配置失败: $(_cf_api_err "$cname_resp")"
-        fi
-
-        # 保存 SaaS 配置
-        mkdir -p "$SAAS_CONFIG_DIR"
-        cat > "${SAAS_CONFIG_DIR}/${full_domain}.conf" << SAASEOF
-SAAS_STATUS="active"
-ROOT_DOMAIN="$root_domain"
-BIZ_DOMAIN="$full_domain"
-ORIGIN_DOMAIN="$origin_domain"
-SERVER_IP="$public_ip"
-PREFERRED_DOMAIN="$preferred_domain"
-ZONE_ID="$zone_id"
-CH_ID="$ch_id"
-CREATED="$(date '+%Y-%m-%d %H:%M:%S')"
-SAASEOF
-        chmod 600 "${SAAS_CONFIG_DIR}/${full_domain}.conf"
-        log_action "SaaS CDN configured (home expose): ${full_domain} -> ${preferred_domain}"
-        ((step++))
-    fi
+    # ── Step: SSL/TLS Full 模式 ──
+    print_info "设置 SSL/TLS 为 Full 模式..."
+    local ssl_resp=$(_cf_api PATCH "/zones/$zone_id/settings/ssl" "$token" \
+        --data '{"value":"full"}')
+    _cf_api_ok "$ssl_resp" && print_success "SSL/TLS → Full" || \
+        print_warn "SSL 设置: $(_cf_api_err "$ssl_resp") (可能已是 Full)"
 
     # ══════════════════════════════════════════════════════════════
     #  保存配置文件 + 证书续签 Hook
@@ -4887,18 +4688,10 @@ CONFEOF
     echo -e "    https://${full_domain}"
     echo ""
     echo -e "  ${C_CYAN}[访问链路]${C_RESET}"
-    if [[ "$use_saas" == "true" ]]; then
-        echo -e "    用户 → ${C_GREEN}${full_domain}${C_RESET} (CF 优选 IP)"
-        echo -e "      → CF SaaS → 回源 ${C_GREEN}${origin_domain}${C_RESET}"
-        [[ "$https_port" != "443" ]] && \
-        echo -e "      → Origin Rule :443 → :${C_GREEN}${https_port}${C_RESET}"
-        echo -e "      → 家宽路由器 → 内网 Nginx → ${C_GREEN}${backend_addr}${C_RESET}"
-    else
-        echo -e "    用户 → ${C_GREEN}${full_domain}${C_RESET} (CF 代理)"
-        [[ "$https_port" != "443" ]] && \
-        echo -e "      → Origin Rule :443 → :${C_GREEN}${https_port}${C_RESET}"
-        echo -e "      → 家宽路由器 → 内网 Nginx → ${C_GREEN}${backend_addr}${C_RESET}"
-    fi
+    echo -e "    用户 → ${C_GREEN}${full_domain}${C_RESET} (CF CDN 代理)"
+    [[ "$https_port" != "443" ]] && \
+    echo -e "      → Origin Rule :443 → :${C_GREEN}${https_port}${C_RESET}"
+    echo -e "      → 家宽路由器 → 内网 Nginx → ${C_GREEN}${backend_addr}${C_RESET}"
     echo ""
     echo -e "  ${C_CYAN}[证书]${C_RESET}"
     echo -e "    公钥: ${cert_dir}/fullchain.pem"
