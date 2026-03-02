@@ -456,7 +456,7 @@ EOF
             print_success "自定义主机名已添加"
         else
             local ch_err=$(_cf_api_err "$ch_resp")
-            if echo "$ch_err" | grep -qi "already exists"; then
+            if echo "$ch_err" | grep -qiE "already exists|duplicate"; then
                 print_warn "已存在，获取现有配置..."
                 local ch_existing=$(_cf_api GET "/zones/$zone_id/custom_hostnames?hostname=$full_domain" "$token")
                 ch_id=$(echo "$ch_existing" | jq -r '.result[0].id // empty')

@@ -2783,7 +2783,7 @@ web_cf_saas_setup() {
         print_success "自定义主机名已添加: ${biz_domain}"
     else
         local ch_err=$(_cf_api_err "$ch_resp")
-        if echo "$ch_err" | grep -qi "already exists"; then
+        if echo "$ch_err" | grep -qiE "already exists|duplicate"; then
             print_warn "自定义主机名已存在，获取现有配置..."
             local existing=$(_cf_api GET "/zones/$zone_id/custom_hostnames?hostname=$biz_domain" "$token")
             ch_id=$(echo "$existing" | jq -r '.result[0].id // empty')
@@ -4724,7 +4724,7 @@ EOF
             print_success "自定义主机名已添加"
         else
             local ch_err=$(_cf_api_err "$ch_resp")
-            if echo "$ch_err" | grep -qi "already exists"; then
+            if echo "$ch_err" | grep -qiE "already exists|duplicate"; then
                 print_warn "已存在，获取现有配置..."
                 local ch_existing=$(_cf_api GET "/zones/$zone_id/custom_hostnames?hostname=$full_domain" "$token")
                 ch_id=$(echo "$ch_existing" | jq -r '.result[0].id // empty')
