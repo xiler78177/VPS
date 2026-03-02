@@ -4337,15 +4337,17 @@ web_home_expose() {
     local zone_id="${zone_ids[$((zone_choice-1))]}"
     print_success "已选择: ${root_domain} (Zone: ${zone_id})"
 
-    # 3. SaaS 优选 (提前询问，避免后续步骤因权限不足而无法回退)
+    # 3. SaaS 优选 (提前询问)
     local use_saas=false
     local preferred_domain=""
     echo ""
     echo -e "${C_CYAN}SaaS CDN 优选加速:${C_RESET}"
     echo -e "  ${C_GRAY}开启 → 用户通过优选 CF 节点访问，速度更快${C_RESET}"
     echo -e "  ${C_GRAY}关闭 → 直接通过 CF CDN 代理访问，速度一般但无额外要求${C_RESET}"
-    echo -e "  ${C_YELLOW}⚠ 开启 SaaS 需要在 CF 后台对 ${root_domain} 绑卡开通 Cloudflare for SaaS${C_RESET}"
-    if confirm "是否启用 SaaS 优选加速?"; then
+    echo -e "  ${C_RED}⚠ 重要限制: SaaS 优选要求域名 DNS 托管在第三方 (如 DNSPod/阿里云DNS)${C_RESET}"
+    echo -e "  ${C_RED}  如果域名直接托管在 Cloudflare (NS 接入)，请选 N 使用 CF 代理模式${C_RESET}"
+    echo -e "  ${C_RED}  CF NS 接入 + SaaS 优选会导致 Error 1000 (DNS points to prohibited IP)${C_RESET}"
+    if confirm "是否启用 SaaS 优选加速? (域名需托管在第三方 DNS)"; then
         use_saas=true
         echo -e "${C_CYAN}选择优选域名:${C_RESET}"
         local i=1 pd_arr=()
