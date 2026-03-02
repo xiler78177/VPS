@@ -373,6 +373,9 @@ menu_web() {
 "
         echo -e "${C_CYAN}--- 证书总览 ---${C_RESET}"
         echo "18. 证书状态总览
+"
+        echo -e "${C_CYAN}--- 一键配置 ---${C_RESET}"
+        echo -e "19. 家宽内网服务公网暴露（一键配置）${C_GRAY} ← 需先在路由器开启端口转发${C_RESET}
 0. 返回主菜单
 "
         read -e -r -p "请选择: " c
@@ -433,6 +436,7 @@ menu_web() {
             16) web_reverse_proxy_site ;;
             17) web_edit_reverse_proxy ;;
             18) web_cert_overview ;;
+            19) web_home_expose ;;
             0|q) break ;;
             *) print_error "无效选项" ;;
         esac

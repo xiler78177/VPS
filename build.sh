@@ -25,6 +25,7 @@ MODULES=(
     "09b-web-cloudflare.sh"
     "09c-web-domain.sh"
     "09d-web-proxy.sh"
+    "09e-web-home-expose.sh"
     "10-docker.sh"
     "11a-wireguard-netcheck.sh"
     "11-wireguard.sh"
