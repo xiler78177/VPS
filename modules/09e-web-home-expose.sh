@@ -510,7 +510,9 @@ EOF
             fi
         fi
 
-        # CNAME → 优选域名
+        # CNAME → 优选域名 (需先删除临时 A 记录，CF 不允许同名 A 和 CNAME 共存)
+        print_info "删除临时 A 记录: ${full_domain} (为 CNAME 让路)"
+        _cf_dns_delete "$zone_id" "$token" "A" "$full_domain"
         print_info "配置 CNAME: ${full_domain} → ${preferred_domain} (关代理)"
         local cname_resp=$(_cf_dns_upsert "$zone_id" "$token" "CNAME" "$full_domain" "$preferred_domain" "false")
         if _cf_api_ok "$cname_resp"; then
