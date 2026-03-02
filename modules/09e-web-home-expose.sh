@@ -239,6 +239,8 @@ web_home_expose() {
     echo -e "\n${C_CYAN}━━━ [${step}/${total_steps}] DNS 解析 ━━━${C_RESET}"
     if [[ "$use_saas" == "true" ]]; then
         # SaaS 模式: 先创建临时 A 记录用于证书验证（SaaS 步骤最后会改为 CNAME）
+        # 重新配置时可能残留旧 CNAME，CF 不允许同名 A/CNAME 共存，需先清除
+        _cf_dns_delete "$zone_id" "$token" "CNAME" "$full_domain" 2>/dev/null
         print_info "创建 A 记录: ${full_domain} → ${public_ip}"
         _cf_update_dns_record "$zone_id" "$token" "$full_domain" "A" "$public_ip" "false"
     else
