@@ -21,7 +21,7 @@ web_home_expose() {
     # 1. CF API Token
     local token=""
     print_guide "输入 Cloudflare API Token"
-    echo -e "  ${C_GRAY}权限需要: Zone.DNS + Zone.SSL (SaaS 需额外 Custom Hostnames)${C_RESET}"
+    echo -e "  ${C_GRAY}权限需要: Zone.DNS + Zone.SSL${C_RESET}"
     echo -e "  ${C_GRAY}创建: CF 后台 → My Profile → API Tokens → Create Token${C_RESET}"
     while [[ -z "$token" ]]; do
         read -s -r -p "API Token: " token; echo ""
@@ -334,10 +334,9 @@ EOF
             }')
         local final_rules=$(echo "$filtered_rules" | jq --argjson new "$new_rule" '. + [$new]')
         local err
-        err=$(_cf_put_origin_ruleset "$token" "$zone_id" "$final_rules")
-        if [[ $? -ne 0 ]]; then
+        if ! err=$(_cf_put_origin_ruleset "$token" "$zone_id" "$final_rules"); then
             print_warn "Origin Rule 创建失败: $err"
-            print_warn "可稍后通过菜单 [13.创建回源规则] 手动添加"
+            print_warn "可稍后通过菜单 [10.创建回源规则] 手动添加"
         else
             print_success "Origin Rule 已创建 (用户 :443 → 回源 :${https_port})"
         fi
@@ -392,7 +391,7 @@ exit 0
     # Crontab 自动续签
     local cron_tag="CertRenew_${full_domain}"
     local cron_minute=$(( $(echo "$full_domain" | cksum | cut -d' ' -f1) % 60 ))
-    cron_add_job "$cron_tag" "${cron_minute} 3 * * * certbot renew --quiet --deploy-hook '${hook_script}' # ${cron_tag}"
+    cron_add_job "$cron_tag" "${cron_minute} 3 * * * certbot renew --quiet --cert-name '${full_domain}' --deploy-hook '${hook_script}' # ${cron_tag}"
 
     # 域名管理配置文件
     cat > "${CONFIG_DIR}/${full_domain}.conf" << CONFEOF
@@ -439,8 +438,9 @@ CONFEOF
     if [[ "$backend_addr" != 127.0.0.1:* ]]; then
         echo -e "    后端服务在 ${C_GREEN}${backend_addr}${C_RESET}，请确保内网互通"
     fi
+    echo -e "    当前 CF 支持的 HTTPS 代理端口: ${C_GREEN}443 2053 2083 2087 2096 8443${C_RESET}"
     draw_line
-    log_action "Home expose configured: ${full_domain} -> ${backend_addr} (port=${https_port}, saas=${use_saas})"
+    log_action "Home expose configured: ${full_domain} -> ${backend_addr} (port=${https_port})"
 
     # ── 可选: 内网 DNS 劫持 (解决 NAT 回环) ──
     echo ""
@@ -476,11 +476,6 @@ CONFEOF
 
         # 通过 uci 配置 (兼容所有 OpenWrt 版本)
         local uci_cmds="
-# 清除同名旧记录
-while uci -q delete dhcp.@domain[-1] 2>/dev/null; do
-    name=\$(uci -q get dhcp.@domain[-1].name 2>/dev/null)
-    [ \"\$name\" = '${full_domain}' ] && continue || { uci revert dhcp; break; }
-done 2>/dev/null
 # 精确清除: 遍历查找并删除匹配的 domain 条目
 idx=0
 while uci -q get dhcp.@domain[\$idx] >/dev/null 2>&1; do

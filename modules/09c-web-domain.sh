@@ -127,6 +127,7 @@ web_add_domain() {
     local ipv4 ipv6
     ipv4=$(curl -4 -s --max-time 5 https://4.ipw.cn 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv4=""
     ipv6=$(curl -6 -s --max-time 5 https://6.ipw.cn 2>/dev/null || curl -6 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv6=""
+    _CACHED_IPV4="$ipv4"; _CACHED_IPV6="$ipv6"
     [[ -n "$ipv6" && ! "$ipv6" =~ : ]] && { print_warn "IPv6 探测异常 ($ipv6)，已忽略"; ipv6=""; }
     echo "  IPv4: ${ipv4:-[✗] 未检测到}"
     echo "  IPv6: ${ipv6:-[✗] 未检测到}"
@@ -318,7 +319,7 @@ exit 0
         chmod +x "$DEPLOY_HOOK_SCRIPT"
         local cron_tag="CertRenew_${DOMAIN}"
         local cron_minute=$(( $(echo "$DOMAIN" | cksum | cut -d' ' -f1) % 60 ))
-        cron_add_job "$cron_tag" "${cron_minute} 3 * * * certbot renew --quiet --deploy-hook '${DEPLOY_HOOK_SCRIPT}' # ${cron_tag}"
+        cron_add_job "$cron_tag" "${cron_minute} 3 * * * certbot renew --quiet --cert-name '${DOMAIN}' --deploy-hook '${DEPLOY_HOOK_SCRIPT}' # ${cron_tag}"
         print_success "自动续签已配置 (每日 3:$(printf '%02d' $cron_minute) AM)"
 
         # 保存域名管理配置
@@ -330,7 +331,8 @@ DEPLOY_HOOK_SCRIPT=\"$DEPLOY_HOOK_SCRIPT\"
 CLOUDFLARE_CREDENTIALS=\"$CLOUDFLARE_CREDENTIALS\"
 "
         if [[ $do_nginx -eq 1 ]]; then
-            config_content+="NGINX_CONF_PATH=\"$NGINX_CONF_PATH\"
+            config_content+="NGINX_CONF_PATH=\"/etc/nginx/sites-available/${DOMAIN}.conf\"
+
 NGINX_HTTP_PORT=\"$NGINX_HTTP_PORT\"
 NGINX_HTTPS_PORT=\"$NGINX_HTTPS_PORT\"
 LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"

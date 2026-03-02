@@ -1990,7 +1990,7 @@ menu_net() {
 }
 # 子模块按依赖顺序加载:
 #   09a → 依赖管理 + 通用辅助函数
-#   09b → Cloudflare API / SaaS / Origin Rules / DNS
+#   09b → Cloudflare API / Origin Rules / DNS
 #   09c → 域名管理 (添加/查看/删除 + 证书)
 #   09d → 反向代理 + 主菜单
 #   09e → 家宽内网服务公网暴露（一键配置）
@@ -2364,12 +2364,8 @@ _web_cleanup_domain() {
         [[ -z "$quiet" ]] && print_success "DDNS 配置已清理"
     fi
 
-    # SaaS 配置
-    if [[ -f "${SAAS_CONFIG_DIR}/${domain}.conf" ]]; then
-        rm -f "${SAAS_CONFIG_DIR}/${domain}.conf"
-        cleaned=$((cleaned+1))
-        [[ -z "$quiet" ]] && print_success "SaaS 配置已清理"
-    fi
+    # 提示: CF Origin Rule 无法自动清理 (需 API Token)
+    [[ -z "$quiet" ]] && print_info "提示: 如有 CF Origin Rule，请通过菜单 [12.删除回源规则] 手动清理"
 
     # 域名管理配置
     if [[ -f "${CONFIG_DIR}/${domain}.conf" ]]; then
@@ -2522,8 +2518,13 @@ web_cf_dns_update() {
     command_exists jq || install_package "jq" "silent"
     print_info "正在探测本机公网 IP..."
     local ipv4 ipv6
-    ipv4=$(curl -4 -s --max-time 5 https://4.ipw.cn 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv4=""
-    ipv6=$(curl -6 -s --max-time 5 https://6.ipw.cn 2>/dev/null || curl -6 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv6=""
+    if [[ -n "${_CACHED_IPV4:-}" || -n "${_CACHED_IPV6:-}" ]]; then
+        ipv4="$_CACHED_IPV4"; ipv6="$_CACHED_IPV6"
+    else
+        ipv4=$(curl -4 -s --max-time 5 https://4.ipw.cn 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv4=""
+        ipv6=$(curl -6 -s --max-time 5 https://6.ipw.cn 2>/dev/null || curl -6 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv6=""
+        _CACHED_IPV4="$ipv4"; _CACHED_IPV6="$ipv6"
+    fi
     # IPv6 格式校验：必须包含冒号
     [[ -n "$ipv6" && ! "$ipv6" =~ : ]] && { print_warn "IPv6 探测结果异常 ($ipv6)，已忽略"; ipv6=""; }
     echo "----------------------------------------"
@@ -2697,8 +2698,7 @@ web_cf_origin_rule_create() {
     # 写入
     print_info "写入回源规则..."
     local err
-    err=$(_cf_put_origin_ruleset "$token" "$zone_id" "$final_rules")
-    if [[ $? -ne 0 ]]; then
+    if ! err=$(_cf_put_origin_ruleset "$token" "$zone_id" "$final_rules"); then
         print_error "规则创建失败: $err"; pause; return
     fi
     print_success "回源规则创建成功！"
@@ -2721,9 +2721,9 @@ web_cf_origin_rule_list() {
     print_title "查看 CF 回源规则 (Origin Rules)"
     command_exists jq || install_package "jq" "silent"
     local token=""
-    while [[ -z "$token" ]]; do
-        read -s -r -p "Cloudflare API Token: " token; echo ""
-    done
+    if ! _cf_read_token "token"; then
+        pause; return
+    fi
     local domain=""
     read -e -r -p "根域名 (如 example.com): " domain
     local zone_id=$(_cf_get_zone_id "$domain" "$token")
@@ -2756,9 +2756,9 @@ web_cf_origin_rule_delete() {
     print_title "删除 CF 回源规则 (Origin Rules)"
     command_exists jq || install_package "jq" "silent"
     local token=""
-    while [[ -z "$token" ]]; do
-        read -s -r -p "Cloudflare API Token: " token; echo ""
-    done
+    if ! _cf_read_token "token"; then
+        pause; return
+    fi
     local domain=""
     read -e -r -p "根域名 (如 example.com): " domain
     local zone_id=$(_cf_get_zone_id "$domain" "$token")
@@ -2798,8 +2798,7 @@ web_cf_origin_rule_delete() {
     [[ "$del_confirm" != "y" && "$del_confirm" != "Y" ]] && return
     print_info "删除中..."
     local err
-    err=$(_cf_put_origin_ruleset "$token" "$zone_id" "$new_rules")
-    if [[ $? -ne 0 ]]; then
+    if ! err=$(_cf_put_origin_ruleset "$token" "$zone_id" "$new_rules"); then
         print_error "删除失败: $err"; pause; return
     fi
     print_success "规则已删除"
@@ -2934,6 +2933,7 @@ web_add_domain() {
     local ipv4 ipv6
     ipv4=$(curl -4 -s --max-time 5 https://4.ipw.cn 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv4=""
     ipv6=$(curl -6 -s --max-time 5 https://6.ipw.cn 2>/dev/null || curl -6 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv6=""
+    _CACHED_IPV4="$ipv4"; _CACHED_IPV6="$ipv6"
     [[ -n "$ipv6" && ! "$ipv6" =~ : ]] && { print_warn "IPv6 探测异常 ($ipv6)，已忽略"; ipv6=""; }
     echo "  IPv4: ${ipv4:-[✗] 未检测到}"
     echo "  IPv6: ${ipv6:-[✗] 未检测到}"
@@ -3125,7 +3125,7 @@ exit 0
         chmod +x "$DEPLOY_HOOK_SCRIPT"
         local cron_tag="CertRenew_${DOMAIN}"
         local cron_minute=$(( $(echo "$DOMAIN" | cksum | cut -d' ' -f1) % 60 ))
-        cron_add_job "$cron_tag" "${cron_minute} 3 * * * certbot renew --quiet --deploy-hook '${DEPLOY_HOOK_SCRIPT}' # ${cron_tag}"
+        cron_add_job "$cron_tag" "${cron_minute} 3 * * * certbot renew --quiet --cert-name '${DOMAIN}' --deploy-hook '${DEPLOY_HOOK_SCRIPT}' # ${cron_tag}"
         print_success "自动续签已配置 (每日 3:$(printf '%02d' $cron_minute) AM)"
 
         # 保存域名管理配置
@@ -3137,7 +3137,8 @@ DEPLOY_HOOK_SCRIPT=\"$DEPLOY_HOOK_SCRIPT\"
 CLOUDFLARE_CREDENTIALS=\"$CLOUDFLARE_CREDENTIALS\"
 "
         if [[ $do_nginx -eq 1 ]]; then
-            config_content+="NGINX_CONF_PATH=\"$NGINX_CONF_PATH\"
+            config_content+="NGINX_CONF_PATH=\"/etc/nginx/sites-available/${DOMAIN}.conf\"
+
 NGINX_HTTP_PORT=\"$NGINX_HTTP_PORT\"
 NGINX_HTTPS_PORT=\"$NGINX_HTTPS_PORT\"
 LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
@@ -3863,7 +3864,7 @@ web_home_expose() {
     # 1. CF API Token
     local token=""
     print_guide "输入 Cloudflare API Token"
-    echo -e "  ${C_GRAY}权限需要: Zone.DNS + Zone.SSL (SaaS 需额外 Custom Hostnames)${C_RESET}"
+    echo -e "  ${C_GRAY}权限需要: Zone.DNS + Zone.SSL${C_RESET}"
     echo -e "  ${C_GRAY}创建: CF 后台 → My Profile → API Tokens → Create Token${C_RESET}"
     while [[ -z "$token" ]]; do
         read -s -r -p "API Token: " token; echo ""
@@ -4176,10 +4177,9 @@ EOF
             }')
         local final_rules=$(echo "$filtered_rules" | jq --argjson new "$new_rule" '. + [$new]')
         local err
-        err=$(_cf_put_origin_ruleset "$token" "$zone_id" "$final_rules")
-        if [[ $? -ne 0 ]]; then
+        if ! err=$(_cf_put_origin_ruleset "$token" "$zone_id" "$final_rules"); then
             print_warn "Origin Rule 创建失败: $err"
-            print_warn "可稍后通过菜单 [13.创建回源规则] 手动添加"
+            print_warn "可稍后通过菜单 [10.创建回源规则] 手动添加"
         else
             print_success "Origin Rule 已创建 (用户 :443 → 回源 :${https_port})"
         fi
@@ -4234,7 +4234,7 @@ exit 0
     # Crontab 自动续签
     local cron_tag="CertRenew_${full_domain}"
     local cron_minute=$(( $(echo "$full_domain" | cksum | cut -d' ' -f1) % 60 ))
-    cron_add_job "$cron_tag" "${cron_minute} 3 * * * certbot renew --quiet --deploy-hook '${hook_script}' # ${cron_tag}"
+    cron_add_job "$cron_tag" "${cron_minute} 3 * * * certbot renew --quiet --cert-name '${full_domain}' --deploy-hook '${hook_script}' # ${cron_tag}"
 
     # 域名管理配置文件
     cat > "${CONFIG_DIR}/${full_domain}.conf" << CONFEOF
@@ -4281,8 +4281,9 @@ CONFEOF
     if [[ "$backend_addr" != 127.0.0.1:* ]]; then
         echo -e "    后端服务在 ${C_GREEN}${backend_addr}${C_RESET}，请确保内网互通"
     fi
+    echo -e "    当前 CF 支持的 HTTPS 代理端口: ${C_GREEN}443 2053 2083 2087 2096 8443${C_RESET}"
     draw_line
-    log_action "Home expose configured: ${full_domain} -> ${backend_addr} (port=${https_port}, saas=${use_saas})"
+    log_action "Home expose configured: ${full_domain} -> ${backend_addr} (port=${https_port})"
 
     # ── 可选: 内网 DNS 劫持 (解决 NAT 回环) ──
     echo ""
@@ -4318,11 +4319,6 @@ CONFEOF
 
         # 通过 uci 配置 (兼容所有 OpenWrt 版本)
         local uci_cmds="
-# 清除同名旧记录
-while uci -q delete dhcp.@domain[-1] 2>/dev/null; do
-    name=\$(uci -q get dhcp.@domain[-1].name 2>/dev/null)
-    [ \"\$name\" = '${full_domain}' ] && continue || { uci revert dhcp; break; }
-done 2>/dev/null
 # 精确清除: 遍历查找并删除匹配的 domain 条目
 idx=0
 while uci -q get dhcp.@domain[\$idx] >/dev/null 2>&1; do

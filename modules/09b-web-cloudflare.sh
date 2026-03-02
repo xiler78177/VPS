@@ -137,8 +137,13 @@ web_cf_dns_update() {
     command_exists jq || install_package "jq" "silent"
     print_info "正在探测本机公网 IP..."
     local ipv4 ipv6
-    ipv4=$(curl -4 -s --max-time 5 https://4.ipw.cn 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv4=""
-    ipv6=$(curl -6 -s --max-time 5 https://6.ipw.cn 2>/dev/null || curl -6 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv6=""
+    if [[ -n "${_CACHED_IPV4:-}" || -n "${_CACHED_IPV6:-}" ]]; then
+        ipv4="$_CACHED_IPV4"; ipv6="$_CACHED_IPV6"
+    else
+        ipv4=$(curl -4 -s --max-time 5 https://4.ipw.cn 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv4=""
+        ipv6=$(curl -6 -s --max-time 5 https://6.ipw.cn 2>/dev/null || curl -6 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv6=""
+        _CACHED_IPV4="$ipv4"; _CACHED_IPV6="$ipv6"
+    fi
     # IPv6 格式校验：必须包含冒号
     [[ -n "$ipv6" && ! "$ipv6" =~ : ]] && { print_warn "IPv6 探测结果异常 ($ipv6)，已忽略"; ipv6=""; }
     echo "----------------------------------------"
@@ -312,8 +317,7 @@ web_cf_origin_rule_create() {
     # 写入
     print_info "写入回源规则..."
     local err
-    err=$(_cf_put_origin_ruleset "$token" "$zone_id" "$final_rules")
-    if [[ $? -ne 0 ]]; then
+    if ! err=$(_cf_put_origin_ruleset "$token" "$zone_id" "$final_rules"); then
         print_error "规则创建失败: $err"; pause; return
     fi
     print_success "回源规则创建成功！"
@@ -336,9 +340,9 @@ web_cf_origin_rule_list() {
     print_title "查看 CF 回源规则 (Origin Rules)"
     command_exists jq || install_package "jq" "silent"
     local token=""
-    while [[ -z "$token" ]]; do
-        read -s -r -p "Cloudflare API Token: " token; echo ""
-    done
+    if ! _cf_read_token "token"; then
+        pause; return
+    fi
     local domain=""
     read -e -r -p "根域名 (如 example.com): " domain
     local zone_id=$(_cf_get_zone_id "$domain" "$token")
@@ -371,9 +375,9 @@ web_cf_origin_rule_delete() {
     print_title "删除 CF 回源规则 (Origin Rules)"
     command_exists jq || install_package "jq" "silent"
     local token=""
-    while [[ -z "$token" ]]; do
-        read -s -r -p "Cloudflare API Token: " token; echo ""
-    done
+    if ! _cf_read_token "token"; then
+        pause; return
+    fi
     local domain=""
     read -e -r -p "根域名 (如 example.com): " domain
     local zone_id=$(_cf_get_zone_id "$domain" "$token")
@@ -413,8 +417,7 @@ web_cf_origin_rule_delete() {
     [[ "$del_confirm" != "y" && "$del_confirm" != "Y" ]] && return
     print_info "删除中..."
     local err
-    err=$(_cf_put_origin_ruleset "$token" "$zone_id" "$new_rules")
-    if [[ $? -ne 0 ]]; then
+    if ! err=$(_cf_put_origin_ruleset "$token" "$zone_id" "$new_rules"); then
         print_error "删除失败: $err"; pause; return
     fi
     print_success "规则已删除"

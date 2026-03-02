@@ -366,12 +366,8 @@ _web_cleanup_domain() {
         [[ -z "$quiet" ]] && print_success "DDNS 配置已清理"
     fi
 
-    # SaaS 配置
-    if [[ -f "${SAAS_CONFIG_DIR}/${domain}.conf" ]]; then
-        rm -f "${SAAS_CONFIG_DIR}/${domain}.conf"
-        cleaned=$((cleaned+1))
-        [[ -z "$quiet" ]] && print_success "SaaS 配置已清理"
-    fi
+    # 提示: CF Origin Rule 无法自动清理 (需 API Token)
+    [[ -z "$quiet" ]] && print_info "提示: 如有 CF Origin Rule，请通过菜单 [12.删除回源规则] 手动清理"
 
     # 域名管理配置
     if [[ -f "${CONFIG_DIR}/${domain}.conf" ]]; then
