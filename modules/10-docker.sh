@@ -204,58 +204,85 @@ docker_images_manage() {
 }
 
 docker_containers_manage() {
-    print_title "Docker 容器管理"
     if ! command_exists docker; then
-        print_error "Docker 未安装。"
-        pause; return
+        print_error "Docker 未安装。"; pause; return
     fi
-    echo "1. 列出运行中的容器
-2. 列出所有容器
-3. 停止所有容器
-4. 删除所有容器 (危险)
-5. 查看容器日志
-0. 返回"
-    read -e -r -p "选择: " c
-    case $c in
-        1)
-            docker ps
-            ;;
-        2)
-            docker ps -a
-            ;;
-        3)
-            if confirm "停止所有容器？"; then
-                local running=$(docker ps -q)
-                if [[ -n "$running" ]]; then
-                    docker stop $running
-                    print_success "所有容器已停止。"
-                    log_action "Docker all containers stopped"
-                else
-                    print_warn "没有运行中的容器。"
+    while true; do
+        print_title "Docker 容器管理"
+        # Build container table
+        local containers=()
+        local fmt='{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+        while IFS=$'\t' read -r id name image status ports; do
+            [[ -z "$id" ]] && continue
+            containers+=("$id|$name|$image|$status|$ports")
+        done < <(docker ps -a --format "$fmt" 2>/dev/null)
+        if [[ ${#containers[@]} -eq 0 ]]; then
+            print_warn "没有容器。"
+        else
+            printf "  ${C_CYAN}%-3s %-4s %-20s %-25s %-30s${C_RESET}\n" "#" "状态" "名称" "镜像" "端口"
+            local idx=1
+            for entry in "${containers[@]}"; do
+                IFS='|' read -r id name image status ports <<< "$entry"
+                local icon="${C_RED}○${C_RESET}"
+                [[ "$status" == Up* ]] && icon="${C_GREEN}●${C_RESET}"
+                [[ ${#image} -gt 25 ]] && image="${image:0:22}..."
+                [[ ${#ports} -gt 30 ]] && ports="${ports:0:27}..."
+                printf "  %-3s %b  %-20s %-25s %-30s\n" "$idx" "$icon" "$name" "$image" "$ports"
+                ((idx++)) || true
+            done
+        fi
+        local running_ids=$(docker ps -q 2>/dev/null)
+        if [[ -n "$running_ids" ]]; then
+            echo ""
+            echo -e "${C_CYAN}[资源占用]${C_RESET}"
+            docker stats --no-stream --format "  {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}" 2>/dev/null | column -t -s $'\t'
+        fi
+        echo ""
+        echo -e "${C_CYAN}操作:${C_RESET} 1.启动 2.停止 3.重启 4.日志 5.删除  6.停止所有 7.删除所有  0.返回"
+        read -e -r -p "操作 [如 '3 2' 表示重启第2个容器]: " action_input
+        [[ -z "$action_input" || "$action_input" == "0" || "$action_input" == "q" ]] && break
+        local action=$(echo "$action_input" | awk '{print $1}')
+        local target_idx=$(echo "$action_input" | awk '{print $2}')
+        if [[ "$action" == "6" ]]; then
+            if confirm "停止所有容器?"; then
+                local rq=$(docker ps -q)
+                [[ -n "$rq" ]] && docker stop $rq && print_success "已停止" || print_warn "无运行中容器"
+                log_action "Docker all containers stopped"
+            fi
+            pause; continue
+        fi
+        if [[ "$action" == "7" ]]; then
+            if confirm "删除所有容器? (危险)"; then
+                local aq=$(docker ps -aq)
+                [[ -n "$aq" ]] && docker rm -f $aq && print_success "已删除" || print_warn "无容器"
+                log_action "Docker all containers removed"
+            fi
+            pause; continue
+        fi
+        if [[ -z "$target_idx" || ! "$target_idx" =~ ^[0-9]+$ ]]; then
+            print_error "格式: 操作编号 容器序号 (如 '3 2')"; pause; continue
+        fi
+        if [[ "$target_idx" -lt 1 || "$target_idx" -gt ${#containers[@]} ]]; then
+            print_error "容器序号超出范围"; pause; continue
+        fi
+        local target_entry="${containers[$((target_idx-1))]}"
+        local target_id=$(echo "$target_entry" | cut -d'|' -f1)
+        local target_name=$(echo "$target_entry" | cut -d'|' -f2)
+        case $action in
+            1) docker start "$target_id" && print_success "已启动: $target_name" || print_error "启动失败" ;;
+            2) docker stop "$target_id" && print_success "已停止: $target_name" || print_error "停止失败" ;;
+            3) docker restart "$target_id" && print_success "已重启: $target_name" || print_error "重启失败" ;;
+            4) print_info "按 Ctrl+C 退出日志..."; docker logs --tail 50 -f "$target_id" ;;
+            5)
+                if confirm "确认删除容器 $target_name?"; then
+                    docker rm -f "$target_id" && print_success "已删除: $target_name" || print_error "删除失败"
+                    log_action "Docker container removed: $target_name"
                 fi
-            fi
-            ;;
-        4)
-            if confirm "删除所有容器？"; then
-                local all_containers=$(docker ps -aq)
-                if [[ -n "$all_containers" ]]; then
-                    docker rm -f $all_containers
-                    print_success "所有容器已删除。"
-                    log_action "Docker all containers removed"
-                else
-                    print_warn "没有容器可删除。"
-                fi
-            fi
-            ;;
-        5)
-            read -e -r -p "容器名称或 ID: " cid
-            if [[ -n "$cid" ]]; then
-                docker logs --tail 100 -f "$cid"
-            fi
-            ;;
-        0|q) return ;;
-    esac
-    pause
+                ;;
+            *) print_error "无效操作" ;;
+        esac
+        pause
+    done
 }
 
 menu_docker() {
@@ -263,9 +290,11 @@ menu_docker() {
     while true; do
         print_title "Docker 管理"
         if command_exists docker; then
-            echo -e "${C_GREEN}Docker 已安装${C_RESET}"
-            docker --version
-            echo ""
+            local dver=$(docker --version 2>/dev/null | grep -oP '[\d.]+' | head -1)
+            local cver=$(docker compose version 2>/dev/null | grep -oP '[\d.]+' | head -1)
+            local running=$(docker ps -q 2>/dev/null | wc -l)
+            local total=$(docker ps -aq 2>/dev/null | wc -l)
+            echo -e "${C_GREEN}Docker $dver${C_RESET}${cver:+ | Compose $cver} | 容器: ${running}/${total} 运行中"
         else
             echo -e "${C_YELLOW}Docker 未安装${C_RESET}"
         fi
@@ -274,7 +303,7 @@ menu_docker() {
 3. 安装 Docker Compose
 4. 配置 Docker 代理
 5. 镜像管理
-6. 容器管理
+6. 容器管理 (一览式)
 7. 系统清理 (prune)
 0. 返回主菜单
 "

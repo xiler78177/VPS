@@ -365,6 +365,96 @@ select_timezone() {
     log_action "Timezone changed to $z"
 }
 
+opt_sysctl() {
+    print_title "内核参数调优"
+    echo -e "${C_CYAN}当前关键参数:${C_RESET}"
+    printf "  %-40s %s\n" "net.core.somaxconn" "$(sysctl -n net.core.somaxconn 2>/dev/null)"
+    printf "  %-40s %s\n" "fs.file-max" "$(sysctl -n fs.file-max 2>/dev/null)"
+    printf "  %-40s %s\n" "net.ipv4.tcp_max_syn_backlog" "$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null)"
+    printf "  %-40s %s\n" "net.ipv4.tcp_tw_reuse" "$(sysctl -n net.ipv4.tcp_tw_reuse 2>/dev/null)"
+    echo ""
+    echo -e "${C_CYAN}选择预设方案:${C_RESET}"
+    echo "  1. 代理/隧道场景 (WireGuard/Xray 等，高并发连接)"
+    echo "  2. Web 服务器场景 (Nginx 反代，优化 HTTP 并发)"
+    echo "  3. 保守方案 (仅基础优化，适合小内存机器)"
+    echo "  4. 回滚到备份 (恢复修改前的配置)"
+    echo "  0. 返回"
+    read -e -r -p "选择: " sc
+    [[ "$sc" == "0" || -z "$sc" ]] && return
+    if [[ "$sc" == "4" ]]; then
+        if [[ -f /etc/sysctl.conf.pre-tuning ]]; then
+            cp /etc/sysctl.conf.pre-tuning /etc/sysctl.conf
+            sysctl -p >/dev/null 2>&1
+            print_success "已回滚到调优前的配置。"
+            log_action "Sysctl tuning rolled back"
+        else
+            print_warn "没有找到备份文件。"
+        fi
+        pause; return
+    fi
+    # Backup before modifying
+    [[ ! -f /etc/sysctl.conf.pre-tuning ]] && cp /etc/sysctl.conf /etc/sysctl.conf.pre-tuning
+    local params=""
+    case $sc in
+    1)
+        params="
+# server-manage sysctl tuning: proxy/tunnel
+fs.file-max = 1048576
+net.core.somaxconn = 4096
+net.core.netdev_max_backlog = 4096
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_max_syn_backlog = 4096
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_max_tw_buckets = 32768
+net.ipv4.tcp_syncookies = 1
+net.ipv4.ip_forward = 1
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216"
+        ;;
+    2)
+        params="
+# server-manage sysctl tuning: web server
+fs.file-max = 524288
+net.core.somaxconn = 8192
+net.core.netdev_max_backlog = 8192
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 10
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 3
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_max_tw_buckets = 65536"
+        ;;
+    3)
+        params="
+# server-manage sysctl tuning: conservative
+fs.file-max = 262144
+net.core.somaxconn = 2048
+net.ipv4.tcp_max_syn_backlog = 2048
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_fin_timeout = 30"
+        ;;
+    *) print_error "无效选择"; pause; return ;;
+    esac
+    # Remove old tuning block and append new
+    sed -i '/^# server-manage sysctl tuning/,/^$/d' /etc/sysctl.conf
+    echo "$params" >> /etc/sysctl.conf
+    if sysctl -p >/dev/null 2>&1; then
+        print_success "内核参数已应用 (无需重启)。"
+        log_action "Sysctl tuning applied: preset=$sc"
+    else
+        print_error "sysctl -p 执行失败，请检查 /etc/sysctl.conf"
+    fi
+    pause
+}
+
 menu_opt() {
     fix_terminal
     while true; do
@@ -374,6 +464,7 @@ menu_opt() {
 3. 修改主机名
 4. 系统垃圾清理
 5. 修改时区
+6. 内核参数调优
 0. 返回
 "
         read -e -r -p "选择: " c
@@ -383,6 +474,7 @@ menu_opt() {
             3) opt_hostname ;;
             4) opt_cleanup ;;
             5) select_timezone || true; pause ;;
+            6) opt_sysctl ;;
             0|q) break ;;
             *) print_error "无效" ;;
         esac

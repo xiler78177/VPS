@@ -785,6 +785,374 @@ ufw_add() {
     pause
 }
 
+# ── GeoIP 国家级 IP 白/黑名单 ──
+readonly GEOIP_CONF_DIR="/etc/server-manage"
+readonly GEOIP_CONF="${GEOIP_CONF_DIR}/geoip.conf"
+readonly GEOIP_DATA_DIR="${GEOIP_CONF_DIR}/geoip-data"
+readonly GEOIP_CHAIN="GEOIP_FILTER"
+readonly GEOIP_URL="https://www.ipdeny.com/ipblocks/data/aggregated"
+
+_geoip_country_name() {
+    case "${1^^}" in
+        CN) echo "中国" ;; JP) echo "日本" ;; US) echo "美国" ;; KR) echo "韩国" ;;
+        SG) echo "新加坡" ;; HK) echo "香港" ;; TW) echo "台湾" ;; DE) echo "德国" ;;
+        GB) echo "英国" ;; FR) echo "法国" ;; RU) echo "俄罗斯" ;; AU) echo "澳大利亚" ;;
+        CA) echo "加拿大" ;; IN) echo "印度" ;; NL) echo "荷兰" ;; BR) echo "巴西" ;;
+        *) echo "${1^^}" ;;
+    esac
+}
+
+_geoip_load_conf() {
+    GEOIP_MODE="" GEOIP_COUNTRIES="" GEOIP_LAST_UPDATE=""
+    [[ -f "$GEOIP_CONF" ]] && validate_conf_file "$GEOIP_CONF" && source "$GEOIP_CONF"
+}
+
+_geoip_download() {
+    local countries="$1"
+    mkdir -p "$GEOIP_DATA_DIR"
+    local ok=0 fail=0
+    for cc in $countries; do
+        cc="${cc,,}"
+        local url="${GEOIP_URL}/${cc}-aggregated.zone"
+        local dest="${GEOIP_DATA_DIR}/${cc}.zone"
+        if curl -sSL --connect-timeout 10 --max-time 30 -o "$dest" "$url" 2>/dev/null; then
+            local count=$(grep -c '^[0-9]' "$dest" 2>/dev/null || echo 0)
+            if [[ "$count" -gt 0 ]]; then
+                echo -e "  ${C_GREEN}✓${C_RESET} ${cc^^} ($(_geoip_country_name "$cc")): ${count} 条 IP 段"
+                ((ok++)) || true
+            else
+                print_warn "${cc^^}: 文件为空或格式异常"
+                rm -f "$dest"; ((fail++)) || true
+            fi
+        else
+            print_error "${cc^^}: 下载失败"
+            ((fail++)) || true
+        fi
+    done
+    [[ $ok -gt 0 ]] && return 0 || return 1
+}
+
+_geoip_apply() {
+    local mode="$1" countries="$2"
+    local set_name="geoip_${mode}"
+    local tmp_set="${set_name}_tmp"
+    # Bulk load into temp set
+    ipset create "$tmp_set" hash:net maxelem 131072 2>/dev/null || ipset flush "$tmp_set"
+    for cc in $countries; do
+        local f="${GEOIP_DATA_DIR}/${cc,,}.zone"
+        [[ -f "$f" ]] || continue
+        sed -e '/^#/d' -e '/^$/d' -e '/^[^0-9]/d' -e "s/^/add ${tmp_set} /" "$f" | ipset restore -exist 2>/dev/null
+    done
+    # Atomic swap
+    ipset create "$set_name" hash:net maxelem 131072 2>/dev/null || true
+    ipset swap "$tmp_set" "$set_name"
+    ipset destroy "$tmp_set" 2>/dev/null || true
+    # Build iptables chain
+    iptables -N "$GEOIP_CHAIN" 2>/dev/null || iptables -F "$GEOIP_CHAIN"
+    iptables -A "$GEOIP_CHAIN" -i lo -j RETURN
+    iptables -A "$GEOIP_CHAIN" -s 127.0.0.0/8 -j RETURN
+    iptables -A "$GEOIP_CHAIN" -s 10.0.0.0/8 -j RETURN
+    iptables -A "$GEOIP_CHAIN" -s 172.16.0.0/12 -j RETURN
+    iptables -A "$GEOIP_CHAIN" -s 192.168.0.0/16 -j RETURN
+    iptables -A "$GEOIP_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+    if [[ "$mode" == "whitelist" ]]; then
+        iptables -A "$GEOIP_CHAIN" -m set --match-set "$set_name" src -j RETURN
+        iptables -A "$GEOIP_CHAIN" -j DROP
+    else
+        iptables -A "$GEOIP_CHAIN" -m set --match-set "$set_name" src -j DROP
+    fi
+    # Insert into INPUT chain at position 1 (before UFW)
+    iptables -C INPUT -j "$GEOIP_CHAIN" 2>/dev/null || iptables -I INPUT 1 -j "$GEOIP_CHAIN"
+}
+
+_geoip_clear() {
+    iptables -D INPUT -j "$GEOIP_CHAIN" 2>/dev/null || true
+    iptables -F "$GEOIP_CHAIN" 2>/dev/null || true
+    iptables -X "$GEOIP_CHAIN" 2>/dev/null || true
+    ipset destroy geoip_whitelist 2>/dev/null || true
+    ipset destroy geoip_blacklist 2>/dev/null || true
+}
+
+_geoip_install_persistence() {
+    # Apply script (runs on boot)
+    cat > /usr/local/bin/geoip-apply.sh << 'APPLY_EOF'
+#!/bin/bash
+CONF="/etc/server-manage/geoip.conf"
+DATA="/etc/server-manage/geoip-data"
+CHAIN="GEOIP_FILTER"
+[ -f "$CONF" ] || exit 0
+GEOIP_MODE="" GEOIP_COUNTRIES=""
+source "$CONF"
+[ -z "$GEOIP_MODE" ] && exit 0
+set_name="geoip_${GEOIP_MODE}"
+tmp_set="${set_name}_tmp"
+ipset create "$tmp_set" hash:net maxelem 131072 2>/dev/null || ipset flush "$tmp_set"
+for cc in $GEOIP_COUNTRIES; do
+    f="${DATA}/${cc,,}.zone"
+    [ -f "$f" ] || continue
+    sed -e '/^#/d' -e '/^$/d' -e '/^[^0-9]/d' -e "s/^/add ${tmp_set} /" "$f" | ipset restore -exist 2>/dev/null
+done
+ipset create "$set_name" hash:net maxelem 131072 2>/dev/null || true
+ipset swap "$tmp_set" "$set_name"
+ipset destroy "$tmp_set" 2>/dev/null || true
+iptables -N "$CHAIN" 2>/dev/null || iptables -F "$CHAIN"
+iptables -A "$CHAIN" -i lo -j RETURN
+iptables -A "$CHAIN" -s 127.0.0.0/8 -j RETURN
+iptables -A "$CHAIN" -s 10.0.0.0/8 -j RETURN
+iptables -A "$CHAIN" -s 172.16.0.0/12 -j RETURN
+iptables -A "$CHAIN" -s 192.168.0.0/16 -j RETURN
+iptables -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+if [ "$GEOIP_MODE" = "whitelist" ]; then
+    iptables -A "$CHAIN" -m set --match-set "$set_name" src -j RETURN
+    iptables -A "$CHAIN" -j DROP
+else
+    iptables -A "$CHAIN" -m set --match-set "$set_name" src -j DROP
+fi
+iptables -C INPUT -j "$CHAIN" 2>/dev/null || iptables -I INPUT 1 -j "$CHAIN"
+APPLY_EOF
+    chmod +x /usr/local/bin/geoip-apply.sh
+    # Update script (cron weekly)
+    cat > /usr/local/bin/geoip-update.sh << 'UPDATE_EOF'
+#!/bin/bash
+CONF="/etc/server-manage/geoip.conf"
+DATA="/etc/server-manage/geoip-data"
+URL="https://www.ipdeny.com/ipblocks/data/aggregated"
+[ -f "$CONF" ] || exit 0
+GEOIP_MODE="" GEOIP_COUNTRIES=""
+source "$CONF"
+[ -z "$GEOIP_COUNTRIES" ] && exit 0
+for cc in $GEOIP_COUNTRIES; do
+    cc="${cc,,}"
+    curl -sSL --connect-timeout 10 --max-time 30 \
+        -o "${DATA}/${cc}.zone" "${URL}/${cc}-aggregated.zone" 2>/dev/null
+done
+/usr/local/bin/geoip-apply.sh
+sed -i "s/^GEOIP_LAST_UPDATE=.*/GEOIP_LAST_UPDATE=\"$(date +%Y-%m-%d)\"/" "$CONF"
+UPDATE_EOF
+    chmod +x /usr/local/bin/geoip-update.sh
+    # Systemd boot service
+    if is_systemd; then
+        cat > /etc/systemd/system/geoip-firewall.service << 'SVC_EOF'
+[Unit]
+Description=GeoIP Firewall Rules
+After=network.target
+Before=ufw.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/geoip-apply.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SVC_EOF
+        systemctl daemon-reload
+        systemctl enable geoip-firewall >/dev/null 2>&1
+    fi
+    # Weekly cron (Sunday 04:00)
+    cron_add_job "geoip-update.sh" "0 4 * * 0 /usr/local/bin/geoip-update.sh >/dev/null 2>&1"
+}
+
+geoip_setup() {
+    print_title "GeoIP 国家级 IP 白/黑名单"
+    if ! command_exists ipset; then
+        install_package "ipset"
+        if ! command_exists ipset; then
+            print_error "ipset 安装失败。"; pause; return
+        fi
+    fi
+    if ! command_exists iptables; then
+        print_error "iptables 未安装。"; pause; return
+    fi
+    _geoip_load_conf
+    if [[ -n "$GEOIP_MODE" ]]; then
+        print_warn "GeoIP 已配置: 模式=${GEOIP_MODE} 国家=${GEOIP_COUNTRIES}"
+        if ! confirm "重新配置将覆盖现有规则，继续?"; then
+            pause; return
+        fi
+        _geoip_clear
+    fi
+    echo -e "${C_CYAN}选择模式:${C_RESET}"
+    echo "  1. 白名单 (仅允许指定国家访问，其他全部拦截)"
+    echo "  2. 黑名单 (仅封禁指定国家，其他正常放行)"
+    read -e -r -p "选择 [1]: " mode_choice
+    local mode="whitelist"
+    [[ "$mode_choice" == "2" ]] && mode="blacklist"
+    if [[ "$mode" == "whitelist" ]]; then
+        echo -e "${C_YELLOW}[!] 白名单模式: 非白名单国家的所有入站连接将被直接丢弃${C_RESET}"
+        echo -e "${C_YELLOW}    请确保你的访问来源国家都已加入白名单${C_RESET}"
+    fi
+    echo ""
+    echo -e "${C_CYAN}常用国家代码:${C_RESET}"
+    echo "  CN 中国    JP 日本    US 美国    KR 韩国    SG 新加坡"
+    echo "  HK 香港    TW 台湾    DE 德国    GB 英国    FR 法国"
+    echo "  RU 俄罗斯  AU 澳大利亚  CA 加拿大  NL 荷兰    IN 印度"
+    echo ""
+    read -e -r -p "输入国家代码 (空格分隔): " countries_input
+    [[ -z "$countries_input" ]] && { print_warn "已取消"; pause; return; }
+    local countries=""
+    for cc in $countries_input; do
+        cc="${cc^^}"
+        if [[ ! "$cc" =~ ^[A-Z]{2}$ ]]; then
+            print_error "无效国家代码: $cc (需要2位字母)"; pause; return
+        fi
+        countries="$countries $cc"
+    done
+    countries=$(echo "$countries" | xargs)
+    # SSH safety check (whitelist mode)
+    if [[ "$mode" == "whitelist" ]]; then
+        local ssh_ip="${SSH_CLIENT%% *}"
+        if [[ -n "$ssh_ip" ]]; then
+            print_info "当前 SSH 来源: $ssh_ip"
+            echo -e "${C_RED}[安全提示] 请确认你的 IP 所在国家已在白名单中！${C_RESET}"
+            if ! confirm "确认继续? (设置错误将导致 SSH 断开)"; then
+                pause; return
+            fi
+        fi
+    fi
+    draw_line
+    echo -e "${C_CYAN}配置摘要:${C_RESET}"
+    echo "  模式: $([[ "$mode" == "whitelist" ]] && echo "白名单 (仅允许)" || echo "黑名单 (仅封禁)")"
+    echo "  国家: $countries"
+    draw_line
+    if ! confirm "确认应用?"; then
+        print_warn "已取消"; pause; return
+    fi
+    print_info "正在下载 IP 数据..."
+    if ! _geoip_download "$countries"; then
+        print_error "所有国家数据下载失败"; pause; return
+    fi
+    print_info "正在应用防火墙规则..."
+    _geoip_apply "$mode" "$countries"
+    local total=0
+    for cc in $countries; do
+        local f="${GEOIP_DATA_DIR}/${cc,,}.zone"
+        [[ -f "$f" ]] && total=$((total + $(grep -c '^[0-9]' "$f" 2>/dev/null || echo 0)))
+    done
+    mkdir -p "$GEOIP_CONF_DIR"
+    cat > "$GEOIP_CONF" << EOF
+GEOIP_MODE="$mode"
+GEOIP_COUNTRIES="$countries"
+GEOIP_LAST_UPDATE="$(date +%Y-%m-%d)"
+EOF
+    chmod 600 "$GEOIP_CONF"
+    _geoip_install_persistence
+    print_success "GeoIP 规则已生效！"
+    echo "  模式: $([[ "$mode" == "whitelist" ]] && echo "白名单" || echo "黑名单")"
+    echo "  国家: $countries"
+    echo "  IP段: ${total} 条"
+    echo "  自动更新: 每周日 04:00"
+    log_action "GeoIP configured: mode=$mode countries=$countries entries=$total"
+    pause
+}
+
+geoip_status() {
+    print_title "GeoIP 状态"
+    _geoip_load_conf
+    if [[ -z "$GEOIP_MODE" ]]; then
+        print_warn "GeoIP 未配置"; pause; return
+    fi
+    local set_name="geoip_${GEOIP_MODE}"
+    echo -e "${C_CYAN}模式:${C_RESET} $([[ "$GEOIP_MODE" == "whitelist" ]] && echo "白名单 (仅允许)" || echo "黑名单 (仅封禁)")"
+    echo -e "${C_CYAN}国家:${C_RESET} $GEOIP_COUNTRIES"
+    echo -e "${C_CYAN}更新:${C_RESET} ${GEOIP_LAST_UPDATE:-未知}"
+    echo ""
+    echo -e "${C_CYAN}[IP 段统计]${C_RESET}"
+    local total=0
+    for cc in $GEOIP_COUNTRIES; do
+        local f="${GEOIP_DATA_DIR}/${cc,,}.zone"
+        if [[ -f "$f" ]]; then
+            local count=$(grep -c '^[0-9]' "$f" 2>/dev/null || echo 0)
+            printf "  %-4s %-10s %s 条\n" "${cc}" "$(_geoip_country_name "$cc")" "$count"
+            total=$((total + count))
+        fi
+    done
+    echo "  总计: ${total} 条"
+    echo ""
+    echo -e "${C_CYAN}[iptables 命中统计]${C_RESET}"
+    iptables -L "$GEOIP_CHAIN" -n -v 2>/dev/null | head -20 || \
+        print_warn "iptables 规则不存在"
+    echo ""
+    echo -e "${C_CYAN}[ipset 集合]${C_RESET}"
+    if ipset list "$set_name" 2>/dev/null | head -5; then
+        local entries=$(ipset list "$set_name" 2>/dev/null | grep -c '^[0-9]' || echo 0)
+        echo "  已加载条目: ${entries}"
+    else
+        print_warn "ipset 集合不存在"
+    fi
+    pause
+}
+
+geoip_update() {
+    print_title "更新 GeoIP 数据"
+    _geoip_load_conf
+    if [[ -z "$GEOIP_MODE" ]]; then
+        print_warn "GeoIP 未配置"; pause; return
+    fi
+    print_info "正在更新 IP 数据 (${GEOIP_COUNTRIES})..."
+    if _geoip_download "$GEOIP_COUNTRIES"; then
+        print_info "正在重新加载规则..."
+        _geoip_apply "$GEOIP_MODE" "$GEOIP_COUNTRIES"
+        sed -i "s/^GEOIP_LAST_UPDATE=.*/GEOIP_LAST_UPDATE=\"$(date +%Y-%m-%d)\"/" "$GEOIP_CONF"
+        print_success "更新完成"
+        log_action "GeoIP data updated: $GEOIP_COUNTRIES"
+    else
+        print_error "更新失败"
+    fi
+    pause
+}
+
+geoip_disable() {
+    print_title "禁用 GeoIP"
+    _geoip_load_conf
+    if [[ -z "$GEOIP_MODE" ]]; then
+        print_warn "GeoIP 未配置"; pause; return
+    fi
+    if ! confirm "确认禁用 GeoIP 规则? (将移除所有国家限制)"; then return; fi
+    _geoip_clear
+    rm -f "$GEOIP_CONF"
+    rm -rf "$GEOIP_DATA_DIR"
+    rm -f /usr/local/bin/geoip-apply.sh /usr/local/bin/geoip-update.sh
+    cron_remove_job "geoip-update.sh"
+    if is_systemd; then
+        systemctl disable geoip-firewall 2>/dev/null || true
+        rm -f /etc/systemd/system/geoip-firewall.service
+        systemctl daemon-reload
+    fi
+    print_success "GeoIP 已禁用，所有规则已清除。"
+    log_action "GeoIP disabled and cleaned up"
+    pause
+}
+
+menu_geoip() {
+    fix_terminal
+    while true; do
+        print_title "GeoIP 国家级 IP 白/黑名单"
+        _geoip_load_conf
+        if [[ -n "$GEOIP_MODE" ]]; then
+            echo -e "${C_GREEN}状态: 已启用${C_RESET}"
+            echo -e "模式: $([[ "$GEOIP_MODE" == "whitelist" ]] && echo "白名单" || echo "黑名单") | 国家: ${GEOIP_COUNTRIES} | 更新: ${GEOIP_LAST_UPDATE:-未知}"
+        else
+            echo -e "${C_YELLOW}状态: 未配置${C_RESET}"
+        fi
+        echo ""
+        echo "1. 配置 GeoIP 规则
+2. 查看当前状态
+3. 手动更新 IP 数据库
+4. 禁用 GeoIP
+0. 返回"
+        read -e -r -p "选择: " c
+        case $c in
+            1) geoip_setup ;;
+            2) geoip_status ;;
+            3) geoip_update ;;
+            4) geoip_disable ;;
+            0|q) break ;;
+            *) print_error "无效选项" ;;
+        esac
+    done
+}
+
 menu_ufw() {
     fix_terminal
     while true; do
@@ -802,6 +1170,7 @@ menu_ufw() {
 5. 删除规则
 6. 禁用 UFW
 7. 重置默认规则 (安全模式)
+8. GeoIP 国家级 IP 白/黑名单
 0. 返回主菜单
 "
         read -e -r -p "请选择: " c
@@ -846,6 +1215,7 @@ menu_ufw() {
                 fi
                 ;;
             7) ufw_safe_reset ;;
+            8) menu_geoip ;;
             0|q) break ;;
             *) print_error "无效选项" ;;
         esac
@@ -999,6 +1369,27 @@ f2b_setup() {
             ;;
         *) findtime="10m" ;;
     esac
+    # ignoreip 白名单
+    local default_ignore="127.0.0.1/8 ::1 10.0.0.0/8"
+    echo ""
+    echo -e "${C_CYAN}[ignoreip 白名单]${C_RESET}"
+    echo -e "  白名单中的 IP 永远不会被封禁 (防止误封自己)"
+    echo -e "  默认值: ${C_GREEN}${default_ignore}${C_RESET}"
+    echo -e "  可追加你的固定 IP、WireGuard 网段等 (空格分隔)"
+    read -e -r -p "ignoreip [回车使用默认]: " custom_ignore
+    local ignoreip="${custom_ignore:-$default_ignore}"
+    # Nginx jail detection
+    local nginx_jail=0
+    if command_exists nginx && [[ -d /var/log/nginx ]]; then
+        echo ""
+        echo -e "${C_CYAN}[Nginx 防护]${C_RESET}"
+        echo -e "  检测到 Nginx 已安装，可同时启用 Web 防爆破 jail:"
+        echo -e "  ${C_GREEN}nginx-http-auth${C_RESET}  — 监控 HTTP 401 认证失败 (密码爆破)"
+        echo -e "  ${C_GREEN}nginx-botsearch${C_RESET}  — 监控 404 扫描探测 (.env/wp-admin 等)"
+        if confirm "是否启用 Nginx 防护?"; then
+            nginx_jail=1
+        fi
+    fi
     draw_line
     echo -e "${C_CYAN}配置摘要:${C_RESET}"
     echo "  SSH 端口:     $port"
@@ -1006,6 +1397,8 @@ f2b_setup() {
     echo "  检测窗口:     $findtime"
     echo "  封禁时间:     $bantime"
     echo "  封禁方式:     $ban_backend_info"
+    echo "  白名单:       $ignoreip"
+    [[ $nginx_jail -eq 1 ]] && echo -e "  Nginx 防护:   ${C_GREEN}启用${C_RESET} (http-auth + botsearch)"
     [[ "$bantime" == "-1" ]] && echo -e "  ${C_YELLOW}提示: 永久封禁建议定期检查规则数量${C_RESET}"
     draw_line
     if ! confirm "确认应用此配置?"; then
@@ -1030,12 +1423,29 @@ bantime = $bantime
 findtime = $findtime
 banaction = $banaction
 banaction_allports = $banaction
+ignoreip = $ignoreip
 [sshd]
 enabled = true
 port = $port
 maxretry = $maxretry
 backend = $backend
 logpath = %(sshd_log)s"
+    # Append Nginx jails if enabled
+    if [[ $nginx_jail -eq 1 ]]; then
+        conf_content="${conf_content}
+
+[nginx-http-auth]
+enabled = true
+port = http,https
+maxretry = $maxretry
+logpath = /var/log/nginx/error.log
+
+[nginx-botsearch]
+enabled = true
+port = http,https
+maxretry = 5
+logpath = /var/log/nginx/access.log"
+    fi
     write_file_atomic "$FAIL2BAN_JAIL_LOCAL" "$conf_content"
     print_success "配置已写入: $FAIL2BAN_JAIL_LOCAL (banaction=$banaction)"
     
@@ -1098,16 +1508,32 @@ f2b_status() {
     if is_systemd; then
         systemctl status fail2ban --no-pager -l 2>/dev/null | head -n 5 || echo "服务未运行"
     fi
-    echo -e "${C_CYAN}[SSHD Jail 状态]${C_RESET}"
-    fail2ban-client status sshd 2>/dev/null || echo "SSHD jail 未启用"
-    echo -e "${C_CYAN}[当前封禁的 IP]${C_RESET}"
-    local banned=$(fail2ban-client status sshd 2>/dev/null | grep "Banned IP" | cut -d: -f2 | xargs)
-    if [[ -n "$banned" && "$banned" != "0" ]]; then
-        echo "$banned" | tr ' ' '\n' | while read ip; do
-            [[ -n "$ip" ]] && echo "  - $ip"
-        done
-    else
-        echo "  (无)"
+    # Show all active jails
+    local jails=$(fail2ban-client status 2>/dev/null | grep "Jail list" | cut -d: -f2 | tr -d ' ')
+    if [[ -z "$jails" ]]; then
+        print_warn "没有活跃的 jail"
+        pause; return
+    fi
+    echo -e "${C_CYAN}[活跃 Jail]${C_RESET} $jails"
+    echo ""
+    local IFS=','
+    for jail in $jails; do
+        unset IFS
+        echo -e "${C_CYAN}[$jail]${C_RESET}"
+        local status_out=$(fail2ban-client status "$jail" 2>/dev/null)
+        local cur_banned=$(echo "$status_out" | grep "Currently banned" | awk '{print $NF}')
+        local total_banned=$(echo "$status_out" | grep "Total banned" | awk '{print $NF}')
+        local banned_ips=$(echo "$status_out" | grep "Banned IP" | cut -d: -f2 | xargs)
+        echo "  当前封禁: ${cur_banned:-0} | 累计封禁: ${total_banned:-0}"
+        if [[ -n "$banned_ips" && "$banned_ips" != " " ]]; then
+            echo "  封禁 IP: $banned_ips"
+        fi
+    done
+    unset IFS
+    # Show ignoreip if configured
+    if [[ -f "$FAIL2BAN_JAIL_LOCAL" ]]; then
+        local ignore=$(grep '^ignoreip' "$FAIL2BAN_JAIL_LOCAL" | cut -d= -f2 | xargs)
+        [[ -n "$ignore" ]] && echo -e "\n${C_CYAN}[白名单]${C_RESET} $ignore"
     fi
     pause
 }
@@ -1156,6 +1582,51 @@ f2b_unban() {
             print_error "解封失败，请检查 IP 是否正确。"
         fi
     fi
+    pause
+}
+
+f2b_ban() {
+    print_title "手动封禁 IP"
+    if ! command_exists fail2ban-client; then
+        print_error "Fail2ban 未安装。"
+        pause; return
+    fi
+    # List active jails for selection
+    local jails_raw=$(fail2ban-client status 2>/dev/null | grep "Jail list" | cut -d: -f2 | tr -d ' ')
+    if [[ -z "$jails_raw" ]]; then
+        print_warn "没有活跃的 jail"; pause; return
+    fi
+    local IFS=',' jail_arr=()
+    for j in $jails_raw; do jail_arr+=("$j"); done
+    unset IFS
+    local target_jail="sshd"
+    if [[ ${#jail_arr[@]} -gt 1 ]]; then
+        echo "选择要封禁到哪个 jail:"
+        local i=1
+        for j in "${jail_arr[@]}"; do
+            echo "  $i. $j"
+            ((i++))
+        done
+        read -e -r -p "选择 [1]: " jidx
+        jidx=${jidx:-1}
+        if [[ "$jidx" =~ ^[0-9]+$ ]] && [[ "$jidx" -ge 1 && "$jidx" -le ${#jail_arr[@]} ]]; then
+            target_jail="${jail_arr[$((jidx-1))]}"
+        fi
+    fi
+    echo -e "目标 jail: ${C_CYAN}${target_jail}${C_RESET}"
+    read -e -r -p "输入要封禁的 IP 地址 (空格分隔多个): " ip_input
+    [[ -z "$ip_input" ]] && return
+    for ip in $ip_input; do
+        if ! validate_ip "$ip"; then
+            print_error "无效 IP: $ip"; continue
+        fi
+        if fail2ban-client set "$target_jail" banip "$ip" 2>/dev/null; then
+            print_success "已封禁: $ip (jail=$target_jail)"
+            log_action "Fail2ban: manually banned $ip in $target_jail"
+        else
+            print_error "封禁失败: $ip"
+        fi
+    done
     pause
 }
 
@@ -1226,9 +1697,10 @@ menu_f2b() {
         echo "1. 安装/重新配置 Fail2ban
 2. 查看状态和封禁列表
 3. 解封 IP 地址
-4. 查看当前配置
-5. 查看日志
-6. 启动/停止服务
+4. 手动封禁 IP
+5. 查看当前配置
+6. 查看日志
+7. 启动/停止服务
 0. 返回主菜单
 "
         read -e -r -p "请选择: " c
@@ -1236,9 +1708,10 @@ menu_f2b() {
             1) f2b_setup ;;
             2) f2b_status ;;
             3) f2b_unban ;;
-            4) f2b_view_config ;;
-            5) f2b_logs ;;
-            6)
+            4) f2b_ban ;;
+            5) f2b_view_config ;;
+            6) f2b_logs ;;
+            7)
                 if ! command_exists fail2ban-client; then
                     print_error "Fail2ban 未安装。"
                     pause
@@ -1325,9 +1798,14 @@ ssh_change_port() {
 ssh_keys() {
     print_title "SSH 密钥管理"
     echo "1. 导入公钥
-2. 禁用密码登录"
+2. 查看已部署的公钥
+3. 删除指定公钥
+4. 生成服务器密钥对
+5. 禁用密码登录
+0. 返回"
     read -e -r -p "选择: " c
-    if [[ "$c" == "1" ]]; then
+    case $c in
+    1)
         read -e -r -p "用户名: " user
         if ! id "$user" >/dev/null 2>&1; then 
             print_error "用户不存在"
@@ -1347,12 +1825,93 @@ ssh_keys() {
             pause; return
         fi
         echo "$key" >> "$dir/authorized_keys"
-        chmod 700 "$dir"
-        chmod 600 "$dir/authorized_keys"
+        chmod 700 "$dir"; chmod 600 "$dir/authorized_keys"
         chown -R "$user:$user" "$dir"
         print_success "公钥已添加。"
         log_action "SSH key added for user $user"
-    elif [[ "$c" == "2" ]]; then
+        ;;
+    2)
+        read -e -r -p "用户名 [root]: " user
+        user=${user:-root}
+        local dir="/home/$user/.ssh"
+        [[ "$user" == "root" ]] && dir="/root/.ssh"
+        local ak="$dir/authorized_keys"
+        if [[ ! -f "$ak" ]] || [[ ! -s "$ak" ]]; then
+            print_warn "该用户没有部署任何公钥。"
+            pause; return
+        fi
+        echo -e "${C_CYAN}[$user 的公钥列表]${C_RESET}"
+        local idx=1
+        while IFS= read -r line; do
+            [[ -z "$line" || "$line" == \#* ]] && continue
+            local fp=$(echo "$line" | ssh-keygen -l -f - 2>/dev/null)
+            if [[ -n "$fp" ]]; then
+                local bits=$(echo "$fp" | awk '{print $1}')
+                local hash=$(echo "$fp" | awk '{print $2}')
+                local comment=$(echo "$line" | awk '{print $NF}')
+                local ktype=$(echo "$line" | awk '{print $1}')
+                printf "  ${C_GREEN}%d.${C_RESET} %-12s %s位  %s  ${C_GRAY}%s${C_RESET}\n" "$idx" "$ktype" "$bits" "$hash" "$comment"
+            else
+                printf "  ${C_GREEN}%d.${C_RESET} %s\n" "$idx" "${line:0:80}"
+            fi
+            ((idx++)) || true
+        done < "$ak"
+        [[ $idx -eq 1 ]] && print_warn "无有效公钥"
+        ;;
+    3)
+        read -e -r -p "用户名 [root]: " user
+        user=${user:-root}
+        local dir="/home/$user/.ssh"
+        [[ "$user" == "root" ]] && dir="/root/.ssh"
+        local ak="$dir/authorized_keys"
+        if [[ ! -f "$ak" ]] || [[ ! -s "$ak" ]]; then
+            print_warn "该用户没有部署任何公钥。"; pause; return
+        fi
+        # Show keys with index
+        local keys=() idx=1
+        while IFS= read -r line; do
+            [[ -z "$line" || "$line" == \#* ]] && continue
+            keys+=("$line")
+            local comment=$(echo "$line" | awk '{print $NF}')
+            local ktype=$(echo "$line" | awk '{print $1}')
+            printf "  %d. %-12s %s\n" "$idx" "$ktype" "$comment"
+            ((idx++)) || true
+        done < "$ak"
+        [[ ${#keys[@]} -eq 0 ]] && { print_warn "无公钥"; pause; return; }
+        read -e -r -p "输入要删除的序号: " didx
+        if [[ "$didx" =~ ^[0-9]+$ ]] && [[ "$didx" -ge 1 && "$didx" -le ${#keys[@]} ]]; then
+            local target_key="${keys[$((didx-1))]}"
+            if confirm "确认删除第 ${didx} 个公钥?"; then
+                local escaped_key=$(printf '%s\n' "$target_key" | sed 's/[.[\*^$/]/\\&/g')
+                sed -i "\|${escaped_key}|d" "$ak"
+                print_success "已删除。"
+                log_action "SSH key deleted for user $user (index=$didx)"
+            fi
+        else
+            print_error "无效序号"
+        fi
+        ;;
+    4)
+        echo -e "${C_CYAN}生成 Ed25519 密钥对 (用于服务器主动连接其他主机)${C_RESET}"
+        read -e -r -p "备注信息 [留空跳过]: " comment
+        local key_file="/root/.ssh/id_ed25519_server"
+        if [[ -f "$key_file" ]]; then
+            print_warn "密钥已存在: $key_file"
+            if ! confirm "覆盖现有密钥?"; then pause; return; fi
+        fi
+        local cmd="ssh-keygen -t ed25519 -f $key_file -N \"\""
+        [[ -n "$comment" ]] && cmd="$cmd -C \"$comment\""
+        eval $cmd
+        echo ""
+        print_success "密钥对已生成。"
+        echo -e "${C_CYAN}私钥:${C_RESET} $key_file"
+        echo -e "${C_CYAN}公钥:${C_RESET} ${key_file}.pub"
+        echo ""
+        echo -e "${C_CYAN}公钥内容 (复制到目标服务器的 authorized_keys):${C_RESET}"
+        cat "${key_file}.pub"
+        log_action "SSH keypair generated: $key_file"
+        ;;
+    5)
         if confirm "确认已测试密钥登录成功？"; then
             local backup_file="${SSHD_CONFIG}.bak.$(date +%s)"
             cp "$SSHD_CONFIG" "$backup_file"
@@ -1367,7 +1926,9 @@ ssh_keys() {
             print_success "密码登录已禁用。"
             log_action "SSH password authentication disabled"
         fi
-    fi
+        ;;
+    0|q) return ;;
+    esac
     pause
 }
 
@@ -1378,7 +1939,7 @@ menu_ssh() {
         echo "1. 修改 SSH 端口
 2. 创建 Sudo 用户
 3. 禁用 Root 远程登录
-4. 密钥/密码设置
+4. 密钥管理 (导入/查看/删除/生成)
 5. 修改用户密码
 0. 返回主菜单
 "
@@ -1787,6 +2348,96 @@ select_timezone() {
     log_action "Timezone changed to $z"
 }
 
+opt_sysctl() {
+    print_title "内核参数调优"
+    echo -e "${C_CYAN}当前关键参数:${C_RESET}"
+    printf "  %-40s %s\n" "net.core.somaxconn" "$(sysctl -n net.core.somaxconn 2>/dev/null)"
+    printf "  %-40s %s\n" "fs.file-max" "$(sysctl -n fs.file-max 2>/dev/null)"
+    printf "  %-40s %s\n" "net.ipv4.tcp_max_syn_backlog" "$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null)"
+    printf "  %-40s %s\n" "net.ipv4.tcp_tw_reuse" "$(sysctl -n net.ipv4.tcp_tw_reuse 2>/dev/null)"
+    echo ""
+    echo -e "${C_CYAN}选择预设方案:${C_RESET}"
+    echo "  1. 代理/隧道场景 (WireGuard/Xray 等，高并发连接)"
+    echo "  2. Web 服务器场景 (Nginx 反代，优化 HTTP 并发)"
+    echo "  3. 保守方案 (仅基础优化，适合小内存机器)"
+    echo "  4. 回滚到备份 (恢复修改前的配置)"
+    echo "  0. 返回"
+    read -e -r -p "选择: " sc
+    [[ "$sc" == "0" || -z "$sc" ]] && return
+    if [[ "$sc" == "4" ]]; then
+        if [[ -f /etc/sysctl.conf.pre-tuning ]]; then
+            cp /etc/sysctl.conf.pre-tuning /etc/sysctl.conf
+            sysctl -p >/dev/null 2>&1
+            print_success "已回滚到调优前的配置。"
+            log_action "Sysctl tuning rolled back"
+        else
+            print_warn "没有找到备份文件。"
+        fi
+        pause; return
+    fi
+    # Backup before modifying
+    [[ ! -f /etc/sysctl.conf.pre-tuning ]] && cp /etc/sysctl.conf /etc/sysctl.conf.pre-tuning
+    local params=""
+    case $sc in
+    1)
+        params="
+# server-manage sysctl tuning: proxy/tunnel
+fs.file-max = 1048576
+net.core.somaxconn = 4096
+net.core.netdev_max_backlog = 4096
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_max_syn_backlog = 4096
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_max_tw_buckets = 32768
+net.ipv4.tcp_syncookies = 1
+net.ipv4.ip_forward = 1
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216"
+        ;;
+    2)
+        params="
+# server-manage sysctl tuning: web server
+fs.file-max = 524288
+net.core.somaxconn = 8192
+net.core.netdev_max_backlog = 8192
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 10
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 3
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_max_tw_buckets = 65536"
+        ;;
+    3)
+        params="
+# server-manage sysctl tuning: conservative
+fs.file-max = 262144
+net.core.somaxconn = 2048
+net.ipv4.tcp_max_syn_backlog = 2048
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_fin_timeout = 30"
+        ;;
+    *) print_error "无效选择"; pause; return ;;
+    esac
+    # Remove old tuning block and append new
+    sed -i '/^# server-manage sysctl tuning/,/^$/d' /etc/sysctl.conf
+    echo "$params" >> /etc/sysctl.conf
+    if sysctl -p >/dev/null 2>&1; then
+        print_success "内核参数已应用 (无需重启)。"
+        log_action "Sysctl tuning applied: preset=$sc"
+    else
+        print_error "sysctl -p 执行失败，请检查 /etc/sysctl.conf"
+    fi
+    pause
+}
+
 menu_opt() {
     fix_terminal
     while true; do
@@ -1796,6 +2447,7 @@ menu_opt() {
 3. 修改主机名
 4. 系统垃圾清理
 5. 修改时区
+6. 内核参数调优
 0. 返回
 "
         read -e -r -p "选择: " c
@@ -1805,6 +2457,7 @@ menu_opt() {
             3) opt_hostname ;;
             4) opt_cleanup ;;
             5) select_timezone || true; pause ;;
+            6) opt_sysctl ;;
             0|q) break ;;
             *) print_error "无效" ;;
         esac
@@ -1956,6 +2609,65 @@ net_dns() {
     pause
 }
 
+net_diag() {
+    print_title "网络诊断工具"
+    echo "1. Ping 测试
+2. Traceroute / MTR 路由追踪
+3. 端口连通性测试 (从服务器往外测)
+0. 返回"
+    read -e -r -p "选择: " c
+    case $c in
+    1)
+        read -e -r -p "目标 IP/域名: " target
+        [[ -z "$target" ]] && return
+        read -e -r -p "次数 [4]: " cnt
+        cnt=${cnt:-4}
+        ping -c "$cnt" "$target"
+        ;;
+    2)
+        read -e -r -p "目标 IP/域名: " target
+        [[ -z "$target" ]] && return
+        if command_exists mtr; then
+            mtr --report --report-cycles 5 "$target"
+        elif command_exists traceroute; then
+            traceroute "$target"
+        else
+            print_info "正在安装 mtr..."
+            install_package "mtr" "silent"
+            if command_exists mtr; then
+                mtr --report --report-cycles 5 "$target"
+            else
+                print_error "mtr 安装失败，请手动安装"
+            fi
+        fi
+        ;;
+    3)
+        read -e -r -p "目标 IP/域名: " host
+        [[ -z "$host" ]] && return
+        read -e -r -p "端口: " port
+        if ! validate_port "$port"; then
+            print_error "端口无效"; pause; return
+        fi
+        print_info "测试 ${host}:${port} ..."
+        if command_exists nc; then
+            if nc -zv -w 5 "$host" "$port" 2>&1; then
+                print_success "端口可达"
+            else
+                print_error "端口不可达或超时"
+            fi
+        else
+            if timeout 5 bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null; then
+                print_success "端口可达"
+            else
+                print_error "端口不可达或超时"
+            fi
+        fi
+        ;;
+    0|q) return ;;
+    esac
+    pause
+}
+
 menu_net() {
     fix_terminal
     while true; do
@@ -1963,6 +2675,7 @@ menu_net() {
         echo "1. DNS 配置
 2. IPv4/IPv6 优先级
 3. iPerf3 测速
+4. 网络诊断 (Ping/MTR/端口测试)
 0. 返回
 "
         read -e -r -p "选择: " c
@@ -1972,7 +2685,6 @@ menu_net() {
                 echo "1. 优先 IPv4  2. 优先 IPv6"
                 read -e -r -p "选: " p
                 [[ ! -f /etc/gai.conf ]] && touch /etc/gai.conf
-                # 先清除已有配置行，再按需添加
                 sed -i '/^#\?precedence ::ffff:0:0\/96  100/d' /etc/gai.conf
                 if [[ "$p" == "1" ]]; then
                     echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
@@ -1983,6 +2695,7 @@ menu_net() {
                 log_action "IP priority changed"
                 pause ;;
             3) net_iperf3 ;;
+            4) net_diag ;;
             0|q) break ;;
             *) print_error "无效" ;;
         esac
@@ -3420,7 +4133,11 @@ web_reverse_proxy_site() {
     fi
     echo -e "${C_CYAN}选择反代模板:${C_RESET}"
     echo "  1. Emby / Jellyfin (流媒体优化: 大缓冲区/WebSocket/超长超时)
-  2. 通用反代 (适用于大多数 Web 服务)
+  2. Alist 网盘 (大文件上传/WebDAV)
+  3. Nextcloud (大文件 + CalDAV/CardDAV 重写)
+  4. 3X-UI (面板 + WebSocket)
+  5. Home Assistant (WebSocket 长连接)
+  6. 通用反代 (适用于大多数 Web 服务)
   0. 返回
 "
     read -e -r -p "选择模板: " tpl_choice
@@ -3428,7 +4145,11 @@ web_reverse_proxy_site() {
     local template_name=""
     case $tpl_choice in
         1) template_name="emby" ;;
-        2) template_name="generic" ;;
+        2) template_name="alist" ;;
+        3) template_name="nextcloud" ;;
+        4) template_name="3xui" ;;
+        5) template_name="homeassistant" ;;
+        6) template_name="generic" ;;
         *) print_error "无效选项"; pause; return ;;
     esac
     
@@ -3606,6 +4327,146 @@ server {
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }
+}"
+    elif [[ "$template_name" == "alist" ]]; then
+        nginx_conf="# Alist 网盘反代配置
+# Generated by $SCRIPT_NAME $VERSION
+server {
+    listen $HTTP_PORT;
+    listen [::]:$HTTP_PORT;
+    server_name $DOMAIN;
+    return 301 https://\$host${redir_port}\$request_uri;
+}
+server {
+    listen $HTTPS_PORT ssl http2;
+    listen [::]:$HTTPS_PORT ssl http2;
+    server_name $DOMAIN;
+    ssl_certificate ${cert_dir}/fullchain.pem;
+    ssl_certificate_key ${cert_dir}/privkey.pem;
+    ssl_trusted_certificate ${cert_dir}/fullchain.pem;
+    include snippets/ssl-params.conf;
+    client_max_body_size 20G;
+    proxy_read_timeout 86400s;
+    proxy_send_timeout 86400s;
+    location / {
+        proxy_pass $BACKEND_URL;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \"upgrade\";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_buffering off;
+        proxy_request_buffering off;
+    }
+}"
+    elif [[ "$template_name" == "nextcloud" ]]; then
+        nginx_conf="# Nextcloud 反代配置
+# Generated by $SCRIPT_NAME $VERSION
+server {
+    listen $HTTP_PORT;
+    listen [::]:$HTTP_PORT;
+    server_name $DOMAIN;
+    return 301 https://\$host${redir_port}\$request_uri;
+}
+server {
+    listen $HTTPS_PORT ssl http2;
+    listen [::]:$HTTPS_PORT ssl http2;
+    server_name $DOMAIN;
+    ssl_certificate ${cert_dir}/fullchain.pem;
+    ssl_certificate_key ${cert_dir}/privkey.pem;
+    ssl_trusted_certificate ${cert_dir}/fullchain.pem;
+    include snippets/ssl-params.conf;
+    client_max_body_size 10G;
+    proxy_read_timeout 86400s;
+    proxy_send_timeout 86400s;
+    location / {
+        proxy_pass $BACKEND_URL;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \"upgrade\";
+        proxy_buffering off;
+        proxy_request_buffering off;
+    }
+    location /.well-known/carddav { return 301 \$scheme://\$host/remote.php/dav; }
+    location /.well-known/caldav  { return 301 \$scheme://\$host/remote.php/dav; }
+}"
+    elif [[ "$template_name" == "3xui" ]]; then
+        nginx_conf="# 3X-UI 反代配置
+# Generated by $SCRIPT_NAME $VERSION
+server {
+    listen $HTTP_PORT;
+    listen [::]:$HTTP_PORT;
+    server_name $DOMAIN;
+    return 301 https://\$host${redir_port}\$request_uri;
+}
+server {
+    listen $HTTPS_PORT ssl http2;
+    listen [::]:$HTTPS_PORT ssl http2;
+    server_name $DOMAIN;
+    ssl_certificate ${cert_dir}/fullchain.pem;
+    ssl_certificate_key ${cert_dir}/privkey.pem;
+    ssl_trusted_certificate ${cert_dir}/fullchain.pem;
+    include snippets/ssl-params.conf;
+    client_max_body_size 50M;
+    location / {
+        proxy_pass $BACKEND_URL;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \"upgrade\";
+        proxy_buffering off;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }
+}"
+    elif [[ "$template_name" == "homeassistant" ]]; then
+        nginx_conf="# Home Assistant 反代配置
+# Generated by $SCRIPT_NAME $VERSION
+server {
+    listen $HTTP_PORT;
+    listen [::]:$HTTP_PORT;
+    server_name $DOMAIN;
+    return 301 https://\$host${redir_port}\$request_uri;
+}
+server {
+    listen $HTTPS_PORT ssl http2;
+    listen [::]:$HTTPS_PORT ssl http2;
+    server_name $DOMAIN;
+    ssl_certificate ${cert_dir}/fullchain.pem;
+    ssl_certificate_key ${cert_dir}/privkey.pem;
+    ssl_trusted_certificate ${cert_dir}/fullchain.pem;
+    include snippets/ssl-params.conf;
+    client_max_body_size 50M;
+    location / {
+        proxy_pass $BACKEND_URL;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \"upgrade\";
+        proxy_buffering off;
+    }
+    location /api/websocket {
+        proxy_pass $BACKEND_URL;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \"upgrade\";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
         proxy_read_timeout 86400s;
         proxy_send_timeout 86400s;
     }
@@ -4557,58 +5418,85 @@ docker_images_manage() {
 }
 
 docker_containers_manage() {
-    print_title "Docker 容器管理"
     if ! command_exists docker; then
-        print_error "Docker 未安装。"
-        pause; return
+        print_error "Docker 未安装。"; pause; return
     fi
-    echo "1. 列出运行中的容器
-2. 列出所有容器
-3. 停止所有容器
-4. 删除所有容器 (危险)
-5. 查看容器日志
-0. 返回"
-    read -e -r -p "选择: " c
-    case $c in
-        1)
-            docker ps
-            ;;
-        2)
-            docker ps -a
-            ;;
-        3)
-            if confirm "停止所有容器？"; then
-                local running=$(docker ps -q)
-                if [[ -n "$running" ]]; then
-                    docker stop $running
-                    print_success "所有容器已停止。"
-                    log_action "Docker all containers stopped"
-                else
-                    print_warn "没有运行中的容器。"
+    while true; do
+        print_title "Docker 容器管理"
+        # Build container table
+        local containers=()
+        local fmt='{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+        while IFS=$'\t' read -r id name image status ports; do
+            [[ -z "$id" ]] && continue
+            containers+=("$id|$name|$image|$status|$ports")
+        done < <(docker ps -a --format "$fmt" 2>/dev/null)
+        if [[ ${#containers[@]} -eq 0 ]]; then
+            print_warn "没有容器。"
+        else
+            printf "  ${C_CYAN}%-3s %-4s %-20s %-25s %-30s${C_RESET}\n" "#" "状态" "名称" "镜像" "端口"
+            local idx=1
+            for entry in "${containers[@]}"; do
+                IFS='|' read -r id name image status ports <<< "$entry"
+                local icon="${C_RED}○${C_RESET}"
+                [[ "$status" == Up* ]] && icon="${C_GREEN}●${C_RESET}"
+                [[ ${#image} -gt 25 ]] && image="${image:0:22}..."
+                [[ ${#ports} -gt 30 ]] && ports="${ports:0:27}..."
+                printf "  %-3s %b  %-20s %-25s %-30s\n" "$idx" "$icon" "$name" "$image" "$ports"
+                ((idx++)) || true
+            done
+        fi
+        local running_ids=$(docker ps -q 2>/dev/null)
+        if [[ -n "$running_ids" ]]; then
+            echo ""
+            echo -e "${C_CYAN}[资源占用]${C_RESET}"
+            docker stats --no-stream --format "  {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}" 2>/dev/null | column -t -s $'\t'
+        fi
+        echo ""
+        echo -e "${C_CYAN}操作:${C_RESET} 1.启动 2.停止 3.重启 4.日志 5.删除  6.停止所有 7.删除所有  0.返回"
+        read -e -r -p "操作 [如 '3 2' 表示重启第2个容器]: " action_input
+        [[ -z "$action_input" || "$action_input" == "0" || "$action_input" == "q" ]] && break
+        local action=$(echo "$action_input" | awk '{print $1}')
+        local target_idx=$(echo "$action_input" | awk '{print $2}')
+        if [[ "$action" == "6" ]]; then
+            if confirm "停止所有容器?"; then
+                local rq=$(docker ps -q)
+                [[ -n "$rq" ]] && docker stop $rq && print_success "已停止" || print_warn "无运行中容器"
+                log_action "Docker all containers stopped"
+            fi
+            pause; continue
+        fi
+        if [[ "$action" == "7" ]]; then
+            if confirm "删除所有容器? (危险)"; then
+                local aq=$(docker ps -aq)
+                [[ -n "$aq" ]] && docker rm -f $aq && print_success "已删除" || print_warn "无容器"
+                log_action "Docker all containers removed"
+            fi
+            pause; continue
+        fi
+        if [[ -z "$target_idx" || ! "$target_idx" =~ ^[0-9]+$ ]]; then
+            print_error "格式: 操作编号 容器序号 (如 '3 2')"; pause; continue
+        fi
+        if [[ "$target_idx" -lt 1 || "$target_idx" -gt ${#containers[@]} ]]; then
+            print_error "容器序号超出范围"; pause; continue
+        fi
+        local target_entry="${containers[$((target_idx-1))]}"
+        local target_id=$(echo "$target_entry" | cut -d'|' -f1)
+        local target_name=$(echo "$target_entry" | cut -d'|' -f2)
+        case $action in
+            1) docker start "$target_id" && print_success "已启动: $target_name" || print_error "启动失败" ;;
+            2) docker stop "$target_id" && print_success "已停止: $target_name" || print_error "停止失败" ;;
+            3) docker restart "$target_id" && print_success "已重启: $target_name" || print_error "重启失败" ;;
+            4) print_info "按 Ctrl+C 退出日志..."; docker logs --tail 50 -f "$target_id" ;;
+            5)
+                if confirm "确认删除容器 $target_name?"; then
+                    docker rm -f "$target_id" && print_success "已删除: $target_name" || print_error "删除失败"
+                    log_action "Docker container removed: $target_name"
                 fi
-            fi
-            ;;
-        4)
-            if confirm "删除所有容器？"; then
-                local all_containers=$(docker ps -aq)
-                if [[ -n "$all_containers" ]]; then
-                    docker rm -f $all_containers
-                    print_success "所有容器已删除。"
-                    log_action "Docker all containers removed"
-                else
-                    print_warn "没有容器可删除。"
-                fi
-            fi
-            ;;
-        5)
-            read -e -r -p "容器名称或 ID: " cid
-            if [[ -n "$cid" ]]; then
-                docker logs --tail 100 -f "$cid"
-            fi
-            ;;
-        0|q) return ;;
-    esac
-    pause
+                ;;
+            *) print_error "无效操作" ;;
+        esac
+        pause
+    done
 }
 
 menu_docker() {
@@ -4616,9 +5504,11 @@ menu_docker() {
     while true; do
         print_title "Docker 管理"
         if command_exists docker; then
-            echo -e "${C_GREEN}Docker 已安装${C_RESET}"
-            docker --version
-            echo ""
+            local dver=$(docker --version 2>/dev/null | grep -oP '[\d.]+' | head -1)
+            local cver=$(docker compose version 2>/dev/null | grep -oP '[\d.]+' | head -1)
+            local running=$(docker ps -q 2>/dev/null | wc -l)
+            local total=$(docker ps -aq 2>/dev/null | wc -l)
+            echo -e "${C_GREEN}Docker $dver${C_RESET}${cver:+ | Compose $cver} | 容器: ${running}/${total} 运行中"
         else
             echo -e "${C_YELLOW}Docker 未安装${C_RESET}"
         fi
@@ -4627,7 +5517,7 @@ menu_docker() {
 3. 安装 Docker Compose
 4. 配置 Docker 代理
 5. 镜像管理
-6. 容器管理
+6. 容器管理 (一览式)
 7. 系统清理 (prune)
 0. 返回主菜单
 "

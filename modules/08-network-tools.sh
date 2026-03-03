@@ -144,6 +144,65 @@ net_dns() {
     pause
 }
 
+net_diag() {
+    print_title "网络诊断工具"
+    echo "1. Ping 测试
+2. Traceroute / MTR 路由追踪
+3. 端口连通性测试 (从服务器往外测)
+0. 返回"
+    read -e -r -p "选择: " c
+    case $c in
+    1)
+        read -e -r -p "目标 IP/域名: " target
+        [[ -z "$target" ]] && return
+        read -e -r -p "次数 [4]: " cnt
+        cnt=${cnt:-4}
+        ping -c "$cnt" "$target"
+        ;;
+    2)
+        read -e -r -p "目标 IP/域名: " target
+        [[ -z "$target" ]] && return
+        if command_exists mtr; then
+            mtr --report --report-cycles 5 "$target"
+        elif command_exists traceroute; then
+            traceroute "$target"
+        else
+            print_info "正在安装 mtr..."
+            install_package "mtr" "silent"
+            if command_exists mtr; then
+                mtr --report --report-cycles 5 "$target"
+            else
+                print_error "mtr 安装失败，请手动安装"
+            fi
+        fi
+        ;;
+    3)
+        read -e -r -p "目标 IP/域名: " host
+        [[ -z "$host" ]] && return
+        read -e -r -p "端口: " port
+        if ! validate_port "$port"; then
+            print_error "端口无效"; pause; return
+        fi
+        print_info "测试 ${host}:${port} ..."
+        if command_exists nc; then
+            if nc -zv -w 5 "$host" "$port" 2>&1; then
+                print_success "端口可达"
+            else
+                print_error "端口不可达或超时"
+            fi
+        else
+            if timeout 5 bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null; then
+                print_success "端口可达"
+            else
+                print_error "端口不可达或超时"
+            fi
+        fi
+        ;;
+    0|q) return ;;
+    esac
+    pause
+}
+
 menu_net() {
     fix_terminal
     while true; do
@@ -151,6 +210,7 @@ menu_net() {
         echo "1. DNS 配置
 2. IPv4/IPv6 优先级
 3. iPerf3 测速
+4. 网络诊断 (Ping/MTR/端口测试)
 0. 返回
 "
         read -e -r -p "选择: " c
@@ -160,7 +220,6 @@ menu_net() {
                 echo "1. 优先 IPv4  2. 优先 IPv6"
                 read -e -r -p "选: " p
                 [[ ! -f /etc/gai.conf ]] && touch /etc/gai.conf
-                # 先清除已有配置行，再按需添加
                 sed -i '/^#\?precedence ::ffff:0:0\/96  100/d' /etc/gai.conf
                 if [[ "$p" == "1" ]]; then
                     echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
@@ -171,6 +230,7 @@ menu_net() {
                 log_action "IP priority changed"
                 pause ;;
             3) net_iperf3 ;;
+            4) net_diag ;;
             0|q) break ;;
             *) print_error "无效" ;;
         esac

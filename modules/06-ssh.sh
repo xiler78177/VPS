@@ -65,9 +65,14 @@ ssh_change_port() {
 ssh_keys() {
     print_title "SSH 密钥管理"
     echo "1. 导入公钥
-2. 禁用密码登录"
+2. 查看已部署的公钥
+3. 删除指定公钥
+4. 生成服务器密钥对
+5. 禁用密码登录
+0. 返回"
     read -e -r -p "选择: " c
-    if [[ "$c" == "1" ]]; then
+    case $c in
+    1)
         read -e -r -p "用户名: " user
         if ! id "$user" >/dev/null 2>&1; then 
             print_error "用户不存在"
@@ -87,12 +92,93 @@ ssh_keys() {
             pause; return
         fi
         echo "$key" >> "$dir/authorized_keys"
-        chmod 700 "$dir"
-        chmod 600 "$dir/authorized_keys"
+        chmod 700 "$dir"; chmod 600 "$dir/authorized_keys"
         chown -R "$user:$user" "$dir"
         print_success "公钥已添加。"
         log_action "SSH key added for user $user"
-    elif [[ "$c" == "2" ]]; then
+        ;;
+    2)
+        read -e -r -p "用户名 [root]: " user
+        user=${user:-root}
+        local dir="/home/$user/.ssh"
+        [[ "$user" == "root" ]] && dir="/root/.ssh"
+        local ak="$dir/authorized_keys"
+        if [[ ! -f "$ak" ]] || [[ ! -s "$ak" ]]; then
+            print_warn "该用户没有部署任何公钥。"
+            pause; return
+        fi
+        echo -e "${C_CYAN}[$user 的公钥列表]${C_RESET}"
+        local idx=1
+        while IFS= read -r line; do
+            [[ -z "$line" || "$line" == \#* ]] && continue
+            local fp=$(echo "$line" | ssh-keygen -l -f - 2>/dev/null)
+            if [[ -n "$fp" ]]; then
+                local bits=$(echo "$fp" | awk '{print $1}')
+                local hash=$(echo "$fp" | awk '{print $2}')
+                local comment=$(echo "$line" | awk '{print $NF}')
+                local ktype=$(echo "$line" | awk '{print $1}')
+                printf "  ${C_GREEN}%d.${C_RESET} %-12s %s位  %s  ${C_GRAY}%s${C_RESET}\n" "$idx" "$ktype" "$bits" "$hash" "$comment"
+            else
+                printf "  ${C_GREEN}%d.${C_RESET} %s\n" "$idx" "${line:0:80}"
+            fi
+            ((idx++)) || true
+        done < "$ak"
+        [[ $idx -eq 1 ]] && print_warn "无有效公钥"
+        ;;
+    3)
+        read -e -r -p "用户名 [root]: " user
+        user=${user:-root}
+        local dir="/home/$user/.ssh"
+        [[ "$user" == "root" ]] && dir="/root/.ssh"
+        local ak="$dir/authorized_keys"
+        if [[ ! -f "$ak" ]] || [[ ! -s "$ak" ]]; then
+            print_warn "该用户没有部署任何公钥。"; pause; return
+        fi
+        # Show keys with index
+        local keys=() idx=1
+        while IFS= read -r line; do
+            [[ -z "$line" || "$line" == \#* ]] && continue
+            keys+=("$line")
+            local comment=$(echo "$line" | awk '{print $NF}')
+            local ktype=$(echo "$line" | awk '{print $1}')
+            printf "  %d. %-12s %s\n" "$idx" "$ktype" "$comment"
+            ((idx++)) || true
+        done < "$ak"
+        [[ ${#keys[@]} -eq 0 ]] && { print_warn "无公钥"; pause; return; }
+        read -e -r -p "输入要删除的序号: " didx
+        if [[ "$didx" =~ ^[0-9]+$ ]] && [[ "$didx" -ge 1 && "$didx" -le ${#keys[@]} ]]; then
+            local target_key="${keys[$((didx-1))]}"
+            if confirm "确认删除第 ${didx} 个公钥?"; then
+                local escaped_key=$(printf '%s\n' "$target_key" | sed 's/[.[\*^$/]/\\&/g')
+                sed -i "\|${escaped_key}|d" "$ak"
+                print_success "已删除。"
+                log_action "SSH key deleted for user $user (index=$didx)"
+            fi
+        else
+            print_error "无效序号"
+        fi
+        ;;
+    4)
+        echo -e "${C_CYAN}生成 Ed25519 密钥对 (用于服务器主动连接其他主机)${C_RESET}"
+        read -e -r -p "备注信息 [留空跳过]: " comment
+        local key_file="/root/.ssh/id_ed25519_server"
+        if [[ -f "$key_file" ]]; then
+            print_warn "密钥已存在: $key_file"
+            if ! confirm "覆盖现有密钥?"; then pause; return; fi
+        fi
+        local cmd="ssh-keygen -t ed25519 -f $key_file -N \"\""
+        [[ -n "$comment" ]] && cmd="$cmd -C \"$comment\""
+        eval $cmd
+        echo ""
+        print_success "密钥对已生成。"
+        echo -e "${C_CYAN}私钥:${C_RESET} $key_file"
+        echo -e "${C_CYAN}公钥:${C_RESET} ${key_file}.pub"
+        echo ""
+        echo -e "${C_CYAN}公钥内容 (复制到目标服务器的 authorized_keys):${C_RESET}"
+        cat "${key_file}.pub"
+        log_action "SSH keypair generated: $key_file"
+        ;;
+    5)
         if confirm "确认已测试密钥登录成功？"; then
             local backup_file="${SSHD_CONFIG}.bak.$(date +%s)"
             cp "$SSHD_CONFIG" "$backup_file"
@@ -107,7 +193,9 @@ ssh_keys() {
             print_success "密码登录已禁用。"
             log_action "SSH password authentication disabled"
         fi
-    fi
+        ;;
+    0|q) return ;;
+    esac
     pause
 }
 
@@ -118,7 +206,7 @@ menu_ssh() {
         echo "1. 修改 SSH 端口
 2. 创建 Sudo 用户
 3. 禁用 Root 远程登录
-4. 密钥/密码设置
+4. 密钥管理 (导入/查看/删除/生成)
 5. 修改用户密码
 0. 返回主菜单
 "

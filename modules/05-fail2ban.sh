@@ -146,6 +146,27 @@ f2b_setup() {
             ;;
         *) findtime="10m" ;;
     esac
+    # ignoreip 白名单
+    local default_ignore="127.0.0.1/8 ::1 10.0.0.0/8"
+    echo ""
+    echo -e "${C_CYAN}[ignoreip 白名单]${C_RESET}"
+    echo -e "  白名单中的 IP 永远不会被封禁 (防止误封自己)"
+    echo -e "  默认值: ${C_GREEN}${default_ignore}${C_RESET}"
+    echo -e "  可追加你的固定 IP、WireGuard 网段等 (空格分隔)"
+    read -e -r -p "ignoreip [回车使用默认]: " custom_ignore
+    local ignoreip="${custom_ignore:-$default_ignore}"
+    # Nginx jail detection
+    local nginx_jail=0
+    if command_exists nginx && [[ -d /var/log/nginx ]]; then
+        echo ""
+        echo -e "${C_CYAN}[Nginx 防护]${C_RESET}"
+        echo -e "  检测到 Nginx 已安装，可同时启用 Web 防爆破 jail:"
+        echo -e "  ${C_GREEN}nginx-http-auth${C_RESET}  — 监控 HTTP 401 认证失败 (密码爆破)"
+        echo -e "  ${C_GREEN}nginx-botsearch${C_RESET}  — 监控 404 扫描探测 (.env/wp-admin 等)"
+        if confirm "是否启用 Nginx 防护?"; then
+            nginx_jail=1
+        fi
+    fi
     draw_line
     echo -e "${C_CYAN}配置摘要:${C_RESET}"
     echo "  SSH 端口:     $port"
@@ -153,6 +174,8 @@ f2b_setup() {
     echo "  检测窗口:     $findtime"
     echo "  封禁时间:     $bantime"
     echo "  封禁方式:     $ban_backend_info"
+    echo "  白名单:       $ignoreip"
+    [[ $nginx_jail -eq 1 ]] && echo -e "  Nginx 防护:   ${C_GREEN}启用${C_RESET} (http-auth + botsearch)"
     [[ "$bantime" == "-1" ]] && echo -e "  ${C_YELLOW}提示: 永久封禁建议定期检查规则数量${C_RESET}"
     draw_line
     if ! confirm "确认应用此配置?"; then
@@ -177,12 +200,29 @@ bantime = $bantime
 findtime = $findtime
 banaction = $banaction
 banaction_allports = $banaction
+ignoreip = $ignoreip
 [sshd]
 enabled = true
 port = $port
 maxretry = $maxretry
 backend = $backend
 logpath = %(sshd_log)s"
+    # Append Nginx jails if enabled
+    if [[ $nginx_jail -eq 1 ]]; then
+        conf_content="${conf_content}
+
+[nginx-http-auth]
+enabled = true
+port = http,https
+maxretry = $maxretry
+logpath = /var/log/nginx/error.log
+
+[nginx-botsearch]
+enabled = true
+port = http,https
+maxretry = 5
+logpath = /var/log/nginx/access.log"
+    fi
     write_file_atomic "$FAIL2BAN_JAIL_LOCAL" "$conf_content"
     print_success "配置已写入: $FAIL2BAN_JAIL_LOCAL (banaction=$banaction)"
     
@@ -245,16 +285,32 @@ f2b_status() {
     if is_systemd; then
         systemctl status fail2ban --no-pager -l 2>/dev/null | head -n 5 || echo "服务未运行"
     fi
-    echo -e "${C_CYAN}[SSHD Jail 状态]${C_RESET}"
-    fail2ban-client status sshd 2>/dev/null || echo "SSHD jail 未启用"
-    echo -e "${C_CYAN}[当前封禁的 IP]${C_RESET}"
-    local banned=$(fail2ban-client status sshd 2>/dev/null | grep "Banned IP" | cut -d: -f2 | xargs)
-    if [[ -n "$banned" && "$banned" != "0" ]]; then
-        echo "$banned" | tr ' ' '\n' | while read ip; do
-            [[ -n "$ip" ]] && echo "  - $ip"
-        done
-    else
-        echo "  (无)"
+    # Show all active jails
+    local jails=$(fail2ban-client status 2>/dev/null | grep "Jail list" | cut -d: -f2 | tr -d ' ')
+    if [[ -z "$jails" ]]; then
+        print_warn "没有活跃的 jail"
+        pause; return
+    fi
+    echo -e "${C_CYAN}[活跃 Jail]${C_RESET} $jails"
+    echo ""
+    local IFS=','
+    for jail in $jails; do
+        unset IFS
+        echo -e "${C_CYAN}[$jail]${C_RESET}"
+        local status_out=$(fail2ban-client status "$jail" 2>/dev/null)
+        local cur_banned=$(echo "$status_out" | grep "Currently banned" | awk '{print $NF}')
+        local total_banned=$(echo "$status_out" | grep "Total banned" | awk '{print $NF}')
+        local banned_ips=$(echo "$status_out" | grep "Banned IP" | cut -d: -f2 | xargs)
+        echo "  当前封禁: ${cur_banned:-0} | 累计封禁: ${total_banned:-0}"
+        if [[ -n "$banned_ips" && "$banned_ips" != " " ]]; then
+            echo "  封禁 IP: $banned_ips"
+        fi
+    done
+    unset IFS
+    # Show ignoreip if configured
+    if [[ -f "$FAIL2BAN_JAIL_LOCAL" ]]; then
+        local ignore=$(grep '^ignoreip' "$FAIL2BAN_JAIL_LOCAL" | cut -d= -f2 | xargs)
+        [[ -n "$ignore" ]] && echo -e "\n${C_CYAN}[白名单]${C_RESET} $ignore"
     fi
     pause
 }
@@ -303,6 +359,51 @@ f2b_unban() {
             print_error "解封失败，请检查 IP 是否正确。"
         fi
     fi
+    pause
+}
+
+f2b_ban() {
+    print_title "手动封禁 IP"
+    if ! command_exists fail2ban-client; then
+        print_error "Fail2ban 未安装。"
+        pause; return
+    fi
+    # List active jails for selection
+    local jails_raw=$(fail2ban-client status 2>/dev/null | grep "Jail list" | cut -d: -f2 | tr -d ' ')
+    if [[ -z "$jails_raw" ]]; then
+        print_warn "没有活跃的 jail"; pause; return
+    fi
+    local IFS=',' jail_arr=()
+    for j in $jails_raw; do jail_arr+=("$j"); done
+    unset IFS
+    local target_jail="sshd"
+    if [[ ${#jail_arr[@]} -gt 1 ]]; then
+        echo "选择要封禁到哪个 jail:"
+        local i=1
+        for j in "${jail_arr[@]}"; do
+            echo "  $i. $j"
+            ((i++))
+        done
+        read -e -r -p "选择 [1]: " jidx
+        jidx=${jidx:-1}
+        if [[ "$jidx" =~ ^[0-9]+$ ]] && [[ "$jidx" -ge 1 && "$jidx" -le ${#jail_arr[@]} ]]; then
+            target_jail="${jail_arr[$((jidx-1))]}"
+        fi
+    fi
+    echo -e "目标 jail: ${C_CYAN}${target_jail}${C_RESET}"
+    read -e -r -p "输入要封禁的 IP 地址 (空格分隔多个): " ip_input
+    [[ -z "$ip_input" ]] && return
+    for ip in $ip_input; do
+        if ! validate_ip "$ip"; then
+            print_error "无效 IP: $ip"; continue
+        fi
+        if fail2ban-client set "$target_jail" banip "$ip" 2>/dev/null; then
+            print_success "已封禁: $ip (jail=$target_jail)"
+            log_action "Fail2ban: manually banned $ip in $target_jail"
+        else
+            print_error "封禁失败: $ip"
+        fi
+    done
     pause
 }
 
@@ -373,9 +474,10 @@ menu_f2b() {
         echo "1. 安装/重新配置 Fail2ban
 2. 查看状态和封禁列表
 3. 解封 IP 地址
-4. 查看当前配置
-5. 查看日志
-6. 启动/停止服务
+4. 手动封禁 IP
+5. 查看当前配置
+6. 查看日志
+7. 启动/停止服务
 0. 返回主菜单
 "
         read -e -r -p "请选择: " c
@@ -383,9 +485,10 @@ menu_f2b() {
             1) f2b_setup ;;
             2) f2b_status ;;
             3) f2b_unban ;;
-            4) f2b_view_config ;;
-            5) f2b_logs ;;
-            6)
+            4) f2b_ban ;;
+            5) f2b_view_config ;;
+            6) f2b_logs ;;
+            7)
                 if ! command_exists fail2ban-client; then
                     print_error "Fail2ban 未安装。"
                     pause
