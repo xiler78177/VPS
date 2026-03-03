@@ -152,7 +152,11 @@ main() {
                 fi
                 ;;
             9)
-                wg_main_menu
+                if [[ "$PLATFORM" == "openwrt" ]]; then
+                    wg_main_menu
+                else
+                    wg_deb_main_menu
+                fi
                 ;;
             10)
                 print_title "操作日志 (最近 50 条)"

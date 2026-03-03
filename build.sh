@@ -33,6 +33,11 @@ MODULES=(
     "11d-wireguard-peers.sh"
     "11e-wireguard-clash.sh"
     "11g-wireguard-extra.sh"
+    "12a-wireguard-deb-netcheck.sh"
+    "12b-wireguard-deb.sh"
+    "12c-wireguard-deb-server.sh"
+    "12d-wireguard-deb-peers.sh"
+    "12e-wireguard-deb-extra.sh"
     "12-backup.sh"
     "13-menus.sh"
 )
