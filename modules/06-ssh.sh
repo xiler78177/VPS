@@ -177,6 +177,28 @@ ssh_keys() {
         echo -e "${C_CYAN}公钥内容 (复制到目标服务器的 authorized_keys):${C_RESET}"
         cat "${key_file}.pub"
         log_action "SSH keypair generated: $key_file"
+        echo ""
+        if confirm "是否将公钥导入本服务器的 authorized_keys?"; then
+            read -e -r -p "导入到哪个用户 [root]: " imp_user
+            imp_user=${imp_user:-root}
+            if ! id "$imp_user" >/dev/null 2>&1; then
+                print_error "用户不存在"; pause; return
+            fi
+            local imp_dir="/home/$imp_user/.ssh"
+            [[ "$imp_user" == "root" ]] && imp_dir="/root/.ssh"
+            mkdir -p "$imp_dir"
+            local pub_key
+            pub_key=$(cat "${key_file}.pub")
+            if grep -qF "$pub_key" "$imp_dir/authorized_keys" 2>/dev/null; then
+                print_warn "该公钥已存在，无需重复添加。"
+            else
+                echo "$pub_key" >> "$imp_dir/authorized_keys"
+                chmod 700 "$imp_dir"; chmod 600 "$imp_dir/authorized_keys"
+                chown -R "$imp_user:$imp_user" "$imp_dir"
+                print_success "公钥已导入 ${imp_user} 的 authorized_keys。"
+                log_action "SSH pubkey auto-imported for user $imp_user from $key_file"
+            fi
+        fi
         ;;
     5)
         if confirm "确认已测试密钥登录成功？"; then
