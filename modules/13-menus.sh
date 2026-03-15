@@ -32,9 +32,9 @@ show_main_menu() {
     else
         printf "  %-36s %-36s\n" "7. Web 服务 (SSL+Nginx)" "8. Docker 管理"
     fi
-    printf "  %-36s\n" "9. WireGuard VPN"
+    printf "  %-36s %-36s\n" "9. WireGuard VPN" "10. 临时邮箱 (Cloudflare)"
     echo -e " ${C_CYAN}[ 维护工具 ]${C_RESET}"
-    printf "  %-36s %-36s\n" "10. 查看操作日志" "11. 备份与恢复 (WebDAV)"
+    printf "  %-36s %-36s\n" "11. 查看操作日志" "12. 备份与恢复 (WebDAV)"
     printf "${C_DIM}%${W}s${C_RESET}\n" | tr ' ' '-'
     printf "  %-36s\n" "0. 退出脚本"
 }
@@ -99,7 +99,7 @@ main() {
     
     while true; do
         show_main_menu
-        read -e -r -p "请选择功能 [0-11]: " choice
+        read -e -r -p "请选择功能 [0-12]: " choice
         case $choice in
             1)
                 if [[ "$PLATFORM" == "openwrt" ]]; then
@@ -159,6 +159,13 @@ main() {
                 fi
                 ;;
             10)
+                if [[ "$PLATFORM" == "openwrt" ]]; then
+                    feature_blocked "临时邮箱 (需要 Cloudflare)"
+                else
+                    menu_email
+                fi
+                ;;
+            11)
                 print_title "操作日志 (最近 50 条)"
                 if [[ -f "$LOG_FILE" ]]; then
                     tail -n 50 "$LOG_FILE"
@@ -167,7 +174,7 @@ main() {
                 fi
                 pause
                 ;;
-            11)
+            12)
                 menu_backup
                 ;;
             0|q|Q)
