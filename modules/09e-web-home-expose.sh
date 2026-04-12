@@ -257,7 +257,7 @@ server {
     ssl_certificate_key ${cert_dir}/privkey.pem;
     ssl_trusted_certificate ${cert_dir}/fullchain.pem;
     include snippets/ssl-params.conf;
-    client_max_body_size 128M;
+    client_max_body_size 50M;
     location / {
         proxy_pass http://${backend_addr};
         proxy_http_version 1.1;

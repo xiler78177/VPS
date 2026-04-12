@@ -1,11 +1,29 @@
 # modules/02-network.sh - 公网IP获取、DDNS管理
+_extract_ipv4_from_text() {
+    local raw="$1" ip=""
+    [[ -z "$raw" ]] && return 1
+    ip=$(printf '%s' "$raw" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1)
+    [[ -n "$ip" && "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    echo "$ip"
+    return 0
+}
+
 # 统一公网 IP 获取函数（使用国内可达的 API）
 get_public_ipv4() {
-    local ip=""
-    ip=$(curl -4 -s --connect-timeout 3 --max-time 5 https://4.ipw.cn 2>/dev/null) && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$ip"; return 0; }
-    ip=$(curl -4 -s --connect-timeout 3 --max-time 5 https://myip.ipip.net/ip 2>/dev/null) && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$ip"; return 0; }
-    ip=$(curl -4 -s --connect-timeout 3 --max-time 5 https://ip.3322.net 2>/dev/null) && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$ip"; return 0; }
-    ip=$(curl -4 -s --connect-timeout 3 --max-time 5 https://ifconfig.me 2>/dev/null) && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$ip"; return 0; }
+    local raw="" ip="" url=""
+    local endpoints=(
+        "https://4.ipw.cn"
+        "https://myip.ipip.net/ip"
+        "https://ip.3322.net"
+        "https://ifconfig.me/ip"
+        "https://4.ident.me"
+    )
+    for url in "${endpoints[@]}"; do
+        raw=$(curl -4 -s --connect-timeout 3 --max-time 5 "$url" 2>/dev/null) || continue
+        ip=$(_extract_ipv4_from_text "$raw") || continue
+        echo "$ip"
+        return 0
+    done
     return 1
 }
 
@@ -45,19 +63,41 @@ DDNS_CONFIG_DIR="/etc/ddns"
 DDNS_LOG="/var/log/ddns.log"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$DDNS_LOG"; }
 
+extract_ipv4() {
+    local raw="$1" ip=""
+    [[ -z "$raw" ]] && return 1
+    ip=$(printf '%s' "$raw" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1)
+    [[ -n "$ip" && "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    echo "$ip"
+    return 0
+}
+
 get_ip() {
-    local raw=""
+    local raw="" ip="" url=""
     if [[ "$1" == "4" ]]; then
-        raw=$(curl -4 -s --max-time 5 https://4.ipw.cn 2>/dev/null || \
-              curl -4 -s --max-time 5 https://myip.ipip.net/ip 2>/dev/null || \
-              curl -4 -s --max-time 5 https://ip.3322.net 2>/dev/null || \
-              curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null)
-        [[ "$raw" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo "$raw" || return 1
+        for url in \
+            https://4.ipw.cn \
+            https://myip.ipip.net/ip \
+            https://ip.3322.net \
+            https://ifconfig.me/ip \
+            https://4.ident.me
+        do
+            raw=$(curl -4 -s --connect-timeout 3 --max-time 5 "$url" 2>/dev/null) || continue
+            ip=$(extract_ipv4 "$raw") || continue
+            echo "$ip"
+            return 0
+        done
+        return 1
     else
-        raw=$(curl -6 -s --max-time 5 https://6.ipw.cn 2>/dev/null || \
-              curl -6 -s --max-time 5 https://v6.ident.me 2>/dev/null || \
-              curl -6 -s --max-time 5 https://ifconfig.me 2>/dev/null)
-        [[ "$raw" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$raw" == *:* ]] && echo "$raw" || return 1
+        for url in \
+            https://6.ipw.cn \
+            https://v6.ident.me \
+            https://ifconfig.me/ip
+        do
+            raw=$(curl -6 -s --connect-timeout 3 --max-time 5 "$url" 2>/dev/null) || continue
+            [[ "$raw" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$raw" == *:* ]] && { echo "$raw"; return 0; }
+        done
+        return 1
     fi
 }
 
@@ -184,4 +224,3 @@ ddns_force_update() {
     fi
     pause
 }
-
