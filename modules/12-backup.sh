@@ -20,8 +20,11 @@ backup_create() {
     [[ -d "$CERT_HOOKS_DIR" ]]      && _scan_add "证书续签 Hooks"    "$CERT_HOOKS_DIR"        "dir" "cert-hooks"
     command -v crontab >/dev/null 2>&1 && _scan_add "Crontab 定时任务" "crontab" "cmd" "crontab.bak"
     [[ -f "$CONFIG_FILE" ]]         && _scan_add "脚本自身配置"      "$CONFIG_FILE"           "file" "script-config"
-    [[ -f /usr/local/bin/ddns-update.sh ]] && _scan_add "DDNS更新脚本" "/usr/local/bin/ddns-update.sh" "file" "ddns-update.sh"
+    [[ -f "$DDNS_UPDATE_SCRIPT" ]] && _scan_add "DDNS更新脚本" "$DDNS_UPDATE_SCRIPT" "file" "ddns-update.sh"
     [[ -f /etc/x-ui/x-ui.db ]]     && _scan_add "3X-UI 数据库"      "/etc/x-ui/x-ui.db"      "file" "x-ui/x-ui.db"
+    [[ -d "$REALITY_CONFIG_DIR" ]] && _scan_add "Sing-box Reality 配置" "$REALITY_CONFIG_DIR" "dir" "reality"
+    [[ -f "$REALITY_SINGBOX_CONFIG" ]] && _scan_add "sing-box 主配置" "$REALITY_SINGBOX_CONFIG" "file" "sing-box/config.json"
+    [[ -f "$REALITY_REALM_CONFIG" ]] && _scan_add "Realm 中转配置" "$REALITY_REALM_CONFIG" "file" "realm/config.toml"
     local total=${#scan_names[@]}
     if [[ $total -eq 0 ]]; then
         print_warn "未发现任何可备份项。"
@@ -508,8 +511,9 @@ backup_restore() {
         restored=$((restored + 1))
     }
     [[ -f "${tmp_restore}/ddns-update.sh" ]] && {
-        cp "${tmp_restore}/ddns-update.sh" /usr/local/bin/ 2>/dev/null
-        chmod +x /usr/local/bin/ddns-update.sh 2>/dev/null
+        mkdir -p "$(dirname "$DDNS_UPDATE_SCRIPT")"
+        cp "${tmp_restore}/ddns-update.sh" "$DDNS_UPDATE_SCRIPT" 2>/dev/null
+        chmod +x "$DDNS_UPDATE_SCRIPT" 2>/dev/null
         echo -e "  ${C_GREEN}✓${C_RESET} ddns-update.sh"
         restored=$((restored + 1))
     }
@@ -738,4 +742,3 @@ menu_backup() {
         esac
     done
 }
-

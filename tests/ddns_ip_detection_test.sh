@@ -86,11 +86,12 @@ run_ddns_fallback_test() {
 
     ddns_script="$(
         bash -lc '
+            export DDNS_UPDATE_SCRIPT="'"$mock_dir"'/ddns-update.sh"
             source modules/00-constants.sh
             source modules/01-utils.sh
             source modules/02-network.sh
             ddns_create_script >/dev/null 2>&1
-            cat /usr/local/bin/ddns-update.sh
+            cat "$DDNS_UPDATE_SCRIPT"
         '
     )"
 
@@ -115,11 +116,12 @@ export DDNS_SCRIPT_CONTENT=""
 DDNS_SCRIPT_CONTENT="$(printf '%s' "$(
     bash -lc '
         cd "'"$ROOT_DIR"'"
+        export DDNS_UPDATE_SCRIPT="$(mktemp)"
         source modules/00-constants.sh
         source modules/01-utils.sh
         source modules/02-network.sh
         ddns_create_script >/dev/null 2>&1
-        cat /usr/local/bin/ddns-update.sh
+        cat "$DDNS_UPDATE_SCRIPT"
     '
 )")"
 

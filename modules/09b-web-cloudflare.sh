@@ -124,6 +124,31 @@ _cf_update_dns_record() {
     fi
 }
 
+cf_dns_sync_node_grey() {
+    local token="$1" domain="$2" ipv4="${3:-}" ipv6="${4:-}" enable_ddns="${5:-true}" interval="${6:-5}"
+    [[ -z "$token" || -z "$domain" ]] && return 1
+    command_exists jq || install_package "jq" "silent" || return 1
+    print_info "验证 Cloudflare Token..."
+    _cf_verify_token "$token" || return 1
+    local zone_id
+    zone_id=$(_cf_get_zone_id "$domain" "$token")
+    [[ -z "$zone_id" ]] && { print_error "无法获取 Zone ID: $domain"; return 1; }
+    local has_v4=false has_v6=false
+    if [[ -n "$ipv4" ]]; then
+        _cf_update_dns_record "$zone_id" "$token" "$domain" "A" "$ipv4" "false" || return 1
+        has_v4=true
+    fi
+    if [[ -n "$ipv6" ]]; then
+        _cf_update_dns_record "$zone_id" "$token" "$domain" "AAAA" "$ipv6" "false" || return 1
+        has_v6=true
+    fi
+    if [[ "$enable_ddns" == "true" ]]; then
+        ddns_setup_noninteractive "$domain" "$token" "$zone_id" "$has_v4" "$has_v6" "false" "$interval" || return 1
+        print_success "DDNS 已启用: $domain"
+    fi
+    log_action "Cloudflare Reality node DNS synced: $domain proxied=false"
+}
+
 # ── DNS 智能解析 ──
 
 _CF_RESULT_DOMAIN=""
@@ -423,4 +448,3 @@ web_cf_origin_rule_delete() {
     print_success "规则已删除"
     pause
 }
-

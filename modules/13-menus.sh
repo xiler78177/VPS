@@ -33,8 +33,9 @@ show_main_menu() {
         printf "  %-36s %-36s\n" "7. Web 服务 (SSL+Nginx)" "8. Docker 管理"
     fi
     printf "  %-36s %-36s\n" "9. WireGuard VPN" "10. 临时邮箱 (Cloudflare)"
+    printf "  %-36s\n" "11. Sing-box Reality 节点"
     echo -e " ${C_CYAN}[ 维护工具 ]${C_RESET}"
-    printf "  %-36s %-36s\n" "11. 查看操作日志" "12. 备份与恢复 (WebDAV)"
+    printf "  %-36s %-36s\n" "12. 查看操作日志" "13. 备份与恢复 (WebDAV)"
     printf "${C_DIM}%${W}s${C_RESET}\n" | tr ' ' '-'
     printf "  %-36s\n" "0. 退出脚本"
 }
@@ -81,6 +82,15 @@ menu_net_openwrt() {
 }
 
 main() {
+    if [[ "${1:-}" == "--reality" ]]; then
+        shift
+        check_root
+        check_os
+        init_environment
+        refresh_ssh_port
+        reality_cli "$@"
+        exit $?
+    fi
     # 支持 --backup 命令行参数（用于定时任务）
     if [[ "${1:-}" == "--backup" ]]; then
         check_root
@@ -99,7 +109,7 @@ main() {
     
     while true; do
         show_main_menu
-        read -e -r -p "请选择功能 [0-12]: " choice
+        read -e -r -p "请选择功能 [0-13]: " choice
         case $choice in
             1)
                 if [[ "$PLATFORM" == "openwrt" ]]; then
@@ -166,6 +176,13 @@ main() {
                 fi
                 ;;
             11)
+                if [[ "$PLATFORM" == "openwrt" ]]; then
+                    feature_blocked "Sing-box Reality 节点"
+                else
+                    reality_menu
+                fi
+                ;;
+            12)
                 print_title "操作日志 (最近 50 条)"
                 if [[ -f "$LOG_FILE" ]]; then
                     tail -n 50 "$LOG_FILE"
@@ -174,7 +191,7 @@ main() {
                 fi
                 pause
                 ;;
-            12)
+            13)
                 menu_backup
                 ;;
             0|q|Q)
