@@ -40,6 +40,7 @@ MODULES=(
     "12e-wireguard-deb-extra.sh"
     "12-backup.sh"
     "14-email.sh"
+    "15-singbox-reality.sh"
     "13-menus.sh"
 )
 

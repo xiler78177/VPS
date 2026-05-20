@@ -10,6 +10,12 @@
 bash <(curl -sSL https://raw.githubusercontent.com/xiler78177/VPS/main/dist/v4-built.sh)
 ```
 
+Reality 节点向导：
+
+```bash
+bash <(curl -sSL https://raw.githubusercontent.com/xiler78177/VPS/main/dist/v4-built.sh) --reality install
+```
+
 > 需要 root 权限。脚本会自动检测系统环境并安装必要依赖。
 
 ## 功能概览
@@ -63,6 +69,18 @@ bash <(curl -sSL https://raw.githubusercontent.com/xiler78177/VPS/main/dist/v4-b
 | Watchdog | 连接监控与自动恢复 |
 | 导入/导出 | 批量导入导出设备配置 |
 
+### Sing-box Reality 节点
+
+| 功能 | 说明 |
+|------|------|
+| VLESS + REALITY | 官方 sing-box stable，一键生成 Vision 节点 |
+| 随机高位端口 | 默认 20000-60000 自动避开占用，避免抢占 Nginx 443 |
+| 自定义节点名称 | 安装向导会要求输入节点名称/备注，用于状态展示、vless 链接备注和客户端 tag |
+| Cloudflare DNS/DDNS | 节点域名强制灰云，自动同步 A/AAAA 并启用 DDNS |
+| 防火墙放行 | 在已启用 UFW 的前提下，仅追加放行 Reality/Realm TCP 端口，不重置已有规则 |
+| Realm 中转 | 支持单跳 TCP 中转：客户端 → 中转机 → 落地机 |
+| 诊断/自检 | 检查服务、监听端口、UFW、DNS 公网解析、SNI TLS，并提供 tcpdump 外部连通性抓包指引 |
+
 ### Docker 管理
 
 | 功能 | 说明 |
@@ -101,6 +119,7 @@ VPS/
     ├── 10-docker.sh        # Docker 管理
     ├── 11-wireguard.sh     # WireGuard VPN
     ├── 12-backup.sh        # 备份与恢复
+    ├── 15-singbox-reality.sh # Sing-box Reality / Realm 中转
     └── 13-menus.sh         # 菜单与主入口
 ```
 

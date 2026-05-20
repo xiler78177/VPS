@@ -66,6 +66,15 @@ CACHED_ISP=""
 CACHED_LOCATION=""
 DDNS_CONFIG_DIR="/etc/ddns"
 DDNS_LOG="/var/log/ddns.log"
+DDNS_UPDATE_SCRIPT="${DDNS_UPDATE_SCRIPT:-/usr/local/bin/ddns-update.sh}"
 SAAS_CONFIG_DIR="/etc/saas-cdn"
 SAAS_PREFERRED_DOMAINS="saas.sin.fan cdn.anycast.eu.org cdn-all.xn--b6gac.eu.org www.freedidi.com"
-
+REALITY_CONFIG_DIR="/etc/server-manage/reality"
+REALITY_STATE_FILE="${REALITY_CONFIG_DIR}/state.conf"
+REALITY_LINK_FILE="${REALITY_CONFIG_DIR}/client-link.txt"
+REALITY_CLIENT_JSON="${REALITY_CONFIG_DIR}/client.json"
+REALITY_BACKUP_DIR="${REALITY_CONFIG_DIR}/backups"
+REALITY_SINGBOX_CONFIG="/etc/sing-box/config.json"
+REALITY_REALM_CONFIG="/etc/realm/config.toml"
+REALITY_PORT_MIN=20000
+REALITY_PORT_MAX=60000

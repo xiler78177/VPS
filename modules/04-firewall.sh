@@ -94,6 +94,33 @@ ufw_add() {
     pause
 }
 
+firewall_allow_tcp_port() {
+    local port="$1" comment="${2:-Managed-TCP}"
+    validate_port "$port" || { print_error "端口无效: $port"; return 1; }
+    if [[ "$PLATFORM" == "openwrt" ]]; then
+        print_warn "OpenWrt 防火墙请在 LuCI/fw4 中放行 ${port}/tcp"
+        return 0
+    fi
+    command_exists ufw || { print_error "UFW 未安装，请先在防火墙模块安装并启用 UFW"; return 1; }
+    if ! ufw status 2>/dev/null | grep -q "Status: active"; then
+        print_error "UFW 当前未启用。为避免影响已有服务，本脚本不会自动启用/重置 UFW。"
+        print_info "请先在防火墙模块启用 UFW，或手动确认策略后重试。"
+        return 1
+    fi
+    ufw allow "${port}/tcp" comment "$comment" >/dev/null 2>&1 || return 1
+    log_action "UFW allowed ${port}/tcp comment=${comment}"
+}
+
+firewall_apply_reality_port() {
+    local port="$1"
+    firewall_allow_tcp_port "$port" "SingBox-Reality"
+}
+
+firewall_apply_realm_port() {
+    local port="$1"
+    firewall_allow_tcp_port "$port" "Realm-Relay"
+}
+
 # ── GeoIP 国家级 IP 白/黑名单 ──
 readonly GEOIP_CONF_DIR="/etc/server-manage"
 readonly GEOIP_CONF="${GEOIP_CONF_DIR}/geoip.conf"
@@ -530,4 +557,3 @@ menu_ufw() {
         esac
     done
 }
-

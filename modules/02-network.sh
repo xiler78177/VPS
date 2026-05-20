@@ -44,13 +44,14 @@ ddns_rebuild_cron() {
             local iv=$(grep '^DDNS_INTERVAL=' "$conf" | cut -d'"' -f2)
             [[ -n "$iv" && "$iv" =~ ^[0-9]+$ && "$iv" -ge 1 && "$iv" -le 59 && "$iv" -lt "$min" ]] && min=$iv
         done
-        cron_add_job "ddns-update.sh" "*/$min * * * * /usr/local/bin/ddns-update.sh >/dev/null 2>&1"
+        cron_add_job "ddns-update.sh" "*/$min * * * * $DDNS_UPDATE_SCRIPT >/dev/null 2>&1"
     fi
 }
 
 ddns_create_script() {
     mkdir -p "$DDNS_CONFIG_DIR"
-        cat > /usr/local/bin/ddns-update.sh << 'EOF'
+    mkdir -p "$(dirname "$DDNS_UPDATE_SCRIPT")"
+        cat > "$DDNS_UPDATE_SCRIPT" << 'EOF'
 #!/bin/bash
 if command -v flock >/dev/null 2>&1; then
     exec 200>/var/lock/ddns-update.lock
@@ -132,7 +133,7 @@ for conf in "$DDNS_CONFIG_DIR"/*.conf; do
     [[ "$DDNS_IPV6" == "true" ]] && { ip=$(get_ip 6); [[ -n "$ip" ]] && update_cf "$DDNS_DOMAIN" AAAA "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED"; }
 done
 EOF
-    chmod +x /usr/local/bin/ddns-update.sh
+    chmod +x "$DDNS_UPDATE_SCRIPT"
 }
 
 ddns_setup() {
@@ -161,6 +162,29 @@ EOF
     ddns_create_script
     ddns_rebuild_cron
     print_success "DDNS 已启用 (每 ${interval} 分钟检测)"
+    log_action "DDNS enabled: $domain interval=${interval}m"
+    return 0
+}
+
+ddns_setup_noninteractive() {
+    local domain=$1 token=$2 zone_id=$3 ipv4=${4:-true} ipv6=${5:-false} proxied=${6:-false} interval=${7:-5}
+    [[ -z "$domain" || -z "$token" || -z "$zone_id" ]] && return 1
+    if [[ ! "$interval" =~ ^[0-9]+$ ]] || [[ "$interval" -lt 1 || "$interval" -gt 59 ]]; then
+        interval=5
+    fi
+    mkdir -p "$DDNS_CONFIG_DIR"
+    cat > "$DDNS_CONFIG_DIR/${domain}.conf" << EOF
+DDNS_DOMAIN="$domain"
+DDNS_TOKEN="$token"
+DDNS_ZONE_ID="$zone_id"
+DDNS_IPV4="$ipv4"
+DDNS_IPV6="$ipv6"
+DDNS_PROXIED="$proxied"
+DDNS_INTERVAL="$interval"
+EOF
+    chmod 600 "$DDNS_CONFIG_DIR/${domain}.conf"
+    ddns_create_script
+    ddns_rebuild_cron
     log_action "DDNS enabled: $domain interval=${interval}m"
     return 0
 }
@@ -205,7 +229,7 @@ ddns_delete() {
         rm -f "${files[$((idx-1))]}"
         if [[ -z "$(ls -A "$DDNS_CONFIG_DIR" 2>/dev/null)" ]]; then
             cron_remove_job "ddns-update.sh"
-            rm -f /usr/local/bin/ddns-update.sh
+            rm -f "$DDNS_UPDATE_SCRIPT"
         else
             ddns_rebuild_cron
         fi
@@ -214,9 +238,9 @@ ddns_delete() {
     pause
 }
 ddns_force_update() {
-    if [[ -x /usr/local/bin/ddns-update.sh ]]; then
+    if [[ -x "$DDNS_UPDATE_SCRIPT" ]]; then
         print_info "正在更新..."
-        /usr/local/bin/ddns-update.sh
+        "$DDNS_UPDATE_SCRIPT"
         print_success "更新完成"
         tail -n 10 "$DDNS_LOG" 2>/dev/null || echo "暂无日志"
     else
