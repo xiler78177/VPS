@@ -71,9 +71,9 @@ for mod in "${MODULES[@]}"; do
     fi
 
     # 跳过第一行（模块注释头 # modules/xx-xxx.sh - ...），并去除 Windows 换行符 \r
-    # 对于 15-singbox-reality.sh，删除 source 代码块和原始 reality_prompt_sni 函数（因为已经内联增强版本）
+    # 对于 15-singbox-reality.sh，仅删除 source 代码块；增强模块已内联，legacy SNI 函数保留为兜底且不会覆盖增强入口
     if [[ "$mod" == "15-singbox-reality.sh" ]]; then
-        tail -n +2 "$mod_path" | tr -d '\r' | sed '/^# Source SNI 测速增强模块/,/^fi$/d' | sed '/^reality_prompt_sni() {$/,/^}$/d' >> "$OUTPUT"
+        tail -n +2 "$mod_path" | tr -d '\r' | sed '/^# Source SNI 测速增强模块/,/^fi$/d' >> "$OUTPUT"
     else
         tail -n +2 "$mod_path" | tr -d '\r' >> "$OUTPUT"
     fi

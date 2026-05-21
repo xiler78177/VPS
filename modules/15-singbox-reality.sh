@@ -1,7 +1,8 @@
 # modules/15-singbox-reality.sh - Sing-box VLESS REALITY / Realm 中转
 
 # Source SNI 测速增强模块（纯交互式）
-REALITY_ENHANCEMENT_MODULE="$(dirname "$0")/enhancements/reality-sni-speedtest-interactive.sh"
+REALITY_MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REALITY_ENHANCEMENT_MODULE="${REALITY_MODULE_DIR}/enhancements/reality-sni-speedtest-interactive.sh"
 if [[ -f "$REALITY_ENHANCEMENT_MODULE" ]]; then
     source "$REALITY_ENHANCEMENT_MODULE"
     # reality_prompt_sni() 会被增强模块自动替换
@@ -338,7 +339,7 @@ reality_pick_sni_candidates() {
     fi
 }
 
-reality_prompt_sni() {
+reality_prompt_sni_legacy() {
     local choice sni i shown=()
     while true; do
         mapfile -t shown < <(reality_pick_sni_candidates 12)
@@ -373,6 +374,12 @@ reality_prompt_sni() {
         confirm "仍然使用该 SNI?" && { echo "$sni"; return 0; }
     done
 }
+
+if ! declare -F reality_prompt_sni >/dev/null; then
+    reality_prompt_sni() {
+        reality_prompt_sni_legacy "$@"
+    }
+fi
 
 reality_backup_file() {
     local file="$1"

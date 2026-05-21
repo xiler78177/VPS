@@ -11553,7 +11553,7 @@ REALITY_SNI_TEST_TIMEOUT=3
 reality_fetch_bulianglin_pool() {
     local html_content domains_json
 
-    print_info "正在从 bulianglin.com 拉取最新 SNI 候选池..."
+    print_info "正在从 bulianglin.com 拉取最新 SNI 候选池..." >&2
 
     html_content=$(curl -fsSL --max-time 15 "$BULIANGLIN_SNI_POOL_URL" 2>/dev/null)
     if [[ -z "$html_content" ]]; then
@@ -11576,7 +11576,7 @@ reality_fetch_bulianglin_pool() {
         return 1
     fi
 
-    print_success "成功拉取 $count 个 SNI 候选域名"
+    print_success "成功拉取 $count 个 SNI 候选域名" >&2
     return 0
 }
 
@@ -11588,7 +11588,7 @@ reality_fetch_v2ray_agent_pool() {
     local v2ray_agent_url="https://raw.githubusercontent.com/mack-a/v2ray-agent/master/install.sh"
     local temp_file="/tmp/v2ray-agent-install.sh"
 
-    print_info "正在从 v2ray-agent 拉取备用候选池..."
+    print_info "正在从 v2ray-agent 拉取备用候选池..." >&2
 
     if ! curl -fsSL --max-time 15 "$v2ray_agent_url" -o "$temp_file" 2>/dev/null; then
         return 1
@@ -11613,7 +11613,7 @@ reality_fetch_v2ray_agent_pool() {
         return 1
     fi
 
-    print_success "成功从 v2ray-agent 拉取 $count 个备用域名"
+    print_success "成功从 v2ray-agent 拉取 $count 个备用域名" >&2
     rm -f "$temp_file"
     return 0
 }
@@ -11631,7 +11631,7 @@ reality_update_sni_pool() {
         if [[ $age -lt $REALITY_SNI_CACHE_TTL ]]; then
             local count
             count=$(wc -l < "$REALITY_SNI_POOL_FILE")
-            print_info "使用缓存的候选池（$count 个域名，${age}s 前更新）"
+            print_info "使用缓存的候选池（$count 个域名，${age}s 前更新）" >&2
             return 0
         fi
     fi
@@ -11641,12 +11641,12 @@ reality_update_sni_pool() {
         return 0
     fi
 
-    print_warn "bulianglin.com 不可用，尝试 v2ray-agent 备用池..."
+    print_warn "bulianglin.com 不可用，尝试 v2ray-agent 备用池..." >&2
     if reality_fetch_v2ray_agent_pool; then
         return 0
     fi
 
-    print_warn "v2ray-agent 也不可用，使用内置列表"
+    print_warn "v2ray-agent 也不可用，使用内置列表" >&2
     printf '%s\n' "${REALITY_CANDIDATE_SNI[@]}" > /tmp/reality-fallback-pool.txt
     REALITY_SNI_POOL_FILE="/tmp/reality-fallback-pool.txt"
     return 0
@@ -11687,7 +11687,7 @@ reality_batch_speedtest() {
     local pool_file="${3:-$REALITY_SNI_POOL_FILE}"
 
     if [[ ! -f "$pool_file" ]]; then
-        print_error "候选池文件不存在"
+        print_error "候选池文件不存在" >&2
         return 1
     fi
 
@@ -11695,7 +11695,7 @@ reality_batch_speedtest() {
     mapfile -t batch_domains < <(shuf -n "$batch_size" "$pool_file")
 
     if [[ ${#batch_domains[@]} -eq 0 ]]; then
-        print_error "候选池为空"
+        print_error "候选池为空" >&2
         return 1
     fi
 
@@ -11792,7 +11792,7 @@ reality_smart_sni_selection() {
             return $?
             ;;
         *)
-            print_error "无效选择，使用自动模式"
+            print_error "无效选择，使用自动模式" >&2
             reality_smart_sni_selection_auto
             return $?
             ;;
@@ -11861,10 +11861,10 @@ reality_smart_sni_selection_auto() {
 
         if [[ -n "$batch_output" ]]; then
             mapfile -t all_results < <(echo "$batch_output")
-            print_success "在 ${tier_name} 下找到 ${#all_results[@]} 个合格域名"
+            print_success "在 ${tier_name} 下找到 ${#all_results[@]} 个合格域名" >&2
             break
         else
-            print_warn "${tier_name} 下无合格域名，自动降级..."
+            print_warn "${tier_name} 下无合格域名，自动降级..." >&2
             sleep 1
         fi
     done
@@ -12130,7 +12130,6 @@ reality_prompt_sni() {
 # [SUCCESS] 已选择: gsp-ssl.ls.apple.com (134ms)
 #
 # [继续 Reality 安装流程...]
-
 
 
 
@@ -12465,6 +12464,47 @@ reality_pick_sni_candidates() {
     fi
 }
 
+reality_prompt_sni_legacy() {
+    local choice sni i shown=()
+    while true; do
+        mapfile -t shown < <(reality_pick_sni_candidates 12)
+        echo -e "${C_CYAN}REALITY SNI/handshake 目标:${C_RESET}" >&2
+        echo "  这个域名不是你的节点连接域名，而是 REALITY 握手时模拟访问的 HTTPS 成品网站或自建网站。" >&2
+        echo "  下面随机提供一批较小众的成品网站候选；脚本会对所选域名进行校验 TLS/SAN 和 443 连通性测试。" >&2
+        echo "  请选择一个 SNI 候选编号，或输入 c 自定义 SNI；这里不是节点连接域名。" >&2
+        echo "  如果你使用自建网站，请确保它是正常 HTTPS 站点，且不要填写 Cloudflare 灰云节点域名本身。" >&2
+        i=1
+        for sni in "${shown[@]}"; do echo "  ${i}. ${sni}" >&2; ((i++)); done
+        echo "  r. 换一批候选域名" >&2
+        echo "  c. 自定义域名" >&2
+        read -e -r -p "请选择一个 SNI 候选编号，或输入 c 自定义 [c]: " choice
+        choice=${choice:-c}
+        if [[ "${choice,,}" == "r" ]]; then
+            continue
+        elif [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le ${#shown[@]} ]]; then
+            sni="${shown[$((choice-1))]}"
+        elif [[ "${choice,,}" == "c" ]]; then
+            read -e -r -p "SNI 域名: " sni
+        else
+            sni="$choice"
+        fi
+        validate_domain "$sni" || { print_error "域名格式无效" >&2; continue; }
+        print_info "校验 TLS/SAN: $sni" >&2
+        if reality_verify_sni "$sni"; then
+            print_success "SNI 校验通过: $sni" >&2
+            echo "$sni"; return 0
+        fi
+        print_warn "SNI 校验未通过或网络不可达: $sni" >&2
+        tail -n 3 /tmp/reality-sni-check.log >&2 2>/dev/null || true
+        confirm "仍然使用该 SNI?" && { echo "$sni"; return 0; }
+    done
+}
+
+if ! declare -F reality_prompt_sni >/dev/null; then
+    reality_prompt_sni() {
+        reality_prompt_sni_legacy "$@"
+    }
+fi
 
 reality_backup_file() {
     local file="$1"

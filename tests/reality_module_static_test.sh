@@ -18,6 +18,12 @@ source modules/00-constants.sh
 source modules/01-utils.sh
 source modules/15-singbox-reality.sh
 
+prompt_sni_body="$(declare -f reality_prompt_sni)"
+assert_contains 'reality_smart_sni_selection' "$prompt_sni_body" "sourcing Reality module should keep enhanced SNI prompt active"
+if grep -Fq 'REALITY SNI/handshake 目标' <<< "$prompt_sni_body"; then
+    fail "enhanced SNI prompt should not be overwritten by legacy prompt when sourcing modules"
+fi
+
 candidate_count="$(grep -A80 '^REALITY_CANDIDATE_SNI=(' modules/15-singbox-reality.sh | sed -n '/^)/q;p' | grep -c '\"')"
 [[ "$candidate_count" -ge 20 ]] || fail "SNI candidate pool should contain at least 20 domains"
 if grep -q 'source /etc/os-release' modules/15-singbox-reality.sh; then
@@ -137,7 +143,13 @@ assert_contains '请选择一个 SNI' "$prompts_text" "SNI prompt should explici
 assert_contains '校验 TLS/SAN' "$prompts_text" "SNI prompt should tell user domains are tested"
 assert_contains '换一批' "$(cat modules/15-singbox-reality.sh)" "SNI prompt should support refreshing candidate domains"
 assert_contains 'REALITY_CANDIDATE_SNI=(' "$(cat modules/15-singbox-reality.sh)" "SNI candidate pool should exist"
-echo "reality_module_static_test: PASS"
 
+if [[ -f dist/v4-built.sh ]]; then
+    dist_prompt_count="$(grep -c '^reality_prompt_sni()' dist/v4-built.sh || true)"
+    [[ "$dist_prompt_count" == "1" ]] || fail "dist should contain exactly one reality_prompt_sni definition, got $dist_prompt_count"
+    dist_prompt_body="$(awk '/^reality_prompt_sni\(\)/,/^}/' dist/v4-built.sh)"
+    assert_contains 'reality_smart_sni_selection' "$dist_prompt_body" "dist should use enhanced SNI prompt"
+fi
+echo "reality_module_static_test: PASS"
 
 
