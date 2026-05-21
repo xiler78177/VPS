@@ -1,5 +1,12 @@
 # modules/15-singbox-reality.sh - Sing-box VLESS REALITY / Realm 中转
 
+# Source SNI 测速增强模块（纯交互式）
+REALITY_ENHANCEMENT_MODULE="$(dirname "$0")/enhancements/reality-sni-speedtest-interactive.sh"
+if [[ -f "$REALITY_ENHANCEMENT_MODULE" ]]; then
+    source "$REALITY_ENHANCEMENT_MODULE"
+    # reality_prompt_sni() 会被增强模块自动替换
+fi
+
 REALITY_CANDIDATE_SNI=(
     "c.6sc.co"
     "j.6sc.co"
