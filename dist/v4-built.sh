@@ -11699,34 +11699,34 @@ reality_batch_speedtest() {
         return 1
     fi
 
-    print_info "开始测速（批次大小: ${#batch_domains[@]}，延迟阈值: ${threshold}ms）..."
-    echo ""
+    print_info "开始测速（批次大小: ${#batch_domains[@]}，延迟阈值: ${threshold}ms）..." >&2
+    echo "" >&2
 
     local -a results=()
     local domain latency status
     local qualified_count=0
 
     for domain in "${batch_domains[@]}"; do
-        echo -n "  测试 ${domain} ... "
+        echo -n "  测试 ${domain} ... " >&2
 
         latency=$(reality_test_sni_latency "$domain")
         status=$?
 
         if [[ $status -eq 0 && "$latency" != "timeout" ]]; then
             if [[ $latency -le $threshold ]]; then
-                echo -e "${C_GREEN}${latency}ms ✓${C_RESET}"
+                echo -e "${C_GREEN}${latency}ms ✓${C_RESET}" >&2
                 results+=("${latency}|${domain}")
                 ((qualified_count++))
             else
-                echo -e "${C_YELLOW}${latency}ms (超过阈值)${C_RESET}"
+                echo -e "${C_YELLOW}${latency}ms (超过阈值)${C_RESET}" >&2
             fi
         else
-            echo -e "${C_RED}超时 ✗${C_RESET}"
+            echo -e "${C_RED}超时 ✗${C_RESET}" >&2
         fi
     done
 
-    echo ""
-    print_info "测速完成: ${qualified_count}/${#batch_domains[@]} 个域名符合要求"
+    echo "" >&2
+    print_info "测速完成: ${qualified_count}/${#batch_domains[@]} 个域名符合要求" >&2
 
     if [[ ${#results[@]} -gt 0 ]]; then
         printf '%s\n' "${results[@]}" | sort -t'|' -k1 -n
@@ -11741,34 +11741,36 @@ reality_batch_speedtest() {
 # ============================================================================
 
 reality_smart_sni_selection() {
-    clear
-    print_title "REALITY SNI 智能选择"
-    echo ""
-    echo "${C_CYAN}说明：${C_RESET}"
-    echo "  脚本将从 bulianglin.com 拉取 117+ 个大厂域名候选池"
-    echo "  自动进行 TLS 握手测速，筛选低延迟域名"
-    echo ""
+    echo "" >&2
+    echo "========================================" >&2
+    echo "REALITY SNI 智能选择" >&2
+    echo "========================================" >&2
+    echo "" >&2
+    echo "${C_CYAN}说明：${C_RESET}" >&2
+    echo "  脚本将从 bulianglin.com 拉取 117+ 个大厂域名候选池" >&2
+    echo "  自动进行 TLS 握手测速，筛选低延迟域名" >&2
+    echo "" >&2
 
     # 更新候选池（自动三级降级）
     reality_update_sni_pool
 
-    echo ""
-    echo "${C_CYAN}选择测速模式：${C_RESET}"
-    echo ""
-    echo "  1. 严格模式（推荐，延迟 < 50ms）"
-    echo "     适合：VPS 与 CDN 在同一地区（如美西 VPS 访问美西 CloudFront）"
-    echo ""
-    echo "  2. 正常模式（推荐，延迟 < 200ms）"
-    echo "     适合：大部分场景（如亚洲 VPS 访问全球 CDN）"
-    echo ""
-    echo "  3. 宽松模式（兜底，延迟 < 500ms）"
-    echo "     适合：跨洲访问或网络较慢的场景"
-    echo ""
-    echo "  4. 自动模式（智能，三级阈值自动降级）"
-    echo "     先尝试严格模式，无合格域名则自动降级到正常/宽松模式"
-    echo ""
-    echo "  5. 跳过测速（从候选池随机选择，不测速）"
-    echo ""
+    echo "" >&2
+    echo "${C_CYAN}选择测速模式：${C_RESET}" >&2
+    echo "" >&2
+    echo "  1. 严格模式（延迟 < 50ms）" >&2
+    echo "     适合：VPS 与 CDN 在同一地区（如美西 VPS 访问美西 CloudFront）" >&2
+    echo "" >&2
+    echo "  2. 正常模式（延迟 < 200ms）" >&2
+    echo "     适合：大部分场景（如亚洲 VPS 访问全球 CDN）" >&2
+    echo "" >&2
+    echo "  3. 宽松模式（延迟 < 500ms）" >&2
+    echo "     适合：跨洲访问或网络较慢的场景" >&2
+    echo "" >&2
+    echo "  4. 自动模式（智能三级降级）★ 推荐" >&2
+    echo "     先尝试严格模式，无合格域名则自动降级到正常/宽松模式" >&2
+    echo "" >&2
+    echo "  5. 跳过测速（从候选池随机选择，不测速）" >&2
+    echo "" >&2
 
     local mode_choice
     read -e -r -p "请选择模式 [4]: " mode_choice
@@ -11797,21 +11799,21 @@ reality_smart_sni_selection() {
     esac
 
     # 单一阈值模式
-    echo ""
+    echo "" >&2
     confirm "开始测速?" || return 1
 
-    echo ""
+    echo "" >&2
     local batch_output
     batch_output=$(reality_batch_speedtest "$REALITY_SNI_BATCH_SIZE" "$threshold" "$REALITY_SNI_POOL_FILE")
 
     if [[ -z "$batch_output" ]]; then
-        print_error "未找到符合要求的域名"
-        echo ""
-        echo "建议："
-        echo "  1. 选择更宽松的模式"
-        echo "  2. 检查 VPS 网络连接"
-        echo "  3. 手动输入 SNI 域名"
-        echo ""
+        print_error "未找到符合要求的域名" >&2
+        echo "" >&2
+        echo "建议：" >&2
+        echo "  1. 选择更宽松的模式" >&2
+        echo "  2. 检查 VPS 网络连接" >&2
+        echo "  3. 手动输入 SNI 域名" >&2
+        echo "" >&2
 
         if confirm "是否手动输入 SNI?"; then
             read -e -r -p "请输入 SNI 域名: " manual_sni
@@ -11833,9 +11835,9 @@ reality_smart_sni_selection() {
 # ============================================================================
 
 reality_smart_sni_selection_auto() {
-    echo ""
-    print_info "自动模式：将依次尝试严格（50ms）→ 正常（200ms）→ 宽松（500ms）阈值"
-    echo ""
+    echo "" >&2
+    print_info "自动模式：将依次尝试严格（50ms）→ 正常（200ms）→ 宽松（500ms）阈值" >&2
+    echo "" >&2
     confirm "开始测速?" || return 1
 
     local -a thresholds=(
@@ -11850,9 +11852,9 @@ reality_smart_sni_selection_auto() {
         local threshold="${tier%%:*}"
         local tier_name="${tier##*:}"
 
-        echo ""
-        print_info "========== 尝试 ${tier_name} =========="
-        echo ""
+        echo "" >&2
+        print_info "========== 尝试 ${tier_name} ==========" >&2
+        echo "" >&2
 
         local batch_output
         batch_output=$(reality_batch_speedtest "$REALITY_SNI_BATCH_SIZE" "$threshold" "$REALITY_SNI_POOL_FILE")
@@ -11868,12 +11870,12 @@ reality_smart_sni_selection_auto() {
     done
 
     if [[ ${#all_results[@]} -eq 0 ]]; then
-        print_error "所有阈值级别均未找到合格域名"
-        echo ""
-        echo "建议："
-        echo "  1. 检查 VPS 网络连接"
-        echo "  2. 手动输入 SNI 域名"
-        echo ""
+        print_error "所有阈值级别均未找到合格域名" >&2
+        echo "" >&2
+        echo "建议：" >&2
+        echo "  1. 检查 VPS 网络连接" >&2
+        echo "  2. 手动输入 SNI 域名" >&2
+        echo "" >&2
 
         if confirm "是否手动输入 SNI?"; then
             read -e -r -p "请输入 SNI 域名: " manual_sni
@@ -11895,29 +11897,31 @@ reality_smart_sni_selection_auto() {
 # ============================================================================
 
 reality_select_from_pool_no_test() {
-    echo ""
-    print_info "从候选池中随机选择（不测速）"
-    echo ""
+    echo "" >&2
+    print_info "从候选池中随机选择（不测速）" >&2
+    echo "" >&2
 
     local -a shown
     mapfile -t shown < <(shuf -n 12 "$REALITY_SNI_POOL_FILE")
 
     while true; do
-        clear
-        print_title "REALITY SNI 候选域名"
-        echo ""
+        echo "" >&2
+        echo "========================================" >&2
+        echo "REALITY SNI 候选域名" >&2
+        echo "========================================" >&2
+        echo "" >&2
 
         local i=1
         for domain in "${shown[@]}"; do
-            printf "  %2d. %s\n" "$i" "$domain"
+            printf "  %2d. %s\n" "$i" "$domain" >&2
             ((i++))
         done
 
-        echo ""
-        echo "  ${C_CYAN}r${C_RESET}. 换一批"
-        echo "  ${C_CYAN}c${C_RESET}. 手动输入域名"
-        echo "  ${C_CYAN}s${C_RESET}. 切换到测速模式"
-        echo ""
+        echo "" >&2
+        echo "  ${C_CYAN}r${C_RESET}. 换一批" >&2
+        echo "  ${C_CYAN}c${C_RESET}. 手动输入域名" >&2
+        echo "  ${C_CYAN}s${C_RESET}. 切换到测速模式" >&2
+        echo "" >&2
 
         local choice
         read -e -r -p "请选择 [1]: " choice
@@ -11939,7 +11943,7 @@ reality_select_from_pool_no_test() {
             echo "${shown[$((choice-1))]}"
             return 0
         else
-            print_error "无效选择"
+            print_error "无效选择" >&2
             sleep 1
         fi
     done
@@ -11959,9 +11963,9 @@ reality_display_and_select_sni() {
     local -a results
     mapfile -t results < <(echo "$results_text")
 
-    echo ""
-    print_success "找到 ${#results[@]} 个合格域名："
-    echo ""
+    echo "" >&2
+    print_success "找到 ${#results[@]} 个合格域名：" >&2
+    echo "" >&2
 
     local i=1
     local -a display_list=()
@@ -11970,15 +11974,15 @@ reality_display_and_select_sni() {
         local latency="${result%%|*}"
         local domain="${result##*|}"
         display_list+=("$domain")
-        printf "  %2d. %-50s [%4dms]\n" "$i" "$domain" "$latency"
+        printf "  %2d. %-50s [%4dms]\n" "$i" "$domain" "$latency" >&2
         ((i++))
     done
 
-    echo ""
-    echo "  ${C_CYAN}a${C_RESET}. 自动选择延迟最低的（推荐）"
-    echo "  ${C_CYAN}r${C_RESET}. 重新测速"
-    echo "  ${C_CYAN}c${C_RESET}. 手动输入域名"
-    echo ""
+    echo "" >&2
+    echo "  ${C_CYAN}a${C_RESET}. 自动选择延迟最低的（推荐）" >&2
+    echo "  ${C_CYAN}r${C_RESET}. 重新测速" >&2
+    echo "  ${C_CYAN}c${C_RESET}. 手动输入域名" >&2
+    echo "" >&2
 
     while true; do
         local choice
@@ -11988,7 +11992,7 @@ reality_display_and_select_sni() {
         if [[ "${choice,,}" == "a" ]]; then
             local best_domain="${results[0]##*|}"
             local best_latency="${results[0]%%|*}"
-            print_success "已选择: $best_domain (${best_latency}ms)"
+            print_success "已选择: $best_domain (${best_latency}ms)" >&2
             echo "$best_domain"
             return 0
 
@@ -12005,11 +12009,11 @@ reality_display_and_select_sni() {
 
         elif [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le ${#display_list[@]} ]]; then
             local selected_domain="${display_list[$((choice-1))]}"
-            print_success "已选择: $selected_domain"
+            print_success "已选择: $selected_domain" >&2
             echo "$selected_domain"
             return 0
         else
-            print_error "无效选择"
+            print_error "无效选择" >&2
         fi
     done
 }
