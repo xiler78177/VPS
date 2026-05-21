@@ -57,8 +57,26 @@ for mod in "${MODULES[@]}"; do
         echo "错误: 模块文件不存在 - $mod_path" >&2
         exit 1
     fi
+
+    # 特殊处理：在拼接 15-singbox-reality.sh 之前，先内联增强模块
+    if [[ "$mod" == "15-singbox-reality.sh" ]]; then
+        enhancement_path="$MODULES_DIR/enhancements/reality-sni-speedtest-interactive.sh"
+        if [[ -f "$enhancement_path" ]]; then
+            echo "# ============================================================================" >> "$OUTPUT"
+            echo "# Reality SNI 自动测速增强模块（内联）" >> "$OUTPUT"
+            echo "# ============================================================================" >> "$OUTPUT"
+            tail -n +2 "$enhancement_path" | tr -d '\r' >> "$OUTPUT"
+            echo "" >> "$OUTPUT"
+        fi
+    fi
+
     # 跳过第一行（模块注释头 # modules/xx-xxx.sh - ...），并去除 Windows 换行符 \r
-    tail -n +2 "$mod_path" | tr -d '\r' >> "$OUTPUT"
+    # 对于 15-singbox-reality.sh，跳过 source 增强模块的代码块（因为已经内联）
+    if [[ "$mod" == "15-singbox-reality.sh" ]]; then
+        tail -n +2 "$mod_path" | tr -d '\r' | sed '/^# Source SNI 测速增强模块/,/^fi$/d' >> "$OUTPUT"
+    else
+        tail -n +2 "$mod_path" | tr -d '\r' >> "$OUTPUT"
+    fi
 done
 
 # 末尾追加入口调用
