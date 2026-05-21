@@ -12730,19 +12730,40 @@ reality_realm_arch() {
     esac
 }
 
+reality_select_realm_asset_url() {
+    local api="$1" arch="$2" url=""
+    url=$(grep -Eo "https://[^\" ]+/realm-${arch}\.tar\.gz" <<< "$api" | head -n 1)
+    if [[ -z "$url" ]]; then
+        url=$(grep -Eo "https://[^\" ]+/realm-slim-${arch}\.tar\.gz" <<< "$api" | head -n 1)
+    fi
+    [[ -n "$url" ]] || return 1
+    printf '%s\n' "$url"
+}
+
+reality_find_realm_binary() {
+    local dir="$1" bin=""
+    bin=$(find "$dir" -type f -name realm -print -quit 2>/dev/null)
+    if [[ -z "$bin" ]]; then
+        bin=$(find "$dir" -type f \( -name 'realm-*' -o -name 'realm' \) ! -name '*.sha*' ! -name '*.txt' -print 2>/dev/null | sort | head -n 1)
+    fi
+    [[ -n "$bin" ]] || return 1
+    printf '%s\n' "$bin"
+}
+
 reality_install_realm_binary() {
     command_exists curl || install_package "curl" "silent" || return 1
     command_exists tar || install_package "tar" "silent" || true
     if command_exists realm; then return 0; fi
-    local arch api url tmp
+    local arch api url tmp bin
     arch=$(reality_realm_arch) || { print_error "Realm 不支持当前架构"; return 1; }
     api=$(curl -fsSL https://api.github.com/repos/zhboner/realm/releases/latest) || return 1
-    url=$(grep -Eo 'https://[^" ]+' <<< "$api" | grep "$arch" | grep -E 'tar\.gz|tgz|gz' | head -n 1)
+    url=$(reality_select_realm_asset_url "$api" "$arch") || true
     [[ -n "$url" ]] || { print_error "未找到 Realm ${arch} 发布包"; return 1; }
     tmp=$(mktemp -d)
     curl -fsSL "$url" -o "$tmp/realm.tgz" || return 1
     tar -xzf "$tmp/realm.tgz" -C "$tmp" || return 1
-    install -m 0755 "$(find "$tmp" -type f -name realm | head -n 1)" /usr/local/bin/realm || return 1
+    bin=$(reality_find_realm_binary "$tmp") || { print_error "Realm 发布包中未找到可安装二进制"; rm -rf "$tmp"; return 1; }
+    install -m 0755 "$bin" /usr/local/bin/realm || { rm -rf "$tmp"; return 1; }
     rm -rf "$tmp"
 }
 

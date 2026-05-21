@@ -74,6 +74,18 @@ assert_contains 'listen = "0.0.0.0:25000"' "$realm_cfg" "Realm config should lis
 assert_contains 'remote = "landing.example.com:23456"' "$realm_cfg" "Realm config should forward to landing host and port"
 assert_contains 'log.level = "warn"' "$realm_cfg" "Realm config should use warn logs"
 
+realm_api_json='{"assets":[{"browser_download_url":"https://github.com/zhboner/realm/releases/download/v2.9.4/realm-slim-x86_64-unknown-linux-gnu.tar.gz"},{"browser_download_url":"https://github.com/zhboner/realm/releases/download/v2.9.4/realm-x86_64-unknown-linux-gnu.tar.gz"}]}'
+realm_url="$(reality_select_realm_asset_url "$realm_api_json" 'x86_64-unknown-linux-gnu')"
+[[ "$realm_url" == 'https://github.com/zhboner/realm/releases/download/v2.9.4/realm-x86_64-unknown-linux-gnu.tar.gz' ]] || fail "Realm asset selector should prefer non-slim exact asset, got: $realm_url"
+realm_api_slim_only='{"assets":[{"browser_download_url":"https://github.com/zhboner/realm/releases/download/v2.9.4/realm-slim-x86_64-unknown-linux-gnu.tar.gz"}]}'
+realm_slim_url="$(reality_select_realm_asset_url "$realm_api_slim_only" 'x86_64-unknown-linux-gnu')"
+[[ "$realm_slim_url" == 'https://github.com/zhboner/realm/releases/download/v2.9.4/realm-slim-x86_64-unknown-linux-gnu.tar.gz' ]] || fail "Realm asset selector should fall back to slim asset"
+realm_tmp="$(mktemp -d)"
+trap 'rm -rf "$realm_tmp"' EXIT
+touch "$realm_tmp/realm-slim"
+realm_bin="$(reality_find_realm_binary "$realm_tmp")"
+[[ "$realm_bin" == "$realm_tmp/realm-slim" ]] || fail "Realm binary finder should accept realm-slim extracted binary, got: $realm_bin"
+
 firewall_helper_body="$(awk '/^firewall_allow_tcp_port\(\)/,/^}/' modules/04-firewall.sh)"
 assert_contains 'ufw allow "${port}/tcp"' "$firewall_helper_body" "Reality firewall helper should add only the requested TCP port"
 if grep -Eq 'ufw default|ufw .*enable|CURRENT_SSH_PORT|refresh_ssh_port' <<< "$firewall_helper_body"; then
@@ -151,5 +163,4 @@ if [[ -f dist/v4-built.sh ]]; then
     assert_contains 'reality_smart_sni_selection' "$dist_prompt_body" "dist should use enhanced SNI prompt"
 fi
 echo "reality_module_static_test: PASS"
-
 
