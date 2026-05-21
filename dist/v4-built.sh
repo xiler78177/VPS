@@ -12461,41 +12461,6 @@ reality_pick_sni_candidates() {
     fi
 }
 
-reality_prompt_sni() {
-    local choice sni i shown=()
-    while true; do
-        mapfile -t shown < <(reality_pick_sni_candidates 12)
-        echo -e "${C_CYAN}REALITY SNI/handshake 目标:${C_RESET}" >&2
-        echo "  这个域名不是你的节点连接域名，而是 REALITY 握手时模拟访问的 HTTPS 成品网站或自建网站。" >&2
-        echo "  下面随机提供一批较小众的成品网站候选；脚本会对所选域名进行校验 TLS/SAN 和 443 连通性测试。" >&2
-        echo "  请选择一个 SNI 候选编号，或输入 c 自定义 SNI；这里不是节点连接域名。" >&2
-        echo "  如果你使用自建网站，请确保它是正常 HTTPS 站点，且不要填写 Cloudflare 灰云节点域名本身。" >&2
-        i=1
-        for sni in "${shown[@]}"; do echo "  ${i}. ${sni}" >&2; ((i++)); done
-        echo "  r. 换一批候选域名" >&2
-        echo "  c. 自定义域名" >&2
-        read -e -r -p "请选择一个 SNI 候选编号，或输入 c 自定义 [c]: " choice
-        choice=${choice:-c}
-        if [[ "${choice,,}" == "r" ]]; then
-            continue
-        elif [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le ${#shown[@]} ]]; then
-            sni="${shown[$((choice-1))]}"
-        elif [[ "${choice,,}" == "c" ]]; then
-            read -e -r -p "SNI 域名: " sni
-        else
-            sni="$choice"
-        fi
-        validate_domain "$sni" || { print_error "域名格式无效" >&2; continue; }
-        print_info "校验 TLS/SAN: $sni" >&2
-        if reality_verify_sni "$sni"; then
-            print_success "SNI 校验通过: $sni" >&2
-            echo "$sni"; return 0
-        fi
-        print_warn "SNI 校验未通过或网络不可达: $sni" >&2
-        tail -n 3 /tmp/reality-sni-check.log >&2 2>/dev/null || true
-        confirm "仍然使用该 SNI?" && { echo "$sni"; return 0; }
-    done
-}
 
 reality_backup_file() {
     local file="$1"
