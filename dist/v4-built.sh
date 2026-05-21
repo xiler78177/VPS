@@ -11746,7 +11746,7 @@ reality_smart_sni_selection() {
     echo "REALITY SNI 智能选择" >&2
     echo "========================================" >&2
     echo "" >&2
-    echo "${C_CYAN}说明：${C_RESET}" >&2
+    echo -e "${C_CYAN}说明：${C_RESET}" >&2
     echo "  脚本将从 bulianglin.com 拉取 117+ 个大厂域名候选池" >&2
     echo "  自动进行 TLS 握手测速，筛选低延迟域名" >&2
     echo "" >&2
@@ -11755,7 +11755,7 @@ reality_smart_sni_selection() {
     reality_update_sni_pool
 
     echo "" >&2
-    echo "${C_CYAN}选择测速模式：${C_RESET}" >&2
+    echo -e "${C_CYAN}选择测速模式：${C_RESET}" >&2
     echo "" >&2
     echo "  1. 严格模式（延迟 < 50ms）" >&2
     echo "     适合：VPS 与 CDN 在同一地区（如美西 VPS 访问美西 CloudFront）" >&2
@@ -11918,9 +11918,9 @@ reality_select_from_pool_no_test() {
         done
 
         echo "" >&2
-        echo "  ${C_CYAN}r${C_RESET}. 换一批" >&2
-        echo "  ${C_CYAN}c${C_RESET}. 手动输入域名" >&2
-        echo "  ${C_CYAN}s${C_RESET}. 切换到测速模式" >&2
+        echo -e "  ${C_CYAN}r${C_RESET}. 换一批" >&2
+        echo -e "  ${C_CYAN}c${C_RESET}. 手动输入域名" >&2
+        echo -e "  ${C_CYAN}s${C_RESET}. 切换到测速模式" >&2
         echo "" >&2
 
         local choice
@@ -11979,9 +11979,9 @@ reality_display_and_select_sni() {
     done
 
     echo "" >&2
-    echo "  ${C_CYAN}a${C_RESET}. 自动选择延迟最低的（推荐）" >&2
-    echo "  ${C_CYAN}r${C_RESET}. 重新测速" >&2
-    echo "  ${C_CYAN}c${C_RESET}. 手动输入域名" >&2
+    echo -e "  ${C_CYAN}a${C_RESET}. 自动选择延迟最低的（推荐）" >&2
+    echo -e "  ${C_CYAN}r${C_RESET}. 重新测速" >&2
+    echo -e "  ${C_CYAN}c${C_RESET}. 手动输入域名" >&2
     echo "" >&2
 
     while true; do

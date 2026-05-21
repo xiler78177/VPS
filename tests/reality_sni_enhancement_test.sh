@@ -6,7 +6,11 @@ cd "$ROOT_DIR"
 
 fail() { echo "TEST FAILED: $1" >&2; exit 1; }
 
-C_RED="" C_GREEN="" C_YELLOW="" C_CYAN="" C_RESET=""
+C_RESET='\033[0m'
+C_RED='\033[0;31m'
+C_GREEN='\033[0;32m'
+C_YELLOW='\033[1;33m'
+C_CYAN='\033[0;36m'
 print_info() { echo "[i] $1"; }
 print_success() { echo "[ok] $1"; }
 print_warn() { echo "[!] $1"; }
@@ -37,6 +41,12 @@ fi
 
 if grep -Eq '\[i\]|\[ok\]|\[!\]|\[x\]|REALITY|候选|测速|模式|bulianglin|v2ray-agent' "$stdout_file"; then
     fail "enhanced SNI prompt leaked UI text to stdout"
+fi
+
+if grep -Fq '\033' "$stderr_file"; then
+    echo "stderr was:" >&2
+    sed -n '1,80p' "$stderr_file" >&2
+    fail "enhanced SNI prompt should render ANSI colors, not print literal \\033 text"
 fi
 
 echo "reality_sni_enhancement_test: PASS"
