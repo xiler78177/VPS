@@ -587,7 +587,20 @@ reality_install_landing() {
     reality_render_singbox_config "$REALITY_UUID" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID" > "$REALITY_SINGBOX_CONFIG"
     chmod 600 "$REALITY_SINGBOX_CONFIG"
     sing-box check -c "$REALITY_SINGBOX_CONFIG" || return 1
-    firewall_apply_reality_port "$REALITY_PORT" || return 1
+    firewall_apply_reality_port "$REALITY_PORT"
+    local _fw_rc=$?
+    if [[ $_fw_rc -eq 1 ]]; then
+        return 1
+    elif [[ $_fw_rc -eq 2 ]]; then
+        if [[ -t 0 ]] && confirm "UFW 未启用，是否现在跳转防火墙菜单启用并放行 Reality 端口?"; then
+            ufw_setup
+            # 启用后重试一次；仍失败则只警告，不中断安装
+            firewall_apply_reality_port "$REALITY_PORT" || \
+                print_warn "UFW 仍未生效，请确认云安全组已放行 ${REALITY_PORT}/tcp"
+        else
+            print_warn "已跳过本地防火墙配置，请确认云安全组已放行 ${REALITY_PORT}/tcp"
+        fi
+    fi
     systemctl enable sing-box >/dev/null || return 1
     systemctl restart sing-box || return 1
     [[ -n "$cf_token" ]] && reality_sync_cloudflare_dns "$REALITY_NODE_DOMAIN" "$cf_token"
@@ -671,7 +684,19 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
-    firewall_apply_realm_port "$listen_port" || return 1
+    firewall_apply_realm_port "$listen_port"
+    local _fw_rc=$?
+    if [[ $_fw_rc -eq 1 ]]; then
+        return 1
+    elif [[ $_fw_rc -eq 2 ]]; then
+        if [[ -t 0 ]] && confirm "UFW 未启用，是否现在跳转防火墙菜单启用并放行 Realm 中转端口?"; then
+            ufw_setup
+            firewall_apply_realm_port "$listen_port" || \
+                print_warn "UFW 仍未生效，请确认云安全组已放行 ${listen_port}/tcp"
+        else
+            print_warn "已跳过本地防火墙配置，请确认云安全组已放行 ${listen_port}/tcp"
+        fi
+    fi
     systemctl daemon-reload
     systemctl enable realm >/dev/null || return 1
     systemctl restart realm || return 1

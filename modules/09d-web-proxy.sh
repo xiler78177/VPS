@@ -374,7 +374,7 @@ server {
     echo -e "\n${C_CYAN}[模板]${C_RESET}"
     echo "  $( [[ "$template_name" == "emby" ]] && echo "Emby/Jellyfin 流媒体优化" || echo "通用")"
     echo -e "\n${C_CYAN}[配置文件]${C_RESET}"
-    echo "  $NGINX_CONF_PATH"
+    echo "  /etc/nginx/sites-available/${DOMAIN}.conf"
     draw_line
     log_action "Reverse proxy configured: $DOMAIN -> $BACKEND_URL (template=$template_name)"
     pause

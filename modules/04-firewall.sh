@@ -94,6 +94,14 @@ ufw_add() {
     pause
 }
 
+# firewall_allow_tcp_port <port> [comment]
+# 返回值:
+#   0 = 已成功放行
+#   1 = 真实错误（参数无效 / ufw 命令失败）
+#   2 = UFW 不可用（未安装 / 未启用）—— 业务流程应仅警告，不要中断；启用 UFW 由用户主动进防火墙菜单完成
+#
+# 设计原则：业务模块（Reality/Realm/Email 等）不在自动流程里启用或重置 UFW，
+# 以免与云安全组、用户已有规则、SSH 端口产生冲突。需要启用 UFW 的请走【防火墙模块】。
 firewall_allow_tcp_port() {
     local port="$1" comment="${2:-Managed-TCP}"
     validate_port "$port" || { print_error "端口无效: $port"; return 1; }
@@ -101,14 +109,30 @@ firewall_allow_tcp_port() {
         print_warn "OpenWrt 防火墙请在 LuCI/fw4 中放行 ${port}/tcp"
         return 0
     fi
-    command_exists ufw || { print_error "UFW 未安装，请先在防火墙模块安装并启用 UFW"; return 1; }
-    if ! ufw status 2>/dev/null | grep -q "Status: active"; then
-        print_error "UFW 当前未启用。为避免影响已有服务，本脚本不会自动启用/重置 UFW。"
-        print_info "请先在防火墙模块启用 UFW，或手动确认策略后重试。"
-        return 1
+
+    if ! command_exists ufw; then
+        print_warn "未检测到 UFW — 本脚本不会自动安装。"
+        print_info "如需本地防火墙，请进入【防火墙管理】菜单完成 UFW 安装与启用；"
+        print_info "或在云厂商安全组放行 ${port}/tcp。"
+        log_action "UFW absent during firewall_allow_tcp_port port=${port}" "INFO"
+        return 2
     fi
-    ufw allow "${port}/tcp" comment "$comment" >/dev/null 2>&1 || return 1
-    log_action "UFW allowed ${port}/tcp comment=${comment}"
+
+    if ! ufw status 2>/dev/null | grep -q "Status: active"; then
+        print_warn "UFW 已安装但未启用 — 本脚本不会在业务流程里自动启用 UFW。"
+        print_info "如需本地防火墙保护，请进入【防火墙管理】→ 安装并启用 UFW；"
+        print_info "或在云厂商安全组放行 ${port}/tcp。"
+        log_action "UFW inactive during firewall_allow_tcp_port port=${port}" "INFO"
+        return 2
+    fi
+
+    # UFW 已启用 — 仅追加规则
+    if ufw allow "${port}/tcp" comment "$comment" >/dev/null 2>&1; then
+        log_action "UFW allowed ${port}/tcp comment=${comment}"
+        return 0
+    fi
+    print_error "UFW 添加规则失败: ${port}/tcp"
+    return 1
 }
 
 firewall_apply_reality_port() {
@@ -217,13 +241,34 @@ CONF="/etc/server-manage/geoip.conf"
 DATA="/etc/server-manage/geoip-data"
 CHAIN="GEOIP_FILTER"
 [ -f "$CONF" ] || exit 0
+
+# 安全解析：拒绝 source，避免被替换为恶意 conf 触发 root 命令执行
+fown=$(stat -c '%U' "$CONF" 2>/dev/null || echo "")
+fmode=$(stat -c '%a' "$CONF" 2>/dev/null || echo "")
+[ "$fown" = "root" ] || exit 0
+if [[ "$fmode" =~ ^[0-7]+$ ]] && (( 8#${fmode} & 022 )); then exit 0; fi
 GEOIP_MODE="" GEOIP_COUNTRIES=""
-source "$CONF"
+while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    [[ -z "${line// }" || "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ ^(GEOIP_MODE|GEOIP_COUNTRIES|GEOIP_LAST_UPDATE)=\"([A-Za-z0-9\ _.-]*)\"$ ]]; then
+        case "${BASH_REMATCH[1]}" in
+            GEOIP_MODE)        GEOIP_MODE="${BASH_REMATCH[2]}" ;;
+            GEOIP_COUNTRIES)   GEOIP_COUNTRIES="${BASH_REMATCH[2]}" ;;
+            GEOIP_LAST_UPDATE) : ;;
+        esac
+    else
+        exit 0
+    fi
+done < "$CONF"
+
 [ -z "$GEOIP_MODE" ] && exit 0
+[[ "$GEOIP_MODE" =~ ^(whitelist|blacklist)$ ]] || exit 0
 set_name="geoip_${GEOIP_MODE}"
 tmp_set="${set_name}_tmp"
 ipset create "$tmp_set" hash:net maxelem 131072 2>/dev/null || ipset flush "$tmp_set"
 for cc in $GEOIP_COUNTRIES; do
+    [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || continue
     f="${DATA}/${cc,,}.zone"
     [ -f "$f" ] || continue
     sed -e '/^#/d' -e '/^$/d' -e '/^[^0-9]/d' -e "s/^/add ${tmp_set} /" "$f" | ipset restore -exist 2>/dev/null
@@ -246,7 +291,7 @@ else
 fi
 iptables -C INPUT -j "$CHAIN" 2>/dev/null || iptables -I INPUT 1 -j "$CHAIN"
 APPLY_EOF
-    chmod +x /usr/local/bin/geoip-apply.sh
+    chmod 700 /usr/local/bin/geoip-apply.sh
     # Update script (cron weekly)
     cat > /usr/local/bin/geoip-update.sh << 'UPDATE_EOF'
 #!/bin/bash
@@ -254,10 +299,24 @@ CONF="/etc/server-manage/geoip.conf"
 DATA="/etc/server-manage/geoip-data"
 URL="https://www.ipdeny.com/ipblocks/data/aggregated"
 [ -f "$CONF" ] || exit 0
-GEOIP_MODE="" GEOIP_COUNTRIES=""
-source "$CONF"
+
+# 安全解析（同 apply 脚本）
+fown=$(stat -c '%U' "$CONF" 2>/dev/null || echo "")
+fmode=$(stat -c '%a' "$CONF" 2>/dev/null || echo "")
+[ "$fown" = "root" ] || exit 0
+if [[ "$fmode" =~ ^[0-7]+$ ]] && (( 8#${fmode} & 022 )); then exit 0; fi
+GEOIP_COUNTRIES=""
+while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    [[ -z "${line// }" || "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ ^GEOIP_COUNTRIES=\"([A-Za-z0-9\ _.-]*)\"$ ]]; then
+        GEOIP_COUNTRIES="${BASH_REMATCH[1]}"
+    fi
+done < "$CONF"
 [ -z "$GEOIP_COUNTRIES" ] && exit 0
+
 for cc in $GEOIP_COUNTRIES; do
+    [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || continue
     cc="${cc,,}"
     curl -sSL --connect-timeout 10 --max-time 30 \
         -o "${DATA}/${cc}.zone" "${URL}/${cc}-aggregated.zone" 2>/dev/null
@@ -265,7 +324,7 @@ done
 /usr/local/bin/geoip-apply.sh
 sed -i "s/^GEOIP_LAST_UPDATE=.*/GEOIP_LAST_UPDATE=\"$(date +%Y-%m-%d)\"/" "$CONF"
 UPDATE_EOF
-    chmod +x /usr/local/bin/geoip-update.sh
+    chmod 700 /usr/local/bin/geoip-update.sh
     # Systemd boot service
     if is_systemd; then
         cat > /etc/systemd/system/geoip-firewall.service << 'SVC_EOF'

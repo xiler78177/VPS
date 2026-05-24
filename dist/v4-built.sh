@@ -1,6 +1,6 @@
 #!/bin/bash
 
-readonly VERSION="v14.0"
+readonly VERSION="v14.1"
 readonly SCRIPT_NAME="server-manage"
 readonly LOG_FILE="/var/log/${SCRIPT_NAME}.log"
 readonly CONFIG_FILE="/etc/${SCRIPT_NAME}.conf"
@@ -10,8 +10,6 @@ readonly CACHE_TTL=300
 readonly CERT_HOOKS_DIR="/root/cert-hooks"
 readonly WG_DEFAULT_PORT=50000
 readonly WG_MTU_DIRECT=1420
-readonly BACKUP_LOCAL_DIR="/root/${SCRIPT_NAME}-backups"
-readonly BACKUP_CONFIG_FILE="/etc/${SCRIPT_NAME}-backup.conf"
 PLATFORM="debian"
 
 detect_platform() {
@@ -56,7 +54,7 @@ FAIL2BAN_JAIL_LOCAL="/etc/fail2ban/jail.local"
 DOCKER_PROXY_DIR="/etc/systemd/system/docker.service.d"
 DOCKER_PROXY_CONF="${DOCKER_PROXY_DIR}/http-proxy.conf"
 
-[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+# 注意：$CONFIG_FILE 的安全加载在 01-utils.sh 末尾完成（需依赖 validate_conf_file）
 
 CURRENT_SSH_PORT=""
 APT_UPDATED=0
@@ -220,11 +218,54 @@ is_systemd() {
     return 0
 }
 
-refresh_ssh_port() {
-    if [[ -f "$SSHD_CONFIG" ]]; then
-        CURRENT_SSH_PORT=$(grep -iE "^\s*Port\s+" "$SSHD_CONFIG" 2>/dev/null | tail -n 1 | awk '{print $2}')
+# 统一设置 sshd_config 的某个 directive：命中则替换，未命中则追加
+# 用法: _sshd_set_directive <Key> <Value> [file]
+_sshd_set_directive() {
+    local key="$1" value="$2" file="${3:-$SSHD_CONFIG}"
+    [[ -f "$file" ]] || return 1
+    # 检查 drop-in 是否已配置同名 directive（OpenSSH 默认 drop-in 优先生效）
+    if [[ -d /etc/ssh/sshd_config.d ]]; then
+        local overrides
+        overrides=$(grep -lE "^[[:space:]]*${key}[[:space:]]+" /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true)
+        if [[ -n "$overrides" ]]; then
+            print_warn "${key} 已在 drop-in 中配置（OpenSSH 优先生效）："
+            echo "$overrides" | sed 's/^/  - /'
+            confirm "继续修改 ${file}（drop-in 可能覆盖此设置）?" || return 1
+        fi
     fi
-    [[ "$CURRENT_SSH_PORT" =~ ^[0-9]+$ ]] || CURRENT_SSH_PORT=$DEFAULT_SSH_PORT
+    if grep -qE "^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+" "$file"; then
+        sed -i -E "s|^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+.*|${key} ${value}|" "$file"
+    else
+        printf '\n# server-manage: appended %s\n%s %s\n' "$key" "$key" "$value" >> "$file"
+    fi
+}
+
+refresh_ssh_port() {
+    local p=""
+    # 优先用 sshd -T 解析有效配置（覆盖 /etc/ssh/sshd_config + sshd_config.d/*.conf 全部 drop-in）
+    if command_exists sshd; then
+        p=$(sshd -T 2>/dev/null | awk 'tolower($1)=="port"{print $2; exit}')
+    fi
+    # 回退：grep 主配 + drop-in（按字母序，后者优先）
+    if [[ ! "$p" =~ ^[0-9]+$ ]]; then
+        local files=("$SSHD_CONFIG") f
+        if [[ -d /etc/ssh/sshd_config.d ]]; then
+            while IFS= read -r f; do
+                files+=("$f")
+            done < <(ls /etc/ssh/sshd_config.d/*.conf 2>/dev/null | sort)
+        fi
+        for f in "${files[@]}"; do
+            [[ -f "$f" ]] || continue
+            local cand
+            cand=$(grep -iE "^\s*Port\s+" "$f" 2>/dev/null | tail -n 1 | awk '{print $2}')
+            [[ "$cand" =~ ^[0-9]+$ ]] && p="$cand"
+        done
+    fi
+    if [[ "$p" =~ ^[0-9]+$ ]]; then
+        CURRENT_SSH_PORT="$p"
+    else
+        CURRENT_SSH_PORT=$DEFAULT_SSH_PORT
+    fi
 }
 
 confirm() {
@@ -277,9 +318,80 @@ validate_domain() {
 validate_conf_file() {
     local conf="$1"
     [[ -f "$conf" ]] || return 1
-    if grep -qvE '^[[:space:]]*($|#|[A-Za-z_][A-Za-z0-9_]*=)' "$conf"; then
-        print_error "配置文件格式异常，已跳过: $conf"
-        log_action "Rejected config file: $conf" "WARN"
+
+    # ── 文件权限 / owner 检查 ──
+    # 必须由 root 拥有，且 group/other 不可写，否则任何低权限进程都能写入再触发 source 注入
+    if [[ "$PLATFORM" != "openwrt" ]] && command_exists stat; then
+        local fown fmode
+        fown=$(stat -c '%U' "$conf" 2>/dev/null || echo "")
+        fmode=$(stat -c '%a' "$conf" 2>/dev/null || echo "")
+        if [[ -n "$fown" && "$fown" != "root" ]]; then
+            print_error "配置文件 owner 非 root，已拒绝: $conf (owner=$fown)"
+            log_action "Rejected config (owner=$fown): $conf" "WARN" 2>/dev/null || true
+            return 1
+        fi
+        if [[ -n "$fmode" && "$fmode" =~ ^[0-7]+$ ]]; then
+            if (( 8#${fmode} & 022 )); then
+                print_error "配置文件权限过宽，已拒绝: $conf (mode=$fmode，需 group/other 不可写)"
+                log_action "Rejected config (mode=$fmode): $conf" "WARN" 2>/dev/null || true
+                return 1
+            fi
+        fi
+    fi
+
+    # ── 行级语法 / value 安全性校验 ──
+    # 仅接受以下三种合法 value 形式，源自最小信任原则：
+    #   1) 单引号包裹（最安全：bash 不做任何扩展）
+    #   2) 双引号包裹，且不含未转义的 $( / ${ / `  （这三个会触发命令替换/变量扩展）
+    #   3) 裸字面量，字符集限定 [A-Za-z0-9_./@:+-]
+    local lineno=0 reason=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((lineno++)) || true
+        line="${line%$'\r'}"
+        # 跳过空白行 / 注释
+        [[ -z "${line// }" ]] && continue
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # 必须形如 KEY=...
+        if [[ ! "$line" =~ ^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*= ]]; then
+            reason="行${lineno}: 非 KEY=value 形式"
+            break
+        fi
+
+        local value="${line#*=}"
+        [[ -z "$value" ]] && continue
+
+        # 形式 1：单引号
+        if [[ "$value" =~ ^\'[^\']*\'$ ]]; then
+            continue
+        fi
+
+        # 形式 2：双引号
+        if [[ "$value" =~ ^\".*\"$ ]]; then
+            # 先消除所有已转义的元字符，再判断剩余串是否仍含命令替换/变量扩展
+            local stripped="${value//\\\\/}"
+            stripped="${stripped//\\\$/}"
+            stripped="${stripped//\\\`/}"
+            stripped="${stripped//\\\"/}"
+            if [[ "$stripped" == *'$('* || "$stripped" == *'${'* || "$stripped" == *'`'* ]]; then
+                reason="行${lineno}: value 含命令替换/变量扩展（不安全）"
+                break
+            fi
+            continue
+        fi
+
+        # 形式 3：裸字面量
+        if [[ "$value" =~ ^[A-Za-z0-9_./@:+-]+$ ]]; then
+            continue
+        fi
+
+        reason="行${lineno}: value 非合法字面量（需用单/双引号包裹）"
+        break
+    done < "$conf"
+
+    if [[ -n "$reason" ]]; then
+        print_error "配置文件格式异常，已跳过: $conf ($reason)"
+        log_action "Rejected config file: $conf reason=$reason" "WARN" 2>/dev/null || true
         return 1
     fi
     return 0
@@ -323,6 +435,17 @@ init_environment() {
     fi
     log_action "Script initialized (platform=$PLATFORM)" "INFO"
 }
+
+# ── 主配置安全加载 ──
+# 必须放在 validate_conf_file 定义之后；任何校验失败仅警告并跳过 source，
+# 不让格式异常或被篡改的配置文件触发 source 注入。
+if [[ -f "$CONFIG_FILE" ]]; then
+    if validate_conf_file "$CONFIG_FILE"; then
+        source "$CONFIG_FILE"
+    else
+        print_warn "主配置已忽略，本次使用默认值: $CONFIG_FILE"
+    fi
+fi
 _extract_ipv4_from_text() {
     local raw="$1" ip=""
     [[ -z "$raw" ]] && return 1
@@ -443,16 +566,54 @@ update_cf() {
     log "[$domain] $rt update failed"; return 1
 }
 
+# 安全解析 conf：不 source，避免恶意命令替换 / 变量扩展执行
+# 仅接受白名单 KEY，value 必须是双引号包裹的简单字面量
+parse_ddns_conf() {
+    local conf="$1" line key val
+    local fown fmode
+    fown=$(stat -c '%U' "$conf" 2>/dev/null || echo "")
+    fmode=$(stat -c '%a' "$conf" 2>/dev/null || echo "")
+    if [[ "$fown" != "root" ]]; then
+        log "owner 非 root，跳过: $conf (owner=$fown)"
+        return 1
+    fi
+    if [[ "$fmode" =~ ^[0-7]+$ ]] && (( 8#${fmode} & 022 )); then
+        log "权限过宽，跳过: $conf (mode=$fmode)"
+        return 1
+    fi
+    DDNS_DOMAIN="" DDNS_TOKEN="" DDNS_ZONE_ID=""
+    DDNS_IPV4="" DDNS_IPV6="" DDNS_PROXIED="" DDNS_INTERVAL=""
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        [[ -z "${line// }" ]] && continue
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        if [[ "$line" =~ ^(DDNS_DOMAIN|DDNS_TOKEN|DDNS_ZONE_ID|DDNS_IPV4|DDNS_IPV6|DDNS_PROXIED|DDNS_INTERVAL)=\"([^\"\$\`\\]*)\"$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            val="${BASH_REMATCH[2]}"
+            case "$key" in
+                DDNS_DOMAIN)   DDNS_DOMAIN="$val" ;;
+                DDNS_TOKEN)    DDNS_TOKEN="$val" ;;
+                DDNS_ZONE_ID)  DDNS_ZONE_ID="$val" ;;
+                DDNS_IPV4)     DDNS_IPV4="$val" ;;
+                DDNS_IPV6)     DDNS_IPV6="$val" ;;
+                DDNS_PROXIED)  DDNS_PROXIED="$val" ;;
+                DDNS_INTERVAL) DDNS_INTERVAL="$val" ;;
+            esac
+        else
+            log "格式异常行，跳过: $conf"
+            return 1
+        fi
+    done < "$conf"
+    [[ -n "$DDNS_DOMAIN" && -n "$DDNS_TOKEN" && -n "$DDNS_ZONE_ID" ]] || {
+        log "必填字段缺失，跳过: $conf"
+        return 1
+    }
+    return 0
+}
+
 for conf in "$DDNS_CONFIG_DIR"/*.conf; do
     [ -f "$conf" ] || continue
-    # 格式白名单校验
-    if grep -qvE '^[[:space:]]*($|#|[A-Za-z_][A-Za-z0-9_]*=)' "$conf"; then
-        log "格式异常，跳过: $conf"
-        continue
-    fi
-    # 清空变量防止跨文件残留
-    DDNS_DOMAIN="" DDNS_TOKEN="" DDNS_ZONE_ID="" DDNS_IPV4="" DDNS_IPV6="" DDNS_PROXIED="" DDNS_INTERVAL=""
-    source "$conf"
+    parse_ddns_conf "$conf" || continue
     [[ "$DDNS_IPV4" == "true" ]] && { ip=$(get_ip 4); [[ -n "$ip" ]] && update_cf "$DDNS_DOMAIN" A "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED"; }
     [[ "$DDNS_IPV6" == "true" ]] && { ip=$(get_ip 6); [[ -n "$ip" ]] && update_cf "$DDNS_DOMAIN" AAAA "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED"; }
 done
@@ -857,6 +1018,14 @@ ufw_add() {
     pause
 }
 
+# firewall_allow_tcp_port <port> [comment]
+# 返回值:
+#   0 = 已成功放行
+#   1 = 真实错误（参数无效 / ufw 命令失败）
+#   2 = UFW 不可用（未安装 / 未启用）—— 业务流程应仅警告，不要中断；启用 UFW 由用户主动进防火墙菜单完成
+#
+# 设计原则：业务模块（Reality/Realm/Email 等）不在自动流程里启用或重置 UFW，
+# 以免与云安全组、用户已有规则、SSH 端口产生冲突。需要启用 UFW 的请走【防火墙模块】。
 firewall_allow_tcp_port() {
     local port="$1" comment="${2:-Managed-TCP}"
     validate_port "$port" || { print_error "端口无效: $port"; return 1; }
@@ -864,14 +1033,30 @@ firewall_allow_tcp_port() {
         print_warn "OpenWrt 防火墙请在 LuCI/fw4 中放行 ${port}/tcp"
         return 0
     fi
-    command_exists ufw || { print_error "UFW 未安装，请先在防火墙模块安装并启用 UFW"; return 1; }
-    if ! ufw status 2>/dev/null | grep -q "Status: active"; then
-        print_error "UFW 当前未启用。为避免影响已有服务，本脚本不会自动启用/重置 UFW。"
-        print_info "请先在防火墙模块启用 UFW，或手动确认策略后重试。"
-        return 1
+
+    if ! command_exists ufw; then
+        print_warn "未检测到 UFW — 本脚本不会自动安装。"
+        print_info "如需本地防火墙，请进入【防火墙管理】菜单完成 UFW 安装与启用；"
+        print_info "或在云厂商安全组放行 ${port}/tcp。"
+        log_action "UFW absent during firewall_allow_tcp_port port=${port}" "INFO"
+        return 2
     fi
-    ufw allow "${port}/tcp" comment "$comment" >/dev/null 2>&1 || return 1
-    log_action "UFW allowed ${port}/tcp comment=${comment}"
+
+    if ! ufw status 2>/dev/null | grep -q "Status: active"; then
+        print_warn "UFW 已安装但未启用 — 本脚本不会在业务流程里自动启用 UFW。"
+        print_info "如需本地防火墙保护，请进入【防火墙管理】→ 安装并启用 UFW；"
+        print_info "或在云厂商安全组放行 ${port}/tcp。"
+        log_action "UFW inactive during firewall_allow_tcp_port port=${port}" "INFO"
+        return 2
+    fi
+
+    # UFW 已启用 — 仅追加规则
+    if ufw allow "${port}/tcp" comment "$comment" >/dev/null 2>&1; then
+        log_action "UFW allowed ${port}/tcp comment=${comment}"
+        return 0
+    fi
+    print_error "UFW 添加规则失败: ${port}/tcp"
+    return 1
 }
 
 firewall_apply_reality_port() {
@@ -980,13 +1165,34 @@ CONF="/etc/server-manage/geoip.conf"
 DATA="/etc/server-manage/geoip-data"
 CHAIN="GEOIP_FILTER"
 [ -f "$CONF" ] || exit 0
+
+# 安全解析：拒绝 source，避免被替换为恶意 conf 触发 root 命令执行
+fown=$(stat -c '%U' "$CONF" 2>/dev/null || echo "")
+fmode=$(stat -c '%a' "$CONF" 2>/dev/null || echo "")
+[ "$fown" = "root" ] || exit 0
+if [[ "$fmode" =~ ^[0-7]+$ ]] && (( 8#${fmode} & 022 )); then exit 0; fi
 GEOIP_MODE="" GEOIP_COUNTRIES=""
-source "$CONF"
+while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    [[ -z "${line// }" || "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ ^(GEOIP_MODE|GEOIP_COUNTRIES|GEOIP_LAST_UPDATE)=\"([A-Za-z0-9\ _.-]*)\"$ ]]; then
+        case "${BASH_REMATCH[1]}" in
+            GEOIP_MODE)        GEOIP_MODE="${BASH_REMATCH[2]}" ;;
+            GEOIP_COUNTRIES)   GEOIP_COUNTRIES="${BASH_REMATCH[2]}" ;;
+            GEOIP_LAST_UPDATE) : ;;
+        esac
+    else
+        exit 0
+    fi
+done < "$CONF"
+
 [ -z "$GEOIP_MODE" ] && exit 0
+[[ "$GEOIP_MODE" =~ ^(whitelist|blacklist)$ ]] || exit 0
 set_name="geoip_${GEOIP_MODE}"
 tmp_set="${set_name}_tmp"
 ipset create "$tmp_set" hash:net maxelem 131072 2>/dev/null || ipset flush "$tmp_set"
 for cc in $GEOIP_COUNTRIES; do
+    [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || continue
     f="${DATA}/${cc,,}.zone"
     [ -f "$f" ] || continue
     sed -e '/^#/d' -e '/^$/d' -e '/^[^0-9]/d' -e "s/^/add ${tmp_set} /" "$f" | ipset restore -exist 2>/dev/null
@@ -1009,7 +1215,7 @@ else
 fi
 iptables -C INPUT -j "$CHAIN" 2>/dev/null || iptables -I INPUT 1 -j "$CHAIN"
 APPLY_EOF
-    chmod +x /usr/local/bin/geoip-apply.sh
+    chmod 700 /usr/local/bin/geoip-apply.sh
     # Update script (cron weekly)
     cat > /usr/local/bin/geoip-update.sh << 'UPDATE_EOF'
 #!/bin/bash
@@ -1017,10 +1223,24 @@ CONF="/etc/server-manage/geoip.conf"
 DATA="/etc/server-manage/geoip-data"
 URL="https://www.ipdeny.com/ipblocks/data/aggregated"
 [ -f "$CONF" ] || exit 0
-GEOIP_MODE="" GEOIP_COUNTRIES=""
-source "$CONF"
+
+# 安全解析（同 apply 脚本）
+fown=$(stat -c '%U' "$CONF" 2>/dev/null || echo "")
+fmode=$(stat -c '%a' "$CONF" 2>/dev/null || echo "")
+[ "$fown" = "root" ] || exit 0
+if [[ "$fmode" =~ ^[0-7]+$ ]] && (( 8#${fmode} & 022 )); then exit 0; fi
+GEOIP_COUNTRIES=""
+while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    [[ -z "${line// }" || "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ ^GEOIP_COUNTRIES=\"([A-Za-z0-9\ _.-]*)\"$ ]]; then
+        GEOIP_COUNTRIES="${BASH_REMATCH[1]}"
+    fi
+done < "$CONF"
 [ -z "$GEOIP_COUNTRIES" ] && exit 0
+
 for cc in $GEOIP_COUNTRIES; do
+    [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || continue
     cc="${cc,,}"
     curl -sSL --connect-timeout 10 --max-time 30 \
         -o "${DATA}/${cc}.zone" "${URL}/${cc}-aggregated.zone" 2>/dev/null
@@ -1028,7 +1248,7 @@ done
 /usr/local/bin/geoip-apply.sh
 sed -i "s/^GEOIP_LAST_UPDATE=.*/GEOIP_LAST_UPDATE=\"$(date +%Y-%m-%d)\"/" "$CONF"
 UPDATE_EOF
-    chmod +x /usr/local/bin/geoip-update.sh
+    chmod 700 /usr/local/bin/geoip-update.sh
     # Systemd boot service
     if is_systemd; then
         cat > /etc/systemd/system/geoip-firewall.service << 'SVC_EOF'
@@ -1832,11 +2052,38 @@ menu_f2b() {
 
 ssh_change_port() {
     print_title "修改 SSH 端口"
+    refresh_ssh_port
+    echo -e "${C_GRAY}当前生效端口 (sshd -T 解析): ${CURRENT_SSH_PORT}${C_RESET}"
     read -e -r -p "请输入新端口 [$CURRENT_SSH_PORT]: " port
     [[ -z "$port" ]] && return
     if ! validate_port "$port"; then
         print_error "端口无效 (1-65535)。"
         pause; return
+    fi
+    if [[ "$port" == "$CURRENT_SSH_PORT" ]]; then
+        print_warn "新端口与当前端口相同，无需修改。"
+        pause; return
+    fi
+
+    # 检查 drop-in 是否设置了 Port — 若设置了，sed 改主配是无效的
+    local dropin_port_file=""
+    if [[ -d /etc/ssh/sshd_config.d ]]; then
+        dropin_port_file=$(grep -lE "^[[:space:]]*Port[[:space:]]+" /etc/ssh/sshd_config.d/*.conf 2>/dev/null | head -1)
+    fi
+    local target_conf="$SSHD_CONFIG"
+    if [[ -n "$dropin_port_file" ]]; then
+        print_warn "Port 已在 drop-in 中配置（OpenSSH 优先生效）："
+        echo "  - $dropin_port_file"
+        echo ""
+        echo "  1. 修改 drop-in 文件 (推荐)"
+        echo "  2. 修改主配置 $SSHD_CONFIG（drop-in 仍会覆盖，可能无效）"
+        echo "  0. 取消"
+        read -e -r -p "选择 [1]: " dch
+        case "${dch:-1}" in
+            1) target_conf="$dropin_port_file" ;;
+            2) target_conf="$SSHD_CONFIG" ;;
+            *) print_warn "已取消"; pause; return ;;
+        esac
     fi
 
     # 检查端口是否已被其他服务占用
@@ -1847,8 +2094,9 @@ ssh_change_port() {
             pause; return
         fi
     fi
-    local backup_file="${SSHD_CONFIG}.bak.$(date +%s)"
-    cp "$SSHD_CONFIG" "$backup_file"
+
+    local backup_file="${target_conf}.bak.$(date +%s)"
+    cp "$target_conf" "$backup_file"
     # 先放行新端口（防止改完连不上）
     local ufw_opened=0
     if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
@@ -1856,39 +2104,55 @@ ssh_change_port() {
         ufw_opened=1
         print_success "UFW 已放行新端口 $port。"
     fi
-    if grep -qE "^\s*#?\s*Port\s" "$SSHD_CONFIG"; then
-        sed -i -E "s|^\s*#?\s*Port\s+.*|Port ${port}|" "$SSHD_CONFIG"
+
+    # 写入端口配置
+    if grep -qE "^\s*#?\s*Port\s" "$target_conf"; then
+        sed -i -E "s|^\s*#?\s*Port\s+.*|Port ${port}|" "$target_conf"
     else
-        echo "Port ${port}" >> "$SSHD_CONFIG"
+        printf '\n# server-manage: appended Port\nPort %s\n' "$port" >> "$target_conf"
     fi
 
     # 校验配置语法
     if ! sshd -t 2>/dev/null; then
         print_error "sshd 配置校验失败！已回滚。"
-        mv "$backup_file" "$SSHD_CONFIG"
+        mv "$backup_file" "$target_conf"
         [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
         pause; return
     fi
-    if _restart_sshd; then
-        print_success "SSH 重启成功。请使用新端口 $port 连接。"
-        if [[ $ufw_opened -eq 1 ]]; then
-            ufw delete allow "$CURRENT_SSH_PORT/tcp" 2>/dev/null || true
-        fi
-        # 同步更新 Fail2ban jail 端口
-        if [[ -f "$FAIL2BAN_JAIL_LOCAL" ]]; then
-            sed -i "s/^port = .*/port = $port/" "$FAIL2BAN_JAIL_LOCAL"
-            systemctl restart fail2ban 2>/dev/null || true
-            print_info "Fail2ban 已同步新端口 $port"
-        fi
-        CURRENT_SSH_PORT=$port
-        log_action "SSH port changed to $port"
-        rm -f "$backup_file"
-    else
+
+    if ! _restart_sshd; then
         print_error "重启失败！已回滚配置。"
-        mv "$backup_file" "$SSHD_CONFIG" 2>/dev/null || true
+        mv "$backup_file" "$target_conf" 2>/dev/null || true
         [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
         _restart_sshd || true
+        pause; return
     fi
+
+    # 重启后用 sshd -T 重新校验端口是否真的生效（drop-in 覆盖等）
+    local effective_port
+    effective_port=$(sshd -T 2>/dev/null | awk 'tolower($1)=="port"{print $2; exit}')
+    if [[ "$effective_port" != "$port" ]]; then
+        print_error "重启后 sshd -T 解析端口仍为 ${effective_port:-未知}，与目标 $port 不一致。"
+        print_error "可能仍被其他 drop-in 文件覆盖。已回滚配置，UFW 规则保持原状。"
+        mv "$backup_file" "$target_conf" 2>/dev/null || true
+        _restart_sshd || true
+        [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
+        pause; return
+    fi
+
+    print_success "SSH 重启成功，sshd -T 已确认生效端口: $port"
+    if [[ $ufw_opened -eq 1 ]]; then
+        ufw delete allow "$CURRENT_SSH_PORT/tcp" 2>/dev/null || true
+    fi
+    # 同步更新 Fail2ban jail 端口
+    if [[ -f "$FAIL2BAN_JAIL_LOCAL" ]]; then
+        sed -i "s/^port = .*/port = $port/" "$FAIL2BAN_JAIL_LOCAL"
+        systemctl restart fail2ban 2>/dev/null || true
+        print_info "Fail2ban 已同步新端口 $port"
+    fi
+    CURRENT_SSH_PORT=$port
+    log_action "SSH port changed to $port (file=$target_conf)"
+    rm -f "$backup_file"
     pause
 }
 
@@ -1997,9 +2261,9 @@ ssh_keys() {
             print_warn "密钥已存在: $key_file"
             if ! confirm "覆盖现有密钥?"; then pause; return; fi
         fi
-        local cmd="ssh-keygen -t ed25519 -f $key_file -N \"\""
-        [[ -n "$comment" ]] && cmd="$cmd -C \"$comment\""
-        eval $cmd
+        local args=(ssh-keygen -t ed25519 -f "$key_file" -N "")
+        [[ -n "$comment" ]] && args+=(-C "$comment")
+        "${args[@]}"
         echo ""
         print_success "密钥对已生成。"
         echo -e "${C_CYAN}私钥:${C_RESET} $key_file"
@@ -2035,7 +2299,7 @@ ssh_keys() {
         if confirm "确认已测试密钥登录成功？"; then
             local backup_file="${SSHD_CONFIG}.bak.$(date +%s)"
             cp "$SSHD_CONFIG" "$backup_file"
-            sed -i -E "s|^\s*#?\s*PasswordAuthentication\s+.*|PasswordAuthentication no|" "$SSHD_CONFIG"
+            _sshd_set_directive "PasswordAuthentication" "no" "$SSHD_CONFIG" || { mv "$backup_file" "$SSHD_CONFIG"; pause; return; }
             if ! sshd -t 2>/dev/null; then
                 print_error "sshd 配置校验失败！已回滚。"
                 mv "$backup_file" "$SSHD_CONFIG"
@@ -2078,7 +2342,7 @@ menu_ssh() {
                 if confirm "禁用 Root 登录？"; then
                     local backup_file="${SSHD_CONFIG}.bak.$(date +%s)"
                     cp "$SSHD_CONFIG" "$backup_file"
-                    sed -i -E "s|^\s*#?\s*PermitRootLogin\s+.*|PermitRootLogin no|" "$SSHD_CONFIG"
+                    _sshd_set_directive "PermitRootLogin" "no" "$SSHD_CONFIG" || { mv "$backup_file" "$SSHD_CONFIG"; pause; break; }
                     if ! sshd -t 2>/dev/null; then
                         print_error "sshd 配置校验失败！已回滚。"
                         mv "$backup_file" "$SSHD_CONFIG"
@@ -3179,16 +3443,16 @@ _web_cleanup_domain() {
     # CF 凭据
     rm -f "/root/.cloudflare-${domain}.ini" 2>/dev/null
 
-    # DDNS 配置 (域名本身 + origin.xxx 回源域名)
+    # DDNS 配置 (域名本身 + origin.${domain} 子域；不要用通配，避免误删其他域名的 origin DDNS)
     local ddns_cleaned=false
-    for ddns_f in "${DDNS_CONFIG_DIR}/${domain}.conf" "${DDNS_CONFIG_DIR}/origin."*".conf"; do
+    for ddns_f in "${DDNS_CONFIG_DIR}/${domain}.conf" "${DDNS_CONFIG_DIR}/origin.${domain}.conf"; do
         if [[ -f "$ddns_f" ]]; then
             rm -f "$ddns_f"; ddns_cleaned=true
         fi
     done
-    # 用域名后缀匹配回源域名 DDNS
+    # 根域 origin DDNS（仅当 root_part 与 domain 不同才单独删）
     local root_part="${domain#*.}"
-    if [[ -f "${DDNS_CONFIG_DIR}/origin.${root_part}.conf" ]]; then
+    if [[ "$root_part" != "$domain" && -f "${DDNS_CONFIG_DIR}/origin.${root_part}.conf" ]]; then
         rm -f "${DDNS_CONFIG_DIR}/origin.${root_part}.conf"; ddns_cleaned=true
     fi
     if [[ "$ddns_cleaned" == "true" ]]; then
@@ -4641,7 +4905,7 @@ server {
     echo -e "\n${C_CYAN}[模板]${C_RESET}"
     echo "  $( [[ "$template_name" == "emby" ]] && echo "Emby/Jellyfin 流媒体优化" || echo "通用")"
     echo -e "\n${C_CYAN}[配置文件]${C_RESET}"
-    echo "  $NGINX_CONF_PATH"
+    echo "  /etc/nginx/sites-available/${DOMAIN}.conf"
     draw_line
     log_action "Reverse proxy configured: $DOMAIN -> $BACKEND_URL (template=$template_name)"
     pause
@@ -10442,926 +10706,869 @@ wg_deb_main_menu() {
         fi
     done
 }
-backup_create() {
-    print_title "创建备份"
-    print_info "正在扫描 VPS 可备份项..."
-    local -a scan_names=()
-    local -a scan_paths=()
-    local -a scan_types=()   # dir / file / cmd
-    local -a scan_tags=()    # 存档内目录名
-    local -a scan_selected=()
-    
-    _scan_add() {
-        scan_names+=("$1"); scan_paths+=("$2")
-        scan_types+=("$3"); scan_tags+=("$4")
-        scan_selected+=(1)
-    }
-    [[ -d /etc/nginx ]]             && _scan_add "Nginx 配置"        "/etc/nginx"             "dir" "nginx"
-    [[ -d "$DDNS_CONFIG_DIR" ]]     && _scan_add "DDNS 配置"         "$DDNS_CONFIG_DIR"       "dir" "ddns"
-    [[ -d "$CONFIG_DIR" ]]          && _scan_add "域名管理配置"      "$CONFIG_DIR"            "dir" "domain-configs"
-    [[ -d "$CERT_PATH_PREFIX" ]]    && _scan_add "SSL 证书"          "$CERT_PATH_PREFIX"      "dir" "certs"
-    [[ -d "$CERT_HOOKS_DIR" ]]      && _scan_add "证书续签 Hooks"    "$CERT_HOOKS_DIR"        "dir" "cert-hooks"
-    command -v crontab >/dev/null 2>&1 && _scan_add "Crontab 定时任务" "crontab" "cmd" "crontab.bak"
-    [[ -f "$CONFIG_FILE" ]]         && _scan_add "脚本自身配置"      "$CONFIG_FILE"           "file" "script-config"
-    [[ -f "$DDNS_UPDATE_SCRIPT" ]] && _scan_add "DDNS更新脚本" "$DDNS_UPDATE_SCRIPT" "file" "ddns-update.sh"
-    [[ -f /etc/x-ui/x-ui.db ]]     && _scan_add "3X-UI 数据库"      "/etc/x-ui/x-ui.db"      "file" "x-ui/x-ui.db"
-    [[ -d "$REALITY_CONFIG_DIR" ]] && _scan_add "Sing-box Reality 配置" "$REALITY_CONFIG_DIR" "dir" "reality"
-    [[ -f "$REALITY_SINGBOX_CONFIG" ]] && _scan_add "sing-box 主配置" "$REALITY_SINGBOX_CONFIG" "file" "sing-box/config.json"
-    [[ -f "$REALITY_REALM_CONFIG" ]] && _scan_add "Realm 中转配置" "$REALITY_REALM_CONFIG" "file" "realm/config.toml"
-    local total=${#scan_names[@]}
-    if [[ $total -eq 0 ]]; then
-        print_warn "未发现任何可备份项。"
-        pause; return 1
-    fi
-    echo -e "${C_CYAN}发现 ${total} 项可备份内容:${C_RESET}"
-    draw_line
-    local i
-    for ((i=0; i<total; i++)); do
-        local mark="✓"; [[ "${scan_selected[$i]}" -eq 0 ]] && mark=" "
-        printf "  [${C_GREEN}%s${C_RESET}] %2d. %-28s ${C_GRAY}%s${C_RESET}\n" "$mark" "$((i+1))" "${scan_names[$i]}" "${scan_paths[$i]}"
-    done
-    draw_line
-    echo -e "  ${C_GRAY}输入序号切换选中 | a=全选 | n=全不选 | Enter=开始备份 | 0=取消${C_RESET}"
-    
-    while true; do
-        read -e -r -p "操作: " sel_input
-        case "$sel_input" in
-            "") break ;;
-            0) return ;;
-            a|A) for ((i=0; i<total; i++)); do scan_selected[$i]=1; done ;;
-            n|N) for ((i=0; i<total; i++)); do scan_selected[$i]=0; done ;;
-            *)
-                if [[ "$sel_input" =~ ^[0-9]+$ ]] && (( sel_input >= 1 && sel_input <= total )); then
-                    local ti=$((sel_input - 1))
-                    scan_selected[$ti]=$(( 1 - scan_selected[ti] ))
-                else
-                    print_warn "无效输入"; continue
-                fi ;;
-        esac
-        for ((i=0; i<total; i++)); do
-            local mark="✓"; [[ "${scan_selected[$i]}" -eq 0 ]] && mark=" "
-            printf "  [${C_GREEN}%s${C_RESET}] %2d. %-28s\n" "$mark" "$((i+1))" "${scan_names[$i]}"
-        done
-    done
-    local selected_count=0
-    for ((i=0; i<total; i++)); do
-        [[ "${scan_selected[$i]}" -eq 1 ]] && selected_count=$((selected_count + 1))
-    done
-    [[ $selected_count -eq 0 ]] && { print_warn "未选择任何项。"; pause; return; }
-    local timestamp=$(date '+%Y%m%d_%H%M%S')
-    local backup_name="${SCRIPT_NAME}-backup-${timestamp}"
-    local backup_file="${BACKUP_LOCAL_DIR}/${backup_name}.tar.gz"
-    local tmp_dir=$(mktemp -d "/tmp/${SCRIPT_NAME}-backup.XXXXXX")
-    trap "rm -rf '$tmp_dir'" RETURN
-    mkdir -p "$BACKUP_LOCAL_DIR" "${tmp_dir}/data"
-    print_info "正在收集 $selected_count 项备份数据..."
-    local items_backed=0
-    for ((i=0; i<total; i++)); do
-        [[ "${scan_selected[$i]}" -eq 0 ]] && continue
-        local name="${scan_names[$i]}" path="${scan_paths[$i]}"
-        local type="${scan_types[$i]}" tag="${scan_tags[$i]}"
-        case "$type" in
-            dir)
-                cp -r "$path" "${tmp_dir}/data/${tag}" 2>/dev/null && {
-                    echo -e "  ${C_GREEN}✓${C_RESET} $name"
-                    items_backed=$((items_backed + 1))
-                } || echo -e "  ${C_RED}✗${C_RESET} $name (失败)"
-                ;;
-            file)
-                mkdir -p "${tmp_dir}/data/$(dirname "$tag")" 2>/dev/null
-                cp -L "$path" "${tmp_dir}/data/${tag}" 2>/dev/null && {
-                    echo -e "  ${C_GREEN}✓${C_RESET} $name"
-                    items_backed=$((items_backed + 1))
-                } || echo -e "  ${C_RED}✗${C_RESET} $name (失败)"
-                ;;
-            cmd)
-                if [[ "$tag" == "crontab.bak" ]]; then
-                    crontab -l 2>/dev/null > "${tmp_dir}/data/crontab.bak" && {
-                        echo -e "  ${C_GREEN}✓${C_RESET} $name"; items_backed=$((items_backed + 1))
-                    }
-                fi ;;
-        esac
-    done
-    
-    # 元信息
-    printf "VERSION=%s\nDATE=%s\nHOSTNAME=%s\nITEMS=%d\n" \
-        "$VERSION" "$(date '+%Y-%m-%d %H:%M:%S')" "$(hostname)" "$items_backed" \
-        > "${tmp_dir}/data/backup_meta.txt"
-    print_info "正在压缩..."
-    tar -czf "$backup_file" -C "${tmp_dir}/data" . 2>/dev/null || {
-        print_error "压缩失败"; pause; return 1
-    }
-    local file_size=$(du -h "$backup_file" 2>/dev/null | awk '{print $1}')
-    echo ""
-    print_success "备份完成！"
-    echo -e "  文件: ${C_GREEN}$backup_file${C_RESET}"
-    echo -e "  大小: $file_size | 项目: $items_backed 项"
-    if [[ -f "$BACKUP_CONFIG_FILE" ]] && validate_conf_file "$BACKUP_CONFIG_FILE"; then
-        source "$BACKUP_CONFIG_FILE" 2>/dev/null
-        if [[ -n "$WEBDAV_URL" ]]; then
-            if [[ "${BACKUP_NON_INTERACTIVE:-}" == "1" ]] || confirm "是否上传到 WebDAV 远程存储?"; then
-                backup_webdav_upload "$backup_file"
-            fi
-        fi
-    fi
-    log_action "Backup created: $backup_file ($file_size, $items_backed items)"
-    pause
+readonly EMAIL_STATE_DIR="/etc/server-manage/email"
+readonly EMAIL_STATE_FILE="${EMAIL_STATE_DIR}/state.conf"
+readonly EMAIL_ADMIN_FILE="/root/.email-admin.txt"
+readonly EMAIL_LOG_FILE="/var/log/server-manage-email.log"
+readonly EMAIL_INSTALL_DIR="/root/cloudflare_temp_email"
+
+# 默认 state 字段（每次 load 前必须重置，防上轮残值污染）
+_email_state_reset_vars() {
+    EMAIL_INSTALLED=0
+    EMAIL_INSTALL_VERSION=""
+    EMAIL_INSTALL_DATE=""
+    EMAIL_DOMAIN=""
+    EMAIL_ZONE_ID=""
+    EMAIL_CF_ACCOUNT_ID=""
+    EMAIL_API_PREFIX=""
+    EMAIL_API_DOMAIN=""
+    EMAIL_FRONTEND_PREFIX=""
+    EMAIL_FRONTEND_DOMAIN=""
+    EMAIL_ADDRESS_PREFIX=""
+    EMAIL_WORKER_NAME=""
+    EMAIL_PAGES_PROJECT=""
+    EMAIL_PAGES_DOMAIN=""
+    EMAIL_D1_NAME=""
+    EMAIL_D1_ID=""
+    EMAIL_RESEND_ENABLED=0
+    EMAIL_RESEND_SEND_DOMAIN=""
+    EMAIL_DNS_FRONTEND_ID=""
+    EMAIL_DNS_MX1_ID=""
+    EMAIL_DNS_MX2_ID=""
+    EMAIL_DNS_MX3_ID=""
+    EMAIL_DNS_DKIM_ID=""
+    EMAIL_DNS_SPF_ID=""
+    EMAIL_DNS_SEND_MX_ID=""
+    EMAIL_DNS_DMARC_ID=""
+    EMAIL_CATCH_ALL_ENABLED=0
+    EMAIL_PATCHES_APPLIED=""
 }
 
-backup_webdav_upload() {
-    local file="$1"
-    [[ ! -f "$file" ]] && { print_error "文件不存在: $file"; return 1; }
-    if [[ ! -f "$BACKUP_CONFIG_FILE" ]]; then
-        print_error "WebDAV 未配置。请先使用菜单配置 WebDAV 参数。"
+# value 转义：与 reality_state_quote 同款，确保通过新版 validate_conf_file
+_email_state_quote() {
+    local s="${1:-}"
+    s=${s//$'\r'/ }
+    s=${s//$'\n'/ }
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//\$/\\\$}
+    s=${s//\`/\\\`}
+    printf '"%s"' "$s"
+}
+
+email_state_init_dirs() {
+    mkdir -p "$EMAIL_STATE_DIR"
+    chown root:root "$EMAIL_STATE_DIR"
+    chmod 700 "$EMAIL_STATE_DIR"
+    [[ -f "$EMAIL_LOG_FILE" ]] || { touch "$EMAIL_LOG_FILE"; chmod 600 "$EMAIL_LOG_FILE"; }
+}
+
+email_state_write() {
+    email_state_init_dirs
+    local tmp
+    tmp=$(mktemp "$EMAIL_STATE_DIR/.state.XXXXXX") || return 1
+    {
+        echo "# server-manage email state — 由脚本管理，请勿手动编辑"
+        echo "EMAIL_INSTALLED=${EMAIL_INSTALLED:-0}"
+        echo "EMAIL_RESEND_ENABLED=${EMAIL_RESEND_ENABLED:-0}"
+        echo "EMAIL_CATCH_ALL_ENABLED=${EMAIL_CATCH_ALL_ENABLED:-0}"
+        echo "EMAIL_INSTALL_VERSION=$(_email_state_quote "${EMAIL_INSTALL_VERSION:-}")"
+        echo "EMAIL_INSTALL_DATE=$(_email_state_quote "${EMAIL_INSTALL_DATE:-}")"
+        echo "EMAIL_DOMAIN=$(_email_state_quote "${EMAIL_DOMAIN:-}")"
+        echo "EMAIL_ZONE_ID=$(_email_state_quote "${EMAIL_ZONE_ID:-}")"
+        echo "EMAIL_CF_ACCOUNT_ID=$(_email_state_quote "${EMAIL_CF_ACCOUNT_ID:-}")"
+        echo "EMAIL_API_PREFIX=$(_email_state_quote "${EMAIL_API_PREFIX:-}")"
+        echo "EMAIL_API_DOMAIN=$(_email_state_quote "${EMAIL_API_DOMAIN:-}")"
+        echo "EMAIL_FRONTEND_PREFIX=$(_email_state_quote "${EMAIL_FRONTEND_PREFIX:-}")"
+        echo "EMAIL_FRONTEND_DOMAIN=$(_email_state_quote "${EMAIL_FRONTEND_DOMAIN:-}")"
+        echo "EMAIL_ADDRESS_PREFIX=$(_email_state_quote "${EMAIL_ADDRESS_PREFIX:-}")"
+        echo "EMAIL_WORKER_NAME=$(_email_state_quote "${EMAIL_WORKER_NAME:-}")"
+        echo "EMAIL_PAGES_PROJECT=$(_email_state_quote "${EMAIL_PAGES_PROJECT:-}")"
+        echo "EMAIL_PAGES_DOMAIN=$(_email_state_quote "${EMAIL_PAGES_DOMAIN:-}")"
+        echo "EMAIL_D1_NAME=$(_email_state_quote "${EMAIL_D1_NAME:-}")"
+        echo "EMAIL_D1_ID=$(_email_state_quote "${EMAIL_D1_ID:-}")"
+        echo "EMAIL_RESEND_SEND_DOMAIN=$(_email_state_quote "${EMAIL_RESEND_SEND_DOMAIN:-}")"
+        echo "EMAIL_DNS_FRONTEND_ID=$(_email_state_quote "${EMAIL_DNS_FRONTEND_ID:-}")"
+        echo "EMAIL_DNS_MX1_ID=$(_email_state_quote "${EMAIL_DNS_MX1_ID:-}")"
+        echo "EMAIL_DNS_MX2_ID=$(_email_state_quote "${EMAIL_DNS_MX2_ID:-}")"
+        echo "EMAIL_DNS_MX3_ID=$(_email_state_quote "${EMAIL_DNS_MX3_ID:-}")"
+        echo "EMAIL_DNS_DKIM_ID=$(_email_state_quote "${EMAIL_DNS_DKIM_ID:-}")"
+        echo "EMAIL_DNS_SPF_ID=$(_email_state_quote "${EMAIL_DNS_SPF_ID:-}")"
+        echo "EMAIL_DNS_SEND_MX_ID=$(_email_state_quote "${EMAIL_DNS_SEND_MX_ID:-}")"
+        echo "EMAIL_DNS_DMARC_ID=$(_email_state_quote "${EMAIL_DNS_DMARC_ID:-}")"
+        echo "EMAIL_PATCHES_APPLIED=$(_email_state_quote "${EMAIL_PATCHES_APPLIED:-}")"
+    } > "$tmp" || { rm -f "$tmp"; return 1; }
+    chmod 600 "$tmp"
+    chown root:root "$tmp"
+    mv -f "$tmp" "$EMAIL_STATE_FILE"
+}
+
+email_state_load() {
+    _email_state_reset_vars
+    [[ -f "$EMAIL_STATE_FILE" ]] || return 1
+    if ! validate_conf_file "$EMAIL_STATE_FILE"; then
+        print_error "邮箱 state 校验失败，已忽略: $EMAIL_STATE_FILE"
         return 1
     fi
-    validate_conf_file "$BACKUP_CONFIG_FILE" || { print_error "备份配置文件格式异常"; return 1; }
-    source "$BACKUP_CONFIG_FILE" 2>/dev/null
-    if [[ -z "$WEBDAV_URL" || -z "$WEBDAV_USER" || -z "$WEBDAV_PASS" ]]; then
-        print_error "WebDAV 配置不完整。"
-        return 1
+    # shellcheck disable=SC1090
+    source "$EMAIL_STATE_FILE"
+    [[ "${EMAIL_INSTALLED:-0}" == "1" ]]
+}
+
+email_state_clear() {
+    rm -f "$EMAIL_STATE_FILE"
+    _email_state_reset_vars
+}
+
+# 把当前 state 文件备份为 .bak.<timestamp>；返回备份文件路径
+# 用于 partial → 重新部署 / upgrade 等"会覆盖 state"的操作前防丢失
+email_state_backup() {
+    [[ -f "$EMAIL_STATE_FILE" ]] || { echo ""; return 0; }
+    local bak="${EMAIL_STATE_FILE}.bak.$(date +%Y%m%d-%H%M%S)"
+    if cp -a "$EMAIL_STATE_FILE" "$bak" 2>/dev/null; then
+        chmod 600 "$bak"
+        echo "$bak"
+        return 0
     fi
-    local upload_file="$file"
-    local filename=$(basename "$file")
-    local encrypted=0
-    
-    # 加密选项
-    if [[ "${WEBDAV_ENCRYPT:-}" == "true" ]] || { [[ "${BACKUP_NON_INTERACTIVE:-}" != "1" ]] && confirm "是否加密后再上传? (AES-256, 推荐启用)"; }; then
-        if ! command_exists openssl; then
-            print_warn "openssl 未安装，跳过加密直接上传。"
+    return 1
+}
+
+# ── Token / 敏感输入 ──
+# 用法: email_read_secret "Cloudflare API Token" CF_API_TOKEN
+email_read_secret() {
+    local prompt="$1" var_name="$2" t=""
+    [[ -t 0 ]] || { print_error "非交互终端无法读取 ${prompt}"; return 1; }
+    read -r -s -p "$(echo -e "${C_YELLOW}${prompt}: ${C_RESET}")" t
+    echo ""
+    printf -v "$var_name" '%s' "$t"
+    [[ -n "$t" ]]
+}
+
+email_mask_token() {
+    local t="${1:-}" len=${#1}
+    if (( len <= 8 )); then
+        printf '****'
+    else
+        printf '%s****%s' "${t:0:4}" "${t: -4}"
+    fi
+}
+
+# 同步 export Wrangler 推荐的新版环境变量（CF_* 在 Wrangler 4.x 已 deprecated）
+# 调用前确保 CF_API_TOKEN / CF_ACCOUNT_ID 已就位
+_email_export_wrangler_env() {
+    export CF_API_TOKEN CF_ACCOUNT_ID
+    export CLOUDFLARE_API_TOKEN="${CF_API_TOKEN:-}"
+    export CLOUDFLARE_ACCOUNT_ID="${CF_ACCOUNT_ID:-}"
+}
+
+email_save_admin_password() {
+    local pw="$1"
+    (
+        umask 077
+        {
+            echo "# Cloudflare Temp Email 管理员密码"
+            echo "# 自动生成于 $(date '+%Y-%m-%d %H:%M:%S')"
+            echo "# 该文件仅 root 可读 (mode 600)"
+            echo ""
+            printf 'admin_password=%s\n' "$pw"
+        } > "$EMAIL_ADMIN_FILE"
+    )
+    chmod 600 "$EMAIL_ADMIN_FILE"
+    chown root:root "$EMAIL_ADMIN_FILE"
+}
+
+# ── 日志包装 ──
+email_log() {
+    email_state_init_dirs
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$EMAIL_LOG_FILE"
+}
+
+# 用法: email_run "构建前端" pnpm build:pages
+# 默认安静运行，失败时自动打印日志尾部
+email_run() {
+    local label="$1"; shift
+    email_state_init_dirs
+    email_log "===== $label ====="
+    printf '%b' "${C_BLUE}[..]${C_RESET} $label..."
+    if "$@" >> "$EMAIL_LOG_FILE" 2>&1; then
+        printf '\r%b\n' "${C_GREEN}[✓]${C_RESET} $label                                                  "
+        return 0
+    fi
+    local rc=$?
+    printf '\r%b\n' "${C_RED}[✗]${C_RESET} $label (exit=$rc)                                            "
+    echo -e "${C_GRAY}最近日志 (${EMAIL_LOG_FILE} 末 30 行，敏感字段已脱敏)：${C_RESET}"
+    # tail 时过滤可能出现的 secret 明文（curl --data 的 secret_text、wrangler 输出 TOKEN 等）
+    tail -n 30 "$EMAIL_LOG_FILE" 2>/dev/null | _email_redact_secrets | sed 's/^/  /'
+    return "$rc"
+}
+
+# 行级脱敏：替换日志中可能出现的 secret 明文
+# 覆盖 CF API JSON 中的 "text":"..."、wrangler 输出的 TOKEN=xxx 形式
+_email_redact_secrets() {
+    sed -E \
+        -e 's/("text"[[:space:]]*:[[:space:]]*)"[^"]*"/\1"<redacted>"/g' \
+        -e 's/(ADMIN_PASSWORDS|RESEND_TOKEN|CLOUDFLARE_API_TOKEN|CF_API_TOKEN)([[:space:]]*=[[:space:]]*|:[[:space:]]*)["'"'"']?[^[:space:]"'"'"']+["'"'"']?/\1\2<redacted>/g' \
+        -e 's/(Bearer[[:space:]]+)[A-Za-z0-9._-]+/\1<redacted>/g'
+}
+
+# 同步 pages/wrangler.toml 中 [[services]] service 字段为当前 Worker 名
+# 幂等：已是正确值则 noop；无 services section 也 noop（不视为错误）
+# 调用方：14c 首次部署、14d 升级、14d 重新部署 — 三处复用，避免自定义 Worker 名后 Pages Functions 仍指向 cloudflare_temp_email
+_email_patch_pages_service_binding() {
+    local pages_dir="${1:-$EMAIL_INSTALL_DIR/pages}"
+    local pages_toml="$pages_dir/wrangler.toml"
+    [[ -f "$pages_toml" ]] || { email_log "pages toml 不存在: $pages_toml"; return 1; }
+    if ! grep -qE '^[[:space:]]*service[[:space:]]*=' "$pages_toml"; then
+        email_log "pages toml 未包含 service 行，无需 patch"
+        return 0
+    fi
+    if grep -qE "^[[:space:]]*service[[:space:]]*=[[:space:]]*\"${EMAIL_WORKER_NAME}\"" "$pages_toml"; then
+        email_log "pages service binding 已是 ${EMAIL_WORKER_NAME}，跳过"
+        return 0
+    fi
+    sed -i.bak -E "s|^([[:space:]]*service[[:space:]]*=[[:space:]]*\")[^\"]+(\".*)$|\1${EMAIL_WORKER_NAME}\2|" "$pages_toml"
+    rm -f "${pages_toml}.bak"
+    email_log "Patched pages/wrangler.toml service binding → ${EMAIL_WORKER_NAME}"
+    return 0
+}
+# 调用前需要：export CF_API_TOKEN / CF_ACCOUNT_ID
+#
+# 所有 _email_cf_* 函数约定：
+#   stdout = 业务数据（id / 域名等）或完整响应
+#   exit   = 0 成功；1 业务失败；2 网络失败
+#   错误细节进 EMAIL_LOG_FILE，不打印到终端（由调用方决定是否打印）
+
+_email_cf_api() {
+    # $1: method  $2: path (不带前导 /)  $3: 可选 JSON body
+    local method="$1" path="$2" body="${3:-}"
+    [[ -n "${CF_API_TOKEN:-}" ]] || { email_log "CF API token missing"; return 1; }
+    local url="https://api.cloudflare.com/client/v4/$path"
+    local -a args=(-sS --max-time 30 -X "$method"
+                   -H "Authorization: Bearer $CF_API_TOKEN"
+                   -H "Content-Type: application/json")
+    [[ -n "$body" ]] && args+=(-d "$body")
+    local resp
+    resp=$(curl "${args[@]}" "$url" 2>>"$EMAIL_LOG_FILE") || {
+        email_log "CF API network failure: $method $path"
+        return 2
+    }
+    local ok
+    ok=$(echo "$resp" | jq -r '.success // false' 2>/dev/null)
+    if [[ "$ok" != "true" ]]; then
+        local err safe_body
+        err=$(echo "$resp" | jq -r '.errors // [] | map("\(.code): \(.message)") | join("; ")' 2>/dev/null)
+        # ── secret 路径脱敏 ──
+        # /secrets 路径的 body 包含 ADMIN_PASSWORDS / RESEND_TOKEN 等明文，绝不入日志
+        if [[ "$path" == *"/secrets"* ]]; then
+            safe_body="<redacted: secret payload>"
         else
-            local enc_pass="${WEBDAV_ENC_KEY:-}"
-            if [[ -z "$enc_pass" ]]; then
-                read -s -r -p "设置加密密码 (用于解密恢复): " enc_pass
-                echo ""
-                if [[ -z "$enc_pass" ]]; then
-                    print_warn "密码为空，跳过加密。"
-                else
-                    echo ""
-                    print_guide "提示: 可在 WebDAV 配置中设置 WEBDAV_ENC_KEY 免去每次输入。"
-                fi
-            fi
-            if [[ -n "$enc_pass" ]]; then
-                upload_file="${file}.enc"
-                print_info "正在加密..."
-                if printf '%s' "${enc_pass}" | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 \
-                    -in "$file" -out "$upload_file" -pass stdin 2>/dev/null; then
-                    filename="${filename}.enc"
-                    encrypted=1
-                    local enc_size=$(du -h "$upload_file" 2>/dev/null | awk '{print $1}')
-                    print_success "加密完成 (加密后: $enc_size)"
-                else
-                    print_error "加密失败，使用明文上传。"
-                    upload_file="$file"
-                fi
-            fi
+            safe_body="${body:-<none>}"
         fi
-    fi
-    local upload_url="${WEBDAV_URL%/}/${filename}"
-    print_info "正在上传: ${filename}..."
-    local http_code
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
-        --location-trusted \
-        -T "$upload_file" \
-        -u "${WEBDAV_USER}:${WEBDAV_PASS}" \
-        -H 'Expect:' \
-        --connect-timeout 10 \
-        --max-time 600 \
-        "$upload_url" 2>/dev/null)
-    
-    # 清理加密临时文件
-    [[ $encrypted -eq 1 ]] && rm -f "$upload_file"
-    if [[ "$http_code" =~ ^(200|201|204)$ ]]; then
-        print_success "上传成功！(HTTP $http_code)"
-        [[ $encrypted -eq 1 ]] && print_info "文件已加密传输 (AES-256-CBC)。恢复时需要解密密码。"
-        log_action "Backup uploaded to WebDAV: $filename (encrypted=$encrypted)"
-    else
-        print_error "上传失败 (HTTP $http_code)"
+        email_log "CF API ${method} ${path} failed: ${err:-<empty>} body=${safe_body}"
         return 1
     fi
+    printf '%s' "$resp"
 }
 
-backup_webdav_config() {
-    print_title "WebDAV 远程存储配置"
-    if [[ -f "$BACKUP_CONFIG_FILE" ]] && validate_conf_file "$BACKUP_CONFIG_FILE"; then
-        source "$BACKUP_CONFIG_FILE" 2>/dev/null
-        echo -e "当前配置:"
-        echo -e "  URL:  ${C_CYAN}${WEBDAV_URL:-未设置}${C_RESET}"
-        echo -e "  用户: ${C_CYAN}${WEBDAV_USER:-未设置}${C_RESET}"
-        echo -e "  密码: ${C_CYAN}${WEBDAV_PASS:+****}${C_RESET}"
-        echo -e "  加密: ${C_CYAN}${WEBDAV_ENCRYPT:-false}${C_RESET}"
-        [[ -n "${WEBDAV_ENC_KEY:-}" ]] && echo -e "  密钥: ${C_CYAN}****${C_RESET}"
-        echo ""
-    fi
-    echo "1. 设置/修改 WebDAV 参数
-2. 测试 WebDAV 连通性
-3. 配置传输加密
-4. 清除 WebDAV 配置
-0. 返回
-"
-    read -e -r -p "选择: " wc
-    case $wc in
-        1)
-            local url user pass
-            echo ""
-            print_guide "输入 WebDAV 地址 (例如 https://dav.jianguoyun.com/dav/backups)"
-            read -e -r -p "WebDAV URL: " url
-            [[ -z "$url" ]] && { print_warn "已取消"; pause; return; }
-            read -e -r -p "用户名: " user
-            [[ -z "$user" ]] && { print_warn "已取消"; pause; return; }
-            read -s -r -p "密码/应用密钥: " pass
-            echo ""
-            [[ -z "$pass" ]] && { print_warn "已取消"; pause; return; }
-            # 转义特殊字符防止 source 时执行
-            local safe_url safe_user safe_pass
-            safe_url=$(printf '%s' "$url" | sed 's/["\\$`]/\\&/g')
-            safe_user=$(printf '%s' "$user" | sed 's/["\\$`]/\\&/g')
-            safe_pass=$(printf '%s' "$pass" | sed 's/["\\$`]/\\&/g')
-            write_file_atomic "$BACKUP_CONFIG_FILE" "# WebDAV 备份配置
-# Generated by $SCRIPT_NAME $VERSION
-WEBDAV_URL=\"$safe_url\"
-WEBDAV_USER=\"$safe_user\"
-WEBDAV_PASS=\"$safe_pass\"
-WEBDAV_ENCRYPT=\"false\"
-WEBDAV_ENC_KEY=\"\""
-            chmod 600 "$BACKUP_CONFIG_FILE"
-            print_success "WebDAV 配置已保存。"
-            ;;
-        2)
-            if [[ ! -f "$BACKUP_CONFIG_FILE" ]]; then
-                print_error "未配置 WebDAV"; pause; return
-            fi
-            validate_conf_file "$BACKUP_CONFIG_FILE" || { print_error "备份配置文件格式异常"; pause; return; }
-            source "$BACKUP_CONFIG_FILE" 2>/dev/null
-            print_info "正在测试连通性..."
-            local code
-            code=$(curl -s -o /dev/null -w "%{http_code}" \
-                --location-trusted \
-                -u "${WEBDAV_USER}:${WEBDAV_PASS}" \
-                --connect-timeout 10 \
-                -X PROPFIND "$WEBDAV_URL" 2>/dev/null)
-            if [[ "$code" =~ ^(200|207|301|405)$ ]]; then
-                print_success "连接成功 (HTTP $code)"
-            else
-                print_error "连接失败 (HTTP $code)"
-            fi
-            ;;
-        3)
-            if [[ ! -f "$BACKUP_CONFIG_FILE" ]]; then
-                print_error "未配置 WebDAV"; pause; return
-            fi
-            validate_conf_file "$BACKUP_CONFIG_FILE" || { print_error "备份配置文件格式异常"; pause; return; }
-            source "$BACKUP_CONFIG_FILE" 2>/dev/null
-            echo -e "当前加密状态: $( [[ "${WEBDAV_ENCRYPT:-}" == "true" ]] && echo -e "${C_GREEN}已启用${C_RESET}" || echo -e "${C_YELLOW}未启用${C_RESET}" )"
-            echo "  1. 启用加密上传 (每次上传前自动 AES-256-CBC 加密)
-  2. 关闭加密上传
-  3. 设置加密密钥 (免去每次输入)
-"
-            read -e -r -p "选择: " ec
-            case $ec in
-                1)
-                    sed -i 's/^WEBDAV_ENCRYPT=.*/WEBDAV_ENCRYPT="true"/' "$BACKUP_CONFIG_FILE" 2>/dev/null
-                    print_success "加密已启用。上传时将自动加密。"
-                    ;;
-                2)
-                    sed -i 's/^WEBDAV_ENCRYPT=.*/WEBDAV_ENCRYPT="false"/' "$BACKUP_CONFIG_FILE" 2>/dev/null
-                    print_success "加密已关闭。"
-                    ;;
-                3)
-                    read -s -r -p "输入加密密钥: " ekey
-                    echo ""
-                    if [[ -n "$ekey" ]]; then
-                        # 完整转义: 双引号、反斜杠、$、反引号、sed分隔符
-                        local escaped_key
-                        escaped_key=$(printf '%s' "$ekey" | sed 's/[\\/"$`&]/\\&/g')
-                        sed -i "s/^WEBDAV_ENC_KEY=.*/WEBDAV_ENC_KEY=\"${escaped_key}\"/" "$BACKUP_CONFIG_FILE" 2>/dev/null
-                        print_success "加密密钥已保存。"
-                    fi
-                    ;;
-            esac
-            ;;
-        4)
-            if [[ -f "$BACKUP_CONFIG_FILE" ]]; then
-                rm -f "$BACKUP_CONFIG_FILE"
-                print_success "WebDAV 配置已清除。"
-            else
-                print_warn "无配置可清除。"
-            fi
-            ;;
-    esac
-    pause
+_email_cf_token_verify() {
+    _email_cf_api GET "user/tokens/verify" >/dev/null
 }
 
-backup_schedule() {
-    print_title "定时备份设置"
-    local current_cron=""
-    current_cron=$(crontab -l 2>/dev/null | grep "${SCRIPT_NAME}.*--backup" || true)
-    if [[ -n "$current_cron" ]]; then
-        echo -e "当前定时备份: ${C_GREEN}已启用${C_RESET}"
-        echo -e "  ${C_GRAY}$current_cron${C_RESET}"
-        echo "1. 修改定时频率
-2. 停用定时备份
-0. 返回"
+# URL-encode 单个字符串（用 jq 的 @uri 滤镜，无 jq 时回退裸值）
+# 适用于把用户输入或派生字段安全嵌入 query string
+_email_cf_urlencode() {
+    if command_exists jq; then
+        jq -rn --arg v "${1:-}" '$v | @uri'
     else
-        echo -e "当前定时备份: ${C_YELLOW}未启用${C_RESET}"
-        echo "1. 启用定时备份
-0. 返回"
+        printf '%s' "${1:-}"
     fi
-    read -e -r -p "选择: " sc
-    case $sc in
-        1)
-            echo ""
-            echo "选择备份频率:
-  1. 每日 4:00 AM
-  2. 每周日 4:00 AM
-  3. 每月1日 4:00 AM
-"
-            read -e -r -p "选择 [1]: " freq
-            freq=${freq:-1}
-            local cron_expr=""
-            case $freq in
-                1) cron_expr="0 4 * * *" ;;
-                2) cron_expr="0 4 * * 0" ;;
-                3) cron_expr="0 4 1 * *" ;;
-                *) print_error "无效选项"; pause; return ;;
-            esac
-            
-            # 获取脚本实际路径
-            local script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
-            cron_add_job "${SCRIPT_NAME}.*--backup" "$cron_expr bash $script_path --backup >/dev/null 2>&1"
-            print_success "定时备份已设置。"
-            ;;
-        2)
-            cron_remove_job "${SCRIPT_NAME}.*--backup"
-            print_success "定时备份已停用。"
-            ;;
-    esac
-    pause
 }
 
-backup_restore() {
-    print_title "恢复备份"
-    echo "选择恢复来源:
-  1. 本地备份
-  2. WebDAV 远程备份
-  0. 返回
-"
-    read -e -r -p "选择: " src
-    local restore_file=""
-    case $src in
-        1)
-            # 列出本地备份
-            if [[ ! -d "$BACKUP_LOCAL_DIR" ]] || [[ -z "$(ls -A "$BACKUP_LOCAL_DIR" 2>/dev/null)" ]]; then
-                print_warn "本地无备份文件。"
-                pause; return
-            fi
-            echo -e "${C_CYAN}本地备份列表:${C_RESET}"
-            local i=1 files=()
-            for f in $(ls -t "$BACKUP_LOCAL_DIR"/*.tar.gz 2>/dev/null); do
-                local fsize=$(du -h "$f" 2>/dev/null | awk '{print $1}')
-                local fname=$(basename "$f")
-                echo "  $i. $fname ($fsize)"
-                files+=("$f")
-                i=$((i + 1))
-                [[ $i -gt 20 ]] && break
-            done
-            echo "  0. 返回"
-            read -e -r -p "选择要恢复的备份序号: " idx
-            [[ "$idx" == "0" || -z "$idx" ]] && return
-            if [[ "$idx" =~ ^[0-9]+$ ]] && [[ $idx -ge 1 && $idx -le ${#files[@]} ]]; then
-                restore_file="${files[$((idx - 1))]}"
-            else
-                print_error "无效序号"; pause; return
-            fi
-            ;;
-        2)
-            if [[ ! -f "$BACKUP_CONFIG_FILE" ]]; then
-                print_error "WebDAV 未配置。请先配置 WebDAV 参数。"
-                pause; return
-            fi
-            validate_conf_file "$BACKUP_CONFIG_FILE" || { print_error "备份配置文件格式异常"; pause; return; }
-            source "$BACKUP_CONFIG_FILE" 2>/dev/null
-            print_info "正在获取远程备份列表..."
-            local remote_list
-            remote_list=$(curl -s -u "${WEBDAV_USER}:${WEBDAV_PASS}" --connect-timeout 10 \
-                -X PROPFIND "$WEBDAV_URL" 2>/dev/null | grep -oP "${SCRIPT_NAME}-backup-[^<\"]+\.tar\.gz(\.enc)?" | sort -ur | head -20)
-            if [[ -z "$remote_list" ]]; then
-                print_warn "远程无备份文件或无法连接。"
-                pause; return
-            fi
-            echo -e "${C_CYAN}远程备份列表:${C_RESET}"
-            local i=1 rfiles=()
-            while IFS= read -r fname; do
-                echo "  $i. $fname"
-                rfiles+=("$fname")
-                i=$((i + 1))
-            done <<< "$remote_list"
-            echo "  0. 返回"
-            read -e -r -p "选择要恢复的备份序号: " idx
-            [[ "$idx" == "0" || -z "$idx" ]] && return
-            if [[ "$idx" =~ ^[0-9]+$ ]] && [[ $idx -ge 1 && $idx -le ${#rfiles[@]} ]]; then
-                local remote_fname="${rfiles[$((idx - 1))]}"
-                restore_file="/tmp/${remote_fname}"
-                print_info "正在下载 ${remote_fname}..."
-                if ! curl -s -u "${WEBDAV_USER}:${WEBDAV_PASS}" \
-                    -o "$restore_file" --connect-timeout 10 --max-time 300 \
-                    "${WEBDAV_URL%/}/${remote_fname}" 2>/dev/null; then
-                    print_error "下载失败"
-                    pause; return
-                fi
-                print_success "下载完成。"
-            else
-                print_error "无效序号"; pause; return
-            fi
-            ;;
-        *) return ;;
-    esac
-    [[ -z "$restore_file" || ! -f "$restore_file" ]] && { print_error "备份文件不存在"; pause; return; }
-    
-    # 如果是加密文件，先解密
-    if [[ "$restore_file" == *.enc ]]; then
-        print_warn "检测到加密备份文件，需要解密。"
-        local dec_pass="${WEBDAV_ENC_KEY:-}"
-        if [[ -z "$dec_pass" ]]; then
-            read -s -r -p "输入解密密码: " dec_pass
-            echo ""
-        fi
-        [[ -z "$dec_pass" ]] && { print_error "密码不能为空"; pause; return; }
-        local dec_file="${restore_file%.enc}"
-        print_info "正在解密..."
-        if ! printf '%s' "${dec_pass}" | openssl enc -aes-256-cbc -d -salt -pbkdf2 -iter 100000 \
-            -in "$restore_file" -out "$dec_file" -pass stdin 2>/dev/null; then
-            print_error "解密失败，密码可能不正确。"
-            rm -f "$dec_file"
-            pause; return
-        fi
-        restore_file="$dec_file"
-        print_success "解密完成。"
-    fi
-    print_warn "恢复操作将覆盖现有配置。"
-    if ! confirm "确认恢复? (建议先备份当前配置)"; then
-        pause; return
-    fi
-    local tmp_restore=$(mktemp -d "/tmp/${SCRIPT_NAME}-restore.XXXXXX")
-    trap "rm -rf '$tmp_restore'" RETURN
-    print_info "正在解压..."
-    if ! tar -xzf "$restore_file" -C "$tmp_restore" 2>/dev/null; then
-        print_error "解压失败，文件可能已损坏。"
-        pause; return 1
-    fi
-    
-    # 逐项恢复
-    local restored=0
-    [[ -d "${tmp_restore}/nginx" ]] && {
-        cp -r "${tmp_restore}/nginx/"* /etc/nginx/ 2>/dev/null
-        echo -e "  ${C_GREEN}✓${C_RESET} /etc/nginx"
-        restored=$((restored + 1))
-    }
-    [[ -d "${tmp_restore}/ddns" ]] && {
-        mkdir -p "$DDNS_CONFIG_DIR"
-        cp -r "${tmp_restore}/ddns/"* "$DDNS_CONFIG_DIR/" 2>/dev/null
-        echo -e "  ${C_GREEN}✓${C_RESET} $DDNS_CONFIG_DIR"
-        restored=$((restored + 1))
-    }
-    [[ -d "${tmp_restore}/domain-configs" ]] && {
-        mkdir -p "$CONFIG_DIR"
-        cp -r "${tmp_restore}/domain-configs/"* "$CONFIG_DIR/" 2>/dev/null
-        echo -e "  ${C_GREEN}✓${C_RESET} $CONFIG_DIR"
-        restored=$((restored + 1))
-    }
-    [[ -d "${tmp_restore}/certs" ]] && {
-        mkdir -p "$CERT_PATH_PREFIX"
-        cp -r "${tmp_restore}/certs/"* "$CERT_PATH_PREFIX/" 2>/dev/null
-        echo -e "  ${C_GREEN}✓${C_RESET} $CERT_PATH_PREFIX"
-        restored=$((restored + 1))
-    }
-    [[ -d "${tmp_restore}/cert-hooks" ]] && {
-        mkdir -p "$CERT_HOOKS_DIR"
-        cp -r "${tmp_restore}/cert-hooks/"* "$CERT_HOOKS_DIR/" 2>/dev/null
-        echo -e "  ${C_GREEN}✓${C_RESET} $CERT_HOOKS_DIR"
-        restored=$((restored + 1))
-    }
-    [[ -f "${tmp_restore}/crontab.bak" ]] && {
-        if confirm "是否恢复 crontab? (将替换当前所有 cron 定时任务)"; then
-            crontab "${tmp_restore}/crontab.bak" 2>/dev/null
-            echo -e "  ${C_GREEN}✓${C_RESET} crontab"
-            restored=$((restored + 1))
-        fi
-    }
-    [[ -f "${tmp_restore}/script-config" ]] && {
-        cp "${tmp_restore}/script-config" "$CONFIG_FILE" 2>/dev/null
-        echo -e "  ${C_GREEN}✓${C_RESET} $CONFIG_FILE"
-        restored=$((restored + 1))
-    }
-    [[ -f "${tmp_restore}/ddns-update.sh" ]] && {
-        mkdir -p "$(dirname "$DDNS_UPDATE_SCRIPT")"
-        cp "${tmp_restore}/ddns-update.sh" "$DDNS_UPDATE_SCRIPT" 2>/dev/null
-        chmod +x "$DDNS_UPDATE_SCRIPT" 2>/dev/null
-        echo -e "  ${C_GREEN}✓${C_RESET} ddns-update.sh"
-        restored=$((restored + 1))
-    }
-    [[ -f "${tmp_restore}/x-ui/x-ui.db" ]] && {
-        mkdir -p /etc/x-ui
-        cp "${tmp_restore}/x-ui/x-ui.db" /etc/x-ui/ 2>/dev/null
-        echo -e "  ${C_GREEN}✓${C_RESET} /etc/x-ui/x-ui.db"
-        restored=$((restored + 1))
-    }
-    
-    # 重载服务（必须在清理临时目录之前检查）
-    if command_exists nginx && [[ -d "${tmp_restore}/nginx" ]]; then
-        nginx -t >/dev/null 2>&1 && {
-            is_systemd && systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null
-            print_info "Nginx 已重载。"
-        }
-    fi
-    rm -rf "$tmp_restore"
-    trap - RETURN
-    echo ""
-    print_success "恢复完成！共恢复 $restored 项。"
-    log_action "Backup restored from: $(basename "$restore_file") ($restored items)"
-    pause
+# 列出当前 Token 可见的 accounts，用于自动选择
+_email_cf_accounts_list() {
+    local resp
+    resp=$(_email_cf_api GET "accounts?per_page=50") || return 1
+    echo "$resp" | jq -r '.result[] | "\(.id)\t\(.name)"'
 }
 
-backup_list() {
-    print_title "备份文件列表"
-    if [[ ! -d "$BACKUP_LOCAL_DIR" ]] || [[ -z "$(ls -A "$BACKUP_LOCAL_DIR"/*.tar.gz 2>/dev/null)" ]]; then
-        print_warn "本地无备份文件。"
-        echo -e "  备份目录: ${C_GRAY}$BACKUP_LOCAL_DIR${C_RESET}"
-        pause; return
-    fi
-    echo -e "${C_CYAN}本地备份:${C_RESET}"
-    echo -e "  路径: ${C_GRAY}${BACKUP_LOCAL_DIR}${C_RESET}"
-    draw_line
-    for f in $(ls -t "$BACKUP_LOCAL_DIR"/*.tar.gz 2>/dev/null | head -20); do
-        local fsize=$(du -h "$f" 2>/dev/null | awk '{print $1}')
-        local fdate=$(stat -c '%y' "$f" 2>/dev/null | cut -d'.' -f1 || stat -f '%Sm' "$f" 2>/dev/null)
-        printf "  ${C_GREEN}%s${C_RESET}\n" "$f"
-        printf "    大小: %s  日期: %s\n" "$fsize" "$fdate"
-    done
-    draw_line
-    local total=$(ls -1 "$BACKUP_LOCAL_DIR"/*.tar.gz 2>/dev/null | wc -l)
-    local total_size=$(du -sh "$BACKUP_LOCAL_DIR" 2>/dev/null | awk '{print $1}')
-    echo -e "  共 ${C_GREEN}${total}${C_RESET} 个备份, 占用 ${total_size}"
-    pause
+_email_cf_account_first_id() {
+    local resp
+    resp=$(_email_cf_api GET "accounts?page=1&per_page=1") || return 1
+    echo "$resp" | jq -r '.result[0].id // empty'
 }
 
-backup_clean() {
-    print_title "清理旧备份"
-    echo "1. 清理本地备份
-2. 清理 WebDAV 远程备份
-0. 返回
-"
-    read -e -r -p "选择: " clean_scope
-    case $clean_scope in
-        1) _backup_clean_local ;;
-        2) _backup_clean_webdav ;;
-        *) return ;;
-    esac
+_email_cf_zone_id_by_name() {
+    local domain="$1" enc resp
+    enc=$(_email_cf_urlencode "$domain")
+    resp=$(_email_cf_api GET "zones?name=$enc") || return 1
+    local zid
+    zid=$(echo "$resp" | jq -r '.result[0].id // empty')
+    [[ -n "$zid" ]] || return 1
+    printf '%s' "$zid"
 }
 
-_backup_clean_local() {
-    if [[ ! -d "$BACKUP_LOCAL_DIR" ]] || [[ -z "$(ls -A "$BACKUP_LOCAL_DIR"/*.tar.gz 2>/dev/null)" ]]; then
-        print_warn "本地无备份文件。"
-        pause; return
-    fi
-    local total=$(ls -1 "$BACKUP_LOCAL_DIR"/*.tar.gz 2>/dev/null | wc -l)
-    echo "本地共 $total 个备份。"
-    echo ""
-    echo "1. 保留最近 5 个，删除其余
-2. 保留最近 10 个，删除其余
-3. 删除全部备份
-0. 返回
-"
-    read -e -r -p "选择: " cc
-    local keep=0
-    case $cc in
-        1) keep=5 ;;
-        2) keep=10 ;;
-        3) keep=0 ;;
-        *) return ;;
-    esac
-    if [[ $keep -eq 0 ]]; then
-        confirm "确认删除全部本地备份?" || return
-        rm -f "$BACKUP_LOCAL_DIR"/*.tar.gz
-        print_success "全部本地备份已清除。"
-    else
-        local count=0
-        for f in $(ls -t "$BACKUP_LOCAL_DIR"/*.tar.gz 2>/dev/null); do
-            count=$((count + 1))
-            if [[ $count -gt $keep ]]; then
-                rm -f "$f"
-            fi
-        done
-        local deleted=$((count > keep ? count - keep : 0))
-        print_success "已清理 $deleted 个本地旧备份，保留最近 $keep 个。"
-    fi
-    log_action "Local backup cleanup: kept=$keep"
-    pause
+# ── DNS ──
+# 用法: _email_cf_dns_create <zone_id> <type> <name> <content> [priority] [proxied:true|false]
+# 返回: record_id（成功时 stdout）
+_email_cf_dns_create() {
+    local zid="$1" type="$2" name="$3" content="$4" priority="${5:-}" proxied="${6:-}"
+    local body
+    body=$(jq -nc \
+        --arg type "$type" --arg name "$name" --arg content "$content" \
+        --argjson priority "${priority:-null}" \
+        --argjson proxied "${proxied:-null}" \
+        '{type:$type, name:$name, content:$content}
+         + (if $priority != null then {priority:$priority} else {} end)
+         + (if $proxied != null then {proxied:$proxied} else {} end)')
+    local resp
+    resp=$(_email_cf_api POST "zones/$zid/dns_records" "$body") || return 1
+    echo "$resp" | jq -r '.result.id'
 }
 
-_backup_clean_webdav() {
-    if [[ ! -f "$BACKUP_CONFIG_FILE" ]]; then
-        print_error "WebDAV 未配置。请先使用菜单配置 WebDAV 参数。"
-        pause; return
-    fi
-    validate_conf_file "$BACKUP_CONFIG_FILE" || { print_error "备份配置文件格式异常"; pause; return; }
-    source "$BACKUP_CONFIG_FILE" 2>/dev/null
-    if [[ -z "$WEBDAV_URL" || -z "$WEBDAV_USER" || -z "$WEBDAV_PASS" ]]; then
-        print_error "WebDAV 配置不完整。"
-        pause; return
-    fi
-    print_info "正在获取远程备份列表..."
-    local remote_list
-    remote_list=$(curl -s -u "${WEBDAV_USER}:${WEBDAV_PASS}" --connect-timeout 10 \
-        -X PROPFIND "$WEBDAV_URL" 2>/dev/null | grep -oP "${SCRIPT_NAME}-backup-[^<\"]+\.tar\.gz(\.enc)?" | sort -ur)
-    if [[ -z "$remote_list" ]]; then
-        print_warn "远程无备份文件。"
-        pause; return
-    fi
-    local total=$(echo "$remote_list" | wc -l)
-    echo "远程共 $total 个备份。"
-    echo ""
-    echo "1. 保留最近 5 个，删除其余
-2. 保留最近 10 个，删除其余
-3. 删除全部远程备份
-0. 返回
-"
-    read -e -r -p "选择: " cc
-    local keep=0
-    case $cc in
-        1) keep=5 ;;
-        2) keep=10 ;;
-        3) keep=0 ;;
-        *) return ;;
-    esac
-    if [[ $keep -eq 0 ]]; then
-        confirm "确认删除全部远程备份?" || return
-    fi
-    local count=0 deleted=0
-    while IFS= read -r fname; do
-        count=$((count + 1))
-        if [[ $keep -eq 0 ]] || [[ $count -gt $keep ]]; then
-            local del_url="${WEBDAV_URL%/}/${fname}"
-            local http_code
-            http_code=$(curl -s -o /dev/null -w "%{http_code}" \
-                -X DELETE -u "${WEBDAV_USER}:${WEBDAV_PASS}" \
-                --connect-timeout 10 "$del_url" 2>/dev/null)
-            if [[ "$http_code" =~ ^(200|204)$ ]]; then
-                deleted=$((deleted + 1))
-            else
-                print_warn "删除失败: $fname (HTTP $http_code)"
-            fi
-        fi
-    done <<< "$remote_list"
-    if [[ $deleted -gt 0 ]]; then
-        print_success "已清理 $deleted 个远程旧备份$([ $keep -gt 0 ] && echo "，保留最近 $keep 个")。"
-    else
-        print_warn "无需清理。"
-    fi
-    log_action "WebDAV backup cleanup: deleted=$deleted kept=$keep"
-    pause
+_email_cf_dns_delete() {
+    local zid="$1" rid="$2"
+    [[ -z "$rid" || "$rid" == "null" ]] && return 0
+    _email_cf_api DELETE "zones/$zid/dns_records/$rid" >/dev/null
 }
 
-backup_manual_upload() {
-    print_title "手动上传备份到 WebDAV"
-    if [[ ! -f "$BACKUP_CONFIG_FILE" ]]; then
-        print_error "WebDAV 未配置。请先使用菜单配置 WebDAV 参数。"
-        pause; return
-    fi
-    validate_conf_file "$BACKUP_CONFIG_FILE" || { print_error "备份配置文件格式异常"; pause; return; }
-    if [[ ! -d "$BACKUP_LOCAL_DIR" ]] || [[ -z "$(ls -A "$BACKUP_LOCAL_DIR"/*.tar.gz 2>/dev/null)" ]]; then
-        print_warn "本地无备份文件可上传。"
-        pause; return
-    fi
-    echo -e "${C_CYAN}选择要上传的本地备份:${C_RESET}"
-    local i=1 files=()
-    for f in $(ls -t "$BACKUP_LOCAL_DIR"/*.tar.gz 2>/dev/null); do
-        local fsize=$(du -h "$f" 2>/dev/null | awk '{print $1}')
-        printf "  %2d. %-50s (%s)\n" "$i" "$(basename "$f")" "$fsize"
-        files+=("$f")
-        i=$((i + 1))
-        [[ $i -gt 20 ]] && break
-    done
-    echo "   0. 返回"
-    read -e -r -p "选择序号: " idx
-    [[ "$idx" == "0" || -z "$idx" ]] && return
-    if [[ "$idx" =~ ^[0-9]+$ ]] && [[ $idx -ge 1 && $idx -le ${#files[@]} ]]; then
-        local selected="${files[$((idx - 1))]}"
-        print_info "已选择: $(basename "$selected")"
-        backup_webdav_upload "$selected"
-    else
-        print_error "无效序号"
-    fi
-    pause
+# 按 type+name 查找（用于清理脏数据 / 防重复添加）
+# 返回: 多行 record_id
+_email_cf_dns_find_ids() {
+    local zid="$1" type="$2" name="$3"
+    local enc_type enc_name resp
+    enc_type=$(_email_cf_urlencode "$type")
+    enc_name=$(_email_cf_urlencode "$name")
+    resp=$(_email_cf_api GET "zones/$zid/dns_records?type=$enc_type&name=$enc_name&per_page=50") || return 1
+    echo "$resp" | jq -r '.result[].id'
 }
 
-menu_backup() {
-    while true; do
-        print_title "备份与恢复 (支持 WebDAV)"
-        local backup_count=$(ls -1 "$BACKUP_LOCAL_DIR"/*.tar.gz 2>/dev/null | wc -l)
-        local webdav_status="未配置"
-        [[ -f "$BACKUP_CONFIG_FILE" ]] && validate_conf_file "$BACKUP_CONFIG_FILE" 2>/dev/null && source "$BACKUP_CONFIG_FILE" 2>/dev/null && [[ -n "$WEBDAV_URL" ]] && webdav_status="已配置"
-        echo -e "本地备份: ${C_GREEN}${backup_count}${C_RESET} 个 | WebDAV: ${C_GREEN}${webdav_status}${C_RESET}"
-        echo "1. 立即创建备份
-2. 恢复备份
-3. 查看备份列表
-4. 清理旧备份
-5. 配置 WebDAV 远程存储
-6. 定时备份设置
-7. 手动上传备份到 WebDAV
-0. 返回主菜单
-"
-        read -e -r -p "选择: " bc
-        case $bc in
-            1) backup_create ;;
-            2) backup_restore ;;
-            3) backup_list ;;
-            4) backup_clean ;;
-            5) backup_webdav_config ;;
-            6) backup_schedule ;;
-            7) backup_manual_upload ;;
-            0|q) break ;;
-            *) print_error "无效选项" ;;
-        esac
-    done
-}
-# 项目: https://github.com/dreamhunter2333/cloudflare_temp_email
-
-EMAIL_INSTALL_DIR="/root/cloudflare_temp_email"
-
-email_status() {
-    print_title "临时邮箱部署状态"
-    if [[ ! -d "$EMAIL_INSTALL_DIR" ]]; then
-        print_warn "未检测到安装目录 ($EMAIL_INSTALL_DIR)"
-        pause; return
-    fi
-    print_success "安装目录: $EMAIL_INSTALL_DIR"
-    local ver
-    ver=$(cd "$EMAIL_INSTALL_DIR" && git describe --tags 2>/dev/null || echo "未知")
-    echo -e "  版本: ${C_CYAN}$ver${C_RESET}"
-
-    if [[ -f "$EMAIL_INSTALL_DIR/worker/wrangler.toml" ]]; then
-        local api_domain
-        api_domain=$(grep -oP 'pattern\s*=\s*"\K[^"]+' "$EMAIL_INSTALL_DIR/worker/wrangler.toml" 2>/dev/null | head -1)
-        if [[ -n "$api_domain" ]]; then
-            echo -e "  API 域名: ${C_CYAN}$api_domain${C_RESET}"
-            echo ""
-            print_info "检测 Worker 健康状态..."
-            local health
-            health=$(curl -s --connect-timeout 10 "https://$api_domain/health_check" 2>&1)
-            if [[ "$health" == "OK" ]]; then
-                print_success "Worker 后端运行正常"
-            else
-                print_warn "Worker 未响应 (可能 DNS 未生效或未部署)"
-            fi
-        fi
-    else
-        print_warn "未找到 wrangler.toml 配置"
-    fi
-    pause
+# 删除 zone 下所有匹配 type+name 的记录（idempotent 清理）
+_email_cf_dns_purge() {
+    local zid="$1" type="$2" name="$3" id
+    while IFS= read -r id; do
+        [[ -n "$id" ]] && _email_cf_dns_delete "$zid" "$id" || true
+    done < <(_email_cf_dns_find_ids "$zid" "$type" "$name")
 }
 
+# ── Pages ──
+_email_cf_pages_project_create() {
+    local name="$1"
+    local body
+    body=$(jq -nc --arg n "$name" \
+        '{name:$n, production_branch:"production"}')
+    _email_cf_api POST "accounts/$CF_ACCOUNT_ID/pages/projects" "$body" >/dev/null
+}
+
+_email_cf_pages_project_delete() {
+    local name="$1"
+    _email_cf_api DELETE "accounts/$CF_ACCOUNT_ID/pages/projects/$name" >/dev/null
+}
+
+_email_cf_pages_get_subdomain() {
+    local project="$1"
+    local resp
+    resp=$(_email_cf_api GET "accounts/$CF_ACCOUNT_ID/pages/projects/$project") || return 1
+    echo "$resp" | jq -r '.result.subdomain // empty'
+}
+
+_email_cf_pages_attach_domain() {
+    local project="$1" domain="$2"
+    local body
+    body=$(jq -nc --arg d "$domain" '{name:$d}')
+    _email_cf_api POST "accounts/$CF_ACCOUNT_ID/pages/projects/$project/domains" "$body" >/dev/null
+}
+
+# ── Workers / D1 ──
+_email_cf_worker_exists() {
+    local name="$1"
+    _email_cf_api GET "accounts/$CF_ACCOUNT_ID/workers/scripts/$name" >/dev/null 2>&1
+}
+
+_email_cf_pages_project_exists() {
+    local name="$1"
+    _email_cf_api GET "accounts/$CF_ACCOUNT_ID/pages/projects/$name" >/dev/null 2>&1
+}
+
+_email_cf_worker_delete() {
+    local name="$1"
+    _email_cf_api DELETE "accounts/$CF_ACCOUNT_ID/workers/scripts/$name" >/dev/null
+}
+
+_email_cf_worker_secret_put() {
+    # 用 API 直接写 secret，避免 wrangler 交互问题
+    local script="$1" key="$2" value="$3"
+    local body
+    body=$(jq -nc --arg n "$key" --arg t "secret_text" --arg v "$value" \
+        '{name:$n, type:$t, text:$v}')
+    _email_cf_api PUT "accounts/$CF_ACCOUNT_ID/workers/scripts/$script/secrets" "$body" >/dev/null
+}
+
+_email_cf_d1_delete() {
+    local d1_id="$1"
+    [[ -n "$d1_id" ]] || return 0
+    _email_cf_api DELETE "accounts/$CF_ACCOUNT_ID/d1/database/$d1_id" >/dev/null
+}
+
+# ── Email Routing ──
+_email_cf_email_routing_status() {
+    local zid="$1"
+    local resp
+    resp=$(_email_cf_api GET "zones/$zid/email/routing") || return 1
+    echo "$resp" | jq -r '.result.enabled // false'
+}
+
+_email_cf_email_routing_enable() {
+    local zid="$1"
+    local status
+    status=$(_email_cf_email_routing_status "$zid") || return 1
+    if [[ "$status" != "true" ]]; then
+        _email_cf_api POST "zones/$zid/email/routing/enable" "" >/dev/null || return 1
+    fi
+    return 0
+}
+
+# catch-all: 全部邮件转发到 worker
+_email_cf_catch_all_to_worker() {
+    local zid="$1" worker_name="$2"
+    local body
+    body=$(jq -nc --arg w "$worker_name" \
+        '{matchers:[{type:"all"}],
+          actions:[{type:"worker", value:[$w]}],
+          enabled:true,
+          name:"catch_all_to_worker"}')
+    _email_cf_api PUT "zones/$zid/email/routing/rules/catch_all" "$body" >/dev/null
+}
+
+_email_cf_catch_all_disable() {
+    local zid="$1"
+    local body='{"enabled":false,"matchers":[{"type":"all"}],"actions":[{"type":"drop"}]}'
+    _email_cf_api PUT "zones/$zid/email/routing/rules/catch_all" "$body" >/dev/null 2>&1 || true
+}
+
+# ── 高层封装：add-and-record ──
+# 用法: _email_cf_dns_create_record_into <state_var> <zone_id> <type> <name> <content> [priority] [proxied]
+# 成功时：把返回的 record_id 写入指定 state 变量名（如 EMAIL_DNS_MX1_ID）；失败时变量保留旧值
+_email_cf_dns_create_record_into() {
+    local var_name="$1"; shift
+    local rid
+    rid=$(_email_cf_dns_create "$@") || return 1
+    [[ -n "$rid" && "$rid" != "null" ]] || return 1
+    printf -v "$var_name" '%s' "$rid"
+    return 0
+}
+
+# ── 入口 ──
 email_deploy() {
     print_title "Cloudflare Temp Email 一键部署"
     echo -e "${C_CYAN}项目: https://github.com/dreamhunter2333/cloudflare_temp_email${C_RESET}"
     echo ""
 
-    # --- 交互式输入 ---
-    read -e -r -p "Cloudflare API Token: " cf_api_token
-    [[ -z "$cf_api_token" ]] && { print_error "API Token 不能为空"; pause; return; }
-    read -e -r -p "Cloudflare Account ID (留空自动获取): " cf_account_id
-    if [[ -z "$cf_account_id" ]]; then
-        print_info "正在自动获取 Account ID..."
-        cf_account_id=$(curl -s "https://api.cloudflare.com/client/v4/accounts?page=1&per_page=1" \
-            -H "Authorization: Bearer $cf_api_token" | python3 -c "import sys,json; print(json.load(sys.stdin)['result'][0]['id'])" 2>/dev/null)
-        if [[ -z "$cf_account_id" ]]; then
-            print_error "自动获取 Account ID 失败，请手动输入"; pause; return
+    # 已部署：让用户决定是否覆盖
+    if email_state_load 2>/dev/null; then
+        print_warn "检测到已有部署：${EMAIL_FRONTEND_DOMAIN:-?} / ${EMAIL_API_DOMAIN:-?}"
+        echo -e "${C_GRAY}如需修改密码/域名/Resend，请使用管理菜单；本流程会覆盖现有配置。${C_RESET}"
+        confirm "继续覆盖部署?" || { pause; return; }
+        local bak
+        bak=$(email_state_backup) && [[ -n "$bak" ]] && print_info "已备份旧 state → $bak"
+    # 半成品（state 存在但 INSTALLED=0）：强警告，建议先卸载残留
+    elif [[ -f "$EMAIL_STATE_FILE" ]] && validate_conf_file "$EMAIL_STATE_FILE" 2>/dev/null; then
+        _email_state_reset_vars
+        # shellcheck disable=SC1090
+        source "$EMAIL_STATE_FILE"
+        echo -e "${C_RED}⚠ 检测到上次部署未完成（state 存在但 EMAIL_INSTALLED=0）${C_RESET}"
+        echo "  旧 state 中记录的资源："
+        [[ -n "$EMAIL_D1_ID" ]]         && echo "    • D1:     $EMAIL_D1_NAME ($EMAIL_D1_ID)"
+        [[ -n "$EMAIL_WORKER_NAME" ]]   && echo "    • Worker: $EMAIL_WORKER_NAME"
+        [[ -n "$EMAIL_PAGES_PROJECT" ]] && echo "    • Pages:  $EMAIL_PAGES_PROJECT"
+        echo ""
+        print_warn "强烈建议先返回菜单选【强制卸载】清理远端残留，再重新部署。"
+        print_warn "直接覆盖部署会生成新的 D1/Pages 名，旧资源 ID 将永远丢失，导致后续无法精准回收。"
+        echo ""
+        if ! confirm "确定要继续覆盖部署？（旧 state 会备份到 .bak.<时间戳>）"; then
+            pause; return
         fi
-        print_success "Account ID: $cf_account_id"
+        local bak
+        bak=$(email_state_backup) && [[ -n "$bak" ]] && print_info "已备份旧 state → $bak"
     fi
 
-    read -e -r -p "域名 (如 example.com): " domain
-    [[ -z "$domain" ]] && { print_error "域名不能为空"; pause; return; }
+    _email_state_reset_vars
+    email_state_init_dirs
+    email_log "===== email_deploy start ====="
 
-    read -e -r -p "API 子域名前缀 [mail-api]: " api_prefix
-    api_prefix=${api_prefix:-mail-api}
+    _email_deploy_check_env || { pause; return 1; }
+    _email_deploy_collect_inputs || { pause; return 1; }
 
-    read -e -r -p "前端子域名前缀 [mail]: " frontend_prefix
-    frontend_prefix=${frontend_prefix:-mail}
-
-    read -e -r -p "邮箱地址前缀 [留空无前缀]: " email_prefix
-
-    read -e -r -p "管理员密码 [留空自动生成]: " admin_password
-    if [[ -z "$admin_password" ]]; then
-        admin_password=$(openssl rand -hex 16)
-        print_success "已生成管理员密码: $admin_password"
+    # 校验 token / 拉 zone
+    if ! email_run "校验 Cloudflare API Token" _email_cf_token_verify; then
+        print_error "Token 验证失败，请检查 Token 权限与有效性"
+        return 1
     fi
 
-    read -e -r -p "Resend API Token [留空跳过发送功能]: " resend_token
-    local resend_dkim=""
-    if [[ -n "$resend_token" ]]; then
-        read -e -r -p "Resend DKIM 值 (p=MIGfMA0...): " resend_dkim
-        [[ -z "$resend_dkim" ]] && { print_error "配置 Resend 时 DKIM 值不能为空"; pause; return; }
+    if ! EMAIL_ZONE_ID=$(_email_cf_zone_id_by_name "$EMAIL_DOMAIN"); then
+        print_error "无法获取域名 Zone ID，确认 $EMAIL_DOMAIN 已托管到 Cloudflare"
+        return 1
+    fi
+    email_log "Zone ID: $EMAIL_ZONE_ID"
+    print_success "Zone ID: $EMAIL_ZONE_ID"
+
+    _email_deploy_pick_worker_name || { pause; return 1; }
+
+    _email_deploy_clone_project || { pause; return 1; }
+    _email_deploy_setup_d1 || { pause; return 1; }
+    _email_deploy_render_toml || { pause; return 1; }
+    _email_deploy_worker || { pause; return 1; }
+    _email_deploy_secrets || { pause; return 1; }
+    _email_deploy_frontend || { pause; return 1; }
+    _email_deploy_pages || { pause; return 1; }
+    _email_deploy_dns || { pause; return 1; }
+    _email_deploy_email_routing || { pause; return 1; }
+
+    EMAIL_INSTALLED=1
+    EMAIL_INSTALL_DATE="$(date '+%Y-%m-%d %H:%M:%S')"
+    email_state_write
+
+    _email_deploy_postcheck
+    _email_deploy_summary
+    log_action "Cloudflare Temp Email deployed: ${EMAIL_FRONTEND_DOMAIN} / ${EMAIL_API_DOMAIN}"
+    pause
+}
+
+# ── 1. 环境依赖 ──
+_email_validate_dns_label() {
+    [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
+}
+
+# 当 Token 可见多个 Account 时，强制让用户选；只有 1 个时静默选用
+_email_deploy_pick_account() {
+    local accounts_raw count
+    accounts_raw=$(_email_cf_accounts_list 2>/dev/null) || {
+        print_error "获取 Account 列表失败（Token 权限不足?）"
+        return 1
+    }
+    count=$(printf '%s\n' "$accounts_raw" | grep -c .)
+    if [[ "$count" -eq 0 ]]; then
+        print_error "Token 未关联任何 Account"
+        return 1
+    fi
+    if [[ "$count" -eq 1 ]]; then
+        CF_ACCOUNT_ID=$(printf '%s' "$accounts_raw" | awk -F'\t' '{print $1}')
+        export CF_ACCOUNT_ID
+        local aname
+        aname=$(printf '%s' "$accounts_raw" | awk -F'\t' '{print $2}')
+        print_success "Account: $aname ($CF_ACCOUNT_ID)"
+        return 0
+    fi
+    echo -e "${C_CYAN}Token 可见多个 Cloudflare Account，请选择:${C_RESET}"
+    local i=1 ids=() names=() aid aname
+    while IFS=$'\t' read -r aid aname; do
+        [[ -z "$aid" ]] && continue
+        printf "  %d. %s (%s)\n" "$i" "$aname" "$aid"
+        ids+=("$aid"); names+=("$aname"); ((i++)) || true
+    done <<< "$accounts_raw"
+    local sel
+    while true; do
+        read -e -r -p "选择 [1-$((i-1))]: " sel
+        if [[ "$sel" =~ ^[0-9]+$ && "$sel" -ge 1 && "$sel" -le $((i-1)) ]]; then
+            CF_ACCOUNT_ID="${ids[$((sel-1))]}"
+            export CF_ACCOUNT_ID
+            print_success "Account: ${names[$((sel-1))]} ($CF_ACCOUNT_ID)"
+            return 0
+        fi
+        print_error "无效选择"
+    done
+}
+
+_email_deploy_check_env() {
+    print_info "检查运行环境..."
+    local pkg
+    for pkg in git curl jq; do
+        command_exists "$pkg" || install_package "$pkg" || { print_error "$pkg 安装失败"; return 1; }
+    done
+
+    if ! command_exists node; then
+        email_run "安装 Node.js 22" bash -c '
+            curl -fsSL https://deb.nodesource.com/setup_22.x | bash - >/dev/null 2>&1
+            apt-get install -y -qq nodejs
+        ' || { print_error "Node.js 安装失败，请手动安装"; return 1; }
+    fi
+    command_exists pnpm || email_run "安装 pnpm" npm install -g pnpm || return 1
+    command_exists wrangler || email_run "安装 wrangler" npm install -g wrangler || return 1
+    print_success "环境检查通过 (node=$(node -v 2>/dev/null) pnpm=$(pnpm -v 2>/dev/null) wrangler=$(wrangler --version 2>/dev/null | head -1))"
+}
+
+# ── 2. 交互式收集（Token 隐藏 / 管理员密码不回显）──
+_email_deploy_collect_inputs() {
+    echo ""
+    email_read_secret "Cloudflare API Token" CF_API_TOKEN || { print_error "Token 不能为空"; return 1; }
+    export CF_API_TOKEN
+    print_info "已收到 Token: $(email_mask_token "$CF_API_TOKEN")"
+
+    local cf_aid=""
+    read -e -r -p "Cloudflare Account ID (留空让脚本列出可见账户): " cf_aid
+    if [[ -z "$cf_aid" ]]; then
+        _email_deploy_pick_account || return 1
+    else
+        CF_ACCOUNT_ID="$cf_aid"
+        export CF_ACCOUNT_ID
+    fi
+    # 持久化到 state，供后续管理/卸载使用，避免多 Account 场景下误用第一个
+    EMAIL_CF_ACCOUNT_ID="$CF_ACCOUNT_ID"
+    # 同步导出 Wrangler 新版环境变量（避免走 deprecated CF_*）
+    _email_export_wrangler_env
+
+    read -e -r -p "域名 (如 example.com): " EMAIL_DOMAIN
+    validate_domain "$EMAIL_DOMAIN" || { print_error "域名格式无效"; return 1; }
+
+    while :; do
+        read -e -r -p "API 子域名前缀 [mail-api]: " EMAIL_API_PREFIX
+        EMAIL_API_PREFIX="${EMAIL_API_PREFIX:-mail-api}"
+        _email_validate_dns_label "$EMAIL_API_PREFIX" && break
+        print_error "前缀格式无效（DNS label: 仅 a-z 0-9 -，首尾非短横，1-63 字符）"
+    done
+    while :; do
+        read -e -r -p "前端子域名前缀 [mail]: " EMAIL_FRONTEND_PREFIX
+        EMAIL_FRONTEND_PREFIX="${EMAIL_FRONTEND_PREFIX:-mail}"
+        _email_validate_dns_label "$EMAIL_FRONTEND_PREFIX" && break
+        print_error "前缀格式无效（DNS label）"
+    done
+    while :; do
+        read -e -r -p "邮箱地址前缀 (留空无前缀): " EMAIL_ADDRESS_PREFIX
+        # 邮箱地址前缀可为空；非空时按 DNS label 字符集校验（更严格的 mailbox local-part 略过）
+        [[ -z "$EMAIL_ADDRESS_PREFIX" ]] && break
+        _email_validate_dns_label "$EMAIL_ADDRESS_PREFIX" && break
+        print_error "前缀格式无效（仅 a-z 0-9 -）"
+    done
+
+    EMAIL_API_DOMAIN="${EMAIL_API_PREFIX}.${EMAIL_DOMAIN}"
+    EMAIL_FRONTEND_DOMAIN="${EMAIL_FRONTEND_PREFIX}.${EMAIL_DOMAIN}"
+    # Pages 项目用随机后缀彻底避免撞名（pages 名不影响 worker 路由）
+    EMAIL_PAGES_PROJECT="temp-email-pages-$(openssl rand -hex 3)"
+    EMAIL_D1_NAME="temp-email-$(openssl rand -hex 3)"
+    # Worker 名在 _email_deploy_pick_worker_name 中决定（需要先验证 Token）
+    EMAIL_WORKER_NAME=""
+
+    echo -e "${C_GRAY}留空将自动生成 32 位十六进制密码（部署完成后展示并保存到 ${EMAIL_ADMIN_FILE}）${C_RESET}"
+    local admin_pw=""
+    # 隐藏输入避免肩窥；email_read_secret 在空值时返回 1，但这里允许留空走自动生成
+    read -r -s -p "$(echo -e "${C_YELLOW}管理员密码 [留空自动生成]: ${C_RESET}")" admin_pw
+    echo ""
+    EMAIL_ADMIN_PASSWORD="$admin_pw"
+    if [[ -z "$EMAIL_ADMIN_PASSWORD" ]]; then
+        EMAIL_ADMIN_PASSWORD=$(openssl rand -hex 16)
+        print_success "已自动生成管理员密码（部署完成后展示并保存到 $EMAIL_ADMIN_FILE）"
+    else
+        print_info "已收到管理员密码（不回显）"
     fi
 
-    local api_domain="${api_prefix}.${domain}"
-    local frontend_domain="${frontend_prefix}.${domain}"
-    local jwt_secret
-    jwt_secret=$(openssl rand -hex 32)
+    EMAIL_JWT_SECRET=$(openssl rand -hex 32)
+
+    EMAIL_RESEND_TOKEN=""
+    EMAIL_RESEND_DKIM=""
+    if confirm "是否启用 Resend 发件能力?"; then
+        email_read_secret "Resend API Token" EMAIL_RESEND_TOKEN || { print_error "Resend Token 不能为空"; return 1; }
+        print_info "已收到 Resend Token: $(email_mask_token "$EMAIL_RESEND_TOKEN")"
+        read -e -r -p "Resend DKIM 值 (p=MIGfMA0...): " EMAIL_RESEND_DKIM
+        [[ -z "$EMAIL_RESEND_DKIM" ]] && { print_error "DKIM 不能为空"; return 1; }
+        EMAIL_RESEND_ENABLED=1
+        EMAIL_RESEND_SEND_DOMAIN="send.${EMAIL_DOMAIN}"
+    fi
 
     echo ""
     print_info "配置确认:"
-    echo "  域名:         $domain"
-    echo "  API 地址:     https://$api_domain"
-    echo "  前端地址:     https://$frontend_domain"
-    echo "  邮箱格式:     ${email_prefix:+${email_prefix}.}xxx@$domain"
-    echo "  管理员密码:   $admin_password"
-    echo "  Resend:       ${resend_token:+已配置}${resend_token:-未配置}"
+    echo "  域名:           $EMAIL_DOMAIN"
+    echo "  API 地址:       https://$EMAIL_API_DOMAIN"
+    echo "  前端地址:       https://$EMAIL_FRONTEND_DOMAIN"
+    echo "  邮箱格式:       ${EMAIL_ADDRESS_PREFIX:+${EMAIL_ADDRESS_PREFIX}.}xxx@${EMAIL_DOMAIN}"
+    echo "  D1 数据库名:    $EMAIL_D1_NAME"
+    echo "  管理员密码:     $([[ -n "$admin_pw" ]] && echo "(用户提供)" || echo "(自动生成 — 完成后查看)")"
+    echo "  Resend:         $([[ $EMAIL_RESEND_ENABLED -eq 1 ]] && echo "已启用" || echo "未启用")"
     echo ""
-    if ! confirm "确认以上配置开始部署?"; then pause; return; fi
-
-    # --- 环境检查 ---
-    export CLOUDFLARE_API_TOKEN="$cf_api_token"
-    export CLOUDFLARE_ACCOUNT_ID="$cf_account_id"
-
-    print_info "检查运行环境..."
-    if ! command -v git &>/dev/null; then
-        print_info "安装 git..."
-        apt-get update -qq && apt-get install -y -qq git || { print_error "git 安装失败"; pause; return; }
+    echo -e "${C_RED}========== ⚠ MX 记录将被替换 — 请仔细阅读 ==========${C_RESET}"
+    echo -e "${C_YELLOW}本部署会清空 ${C_RESET}${C_RED}${EMAIL_DOMAIN}${C_RESET}${C_YELLOW} 根域现有的所有 MX 记录，并写入 3 条 Cloudflare Email Routing：${C_RESET}"
+    echo -e "${C_GRAY}    • route1.mx.cloudflare.net  (priority 12)${C_RESET}"
+    echo -e "${C_GRAY}    • route2.mx.cloudflare.net  (priority 41)${C_RESET}"
+    echo -e "${C_GRAY}    • route3.mx.cloudflare.net  (priority 69)${C_RESET}"
+    echo -e "${C_RED}如该域名已有：Google Workspace / Microsoft 365 / Zoho / 自建邮件服务器 / 任何企业邮箱，${C_RESET}"
+    echo -e "${C_RED}部署后这些服务将立即停止收信！${C_RESET}"
+    echo -e "${C_GREEN}推荐做法：使用一个未托管邮件的专用域名作为 EMAIL_DOMAIN${C_RESET}"
+    echo -e "${C_GREEN}（例如新购的 .top/.xyz 等便宜域名，从未配置过 MX）。${C_RESET}"
+    echo -e "${C_GRAY}如需用子域名（如 ${C_RESET}${C_CYAN}tmp.${EMAIL_DOMAIN}${C_RESET}${C_GRAY}），${C_RESET}"
+    echo -e "${C_GRAY}必须先在 Cloudflare 控制台把该子域名独立托管/委派为新 Zone（与主域 Zone 分离），${C_RESET}"
+    echo -e "${C_GRAY}否则部署会在 \"获取 Zone ID\" 阶段失败 — CF Email Routing 要求收信域名必须是独立 Zone。${C_RESET}"
+    echo -e "${C_RED}======================================================${C_RESET}"
+    echo ""
+    confirm "确认以上配置开始部署?" || return 1
+    # 二次确认 MX 替换 — 防止用户在第一道 confirm 时未仔细看警告
+    if ! confirm "$(echo -e "${C_RED}再次确认：${EMAIL_DOMAIN} 没有正在使用的企业邮箱或其他 MX 服务，可以清空现有 MX?${C_RESET}")"; then
+        print_warn "已取消部署 — 强烈建议改用专用域名（或已独立托管为 Zone 的子域名）后重试"
+        return 1
     fi
-    if ! command -v node &>/dev/null; then
-        print_info "安装 Node.js..."
-        curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt-get install -y -qq nodejs || { print_error "Node.js 安装失败"; pause; return; }
-    fi
-    if ! command -v pnpm &>/dev/null; then
-        print_info "安装 pnpm..."
-        npm install -g pnpm || { print_error "pnpm 安装失败"; pause; return; }
-    fi
-    if ! command -v wrangler &>/dev/null; then
-        print_info "安装 wrangler..."
-        npm install -g wrangler || { print_error "wrangler 安装失败"; pause; return; }
-    fi
-    print_success "环境检查通过"
+}
 
-    # --- 获取 Zone ID ---
-    print_info "获取域名 Zone ID..."
-    local zone_id
-    zone_id=$(curl -s "https://api.cloudflare.com/client/v4/zones?name=$domain" \
-        -H "Authorization: Bearer $cf_api_token" | python3 -c "import sys,json; r=json.load(sys.stdin)['result']; print(r[0]['id'] if r else '')" 2>/dev/null)
-    [[ -z "$zone_id" ]] && { print_error "获取 Zone ID 失败，请确认域名已托管到 Cloudflare"; pause; return; }
-    print_success "Zone ID: $zone_id"
+# ── 2b. Worker 名字决策（需要 Token 已验证）──
+_email_deploy_pick_worker_name() {
+    local default_name="cloudflare_temp_email"
+    if ! _email_cf_worker_exists "$default_name"; then
+        EMAIL_WORKER_NAME="$default_name"
+        print_success "Worker 名: $EMAIL_WORKER_NAME"
+        return 0
+    fi
+    print_warn "账户已存在名为 ${default_name} 的 Worker"
+    echo "  1. 取消部署"
+    echo "  2. 使用自定义 Worker 名"
+    echo "  3. 覆盖现有 Worker (危险：会破坏当前同名 Worker 的部署!)"
+    local ans new_name
+    while true; do
+        read -e -r -p "选择 [1]: " ans
+        case "${ans:-1}" in
+            1)
+                print_warn "已取消部署"
+                return 1
+                ;;
+            2)
+                read -e -r -p "新 Worker 名 (3-63 字符, 仅 a-z 0-9 - _): " new_name
+                if [[ ! "$new_name" =~ ^[a-z][a-z0-9_-]{2,62}$ ]]; then
+                    print_error "名字格式无效（需以小写字母开头）"
+                    continue
+                fi
+                if _email_cf_worker_exists "$new_name"; then
+                    print_error "$new_name 也已存在，请换一个"
+                    continue
+                fi
+                EMAIL_WORKER_NAME="$new_name"
+                print_success "Worker 名: $EMAIL_WORKER_NAME"
+                return 0
+                ;;
+            3)
+                confirm "确认覆盖现有 ${default_name}? 此操作不可逆" || continue
+                EMAIL_WORKER_NAME="$default_name"
+                print_warn "将覆盖现有 Worker: $EMAIL_WORKER_NAME"
+                return 0
+                ;;
+            *) print_error "无效选项" ;;
+        esac
+    done
+}
 
-    # --- 克隆项目 ---
-    if [[ -d "$EMAIL_INSTALL_DIR" ]]; then
-        print_warn "目录 $EMAIL_INSTALL_DIR 已存在，跳过克隆"
-        cd "$EMAIL_INSTALL_DIR"
-        git fetch --tags
+# ── 3. clone 项目 ──
+_email_deploy_clone_project() {
+    if [[ -d "$EMAIL_INSTALL_DIR/.git" ]]; then
+        email_run "更新仓库" git -C "$EMAIL_INSTALL_DIR" fetch --tags --prune || return 1
     else
-        print_info "克隆项目..."
-        git clone https://github.com/dreamhunter2333/cloudflare_temp_email.git "$EMAIL_INSTALL_DIR" || { print_error "克隆失败"; pause; return; }
-        cd "$EMAIL_INSTALL_DIR"
+        rm -rf "$EMAIL_INSTALL_DIR"
+        email_run "克隆 cloudflare_temp_email" git clone --quiet \
+            https://github.com/dreamhunter2333/cloudflare_temp_email.git "$EMAIL_INSTALL_DIR" || return 1
     fi
     local latest_tag
-    latest_tag=$(git describe --tags "$(git rev-list --tags --max-count=1)")
-    print_info "切换到最新版本 $latest_tag..."
-    git checkout "$latest_tag" 2>/dev/null
+    latest_tag=$(git -C "$EMAIL_INSTALL_DIR" describe --tags "$(git -C "$EMAIL_INSTALL_DIR" rev-list --tags --max-count=1)" 2>/dev/null || echo "")
+    if [[ -z "$latest_tag" ]]; then
+        print_error "未能解析 git tag，仓库可能异常"
+        return 1
+    fi
+    email_run "切换到最新 tag $latest_tag" git -C "$EMAIL_INSTALL_DIR" checkout --quiet "$latest_tag" || return 1
+    EMAIL_INSTALL_VERSION="$latest_tag"
     print_success "项目版本: $latest_tag"
+}
 
-    # --- 创建 D1 数据库 ---
-    print_info "创建 D1 数据库..."
-    local d1_output d1_id
-    d1_output=$(wrangler d1 create dev 2>&1) || { print_error "创建 D1 数据库失败: $d1_output"; pause; return; }
-    d1_id=$(echo "$d1_output" | grep -oP 'database_id\s*=\s*"\K[^"]+')
-    [[ -z "$d1_id" ]] && { print_error "无法解析 D1 数据库 ID"; pause; return; }
-    print_success "D1 数据库 ID: $d1_id"
+# ── 4. D1 数据库 ──
+_email_deploy_setup_d1() {
+    cd "$EMAIL_INSTALL_DIR/worker" || return 1
 
-    # --- 生成 wrangler.toml ---
-    print_info "生成 Worker 配置文件..."
-    cd "$EMAIL_INSTALL_DIR/worker"
-    cat > wrangler.toml << TOML_EOF
-name = "cloudflare_temp_email"
+    local out
+    print_info "创建 D1 数据库 $EMAIL_D1_NAME..."
+    if ! out=$(wrangler d1 create "$EMAIL_D1_NAME" 2>&1); then
+        email_log "wrangler d1 create failed: $out"
+        print_error "D1 创建失败"; tail -n 10 "$EMAIL_LOG_FILE" | sed 's/^/  /'
+        return 1
+    fi
+    echo "$out" >> "$EMAIL_LOG_FILE"
+    EMAIL_D1_ID=$(echo "$out" | grep -oE 'database_id\s*=\s*"[^"]+"' | head -1 | grep -oE '"[^"]+"' | tr -d '"')
+    [[ -n "$EMAIL_D1_ID" ]] || { print_error "解析 D1 ID 失败"; return 1; }
+    print_success "D1 ID: $EMAIL_D1_ID"
+
+    # 立刻写一份临时 state 以便失败时能回收
+    email_state_write
+
+    # 渲染最小 wrangler.toml 以便 d1 execute 找到 binding
+    _email_render_min_toml || return 1
+
+    # 按字母序应用所有 migration: schema.sql 优先，然后 *-patch.sql
+    local patches=("../db/schema.sql")
+    local p
+    while IFS= read -r p; do
+        patches+=("$p")
+    done < <(ls "$EMAIL_INSTALL_DIR/db"/*-patch.sql 2>/dev/null | sort)
+
+    for p in "${patches[@]}"; do
+        [[ -f "$p" ]] || continue
+        local base
+        base=$(basename "$p")
+        email_run "应用 D1 schema: $base" \
+            wrangler d1 execute "$EMAIL_D1_NAME" --file="$p" --remote || return 1
+        EMAIL_PATCHES_APPLIED="${EMAIL_PATCHES_APPLIED} ${base}"
+    done
+    EMAIL_PATCHES_APPLIED="${EMAIL_PATCHES_APPLIED# }"
+}
+
+# 仅含 D1 binding 的最小 toml（供 d1 execute 使用）
+_email_render_min_toml() {
+    cat > "$EMAIL_INSTALL_DIR/worker/wrangler.toml" <<EOF
+name = "${EMAIL_WORKER_NAME}"
+main = "src/worker.ts"
+compatibility_date = "2025-04-01"
+compatibility_flags = [ "nodejs_compat" ]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "${EMAIL_D1_NAME}"
+database_id = "${EMAIL_D1_ID}"
+EOF
+}
+
+# ── 5. 完整 wrangler.toml ──
+_email_deploy_render_toml() {
+    local domains_json prefix_val
+    domains_json="[\"${EMAIL_DOMAIN}\"]"
+    # 上游 Worker 直接把 PREFIX 拼到 local-part 前面（无分隔符）。
+    # 为得到用户在确认页看到的 "prefix.xxx@domain" 形态，写入 wrangler.toml 时自动补 "."
+    # 末尾。用户已带 "." 时不重复。
+    if [[ -n "$EMAIL_ADDRESS_PREFIX" ]]; then
+        if [[ "${EMAIL_ADDRESS_PREFIX: -1}" == "." ]]; then
+            prefix_val="$EMAIL_ADDRESS_PREFIX"
+        else
+            prefix_val="${EMAIL_ADDRESS_PREFIX}."
+        fi
+    else
+        prefix_val=""
+    fi
+
+    cat > "$EMAIL_INSTALL_DIR/worker/wrangler.toml" <<EOF
+name = "${EMAIL_WORKER_NAME}"
 main = "src/worker.ts"
 compatibility_date = "2025-04-01"
 compatibility_flags = [ "nodejs_compat" ]
 keep_vars = true
 
 routes = [
-	{ pattern = "$api_domain", custom_domain = true },
+    { pattern = "${EMAIL_API_DOMAIN}", custom_domain = true },
 ]
 
-send_email = [
-   { name = "SEND_MAIL" },
-]
+# 注意：Cloudflare Send Email binding（[[send_email]]）要求 Email Routing 已启用 + 发件地址
+# 已在 Dashboard 完成验证，否则首次 wrangler deploy 会失败。本脚本默认不启用此 binding，
+# 与上游 wrangler.toml.template 保持一致；Resend 用户走 RESEND_TOKEN secret，无需 send_email。
+# 如确需使用 Cloudflare 原生 SEND_MAIL，请手动在 Dashboard 完成地址验证后取消下列注释并重新部署。
+#send_email = [
+#    { name = "SEND_MAIL" },
+#]
 
 [triggers]
 crons = [ "0 0 * * *" ]
 
 [vars]
-PREFIX = "$email_prefix"
-DEFAULT_DOMAINS = ["$domain"]
-DOMAINS = ["$domain"]
-JWT_SECRET = "$jwt_secret"
-ADMIN_PASSWORDS = ["$admin_password"]
+PREFIX = "${prefix_val}"
+DEFAULT_DOMAINS = ${domains_json}
+DOMAINS = ${domains_json}
+JWT_SECRET = "${EMAIL_JWT_SECRET}"
 BLACK_LIST = ""
 ENABLE_USER_CREATE_EMAIL = true
 ENABLE_USER_DELETE_EMAIL = true
@@ -11369,153 +11576,815 @@ ENABLE_AUTO_REPLY = false
 
 [[d1_databases]]
 binding = "DB"
-database_name = "dev"
-database_id = "$d1_id"
-TOML_EOF
+database_name = "${EMAIL_D1_NAME}"
+database_id = "${EMAIL_D1_ID}"
+EOF
+    chmod 600 "$EMAIL_INSTALL_DIR/worker/wrangler.toml"
     print_success "wrangler.toml 已生成"
+}
 
-    print_info "初始化数据库..."
-    wrangler d1 execute dev --file=../db/schema.sql --remote || { print_error "数据库初始化失败"; pause; return; }
-    print_success "数据库初始化完成"
+# ── 6. 部署 Worker ──
+_email_deploy_worker() {
+    cd "$EMAIL_INSTALL_DIR/worker" || return 1
+    email_run "安装 Worker 依赖" npm install --no-audit --no-fund || return 1
+    email_run "部署 Worker (${EMAIL_API_DOMAIN})" npx wrangler deploy || return 1
+}
 
-    # --- 部署 Worker 后端 ---
-    print_info "安装 Worker 依赖..."
-    npm install --silent 2>&1 | tail -1
-    print_info "部署 Worker 后端..."
-    npx wrangler deploy 2>&1 || { print_error "Worker 部署失败"; pause; return; }
-    print_success "Worker 后端已部署到 $api_domain"
-
-    if [[ -n "$resend_token" ]]; then
-        print_info "配置 Resend Token..."
-        echo "$resend_token" | wrangler secret put RESEND_TOKEN 2>&1 || print_warn "Resend Token 配置失败"
+# ── 7. 写 secrets：ADMIN_PASSWORDS + Resend Token（走 API 不走 wrangler）──
+_email_deploy_secrets() {
+    # ADMIN_PASSWORDS 走 secret — 值为 JSON 数组字面量 ["pw"]，上游 Worker 端 JSON.parse 后得数组
+    # 不要再 | tostring，否则 secret 变成字符串字面量 "[\"pw\"]"，JSON.parse 得字符串而不是数组
+    local admin_json
+    admin_json=$(jq -nc --arg p "$EMAIL_ADMIN_PASSWORD" '[$p]')
+    if ! _email_cf_worker_secret_put "$EMAIL_WORKER_NAME" "ADMIN_PASSWORDS" "$admin_json"; then
+        print_error "ADMIN_PASSWORDS secret 写入失败"
+        return 1
     fi
+    print_success "ADMIN_PASSWORDS 已通过 secret 配置"
+    email_save_admin_password "$EMAIL_ADMIN_PASSWORD"
 
-    # --- 部署 Pages 前端 ---
-    print_info "安装前端依赖..."
-    cd "$EMAIL_INSTALL_DIR/frontend"
-    pnpm install --no-frozen-lockfile --silent 2>&1 | tail -1
-    print_info "构建前端..."
-    pnpm build:pages 2>&1 | tail -3
-
-    print_info "创建 Pages 项目..."
-    wrangler pages project create temp-email-pages --production-branch production 2>&1 || print_warn "Pages 项目可能已存在"
-
-    print_info "部署 Pages 前端..."
-    cd "$EMAIL_INSTALL_DIR/pages"
-    pnpm install --no-frozen-lockfile --silent 2>&1 | tail -1
-    wrangler pages deploy --branch production --commit-dirty=true 2>&1 || { print_error "Pages 部署失败"; pause; return; }
-    print_success "Pages 前端已部署"
-
-    # --- DNS 记录 ---
-    print_info "添加 DNS 记录..."
-    _email_add_dns() {
-        local type=$1 name=$2 content=$3 priority=$4 proxied=$5
-        local data="{\"type\":\"$type\",\"name\":\"$name\",\"content\":\"$content\""
-        [[ -n "$priority" ]] && data="$data,\"priority\":$priority"
-        [[ "$proxied" == "true" ]] && data="$data,\"proxied\":true"
-        data="$data}"
-        local result
-        result=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records" \
-            -H "Authorization: Bearer $cf_api_token" \
-            -H "Content-Type: application/json" \
-            -d "$data")
-        if echo "$result" | python3 -c "import sys,json; sys.exit(0 if json.load(sys.stdin)['success'] else 1)" 2>/dev/null; then
-            print_success "DNS: $type $name"
+    if [[ "$EMAIL_RESEND_ENABLED" == "1" ]]; then
+        if _email_cf_worker_secret_put "$EMAIL_WORKER_NAME" "RESEND_TOKEN" "$EMAIL_RESEND_TOKEN"; then
+            print_success "RESEND_TOKEN 已通过 secret 配置"
         else
-            print_warn "DNS 记录添加失败或已存在: $type $name"
+            print_warn "RESEND_TOKEN 配置失败 — 可稍后通过管理菜单重试"
         fi
-    }
+    fi
+}
 
-    local pages_domain
-    pages_domain=$(wrangler pages project list 2>&1 | grep temp-email-pages | awk '{print $2}')
-    [[ -z "$pages_domain" ]] && pages_domain="temp-email-pages.pages.dev"
-    _email_add_dns "CNAME" "$frontend_prefix" "$pages_domain" "" "true"
-    _email_add_dns "MX" "$domain" "route1.mx.cloudflare.net" 12
-    _email_add_dns "MX" "$domain" "route2.mx.cloudflare.net" 41
-    _email_add_dns "MX" "$domain" "route3.mx.cloudflare.net" 69
+# ── 8. 构建前端 ──
+_email_deploy_frontend() {
+    cd "$EMAIL_INSTALL_DIR/frontend" || return 1
+    email_run "安装前端依赖" pnpm install --no-frozen-lockfile || return 1
+    export VITE_API_BASE="https://${EMAIL_API_DOMAIN}"
+    email_run "构建前端 (VITE_API_BASE=${VITE_API_BASE})" pnpm build:pages || return 1
+}
 
-    if [[ -n "$resend_token" ]]; then
-        print_info "添加 Resend DNS 记录..."
-        _email_add_dns "TXT" "resend._domainkey" "$resend_dkim"
-        _email_add_dns "TXT" "send" "v=spf1 include:amazonses.com ~all"
-        _email_add_dns "MX" "send" "feedback-smtp.us-east-1.amazonses.com" 10
-        _email_add_dns "TXT" "_dmarc" "v=DMARC1; p=none;"
+# ── 9. 部署 Pages 前端 ──
+_email_deploy_pages() {
+    cd "$EMAIL_INSTALL_DIR/pages" || return 1
+
+    # 同步 pages/wrangler.toml service binding（升级/重部署链路同样调用此 helper，避免遗漏）
+    _email_patch_pages_service_binding "$EMAIL_INSTALL_DIR/pages" \
+        && print_success "Pages service binding 已确认: ${EMAIL_WORKER_NAME}" \
+        || print_warn "pages/wrangler.toml service 未同步（文件可能缺失，请手工检查）"
+
+    email_run "安装 Pages 依赖" pnpm install --no-frozen-lockfile || return 1
+
+    # 创建项目（已存在则忽略）
+    if ! _email_cf_pages_project_create "$EMAIL_PAGES_PROJECT" 2>/dev/null; then
+        email_log "Pages project create returned non-zero — 可能已存在，继续"
     fi
 
-    # --- 绑定自定义域名 ---
-    print_info "绑定前端自定义域名 $frontend_domain..."
-    curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/$cf_account_id/pages/projects/temp-email-pages/domains" \
-        -H "Authorization: Bearer $cf_api_token" \
-        -H "Content-Type: application/json" \
-        -d "{\"name\":\"$frontend_domain\"}" | python3 -c "import sys,json; d=json.load(sys.stdin); print('OK' if d['success'] else d['errors'])" 2>/dev/null
+    email_run "部署 Pages (${EMAIL_PAGES_PROJECT})" \
+        npx wrangler pages deploy --project-name "$EMAIL_PAGES_PROJECT" \
+            --branch production --commit-dirty=true || return 1
 
-    # --- 验证 ---
-    print_info "等待部署生效 (10秒)..."
-    sleep 10
-    local health
-    health=$(curl -s --connect-timeout 10 "https://$api_domain/health_check" 2>&1)
-    if [[ "$health" == "OK" ]]; then
-        print_success "Worker 后端运行正常"
+    EMAIL_PAGES_DOMAIN=$(_email_cf_pages_get_subdomain "$EMAIL_PAGES_PROJECT" 2>/dev/null)
+    [[ -n "$EMAIL_PAGES_DOMAIN" ]] || EMAIL_PAGES_DOMAIN="${EMAIL_PAGES_PROJECT}.pages.dev"
+    print_success "Pages 部署完成: $EMAIL_PAGES_DOMAIN"
+
+    # 绑定自定义域名
+    if _email_cf_pages_attach_domain "$EMAIL_PAGES_PROJECT" "$EMAIL_FRONTEND_DOMAIN" 2>/dev/null; then
+        print_success "Pages 自定义域名: $EMAIL_FRONTEND_DOMAIN"
     else
-        print_warn "Worker 暂未响应，可能需要等待 DNS 生效"
+        print_warn "自定义域名绑定失败（可能已绑定或域名未配置）"
+    fi
+}
+
+# ── 10. DNS 记录 ──
+# 收信关键记录（Frontend CNAME / MX）失败时 return 1，由 email_deploy 阻断完成标记；
+# Resend 相关（DKIM/SPF/DMARC）仅 warn，因为发件是可选能力
+_email_deploy_dns() {
+    print_info "添加 DNS 记录..."
+    local zid="$EMAIL_ZONE_ID"
+    local _dns_fail=0
+
+    # 前端 CNAME（橙云代理）— 若同名记录已存在，先清理
+    _email_cf_dns_purge "$zid" CNAME "$EMAIL_FRONTEND_DOMAIN"
+    if _email_cf_dns_create_record_into EMAIL_DNS_FRONTEND_ID "$zid" "CNAME" \
+            "$EMAIL_FRONTEND_DOMAIN" "$EMAIL_PAGES_DOMAIN" "" "true"; then
+        print_success "CNAME $EMAIL_FRONTEND_PREFIX → $EMAIL_PAGES_DOMAIN"
+    else
+        print_error "前端 CNAME 添加失败 — 用户将无法通过 ${EMAIL_FRONTEND_DOMAIN} 访问 UI"
+        _dns_fail=1
     fi
 
-    # --- 部署汇总 ---
+    # MX 记录到 Cloudflare Email Routing（3 条任一缺失会降级路由，全失败则无法收信）
+    _email_cf_dns_purge "$zid" MX "$EMAIL_DOMAIN"
+    local _mx_ok=0
+    if _email_cf_dns_create_record_into EMAIL_DNS_MX1_ID "$zid" "MX" "$EMAIL_DOMAIN" "route1.mx.cloudflare.net" "12"; then
+        print_success "MX 1 (route1)"; _mx_ok=$((_mx_ok+1))
+    else
+        print_warn "MX 1 失败"
+    fi
+    if _email_cf_dns_create_record_into EMAIL_DNS_MX2_ID "$zid" "MX" "$EMAIL_DOMAIN" "route2.mx.cloudflare.net" "41"; then
+        print_success "MX 2 (route2)"; _mx_ok=$((_mx_ok+1))
+    else
+        print_warn "MX 2 失败"
+    fi
+    if _email_cf_dns_create_record_into EMAIL_DNS_MX3_ID "$zid" "MX" "$EMAIL_DOMAIN" "route3.mx.cloudflare.net" "69"; then
+        print_success "MX 3 (route3)"; _mx_ok=$((_mx_ok+1))
+    else
+        print_warn "MX 3 失败"
+    fi
+    if [[ "$_mx_ok" -eq 0 ]]; then
+        print_error "MX 记录全部添加失败 — 邮箱将无法收信"
+        _dns_fail=1
+    elif [[ "$_mx_ok" -lt 3 ]]; then
+        print_warn "MX 记录仅创建 ${_mx_ok}/3 — Cloudflare 推荐 3 条，建议 Dashboard 补齐"
+    fi
+
+    # Resend 相关（DKIM/SPF/SEND_MX/DMARC）仅 warn — 不影响收信主链路
+    if [[ "$EMAIL_RESEND_ENABLED" == "1" ]]; then
+        local send_sub="send.${EMAIL_DOMAIN}"
+        _email_cf_dns_purge "$zid" TXT "resend._domainkey.${EMAIL_DOMAIN}"
+        _email_cf_dns_purge "$zid" TXT "$send_sub"
+        _email_cf_dns_purge "$zid" MX  "$send_sub"
+        _email_cf_dns_purge "$zid" TXT "_dmarc.${EMAIL_DOMAIN}"
+
+        _email_cf_dns_create_record_into EMAIL_DNS_DKIM_ID "$zid" "TXT" "resend._domainkey.${EMAIL_DOMAIN}" "$EMAIL_RESEND_DKIM" \
+            && print_success "DKIM (resend._domainkey)" || print_warn "DKIM 失败（发件能力受影响，可后续 Dashboard 补）"
+        _email_cf_dns_create_record_into EMAIL_DNS_SPF_ID "$zid" "TXT" "$send_sub" "v=spf1 include:amazonses.com ~all" \
+            && print_success "SPF (send.${EMAIL_DOMAIN})" || print_warn "SPF 失败（发件能力受影响）"
+        _email_cf_dns_create_record_into EMAIL_DNS_SEND_MX_ID "$zid" "MX" "$send_sub" "feedback-smtp.us-east-1.amazonses.com" "10" \
+            && print_success "Send MX" || print_warn "Send MX 失败（发件能力受影响）"
+        _email_cf_dns_create_record_into EMAIL_DNS_DMARC_ID "$zid" "TXT" "_dmarc.${EMAIL_DOMAIN}" "v=DMARC1; p=none;" \
+            && print_success "DMARC" || print_warn "DMARC 失败（发件能力受影响）"
+    fi
+
+    # 失败也落盘 record_id（已创建的部分仍可被卸载回收），主流程根据 return 决定是否标 installed
+    email_state_write
+    return $_dns_fail
+}
+
+# ── 11. Email Routing catch-all → Worker ──
+# routing enable 或 catch-all 任一失败 → return 1，主流程不会标 installed
+_email_deploy_email_routing() {
+    if ! email_run "启用 Cloudflare Email Routing" _email_cf_email_routing_enable "$EMAIL_ZONE_ID"; then
+        print_error "Email Routing 启用失败 — 临时邮箱无法收信"
+        print_info "请登录 Dashboard → Email → Email Routing 手动启用后，进 partial 菜单【强制卸载】+【重新部署】"
+        email_state_write
+        return 1
+    fi
+    if ! email_run "配置 Catch-all → Worker(${EMAIL_WORKER_NAME})" _email_cf_catch_all_to_worker "$EMAIL_ZONE_ID" "$EMAIL_WORKER_NAME"; then
+        print_error "Catch-all 自动配置失败 — 邮件不会路由到 Worker（收信不入库）"
+        print_info "Dashboard → Email Routing → Catch-all → 手动指向 Worker(${EMAIL_WORKER_NAME})"
+        email_state_write
+        return 1
+    fi
+    EMAIL_CATCH_ALL_ENABLED=1
+    email_state_write
+    return 0
+}
+
+# ── 12. 健康检查 ──
+_email_deploy_postcheck() {
+    print_info "等待部署生效 (10s)..."
+    sleep 10
+    local resp
+    resp=$(curl -sS --max-time 10 "https://${EMAIL_API_DOMAIN}/health_check" 2>/dev/null)
+    if [[ "$resp" == "OK" ]]; then
+        print_success "Worker 后端健康检查通过"
+    else
+        print_warn "Worker 暂未响应 — DNS/边缘可能需要数分钟生效"
+    fi
+}
+
+# ── 13. 汇总 ──
+_email_deploy_summary() {
     echo ""
     echo -e "${C_GREEN}========== 部署完成 ==========${C_RESET}"
-    echo -e "  前端地址:     ${C_CYAN}https://$frontend_domain${C_RESET}"
-    echo -e "  API 地址:     ${C_CYAN}https://$api_domain${C_RESET}"
-    echo -e "  管理面板:     ${C_CYAN}https://$frontend_domain/admin${C_RESET}"
-    echo -e "  管理员密码:   ${C_YELLOW}$admin_password${C_RESET}"
-    echo -e "  邮箱格式:     ${C_CYAN}${email_prefix:+${email_prefix}.}xxx@$domain${C_RESET}"
+    echo -e "  前端地址:    ${C_CYAN}https://${EMAIL_FRONTEND_DOMAIN}${C_RESET}"
+    echo -e "  API 地址:    ${C_CYAN}https://${EMAIL_API_DOMAIN}${C_RESET}"
+    echo -e "  管理面板:    ${C_CYAN}https://${EMAIL_FRONTEND_DOMAIN}/admin${C_RESET}"
+    echo -e "  管理员密码:  ${C_YELLOW}${EMAIL_ADMIN_PASSWORD}${C_RESET}"
+    echo -e "  密码已保存:  ${C_GRAY}${EMAIL_ADMIN_FILE} (mode 600)${C_RESET}"
+    echo -e "  状态文件:    ${C_GRAY}${EMAIL_STATE_FILE}${C_RESET}"
+    echo -e "  部署日志:    ${C_GRAY}${EMAIL_LOG_FILE}${C_RESET}"
     echo ""
-    echo -e "${C_YELLOW}还需手动完成:${C_RESET}"
-    echo "  1. 登录 Cloudflare → 域名 $domain → Email > Email Routing"
-    echo "     Catch-all → Action = Send to a Worker → cloudflare_temp_email"
-    if [[ -n "$resend_token" ]]; then
-        echo "  2. 访问 https://resend.com/domains 验证 DNS"
+    if [[ "$EMAIL_RESEND_ENABLED" == "1" ]]; then
+        echo -e "${C_YELLOW}Resend 后续:${C_RESET} 访问 https://resend.com/domains 触发验证"
+        echo ""
     fi
+
+    # 防止敏感变量残留
+    unset CF_API_TOKEN EMAIL_RESEND_TOKEN EMAIL_RESEND_DKIM EMAIL_JWT_SECRET EMAIL_ADMIN_PASSWORD
+}
+
+# 前置：所有 manage 操作均要求 state 已加载 + Token 已输入
+_email_manage_prepare() {
+    if ! email_state_load 2>/dev/null; then
+        print_error "未检测到已部署的临时邮箱（缺少 ${EMAIL_STATE_FILE}）"
+        return 1
+    fi
+    if [[ -z "${CF_API_TOKEN:-}" ]]; then
+        echo -e "${C_GRAY}管理操作需要 Cloudflare API Token (与部署时同 Token 即可)${C_RESET}"
+        email_read_secret "Cloudflare API Token" CF_API_TOKEN || return 1
+        export CF_API_TOKEN
+        if ! _email_cf_token_verify 2>/dev/null; then
+            print_error "Token 校验失败"
+            unset CF_API_TOKEN
+            return 1
+        fi
+    fi
+    if [[ -z "${CF_ACCOUNT_ID:-}" ]]; then
+        if [[ -n "${EMAIL_CF_ACCOUNT_ID:-}" ]]; then
+            CF_ACCOUNT_ID="$EMAIL_CF_ACCOUNT_ID"
+            export CF_ACCOUNT_ID
+        else
+            # 兼容旧 state（无持久化 ACCOUNT_ID）— 强制让用户选，避免误取第一个
+            print_warn "state 中未记录 Account ID（旧版本部署），需要重新选择"
+            _email_deploy_pick_account || return 1
+            EMAIL_CF_ACCOUNT_ID="$CF_ACCOUNT_ID"
+            email_state_write
+        fi
+    fi
+    # 同步导出 Wrangler 新版环境变量
+    _email_export_wrangler_env
+    cd "$EMAIL_INSTALL_DIR/worker" 2>/dev/null || {
+        print_error "本地项目目录缺失: $EMAIL_INSTALL_DIR/worker"
+        return 1
+    }
+}
+
+# 解析 wrangler.toml [vars] 中的 string 字段值（用于保留 JWT_SECRET 等）
+_email_toml_get_var() {
+    local key="$1" toml="$EMAIL_INSTALL_DIR/worker/wrangler.toml"
+    [[ -f "$toml" ]] || return 1
+    grep -E "^${key}[[:space:]]*=" "$toml" | head -1 | sed -E 's/^[^=]+=[[:space:]]*"?([^"]*)"?.*/\1/'
+}
+
+# ── 1. 修改管理员密码 ──
+email_manage_change_admin_password() {
+    print_title "修改管理员密码"
+    _email_manage_prepare || { pause; return; }
+
+    echo -e "${C_GRAY}留空将自动生成 32 位十六进制密码${C_RESET}"
+    local new_pw=""
+    # 隐藏输入避免肩窥；空值走自动生成分支
+    read -r -s -p "$(echo -e "${C_YELLOW}新管理员密码 [留空自动生成]: ${C_RESET}")" new_pw
     echo ""
-    log_action "Cloudflare Temp Email deployed: $frontend_domain / $api_domain"
+    if [[ -z "$new_pw" ]]; then
+        new_pw=$(openssl rand -hex 16)
+        print_info "已自动生成"
+    else
+        print_info "已收到密码（不回显）"
+    fi
+    if (( ${#new_pw} < 8 )); then
+        print_error "密码长度不足 8 位"; pause; return
+    fi
+
+    local admin_json
+    # 与 14c 一致：JSON 数组字面量 ["pw"]，不要 | tostring
+    admin_json=$(jq -nc --arg p "$new_pw" '[$p]')
+    if ! email_run "写入 ADMIN_PASSWORDS secret" _email_cf_worker_secret_put "$EMAIL_WORKER_NAME" "ADMIN_PASSWORDS" "$admin_json"; then
+        print_error "secret 写入失败"; pause; return
+    fi
+    email_save_admin_password "$new_pw"
+    echo ""
+    echo -e "${C_GREEN}========== 管理员密码已更新 ==========${C_RESET}"
+    echo -e "  新密码:       ${C_YELLOW}${new_pw}${C_RESET}"
+    echo -e "  已保存:       ${C_GRAY}${EMAIL_ADMIN_FILE}${C_RESET}"
+    log_action "Email admin password rotated"
+    unset new_pw
+    pause
+}
+
+# ── 2. 管理收信域名 DOMAINS ──
+email_manage_domains() {
+    print_title "管理收信域名 (DOMAINS)"
+    _email_manage_prepare || { pause; return; }
+
+    local toml="$EMAIL_INSTALL_DIR/worker/wrangler.toml"
+    local current
+    current=$(grep -E '^DOMAINS[[:space:]]*=' "$toml" | head -1 | sed -E 's/^DOMAINS[[:space:]]*=[[:space:]]*//')
+    [[ -z "$current" ]] && current='["'"$EMAIL_DOMAIN"'"]'
+    echo -e "${C_CYAN}当前 DOMAINS:${C_RESET} $current"
+    echo ""
+    echo "1. 追加一个域名"
+    echo "2. 移除一个域名"
+    echo "0. 返回"
+    read -e -r -p "选择: " act
+    [[ "$act" != "1" && "$act" != "2" ]] && return
+
+    local target
+    read -e -r -p "目标域名: " target
+    validate_domain "$target" || { print_error "域名格式无效"; pause; return; }
+
+    # 当前域名数组
+    local arr
+    arr=$(echo "$current" | jq -c '.' 2>/dev/null) || arr='["'"$EMAIL_DOMAIN"'"]'
+    local new_arr
+    case $act in
+        1)
+            if echo "$arr" | jq -e --arg d "$target" 'index($d) != null' >/dev/null 2>&1; then
+                print_warn "$target 已存在"; pause; return
+            fi
+            new_arr=$(echo "$arr" | jq -c --arg d "$target" '. + [$d]')
+            ;;
+        2)
+            if [[ "$target" == "$EMAIL_DOMAIN" ]]; then
+                print_error "主域名 $EMAIL_DOMAIN 不能移除（如需更换请重新部署）"
+                pause; return
+            fi
+            new_arr=$(echo "$arr" | jq -c --arg d "$target" 'map(select(. != $d))')
+            ;;
+    esac
+
+    # 替换 DOMAINS 和 DEFAULT_DOMAINS
+    sed -i.bak -E "s|^DOMAINS[[:space:]]*=.*$|DOMAINS = ${new_arr}|" "$toml"
+    sed -i -E "s|^DEFAULT_DOMAINS[[:space:]]*=.*$|DEFAULT_DOMAINS = ${new_arr}|" "$toml"
+    rm -f "${toml}.bak"
+    print_success "wrangler.toml 已更新"
+    echo "  DOMAINS = $new_arr"
+
+    cd "$EMAIL_INSTALL_DIR/worker" || return
+    if email_run "重新部署 Worker" npx wrangler deploy; then
+        print_success "Worker 已更新，新域名已生效"
+        log_action "Email DOMAINS updated: $new_arr"
+    else
+        print_error "部署失败，wrangler.toml 已修改但 worker 未更新"
+    fi
+    pause
+}
+
+# ── 3. Resend ──
+email_manage_resend() {
+    print_title "配置 / 更新 Resend"
+    _email_manage_prepare || { pause; return; }
+
+    echo "当前状态: $([[ ${EMAIL_RESEND_ENABLED:-0} -eq 1 ]] && echo "${C_GREEN}已启用${C_RESET}" || echo "${C_GRAY}未启用${C_RESET}")"
+    [[ "${EMAIL_RESEND_ENABLED:-0}" == "1" ]] && echo "  发件子域:  $EMAIL_RESEND_SEND_DOMAIN"
+    echo ""
+    echo "1. 启用 / 重新配置 Resend"
+    echo "2. 仅更新 RESEND_TOKEN（不动 DNS）"
+    echo "3. 禁用 Resend（删除相关 DNS 记录）"
+    echo "0. 返回"
+    read -e -r -p "选择: " act
+    case $act in
+        1) _email_manage_resend_setup ;;
+        2) _email_manage_resend_token_only ;;
+        3) _email_manage_resend_disable ;;
+        *) return ;;
+    esac
+    pause
+}
+
+_email_manage_resend_setup() {
+    local tok dkim
+    email_read_secret "Resend API Token" tok || { print_error "Token 不能为空"; return; }
+    print_info "已收到 Token: $(email_mask_token "$tok")"
+    read -e -r -p "Resend DKIM (p=MIGfMA0...): " dkim
+    [[ -z "$dkim" ]] && { print_error "DKIM 不能为空"; return; }
+
+    if ! email_run "写入 RESEND_TOKEN secret" _email_cf_worker_secret_put "$EMAIL_WORKER_NAME" "RESEND_TOKEN" "$tok"; then
+        print_error "secret 写入失败"; return
+    fi
+
+    local send_sub="send.${EMAIL_DOMAIN}"
+    local zid="$EMAIL_ZONE_ID"
+
+    # 清旧记录（按 type+name 全量清，避免脏数据残留）
+    _email_cf_dns_purge "$zid" TXT "resend._domainkey.${EMAIL_DOMAIN}"
+    _email_cf_dns_purge "$zid" TXT "$send_sub"
+    _email_cf_dns_purge "$zid" MX  "$send_sub"
+    _email_cf_dns_purge "$zid" TXT "_dmarc.${EMAIL_DOMAIN}"
+
+    _email_cf_dns_create_record_into EMAIL_DNS_DKIM_ID "$zid" "TXT" "resend._domainkey.${EMAIL_DOMAIN}" "$dkim" \
+        && print_success "DKIM" || print_warn "DKIM 失败"
+    _email_cf_dns_create_record_into EMAIL_DNS_SPF_ID "$zid" "TXT" "$send_sub" "v=spf1 include:amazonses.com ~all" \
+        && print_success "SPF" || print_warn "SPF 失败"
+    _email_cf_dns_create_record_into EMAIL_DNS_SEND_MX_ID "$zid" "MX" "$send_sub" "feedback-smtp.us-east-1.amazonses.com" "10" \
+        && print_success "Send MX" || print_warn "Send MX 失败"
+    _email_cf_dns_create_record_into EMAIL_DNS_DMARC_ID "$zid" "TXT" "_dmarc.${EMAIL_DOMAIN}" "v=DMARC1; p=none;" \
+        && print_success "DMARC" || print_warn "DMARC 失败"
+
+    EMAIL_RESEND_ENABLED=1
+    EMAIL_RESEND_SEND_DOMAIN="$send_sub"
+    email_state_write
+    print_success "Resend 已启用"
+    echo -e "${C_YELLOW}下一步:${C_RESET} 访问 https://resend.com/domains 触发 DKIM/SPF 验证"
+    log_action "Email Resend enabled for $EMAIL_DOMAIN"
+    unset tok dkim
+}
+
+_email_manage_resend_token_only() {
+    local tok
+    email_read_secret "新 Resend API Token" tok || return
+    print_info "已收到 Token: $(email_mask_token "$tok")"
+    if email_run "更新 RESEND_TOKEN secret" _email_cf_worker_secret_put "$EMAIL_WORKER_NAME" "RESEND_TOKEN" "$tok"; then
+        print_success "RESEND_TOKEN 已更新"
+        log_action "Email Resend token rotated"
+    fi
+    unset tok
+}
+
+_email_manage_resend_disable() {
+    confirm "确认禁用 Resend 并删除相关 DNS 记录?" || return
+    local zid="$EMAIL_ZONE_ID"
+    _email_cf_dns_delete "$zid" "$EMAIL_DNS_DKIM_ID" && print_success "已删 DKIM" || true
+    _email_cf_dns_delete "$zid" "$EMAIL_DNS_SPF_ID"  && print_success "已删 SPF" || true
+    _email_cf_dns_delete "$zid" "$EMAIL_DNS_SEND_MX_ID" && print_success "已删 Send MX" || true
+    _email_cf_dns_delete "$zid" "$EMAIL_DNS_DMARC_ID" && print_success "已删 DMARC" || true
+    # 同步清掉可能的同名脏记录
+    _email_cf_dns_purge "$zid" TXT "resend._domainkey.${EMAIL_DOMAIN}"
+    _email_cf_dns_purge "$zid" TXT "send.${EMAIL_DOMAIN}"
+    _email_cf_dns_purge "$zid" MX  "send.${EMAIL_DOMAIN}"
+    _email_cf_dns_purge "$zid" TXT "_dmarc.${EMAIL_DOMAIN}"
+
+    print_warn "RESEND_TOKEN secret 不会自动清除，如需彻底清理请在 Dashboard → Workers → Settings → Variables 删除"
+    EMAIL_RESEND_ENABLED=0
+    EMAIL_RESEND_SEND_DOMAIN=""
+    EMAIL_DNS_DKIM_ID=""; EMAIL_DNS_SPF_ID=""; EMAIL_DNS_SEND_MX_ID=""; EMAIL_DNS_DMARC_ID=""
+    email_state_write
+    log_action "Email Resend disabled for $EMAIL_DOMAIN"
+}
+
+# ── 4. 升级到最新版本 ──
+email_manage_upgrade() {
+    print_title "升级到最新版本"
+    _email_manage_prepare || { pause; return; }
+
+    echo -e "${C_CYAN}当前版本:${C_RESET} ${EMAIL_INSTALL_VERSION:-未知}"
+    email_run "拉取上游 tags" git -C "$EMAIL_INSTALL_DIR" fetch --tags --prune || { pause; return; }
+
+    local latest
+    latest=$(git -C "$EMAIL_INSTALL_DIR" describe --tags "$(git -C "$EMAIL_INSTALL_DIR" rev-list --tags --max-count=1)" 2>/dev/null)
+    [[ -z "$latest" ]] && { print_error "无法识别最新 tag"; pause; return; }
+    echo -e "${C_CYAN}最新版本:${C_RESET} $latest"
+
+    if [[ "$latest" == "${EMAIL_INSTALL_VERSION:-}" ]]; then
+        print_success "已是最新版本，无需升级"
+        pause; return
+    fi
+    confirm "确认升级到 $latest?" || return
+
+    email_run "checkout $latest" git -C "$EMAIL_INSTALL_DIR" checkout --quiet "$latest" || { pause; return; }
+
+    # 增量 D1 migration：跑 patches_applied 中没出现过的
+    local applied_str="${EMAIL_PATCHES_APPLIED:-} "
+    local new_patches=()
+    local p base
+    while IFS= read -r p; do
+        base=$(basename "$p")
+        if [[ "$applied_str" != *" $base "* && "$applied_str" != "$base "* ]]; then
+            new_patches+=("$p")
+        fi
+    done < <(ls "$EMAIL_INSTALL_DIR/db"/*-patch.sql 2>/dev/null | sort)
+
+    if (( ${#new_patches[@]} > 0 )); then
+        print_info "发现 ${#new_patches[@]} 个新 D1 migration"
+        for p in "${new_patches[@]}"; do
+            base=$(basename "$p")
+            if email_run "应用 $base" wrangler d1 execute "$EMAIL_D1_NAME" --file="$p" --remote; then
+                EMAIL_PATCHES_APPLIED="${EMAIL_PATCHES_APPLIED} ${base}"
+            else
+                print_error "patch $base 失败，已中止升级（worker 未重新部署）"
+                pause; return
+            fi
+        done
+        EMAIL_PATCHES_APPLIED="${EMAIL_PATCHES_APPLIED# }"
+    else
+        print_info "无新增 D1 migration"
+    fi
+
+    cd "$EMAIL_INSTALL_DIR/worker" || return
+    email_run "Worker 依赖" npm install --no-audit --no-fund || { pause; return; }
+    email_run "部署 Worker $latest" npx wrangler deploy || { pause; return; }
+
+    cd "$EMAIL_INSTALL_DIR/frontend" || return
+    export VITE_API_BASE="https://${EMAIL_API_DOMAIN}"
+    email_run "前端依赖" pnpm install --no-frozen-lockfile || { pause; return; }
+    email_run "构建前端" pnpm build:pages || { pause; return; }
+
+    cd "$EMAIL_INSTALL_DIR/pages" || return
+    # 升级链路同样需要同步 pages service binding —
+    # 上游 tag 切换后 pages/wrangler.toml 可能重置为默认 service=cloudflare_temp_email
+    _email_patch_pages_service_binding "$EMAIL_INSTALL_DIR/pages" \
+        && print_success "Pages service binding 已确认: ${EMAIL_WORKER_NAME}" \
+        || print_warn "pages/wrangler.toml service 未同步（请手工检查）"
+    email_run "Pages 依赖" pnpm install --no-frozen-lockfile || { pause; return; }
+    email_run "部署 Pages" npx wrangler pages deploy --project-name "$EMAIL_PAGES_PROJECT" \
+        --branch production --commit-dirty=true || { pause; return; }
+
+    EMAIL_INSTALL_VERSION="$latest"
+    email_state_write
+    print_success "已升级到 $latest"
+    log_action "Email upgraded ${EMAIL_INSTALL_VERSION} → $latest"
+    pause
+}
+
+# ── 5. 重新部署（保留 D1 数据）──
+email_manage_redeploy() {
+    print_title "重新部署 Worker / Pages（保留 D1 数据）"
+    _email_manage_prepare || { pause; return; }
+    confirm "确认重新部署当前版本 ${EMAIL_INSTALL_VERSION}?" || return
+
+    cd "$EMAIL_INSTALL_DIR/worker" || return
+    email_run "Worker 依赖" npm install --no-audit --no-fund || { pause; return; }
+    email_run "部署 Worker" npx wrangler deploy || { pause; return; }
+
+    cd "$EMAIL_INSTALL_DIR/frontend" || return
+    export VITE_API_BASE="https://${EMAIL_API_DOMAIN}"
+    email_run "构建前端" pnpm build:pages || { pause; return; }
+
+    cd "$EMAIL_INSTALL_DIR/pages" || return
+    # 重部署链路也需要同步 service binding（防止本地 dirty 文件被覆盖后丢失自定义 worker 名）
+    _email_patch_pages_service_binding "$EMAIL_INSTALL_DIR/pages" \
+        && print_success "Pages service binding 已确认: ${EMAIL_WORKER_NAME}" \
+        || print_warn "pages/wrangler.toml service 未同步（请手工检查）"
+    email_run "部署 Pages" npx wrangler pages deploy --project-name "$EMAIL_PAGES_PROJECT" \
+        --branch production --commit-dirty=true || { pause; return; }
+
+    print_success "重新部署完成"
+    log_action "Email redeployed: $EMAIL_INSTALL_VERSION"
     pause
 }
 
 email_uninstall() {
-    print_title "卸载临时邮箱"
-    if [[ ! -d "$EMAIL_INSTALL_DIR" ]]; then
-        print_warn "未检测到安装目录 ($EMAIL_INSTALL_DIR)"
+    print_title "完全卸载 Cloudflare Temp Email"
+
+    # 不再硬卡 EMAIL_INSTALLED=1 — 只要 state 文件能加载，即视为有可回收的远端资源（涵盖部署中途失败的场景）
+    local has_state=0
+    if [[ -f "$EMAIL_STATE_FILE" ]] && validate_conf_file "$EMAIL_STATE_FILE" 2>/dev/null; then
+        _email_state_reset_vars
+        # shellcheck disable=SC1090
+        source "$EMAIL_STATE_FILE"
+        has_state=1
+    fi
+
+    if [[ $has_state -eq 0 ]]; then
+        print_warn "未检测到 state 文件，将仅执行本地清理"
+        if [[ -d "$EMAIL_INSTALL_DIR" ]]; then
+            confirm "删除本地目录 $EMAIL_INSTALL_DIR ?" && rm -rf "$EMAIL_INSTALL_DIR"
+        fi
+        rm -f "$EMAIL_ADMIN_FILE"
+        email_state_clear
         pause; return
     fi
-    print_warn "本操作将删除本地安装目录: $EMAIL_INSTALL_DIR"
-    print_warn "Cloudflare 上的 Worker/Pages/D1/DNS 需要手动清理"
+
+    if [[ "${EMAIL_INSTALLED:-0}" != "1" ]]; then
+        print_warn "检测到上次部署未完成（state 中 EMAIL_INSTALLED=0）"
+        print_info "将尝试回收 state 中记录的部分资源"
+    fi
+
+    # 显示待清理资源清单
+    echo -e "${C_YELLOW}以下 Cloudflare 资源将被删除：${C_RESET}"
+    echo "  • Worker:        ${EMAIL_WORKER_NAME}"
+    echo "  • Pages:         ${EMAIL_PAGES_PROJECT}"
+    echo "  • D1 数据库:     ${EMAIL_D1_NAME} (${EMAIL_D1_ID})"
+    echo "  • Catch-all:     ${EMAIL_DOMAIN}"
+    local _dns_count=0
+    local _id
+    for _id in "$EMAIL_DNS_FRONTEND_ID" "$EMAIL_DNS_MX1_ID" "$EMAIL_DNS_MX2_ID" "$EMAIL_DNS_MX3_ID" \
+               "$EMAIL_DNS_DKIM_ID" "$EMAIL_DNS_SPF_ID" "$EMAIL_DNS_SEND_MX_ID" "$EMAIL_DNS_DMARC_ID"; do
+        [[ -n "$_id" ]] && _dns_count=$((_dns_count+1))
+    done
+    echo "  • DNS 记录:      $_dns_count 条 (front CNAME / MX / Resend TXT 等)"
+    echo "  • 本地目录:      $EMAIL_INSTALL_DIR"
+    echo "  • 状态/日志:     $EMAIL_STATE_FILE, $EMAIL_ADMIN_FILE"
     echo ""
-    if ! confirm "确认卸载?"; then pause; return; fi
+    echo -e "${C_RED}⚠ D1 数据库中存储的所有邮件、用户、地址都将永久丢失！${C_RESET}"
+    echo ""
+
+    confirm "确认执行完全卸载?" || { pause; return; }
+    local final
+    read -e -r -p "再次确认请输入卸载目标域名 [$EMAIL_DOMAIN]: " final
+    if [[ "$final" != "$EMAIL_DOMAIN" ]]; then
+        print_warn "域名不匹配，已取消"; pause; return
+    fi
+
+    # 拿 Token
+    if [[ -z "${CF_API_TOKEN:-}" ]]; then
+        email_read_secret "Cloudflare API Token (具备删除权限)" CF_API_TOKEN || { pause; return; }
+        export CF_API_TOKEN
+        if ! _email_cf_token_verify 2>/dev/null; then
+            print_error "Token 校验失败"; pause; return
+        fi
+    fi
+    if [[ -z "${CF_ACCOUNT_ID:-}" ]]; then
+        if [[ -n "${EMAIL_CF_ACCOUNT_ID:-}" ]]; then
+            CF_ACCOUNT_ID="$EMAIL_CF_ACCOUNT_ID"
+            export CF_ACCOUNT_ID
+        else
+            # 兼容旧 state — 强制让用户选，绝不取第一个（否则可能误删错账户资源）
+            print_warn "state 中未记录 Account ID，需要选择正确账户以避免误删"
+            _email_deploy_pick_account || { pause; return; }
+        fi
+    fi
+    # 同步导出 Wrangler 新版环境变量
+    _email_export_wrangler_env
+
+    echo ""
+    print_info "开始回收远程资源..."
+
+    # 1. 关闭 catch-all
+    if [[ "${EMAIL_CATCH_ALL_ENABLED:-0}" == "1" && -n "$EMAIL_ZONE_ID" ]]; then
+        if email_run "禁用 Email Routing catch-all" _email_cf_catch_all_disable "$EMAIL_ZONE_ID"; then
+            EMAIL_CATCH_ALL_ENABLED=0
+        fi
+    fi
+
+    # 2. DNS 记录（按 state 中记录的 ID 删除）
+    [[ -n "$EMAIL_ZONE_ID" ]] && _email_uninstall_delete_dns
+
+    # 3. Worker
+    if [[ -n "$EMAIL_WORKER_NAME" ]]; then
+        if email_run "删除 Worker ${EMAIL_WORKER_NAME}" _email_cf_worker_delete "$EMAIL_WORKER_NAME"; then :; else
+            print_warn "Worker 删除失败（可能已不存在）"
+        fi
+    fi
+
+    # 4. Pages
+    if [[ -n "$EMAIL_PAGES_PROJECT" ]]; then
+        if email_run "删除 Pages ${EMAIL_PAGES_PROJECT}" _email_cf_pages_project_delete "$EMAIL_PAGES_PROJECT"; then :; else
+            print_warn "Pages 删除失败（可能已不存在）"
+        fi
+    fi
+
+    # 5. D1
+    if [[ -n "$EMAIL_D1_ID" ]]; then
+        if email_run "删除 D1 ${EMAIL_D1_NAME}" _email_cf_d1_delete "$EMAIL_D1_ID"; then :; else
+            print_warn "D1 删除失败 — 请登录 Dashboard 手动删除 ${EMAIL_D1_NAME}"
+        fi
+    fi
+
+    # 6. 本地目录与状态（先保存日志要用到的字段，再清 state）
+    local _log_domain="${EMAIL_DOMAIN:-unknown}"
     rm -rf "$EMAIL_INSTALL_DIR"
-    print_success "本地目录已删除"
+    rm -f "$EMAIL_ADMIN_FILE"
+    print_success "本地目录已删除: $EMAIL_INSTALL_DIR"
+    print_success "管理员密码文件已删除"
+    email_state_clear
+    print_success "状态文件已清除"
+
+    log_action "Cloudflare Temp Email fully uninstalled: $_log_domain"
     echo ""
-    echo -e "${C_YELLOW}请手动清理 Cloudflare 资源:${C_RESET}"
-    echo "  1. Workers & Pages → 删除 cloudflare_temp_email 和 temp-email-pages"
-    echo "  2. D1 → 删除 dev 数据库"
-    echo "  3. DNS → 删除相关 MX/CNAME/TXT 记录"
-    echo "  4. Email Routing → 关闭 Catch-all"
-    log_action "Cloudflare Temp Email uninstalled (local dir removed)"
+    echo -e "${C_GREEN}========== 卸载完成 ==========${C_RESET}"
+    echo -e "${C_GRAY}部署日志保留在 $EMAIL_LOG_FILE — 如确认无需可手动删除${C_RESET}"
+    unset CF_API_TOKEN
+    pause
+}
+
+_email_uninstall_delete_dns() {
+    local zid="$EMAIL_ZONE_ID"
+    local pairs=(
+        "EMAIL_DNS_FRONTEND_ID:CNAME(前端)"
+        "EMAIL_DNS_MX1_ID:MX(route1)"
+        "EMAIL_DNS_MX2_ID:MX(route2)"
+        "EMAIL_DNS_MX3_ID:MX(route3)"
+        "EMAIL_DNS_DKIM_ID:TXT(DKIM)"
+        "EMAIL_DNS_SPF_ID:TXT(SPF)"
+        "EMAIL_DNS_SEND_MX_ID:MX(Resend)"
+        "EMAIL_DNS_DMARC_ID:TXT(DMARC)"
+    )
+    local entry var_name label rid
+    for entry in "${pairs[@]}"; do
+        var_name="${entry%%:*}"
+        label="${entry#*:}"
+        rid="${!var_name}"
+        [[ -z "$rid" ]] && continue
+        if _email_cf_dns_delete "$zid" "$rid" 2>/dev/null; then
+            print_success "已删 DNS: $label"
+        else
+            print_warn "DNS 删除失败: $label (id=$rid)"
+        fi
+    done
+
+    # 兜底：按 type+name 清理仍可能残留的同名记录（防 state 不完整）
+    _email_cf_dns_purge "$zid" "CNAME" "$EMAIL_FRONTEND_DOMAIN" 2>/dev/null || true
+    _email_cf_dns_purge "$zid" "MX"    "$EMAIL_DOMAIN" 2>/dev/null || true
+    if [[ "${EMAIL_RESEND_ENABLED:-0}" == "1" ]]; then
+        _email_cf_dns_purge "$zid" "TXT" "resend._domainkey.${EMAIL_DOMAIN}" 2>/dev/null || true
+        _email_cf_dns_purge "$zid" "TXT" "send.${EMAIL_DOMAIN}" 2>/dev/null || true
+        _email_cf_dns_purge "$zid" "MX"  "send.${EMAIL_DOMAIN}" 2>/dev/null || true
+        _email_cf_dns_purge "$zid" "TXT" "_dmarc.${EMAIL_DOMAIN}" 2>/dev/null || true
+    fi
+}
+# 项目: https://github.com/dreamhunter2333/cloudflare_temp_email
+# 模块拆分: 14a state / 14b cf-api / 14c deploy / 14d manage / 14e uninstall
+
+email_status() {
+    print_title "临时邮箱部署状态"
+    if ! email_state_load 2>/dev/null; then
+        print_warn "未部署"
+        echo "  $(ls -ld "$EMAIL_INSTALL_DIR" 2>/dev/null || echo "本地目录不存在")"
+        pause; return
+    fi
+    echo -e "  ${C_CYAN}域名:${C_RESET}        ${EMAIL_DOMAIN}"
+    echo -e "  ${C_CYAN}前端:${C_RESET}        https://${EMAIL_FRONTEND_DOMAIN}"
+    echo -e "  ${C_CYAN}API:${C_RESET}         https://${EMAIL_API_DOMAIN}"
+    echo -e "  ${C_CYAN}管理面板:${C_RESET}    https://${EMAIL_FRONTEND_DOMAIN}/admin"
+    echo -e "  ${C_CYAN}邮箱格式:${C_RESET}    ${EMAIL_ADDRESS_PREFIX:+${EMAIL_ADDRESS_PREFIX}.}xxx@${EMAIL_DOMAIN}"
+    echo -e "  ${C_CYAN}版本:${C_RESET}        ${EMAIL_INSTALL_VERSION}"
+    echo -e "  ${C_CYAN}部署时间:${C_RESET}    ${EMAIL_INSTALL_DATE}"
+    echo -e "  ${C_CYAN}D1 数据库:${C_RESET}   ${EMAIL_D1_NAME}"
+    echo -e "  ${C_CYAN}Resend:${C_RESET}      $([[ ${EMAIL_RESEND_ENABLED:-0} -eq 1 ]] && echo "${C_GREEN}已启用${C_RESET}" || echo "${C_GRAY}未启用${C_RESET}")"
+    echo -e "  ${C_CYAN}Catch-all:${C_RESET}   $([[ ${EMAIL_CATCH_ALL_ENABLED:-0} -eq 1 ]] && echo "${C_GREEN}已启用${C_RESET}" || echo "${C_YELLOW}需手动检查${C_RESET}")"
+    echo -e "  ${C_GRAY}State:    ${EMAIL_STATE_FILE}${C_RESET}"
+    echo -e "  ${C_GRAY}Log:      ${EMAIL_LOG_FILE}${C_RESET}"
+    [[ -f "$EMAIL_ADMIN_FILE" ]] && echo -e "  ${C_GRAY}Admin pw: ${EMAIL_ADMIN_FILE} (mode 600)${C_RESET}"
+
+    echo ""
+    print_info "Worker 健康检查..."
+    local resp
+    resp=$(curl -sS --max-time 8 "https://${EMAIL_API_DOMAIN}/health_check" 2>/dev/null)
+    if [[ "$resp" == "OK" ]]; then
+        print_success "API 后端正常 (https://${EMAIL_API_DOMAIN}/health_check → OK)"
+    else
+        print_warn "API 未响应或 DNS 未生效 (response: ${resp:-空})"
+    fi
+    pause
+}
+
+email_view_log() {
+    print_title "查看部署日志"
+    if [[ ! -f "$EMAIL_LOG_FILE" ]]; then
+        print_warn "日志尚未生成: $EMAIL_LOG_FILE"
+        pause; return
+    fi
+    echo -e "${C_GRAY}（最近 80 行；完整日志: $EMAIL_LOG_FILE）${C_RESET}"
+    draw_line
+    # 走脱敏管道：兜底过滤旧版本日志里可能残留的 secret_text / Bearer / TOKEN= 形式
+    tail -n 80 "$EMAIL_LOG_FILE" | _email_redact_secrets
+    draw_line
     pause
 }
 
 menu_email() {
+    fix_terminal
     while true; do
         print_title "Cloudflare 临时邮箱"
-        echo "1. 一键部署"
-        echo "2. 查看部署状态"
-        echo "3. 卸载"
-        echo "0. 返回"
-        read -e -r -p "选择: " c
-        case $c in
-            1) email_deploy ;;
-            2) email_status ;;
-            3) email_uninstall ;;
-            0|q) break ;;
-            *) print_error "无效选项" ;;
+        # 三态：installed=完整部署 / partial=state 存在但 INSTALLED=0 / none=无 state
+        local state_kind="none"
+        if email_state_load 2>/dev/null; then
+            state_kind="installed"
+        elif [[ -f "$EMAIL_STATE_FILE" ]] && validate_conf_file "$EMAIL_STATE_FILE" 2>/dev/null; then
+            _email_state_reset_vars
+            # shellcheck disable=SC1090
+            source "$EMAIL_STATE_FILE"
+            state_kind="partial"
+        fi
+
+        case "$state_kind" in
+            none)
+                echo -e "  ${C_YELLOW}状态: 未部署${C_RESET}"
+                echo ""
+                echo "1. 一键部署"
+                echo "2. 查看部署日志"
+                echo "0. 返回"
+                read -e -r -p "选择: " c
+                case $c in
+                    1) email_deploy ;;
+                    2) email_view_log ;;
+                    0|q) break ;;
+                    *) print_error "无效选项" ;;
+                esac
+                ;;
+            partial)
+                echo -e "  ${C_RED}状态: 部署未完成${C_RESET}  域名: ${EMAIL_DOMAIN:-?}"
+                echo -e "  ${C_GRAY}（state 中 EMAIL_INSTALLED=0，远端可能残留 D1/Worker/Pages/DNS）${C_RESET}"
+                echo ""
+                echo -e "  ${C_GREEN}1. 强制卸载${C_RESET}（推荐 — 先回收远端残留再重新部署）"
+                echo "  2. 重新部署（自动备份旧 state，但会生成新资源名 — 仅在确认旧资源已手工清理时使用）"
+                echo "  3. 查看部署日志"
+                echo "  0. 返回"
+                read -e -r -p "选择: " c
+                case $c in
+                    1) email_uninstall ;;
+                    2) email_deploy ;;
+                    3) email_view_log ;;
+                    0|q) break ;;
+                    *) print_error "无效选项" ;;
+                esac
+                ;;
+            installed)
+                echo -e "  ${C_GREEN}状态: 已部署${C_RESET}  ${EMAIL_FRONTEND_DOMAIN}  (${EMAIL_INSTALL_VERSION})"
+                echo ""
+                echo "1. 查看部署状态 + 健康检查"
+                echo "2. 修改管理员密码"
+                echo "3. 管理收信域名 (DOMAINS)"
+                echo "4. 配置 / 更新 Resend"
+                echo "5. 升级到最新版本"
+                echo "6. 重新部署 Worker / Pages (保留 D1)"
+                echo "7. 查看部署日志"
+                echo "8. 完全卸载"
+                echo "0. 返回"
+                read -e -r -p "选择: " c
+                case $c in
+                    1) email_status ;;
+                    2) email_manage_change_admin_password ;;
+                    3) email_manage_domains ;;
+                    4) email_manage_resend ;;
+                    5) email_manage_upgrade ;;
+                    6) email_manage_redeploy ;;
+                    7) email_view_log ;;
+                    8) email_uninstall ;;
+                    0|q) break ;;
+                    *) print_error "无效选项" ;;
+                esac
+                ;;
         esac
     done
 }
@@ -12712,7 +13581,20 @@ reality_install_landing() {
     reality_render_singbox_config "$REALITY_UUID" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID" > "$REALITY_SINGBOX_CONFIG"
     chmod 600 "$REALITY_SINGBOX_CONFIG"
     sing-box check -c "$REALITY_SINGBOX_CONFIG" || return 1
-    firewall_apply_reality_port "$REALITY_PORT" || return 1
+    firewall_apply_reality_port "$REALITY_PORT"
+    local _fw_rc=$?
+    if [[ $_fw_rc -eq 1 ]]; then
+        return 1
+    elif [[ $_fw_rc -eq 2 ]]; then
+        if [[ -t 0 ]] && confirm "UFW 未启用，是否现在跳转防火墙菜单启用并放行 Reality 端口?"; then
+            ufw_setup
+            # 启用后重试一次；仍失败则只警告，不中断安装
+            firewall_apply_reality_port "$REALITY_PORT" || \
+                print_warn "UFW 仍未生效，请确认云安全组已放行 ${REALITY_PORT}/tcp"
+        else
+            print_warn "已跳过本地防火墙配置，请确认云安全组已放行 ${REALITY_PORT}/tcp"
+        fi
+    fi
     systemctl enable sing-box >/dev/null || return 1
     systemctl restart sing-box || return 1
     [[ -n "$cf_token" ]] && reality_sync_cloudflare_dns "$REALITY_NODE_DOMAIN" "$cf_token"
@@ -12796,7 +13678,19 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
-    firewall_apply_realm_port "$listen_port" || return 1
+    firewall_apply_realm_port "$listen_port"
+    local _fw_rc=$?
+    if [[ $_fw_rc -eq 1 ]]; then
+        return 1
+    elif [[ $_fw_rc -eq 2 ]]; then
+        if [[ -t 0 ]] && confirm "UFW 未启用，是否现在跳转防火墙菜单启用并放行 Realm 中转端口?"; then
+            ufw_setup
+            firewall_apply_realm_port "$listen_port" || \
+                print_warn "UFW 仍未生效，请确认云安全组已放行 ${listen_port}/tcp"
+        else
+            print_warn "已跳过本地防火墙配置，请确认云安全组已放行 ${listen_port}/tcp"
+        fi
+    fi
     systemctl daemon-reload
     systemctl enable realm >/dev/null || return 1
     systemctl restart realm || return 1
@@ -13205,7 +14099,7 @@ show_main_menu() {
     printf "  %-36s %-36s\n" "9. WireGuard VPN" "10. 临时邮箱 (Cloudflare)"
     printf "  %-36s\n" "11. Sing-box Reality 节点"
     echo -e " ${C_CYAN}[ 维护工具 ]${C_RESET}"
-    printf "  %-36s %-36s\n" "12. 查看操作日志" "13. 备份与恢复 (WebDAV)"
+    printf "  %-36s\n" "12. 查看操作日志"
     printf "${C_DIM}%${W}s${C_RESET}\n" | tr ' ' '-'
     printf "  %-36s\n" "0. 退出脚本"
 }
@@ -13261,17 +14155,6 @@ main() {
         reality_cli "$@"
         exit $?
     fi
-    # 支持 --backup 命令行参数（用于定时任务）
-    if [[ "${1:-}" == "--backup" ]]; then
-        check_root
-        check_os
-        init_environment
-        # cron 非交互模式：自动备份全部并上传
-        BACKUP_NON_INTERACTIVE=1
-        export BACKUP_NON_INTERACTIVE
-        backup_create
-        exit 0
-    fi
     check_root
     check_os
     init_environment
@@ -13279,7 +14162,7 @@ main() {
     
     while true; do
         show_main_menu
-        read -e -r -p "请选择功能 [0-13]: " choice
+        read -e -r -p "请选择功能 [0-12]: " choice
         case $choice in
             1)
                 if [[ "$PLATFORM" == "openwrt" ]]; then
@@ -13360,9 +14243,6 @@ main() {
                     print_warn "日志文件不存在。"
                 fi
                 pause
-                ;;
-            13)
-                menu_backup
                 ;;
             0|q|Q)
                 echo ""

@@ -35,7 +35,7 @@ show_main_menu() {
     printf "  %-36s %-36s\n" "9. WireGuard VPN" "10. 临时邮箱 (Cloudflare)"
     printf "  %-36s\n" "11. Sing-box Reality 节点"
     echo -e " ${C_CYAN}[ 维护工具 ]${C_RESET}"
-    printf "  %-36s %-36s\n" "12. 查看操作日志" "13. 备份与恢复 (WebDAV)"
+    printf "  %-36s\n" "12. 查看操作日志"
     printf "${C_DIM}%${W}s${C_RESET}\n" | tr ' ' '-'
     printf "  %-36s\n" "0. 退出脚本"
 }
@@ -91,17 +91,6 @@ main() {
         reality_cli "$@"
         exit $?
     fi
-    # 支持 --backup 命令行参数（用于定时任务）
-    if [[ "${1:-}" == "--backup" ]]; then
-        check_root
-        check_os
-        init_environment
-        # cron 非交互模式：自动备份全部并上传
-        BACKUP_NON_INTERACTIVE=1
-        export BACKUP_NON_INTERACTIVE
-        backup_create
-        exit 0
-    fi
     check_root
     check_os
     init_environment
@@ -109,7 +98,7 @@ main() {
     
     while true; do
         show_main_menu
-        read -e -r -p "请选择功能 [0-13]: " choice
+        read -e -r -p "请选择功能 [0-12]: " choice
         case $choice in
             1)
                 if [[ "$PLATFORM" == "openwrt" ]]; then
@@ -190,9 +179,6 @@ main() {
                     print_warn "日志文件不存在。"
                 fi
                 pause
-                ;;
-            13)
-                menu_backup
                 ;;
             0|q|Q)
                 echo ""

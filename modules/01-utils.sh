@@ -140,11 +140,54 @@ is_systemd() {
     return 0
 }
 
-refresh_ssh_port() {
-    if [[ -f "$SSHD_CONFIG" ]]; then
-        CURRENT_SSH_PORT=$(grep -iE "^\s*Port\s+" "$SSHD_CONFIG" 2>/dev/null | tail -n 1 | awk '{print $2}')
+# 统一设置 sshd_config 的某个 directive：命中则替换，未命中则追加
+# 用法: _sshd_set_directive <Key> <Value> [file]
+_sshd_set_directive() {
+    local key="$1" value="$2" file="${3:-$SSHD_CONFIG}"
+    [[ -f "$file" ]] || return 1
+    # 检查 drop-in 是否已配置同名 directive（OpenSSH 默认 drop-in 优先生效）
+    if [[ -d /etc/ssh/sshd_config.d ]]; then
+        local overrides
+        overrides=$(grep -lE "^[[:space:]]*${key}[[:space:]]+" /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true)
+        if [[ -n "$overrides" ]]; then
+            print_warn "${key} 已在 drop-in 中配置（OpenSSH 优先生效）："
+            echo "$overrides" | sed 's/^/  - /'
+            confirm "继续修改 ${file}（drop-in 可能覆盖此设置）?" || return 1
+        fi
     fi
-    [[ "$CURRENT_SSH_PORT" =~ ^[0-9]+$ ]] || CURRENT_SSH_PORT=$DEFAULT_SSH_PORT
+    if grep -qE "^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+" "$file"; then
+        sed -i -E "s|^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+.*|${key} ${value}|" "$file"
+    else
+        printf '\n# server-manage: appended %s\n%s %s\n' "$key" "$key" "$value" >> "$file"
+    fi
+}
+
+refresh_ssh_port() {
+    local p=""
+    # 优先用 sshd -T 解析有效配置（覆盖 /etc/ssh/sshd_config + sshd_config.d/*.conf 全部 drop-in）
+    if command_exists sshd; then
+        p=$(sshd -T 2>/dev/null | awk 'tolower($1)=="port"{print $2; exit}')
+    fi
+    # 回退：grep 主配 + drop-in（按字母序，后者优先）
+    if [[ ! "$p" =~ ^[0-9]+$ ]]; then
+        local files=("$SSHD_CONFIG") f
+        if [[ -d /etc/ssh/sshd_config.d ]]; then
+            while IFS= read -r f; do
+                files+=("$f")
+            done < <(ls /etc/ssh/sshd_config.d/*.conf 2>/dev/null | sort)
+        fi
+        for f in "${files[@]}"; do
+            [[ -f "$f" ]] || continue
+            local cand
+            cand=$(grep -iE "^\s*Port\s+" "$f" 2>/dev/null | tail -n 1 | awk '{print $2}')
+            [[ "$cand" =~ ^[0-9]+$ ]] && p="$cand"
+        done
+    fi
+    if [[ "$p" =~ ^[0-9]+$ ]]; then
+        CURRENT_SSH_PORT="$p"
+    else
+        CURRENT_SSH_PORT=$DEFAULT_SSH_PORT
+    fi
 }
 
 confirm() {
@@ -197,9 +240,80 @@ validate_domain() {
 validate_conf_file() {
     local conf="$1"
     [[ -f "$conf" ]] || return 1
-    if grep -qvE '^[[:space:]]*($|#|[A-Za-z_][A-Za-z0-9_]*=)' "$conf"; then
-        print_error "配置文件格式异常，已跳过: $conf"
-        log_action "Rejected config file: $conf" "WARN"
+
+    # ── 文件权限 / owner 检查 ──
+    # 必须由 root 拥有，且 group/other 不可写，否则任何低权限进程都能写入再触发 source 注入
+    if [[ "$PLATFORM" != "openwrt" ]] && command_exists stat; then
+        local fown fmode
+        fown=$(stat -c '%U' "$conf" 2>/dev/null || echo "")
+        fmode=$(stat -c '%a' "$conf" 2>/dev/null || echo "")
+        if [[ -n "$fown" && "$fown" != "root" ]]; then
+            print_error "配置文件 owner 非 root，已拒绝: $conf (owner=$fown)"
+            log_action "Rejected config (owner=$fown): $conf" "WARN" 2>/dev/null || true
+            return 1
+        fi
+        if [[ -n "$fmode" && "$fmode" =~ ^[0-7]+$ ]]; then
+            if (( 8#${fmode} & 022 )); then
+                print_error "配置文件权限过宽，已拒绝: $conf (mode=$fmode，需 group/other 不可写)"
+                log_action "Rejected config (mode=$fmode): $conf" "WARN" 2>/dev/null || true
+                return 1
+            fi
+        fi
+    fi
+
+    # ── 行级语法 / value 安全性校验 ──
+    # 仅接受以下三种合法 value 形式，源自最小信任原则：
+    #   1) 单引号包裹（最安全：bash 不做任何扩展）
+    #   2) 双引号包裹，且不含未转义的 $( / ${ / `  （这三个会触发命令替换/变量扩展）
+    #   3) 裸字面量，字符集限定 [A-Za-z0-9_./@:+-]
+    local lineno=0 reason=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((lineno++)) || true
+        line="${line%$'\r'}"
+        # 跳过空白行 / 注释
+        [[ -z "${line// }" ]] && continue
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # 必须形如 KEY=...
+        if [[ ! "$line" =~ ^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*= ]]; then
+            reason="行${lineno}: 非 KEY=value 形式"
+            break
+        fi
+
+        local value="${line#*=}"
+        [[ -z "$value" ]] && continue
+
+        # 形式 1：单引号
+        if [[ "$value" =~ ^\'[^\']*\'$ ]]; then
+            continue
+        fi
+
+        # 形式 2：双引号
+        if [[ "$value" =~ ^\".*\"$ ]]; then
+            # 先消除所有已转义的元字符，再判断剩余串是否仍含命令替换/变量扩展
+            local stripped="${value//\\\\/}"
+            stripped="${stripped//\\\$/}"
+            stripped="${stripped//\\\`/}"
+            stripped="${stripped//\\\"/}"
+            if [[ "$stripped" == *'$('* || "$stripped" == *'${'* || "$stripped" == *'`'* ]]; then
+                reason="行${lineno}: value 含命令替换/变量扩展（不安全）"
+                break
+            fi
+            continue
+        fi
+
+        # 形式 3：裸字面量
+        if [[ "$value" =~ ^[A-Za-z0-9_./@:+-]+$ ]]; then
+            continue
+        fi
+
+        reason="行${lineno}: value 非合法字面量（需用单/双引号包裹）"
+        break
+    done < "$conf"
+
+    if [[ -n "$reason" ]]; then
+        print_error "配置文件格式异常，已跳过: $conf ($reason)"
+        log_action "Rejected config file: $conf reason=$reason" "WARN" 2>/dev/null || true
         return 1
     fi
     return 0
@@ -243,3 +357,14 @@ init_environment() {
     fi
     log_action "Script initialized (platform=$PLATFORM)" "INFO"
 }
+
+# ── 主配置安全加载 ──
+# 必须放在 validate_conf_file 定义之后；任何校验失败仅警告并跳过 source，
+# 不让格式异常或被篡改的配置文件触发 source 注入。
+if [[ -f "$CONFIG_FILE" ]]; then
+    if validate_conf_file "$CONFIG_FILE"; then
+        source "$CONFIG_FILE"
+    else
+        print_warn "主配置已忽略，本次使用默认值: $CONFIG_FILE"
+    fi
+fi

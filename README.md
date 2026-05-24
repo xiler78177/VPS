@@ -94,17 +94,15 @@ bash <(curl -sSL https://raw.githubusercontent.com/xiler78177/VPS/main/dist/v4-b
 | 功能 | 说明 |
 |------|------|
 | 操作日志 | 查看脚本操作记录（自动轮转） |
-| 备份与恢复 | 本地备份 + WebDAV 远程上传，定时自动备份，一键恢复 |
 
 ## 项目结构
 
 ```
 VPS/
-├── v4.sh                   # 主入口（多文件模式）
-├── build.sh                # 构建脚本（合并为单文件）
-├── install.sh              # 安装引导脚本
+├── build.sh                # 构建脚本：合并 modules/*.sh → dist/v4-built.sh
+├── CHANGELOG.md            # 变更日志（Keep a Changelog 格式）
 ├── dist/
-│   └── v4-built.sh         # 构建产物（可直接部署）
+│   └── v4-built.sh         # 构建产物（一键部署入口，可直接 curl 拉取执行）
 └── modules/
     ├── 00-constants.sh     # 全局常量与平台检测
     ├── 01-utils.sh         # 通用工具函数
@@ -118,7 +116,12 @@ VPS/
     ├── 09-web.sh           # Web 服务（SSL/Nginx/Cloudflare）
     ├── 10-docker.sh        # Docker 管理
     ├── 11-wireguard.sh     # WireGuard VPN
-    ├── 12-backup.sh        # 备份与恢复
+    ├── 14a-email-state.sh  # 临时邮箱: state 持久化 + Token 输入工具
+    ├── 14b-email-cf.sh     # 临时邮箱: Cloudflare API 封装
+    ├── 14c-email-deploy.sh # 临时邮箱: 部署主流程
+    ├── 14d-email-manage.sh # 临时邮箱: 改密码/改域名/Resend/升级
+    ├── 14e-email-uninstall.sh # 临时邮箱: 自动回收 Worker/Pages/D1/DNS
+    ├── 14-email.sh         # 临时邮箱: 菜单入口（未部署/部署未完成/已部署 三态）
     ├── 15-singbox-reality.sh # Sing-box Reality / Realm 中转
     └── 13-menus.sh         # 菜单与主入口
 ```
@@ -139,17 +142,9 @@ bash build.sh
 bash build.sh /path/to/output.sh
 ```
 
-## 定时备份
-
-脚本支持通过命令行参数触发非交互式备份，适用于 cron 定时任务：
-
-```bash
-bash /path/to/v4.sh --backup
-```
-
 ## 系统要求
 
 - **Debian / Ubuntu**（完整功能）
-- **OpenWrt**（精简模式：Web/DNS/DDNS/BBR/WireGuard/备份可用）
+- **OpenWrt**（精简模式：Web/DNS/DDNS/BBR/WireGuard 可用）
 - root 权限
 - bash, curl（脚本会自动检测并安装）

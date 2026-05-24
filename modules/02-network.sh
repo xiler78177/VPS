@@ -119,16 +119,54 @@ update_cf() {
     log "[$domain] $rt update failed"; return 1
 }
 
+# 安全解析 conf：不 source，避免恶意命令替换 / 变量扩展执行
+# 仅接受白名单 KEY，value 必须是双引号包裹的简单字面量
+parse_ddns_conf() {
+    local conf="$1" line key val
+    local fown fmode
+    fown=$(stat -c '%U' "$conf" 2>/dev/null || echo "")
+    fmode=$(stat -c '%a' "$conf" 2>/dev/null || echo "")
+    if [[ "$fown" != "root" ]]; then
+        log "owner 非 root，跳过: $conf (owner=$fown)"
+        return 1
+    fi
+    if [[ "$fmode" =~ ^[0-7]+$ ]] && (( 8#${fmode} & 022 )); then
+        log "权限过宽，跳过: $conf (mode=$fmode)"
+        return 1
+    fi
+    DDNS_DOMAIN="" DDNS_TOKEN="" DDNS_ZONE_ID=""
+    DDNS_IPV4="" DDNS_IPV6="" DDNS_PROXIED="" DDNS_INTERVAL=""
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        [[ -z "${line// }" ]] && continue
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        if [[ "$line" =~ ^(DDNS_DOMAIN|DDNS_TOKEN|DDNS_ZONE_ID|DDNS_IPV4|DDNS_IPV6|DDNS_PROXIED|DDNS_INTERVAL)=\"([^\"\$\`\\]*)\"$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            val="${BASH_REMATCH[2]}"
+            case "$key" in
+                DDNS_DOMAIN)   DDNS_DOMAIN="$val" ;;
+                DDNS_TOKEN)    DDNS_TOKEN="$val" ;;
+                DDNS_ZONE_ID)  DDNS_ZONE_ID="$val" ;;
+                DDNS_IPV4)     DDNS_IPV4="$val" ;;
+                DDNS_IPV6)     DDNS_IPV6="$val" ;;
+                DDNS_PROXIED)  DDNS_PROXIED="$val" ;;
+                DDNS_INTERVAL) DDNS_INTERVAL="$val" ;;
+            esac
+        else
+            log "格式异常行，跳过: $conf"
+            return 1
+        fi
+    done < "$conf"
+    [[ -n "$DDNS_DOMAIN" && -n "$DDNS_TOKEN" && -n "$DDNS_ZONE_ID" ]] || {
+        log "必填字段缺失，跳过: $conf"
+        return 1
+    }
+    return 0
+}
+
 for conf in "$DDNS_CONFIG_DIR"/*.conf; do
     [ -f "$conf" ] || continue
-    # 格式白名单校验
-    if grep -qvE '^[[:space:]]*($|#|[A-Za-z_][A-Za-z0-9_]*=)' "$conf"; then
-        log "格式异常，跳过: $conf"
-        continue
-    fi
-    # 清空变量防止跨文件残留
-    DDNS_DOMAIN="" DDNS_TOKEN="" DDNS_ZONE_ID="" DDNS_IPV4="" DDNS_IPV6="" DDNS_PROXIED="" DDNS_INTERVAL=""
-    source "$conf"
+    parse_ddns_conf "$conf" || continue
     [[ "$DDNS_IPV4" == "true" ]] && { ip=$(get_ip 4); [[ -n "$ip" ]] && update_cf "$DDNS_DOMAIN" A "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED"; }
     [[ "$DDNS_IPV6" == "true" ]] && { ip=$(get_ip 6); [[ -n "$ip" ]] && update_cf "$DDNS_DOMAIN" AAAA "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED"; }
 done

@@ -1,5 +1,5 @@
 # modules/00-constants.sh - 全局常量、变量、平台检测
-readonly VERSION="v14.0"
+readonly VERSION="v14.1"
 readonly SCRIPT_NAME="server-manage"
 readonly LOG_FILE="/var/log/${SCRIPT_NAME}.log"
 readonly CONFIG_FILE="/etc/${SCRIPT_NAME}.conf"
@@ -9,8 +9,6 @@ readonly CACHE_TTL=300
 readonly CERT_HOOKS_DIR="/root/cert-hooks"
 readonly WG_DEFAULT_PORT=50000
 readonly WG_MTU_DIRECT=1420
-readonly BACKUP_LOCAL_DIR="/root/${SCRIPT_NAME}-backups"
-readonly BACKUP_CONFIG_FILE="/etc/${SCRIPT_NAME}-backup.conf"
 PLATFORM="debian"
 
 detect_platform() {
@@ -55,7 +53,7 @@ FAIL2BAN_JAIL_LOCAL="/etc/fail2ban/jail.local"
 DOCKER_PROXY_DIR="/etc/systemd/system/docker.service.d"
 DOCKER_PROXY_CONF="${DOCKER_PROXY_DIR}/http-proxy.conf"
 
-[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+# 注意：$CONFIG_FILE 的安全加载在 01-utils.sh 末尾完成（需依赖 validate_conf_file）
 
 CURRENT_SSH_PORT=""
 APT_UPDATED=0

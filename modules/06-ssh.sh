@@ -1,11 +1,38 @@
 # modules/06-ssh.sh - SSH 端口修改与密钥管理
 ssh_change_port() {
     print_title "修改 SSH 端口"
+    refresh_ssh_port
+    echo -e "${C_GRAY}当前生效端口 (sshd -T 解析): ${CURRENT_SSH_PORT}${C_RESET}"
     read -e -r -p "请输入新端口 [$CURRENT_SSH_PORT]: " port
     [[ -z "$port" ]] && return
     if ! validate_port "$port"; then
         print_error "端口无效 (1-65535)。"
         pause; return
+    fi
+    if [[ "$port" == "$CURRENT_SSH_PORT" ]]; then
+        print_warn "新端口与当前端口相同，无需修改。"
+        pause; return
+    fi
+
+    # 检查 drop-in 是否设置了 Port — 若设置了，sed 改主配是无效的
+    local dropin_port_file=""
+    if [[ -d /etc/ssh/sshd_config.d ]]; then
+        dropin_port_file=$(grep -lE "^[[:space:]]*Port[[:space:]]+" /etc/ssh/sshd_config.d/*.conf 2>/dev/null | head -1)
+    fi
+    local target_conf="$SSHD_CONFIG"
+    if [[ -n "$dropin_port_file" ]]; then
+        print_warn "Port 已在 drop-in 中配置（OpenSSH 优先生效）："
+        echo "  - $dropin_port_file"
+        echo ""
+        echo "  1. 修改 drop-in 文件 (推荐)"
+        echo "  2. 修改主配置 $SSHD_CONFIG（drop-in 仍会覆盖，可能无效）"
+        echo "  0. 取消"
+        read -e -r -p "选择 [1]: " dch
+        case "${dch:-1}" in
+            1) target_conf="$dropin_port_file" ;;
+            2) target_conf="$SSHD_CONFIG" ;;
+            *) print_warn "已取消"; pause; return ;;
+        esac
     fi
 
     # 检查端口是否已被其他服务占用
@@ -16,8 +43,9 @@ ssh_change_port() {
             pause; return
         fi
     fi
-    local backup_file="${SSHD_CONFIG}.bak.$(date +%s)"
-    cp "$SSHD_CONFIG" "$backup_file"
+
+    local backup_file="${target_conf}.bak.$(date +%s)"
+    cp "$target_conf" "$backup_file"
     # 先放行新端口（防止改完连不上）
     local ufw_opened=0
     if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
@@ -25,39 +53,55 @@ ssh_change_port() {
         ufw_opened=1
         print_success "UFW 已放行新端口 $port。"
     fi
-    if grep -qE "^\s*#?\s*Port\s" "$SSHD_CONFIG"; then
-        sed -i -E "s|^\s*#?\s*Port\s+.*|Port ${port}|" "$SSHD_CONFIG"
+
+    # 写入端口配置
+    if grep -qE "^\s*#?\s*Port\s" "$target_conf"; then
+        sed -i -E "s|^\s*#?\s*Port\s+.*|Port ${port}|" "$target_conf"
     else
-        echo "Port ${port}" >> "$SSHD_CONFIG"
+        printf '\n# server-manage: appended Port\nPort %s\n' "$port" >> "$target_conf"
     fi
 
     # 校验配置语法
     if ! sshd -t 2>/dev/null; then
         print_error "sshd 配置校验失败！已回滚。"
-        mv "$backup_file" "$SSHD_CONFIG"
+        mv "$backup_file" "$target_conf"
         [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
         pause; return
     fi
-    if _restart_sshd; then
-        print_success "SSH 重启成功。请使用新端口 $port 连接。"
-        if [[ $ufw_opened -eq 1 ]]; then
-            ufw delete allow "$CURRENT_SSH_PORT/tcp" 2>/dev/null || true
-        fi
-        # 同步更新 Fail2ban jail 端口
-        if [[ -f "$FAIL2BAN_JAIL_LOCAL" ]]; then
-            sed -i "s/^port = .*/port = $port/" "$FAIL2BAN_JAIL_LOCAL"
-            systemctl restart fail2ban 2>/dev/null || true
-            print_info "Fail2ban 已同步新端口 $port"
-        fi
-        CURRENT_SSH_PORT=$port
-        log_action "SSH port changed to $port"
-        rm -f "$backup_file"
-    else
+
+    if ! _restart_sshd; then
         print_error "重启失败！已回滚配置。"
-        mv "$backup_file" "$SSHD_CONFIG" 2>/dev/null || true
+        mv "$backup_file" "$target_conf" 2>/dev/null || true
         [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
         _restart_sshd || true
+        pause; return
     fi
+
+    # 重启后用 sshd -T 重新校验端口是否真的生效（drop-in 覆盖等）
+    local effective_port
+    effective_port=$(sshd -T 2>/dev/null | awk 'tolower($1)=="port"{print $2; exit}')
+    if [[ "$effective_port" != "$port" ]]; then
+        print_error "重启后 sshd -T 解析端口仍为 ${effective_port:-未知}，与目标 $port 不一致。"
+        print_error "可能仍被其他 drop-in 文件覆盖。已回滚配置，UFW 规则保持原状。"
+        mv "$backup_file" "$target_conf" 2>/dev/null || true
+        _restart_sshd || true
+        [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
+        pause; return
+    fi
+
+    print_success "SSH 重启成功，sshd -T 已确认生效端口: $port"
+    if [[ $ufw_opened -eq 1 ]]; then
+        ufw delete allow "$CURRENT_SSH_PORT/tcp" 2>/dev/null || true
+    fi
+    # 同步更新 Fail2ban jail 端口
+    if [[ -f "$FAIL2BAN_JAIL_LOCAL" ]]; then
+        sed -i "s/^port = .*/port = $port/" "$FAIL2BAN_JAIL_LOCAL"
+        systemctl restart fail2ban 2>/dev/null || true
+        print_info "Fail2ban 已同步新端口 $port"
+    fi
+    CURRENT_SSH_PORT=$port
+    log_action "SSH port changed to $port (file=$target_conf)"
+    rm -f "$backup_file"
     pause
 }
 
@@ -166,9 +210,9 @@ ssh_keys() {
             print_warn "密钥已存在: $key_file"
             if ! confirm "覆盖现有密钥?"; then pause; return; fi
         fi
-        local cmd="ssh-keygen -t ed25519 -f $key_file -N \"\""
-        [[ -n "$comment" ]] && cmd="$cmd -C \"$comment\""
-        eval $cmd
+        local args=(ssh-keygen -t ed25519 -f "$key_file" -N "")
+        [[ -n "$comment" ]] && args+=(-C "$comment")
+        "${args[@]}"
         echo ""
         print_success "密钥对已生成。"
         echo -e "${C_CYAN}私钥:${C_RESET} $key_file"
@@ -204,7 +248,7 @@ ssh_keys() {
         if confirm "确认已测试密钥登录成功？"; then
             local backup_file="${SSHD_CONFIG}.bak.$(date +%s)"
             cp "$SSHD_CONFIG" "$backup_file"
-            sed -i -E "s|^\s*#?\s*PasswordAuthentication\s+.*|PasswordAuthentication no|" "$SSHD_CONFIG"
+            _sshd_set_directive "PasswordAuthentication" "no" "$SSHD_CONFIG" || { mv "$backup_file" "$SSHD_CONFIG"; pause; return; }
             if ! sshd -t 2>/dev/null; then
                 print_error "sshd 配置校验失败！已回滚。"
                 mv "$backup_file" "$SSHD_CONFIG"
@@ -247,7 +291,7 @@ menu_ssh() {
                 if confirm "禁用 Root 登录？"; then
                     local backup_file="${SSHD_CONFIG}.bak.$(date +%s)"
                     cp "$SSHD_CONFIG" "$backup_file"
-                    sed -i -E "s|^\s*#?\s*PermitRootLogin\s+.*|PermitRootLogin no|" "$SSHD_CONFIG"
+                    _sshd_set_directive "PermitRootLogin" "no" "$SSHD_CONFIG" || { mv "$backup_file" "$SSHD_CONFIG"; pause; break; }
                     if ! sshd -t 2>/dev/null; then
                         print_error "sshd 配置校验失败！已回滚。"
                         mv "$backup_file" "$SSHD_CONFIG"

@@ -9,7 +9,7 @@ MODULES_DIR="$SCRIPT_DIR/modules"
 DIST_DIR="$SCRIPT_DIR/dist"
 OUTPUT="${1:-$DIST_DIR/v4-built.sh}"
 
-# 模块加载顺序（与 v4.sh 中 source 顺序一致）
+# 模块加载顺序（运行时按此顺序拼接，main 由 13-menus.sh 提供）
 MODULES=(
     "00-constants.sh"
     "01-utils.sh"
@@ -38,7 +38,11 @@ MODULES=(
     "12c-wireguard-deb-server.sh"
     "12d-wireguard-deb-peers.sh"
     "12e-wireguard-deb-extra.sh"
-    "12-backup.sh"
+    "14a-email-state.sh"
+    "14b-email-cf.sh"
+    "14c-email-deploy.sh"
+    "14d-email-manage.sh"
+    "14e-email-uninstall.sh"
     "14-email.sh"
     "15-singbox-reality.sh"
     "13-menus.sh"

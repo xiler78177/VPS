@@ -97,9 +97,12 @@ grep -q -- '--reality' modules/13-menus.sh || fail "main menu should expose --re
 grep -q 'Sing-box Reality' modules/13-menus.sh || fail "main menu should expose Reality menu"
 assert_contains '11. Sing-box Reality 节点' "$(cat modules/13-menus.sh)" "main menu should move Reality to option 11"
 assert_contains '12. 查看操作日志' "$(cat modules/13-menus.sh)" "main menu should move logs to option 12"
-assert_contains '13. 备份与恢复 (WebDAV)' "$(cat modules/13-menus.sh)" "main menu should move backup to option 13"
+# 备份模块已删除（见 P0-1 / README 维护工具区块），不再断言菜单 13. 备份与恢复
 if grep -Fq '"13. Sing-box Reality 节点"' modules/13-menus.sh; then
     fail "main menu should not keep Reality as option 13"
+fi
+if grep -Fq '13. 备份与恢复' modules/13-menus.sh; then
+    fail "backup menu item should be removed (module deleted)"
 fi
 grep -q 'systemctl restart sing-box' modules/15-singbox-reality.sh || fail "landing reinstall should restart sing-box after writing new config"
 grep -q 'reality_diagnose' modules/15-singbox-reality.sh || fail "Reality module should provide a diagnose/self-check command"

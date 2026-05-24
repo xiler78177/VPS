@@ -348,16 +348,16 @@ _web_cleanup_domain() {
     # CF 凭据
     rm -f "/root/.cloudflare-${domain}.ini" 2>/dev/null
 
-    # DDNS 配置 (域名本身 + origin.xxx 回源域名)
+    # DDNS 配置 (域名本身 + origin.${domain} 子域；不要用通配，避免误删其他域名的 origin DDNS)
     local ddns_cleaned=false
-    for ddns_f in "${DDNS_CONFIG_DIR}/${domain}.conf" "${DDNS_CONFIG_DIR}/origin."*".conf"; do
+    for ddns_f in "${DDNS_CONFIG_DIR}/${domain}.conf" "${DDNS_CONFIG_DIR}/origin.${domain}.conf"; do
         if [[ -f "$ddns_f" ]]; then
             rm -f "$ddns_f"; ddns_cleaned=true
         fi
     done
-    # 用域名后缀匹配回源域名 DDNS
+    # 根域 origin DDNS（仅当 root_part 与 domain 不同才单独删）
     local root_part="${domain#*.}"
-    if [[ -f "${DDNS_CONFIG_DIR}/origin.${root_part}.conf" ]]; then
+    if [[ "$root_part" != "$domain" && -f "${DDNS_CONFIG_DIR}/origin.${root_part}.conf" ]]; then
         rm -f "${DDNS_CONFIG_DIR}/origin.${root_part}.conf"; ddns_cleaned=true
     fi
     if [[ "$ddns_cleaned" == "true" ]]; then
