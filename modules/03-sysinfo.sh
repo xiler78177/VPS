@@ -134,27 +134,27 @@ show_dual_column_sysinfo() {
     local docker_st="○"; systemctl is-active docker &>/dev/null && docker_st="●"
     local wg_st="○"; ip link show wg0 &>/dev/null && wg_st="●"
     local W=76  # 总宽度
-    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s | ${C_CYAN}%-8s${C_RESET}%s\n" \
         "主机:" "$hostname" "IPv4:" "$CACHED_IPV4"
-    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s | ${C_CYAN}%-8s${C_RESET}%s\n" \
         "系统:" "${os_info:0:17}" "IPv6:" "${CACHED_IPV6:0:20}"
-    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s | ${C_CYAN}%-8s${C_RESET}%s\n" \
         "内核:" "$kernel" "运营商:" "${CACHED_ISP:0:18}"
     printf "${C_DIM}%${W}s${C_RESET}\n" | tr ' ' '-'
-    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s | ${C_CYAN}%-8s${C_RESET}%s\n" \
         "CPU:" "${cpu_model:0:17}" "内存:" "$mem_info"
-    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s | ${C_CYAN}%-8s${C_RESET}%s\n" \
         "核心:" "${cpu_cores}核 @ $cpu_freq" "交换:" "$swap_info"
-    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s | ${C_CYAN}%-8s${C_RESET}%s\n" \
         "负载:" "$load_avg" "硬盘:" "$disk_info"
-    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s | ${C_CYAN}%-8s${C_RESET}%s\n" \
         "占用:" "$cpu_usage 连接:${tcp_conn}t/${udp_conn}u" "流量:" "↓${rx_total} ↑${tx_total}"
     printf "${C_DIM}%${W}s${C_RESET}\n" | tr ' ' '-'
-    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s | ${C_CYAN}%-8s${C_RESET}%s\n" \
         "算法:" "$tcp_cc + $qdisc" "位置:" "${CACHED_LOCATION:0:18}"
-    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s | ${C_CYAN}%-8s${C_RESET}%s\n" \
         "运行:" "$uptime_str" "时区:" "$timezone"
-    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s | ${C_CYAN}%-8s${C_RESET}%s\n" \
         "SSH:" "端口 $ssh_port" "时间:" "$sys_time"
     printf "${C_DIM}%${W}s${C_RESET}\n" | tr ' ' '-'
     printf " 服务: UFW[${C_GREEN}%s${C_RESET}] F2B[${C_GREEN}%s${C_RESET}] Nginx[${C_GREEN}%s${C_RESET}] Docker[${C_GREEN}%s${C_RESET}] WG[${C_GREEN}%s${C_RESET}]\n" \

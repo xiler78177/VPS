@@ -494,12 +494,17 @@ menu_f2b() {
                     pause
                     continue
                 fi
-                echo "1. 启动  2. 停止  3. 重启"
+                echo "1. 启动"
+                echo "2. 停止"
+                echo "3. 重启"
+                echo "0. 返回上一级"
                 read -e -r -p "选择: " sc
                 case $sc in
                     1) systemctl start fail2ban && print_success "已启动" || print_error "启动失败" ;;
                     2) systemctl stop fail2ban && print_success "已停止" || print_error "停止失败" ;;
                     3) systemctl restart fail2ban && print_success "已重启" || print_error "重启失败" ;;
+                    0|q|Q|"") ;;
+                    *) print_error "无效选项" ;;
                 esac
                 pause
                 ;;
@@ -508,4 +513,3 @@ menu_f2b() {
         esac
     done
 }
-

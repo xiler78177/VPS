@@ -868,27 +868,27 @@ show_dual_column_sysinfo() {
     local docker_st="○"; systemctl is-active docker &>/dev/null && docker_st="●"
     local wg_st="○"; ip link show wg0 &>/dev/null && wg_st="●"
     local W=76  # 总宽度
-    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s | ${C_CYAN}%-8s${C_RESET}%s\n" \
         "主机:" "$hostname" "IPv4:" "$CACHED_IPV4"
-    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s | ${C_CYAN}%-8s${C_RESET}%s\n" \
         "系统:" "${os_info:0:17}" "IPv6:" "${CACHED_IPV6:0:20}"
-    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s | ${C_CYAN}%-8s${C_RESET}%s\n" \
         "内核:" "$kernel" "运营商:" "${CACHED_ISP:0:18}"
     printf "${C_DIM}%${W}s${C_RESET}\n" | tr ' ' '-'
-    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s | ${C_CYAN}%-8s${C_RESET}%s\n" \
         "CPU:" "${cpu_model:0:17}" "内存:" "$mem_info"
-    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s | ${C_CYAN}%-8s${C_RESET}%s\n" \
         "核心:" "${cpu_cores}核 @ $cpu_freq" "交换:" "$swap_info"
-    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s | ${C_CYAN}%-8s${C_RESET}%s\n" \
         "负载:" "$load_avg" "硬盘:" "$disk_info"
-    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s | ${C_CYAN}%-8s${C_RESET}%s\n" \
         "占用:" "$cpu_usage 连接:${tcp_conn}t/${udp_conn}u" "流量:" "↓${rx_total} ↑${tx_total}"
     printf "${C_DIM}%${W}s${C_RESET}\n" | tr ' ' '-'
-    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s | ${C_CYAN}%-8s${C_RESET}%s\n" \
         "算法:" "$tcp_cc + $qdisc" "位置:" "${CACHED_LOCATION:0:18}"
-    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s | ${C_CYAN}%-8s${C_RESET}%s\n" \
         "运行:" "$uptime_str" "时区:" "$timezone"
-    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s | ${C_CYAN}%-8s${C_RESET}%s\n" \
         "SSH:" "端口 $ssh_port" "时间:" "$sys_time"
     printf "${C_DIM}%${W}s${C_RESET}\n" | tr ' ' '-'
     printf " 服务: UFW[${C_GREEN}%s${C_RESET}] F2B[${C_GREEN}%s${C_RESET}] Nginx[${C_GREEN}%s${C_RESET}] Docker[${C_GREEN}%s${C_RESET}] WG[${C_GREEN}%s${C_RESET}]\n" \
@@ -2035,12 +2035,17 @@ menu_f2b() {
                     pause
                     continue
                 fi
-                echo "1. 启动  2. 停止  3. 重启"
+                echo "1. 启动"
+                echo "2. 停止"
+                echo "3. 重启"
+                echo "0. 返回上一级"
                 read -e -r -p "选择: " sc
                 case $sc in
                     1) systemctl start fail2ban && print_success "已启动" || print_error "启动失败" ;;
                     2) systemctl stop fail2ban && print_success "已停止" || print_error "停止失败" ;;
                     3) systemctl restart fail2ban && print_success "已重启" || print_error "重启失败" ;;
+                    0|q|Q|"") ;;
+                    *) print_error "无效选项" ;;
                 esac
                 pause
                 ;;
@@ -2049,7 +2054,6 @@ menu_f2b() {
         esac
     done
 }
-
 ssh_change_port() {
     print_title "修改 SSH 端口"
     refresh_ssh_port
@@ -2910,29 +2914,30 @@ net_dns() {
     else
         cat /etc/resolv.conf
     fi
-    echo -e "${C_CYAN}━━━ DNS 预设方案 ━━━${C_RESET}"
-    echo -e "  ${C_YELLOW}── 境外通用 ──${C_RESET}"
+    echo -e "${C_CYAN}=== DNS 预设方案 ===${C_RESET}"
+    echo -e "  ${C_YELLOW}-- 境外通用 --${C_RESET}"
     echo "  1. Cloudflare          1.1.1.1 1.0.0.1
   2. Google              8.8.8.8 8.8.4.4
   3. Cloudflare + Google 1.1.1.1 8.8.8.8
 "
-    echo -e "  ${C_YELLOW}── 境内通用 ──${C_RESET}"
+    echo -e "  ${C_YELLOW}-- 境内通用 --${C_RESET}"
     echo "  4. 阿里 DNS            223.5.5.5 223.6.6.6
   5. 腾讯 DNS            119.29.29.29 119.28.28.28
   6. 114 DNS             114.114.114.114 114.114.115.115
 "
-    echo -e "  ${C_YELLOW}── IPv6 ──${C_RESET}"
+    echo -e "  ${C_YELLOW}-- IPv6 --${C_RESET}"
     echo "  7. Cloudflare IPv6     2606:4700:4700::1111 2606:4700:4700::1001
   8. Google IPv6         2001:4860:4860::8888 2001:4860:4860::8844
   9. 阿里 IPv6           2400:3200::1 2400:3200:baba::1
 "
-    echo -e "  ${C_YELLOW}── 混合方案 ──${C_RESET}"
+    echo -e "  ${C_YELLOW}-- 混合方案 --${C_RESET}"
     echo "  10. 境外双栈 (CF v4+v6)       1.1.1.1 2606:4700:4700::1111
   11. 境内双栈 (阿里 v4+v6)     223.5.5.5 2400:3200::1
   12. 境内+境外混合              223.5.5.5 1.1.1.1
-  0. 自定义输入
+  13. 自定义输入
+  0. 返回上一级
 "
-    read -e -r -p "选择方案 [0]: " dns_choice
+    read -e -r -p "选择方案 [0=返回]: " dns_choice
     dns_choice=${dns_choice:-0}
     local dns=""
     case $dns_choice in
@@ -2948,11 +2953,12 @@ net_dns() {
         10) dns="1.1.1.1 2606:4700:4700::1111" ;;
         11) dns="223.5.5.5 2400:3200::1" ;;
         12) dns="223.5.5.5 1.1.1.1" ;;
-        0)
+        13)
             echo -e "${C_YELLOW}输入 DNS IP (空格隔开)，输入 0 取消${C_RESET}"
             read -e -r -p "DNS: " dns
             [[ -z "$dns" || "$dns" == "0" ]] && return
             ;;
+        0|q|Q) return ;;
         *) print_error "无效选择"; pause; return ;;
     esac
     [[ -z "$dns" ]] && return
@@ -3060,24 +3066,36 @@ menu_net() {
 2. IPv4/IPv6 优先级
 3. iPerf3 测速
 4. 网络诊断 (Ping/MTR/端口测试)
-0. 返回
+0. 返回上一级
 "
         read -e -r -p "选择: " c
         case $c in
             1) net_dns ;;
-            2) 
-                echo "1. 优先 IPv4  2. 优先 IPv6"
+            2)
+                echo "1. 优先 IPv4"
+                echo "2. 优先 IPv6"
+                echo "0. 返回上一级"
                 read -e -r -p "选: " p
-                [[ ! -f /etc/gai.conf ]] && touch /etc/gai.conf
-                sed -i '/^#\?precedence ::ffff:0:0\/96  100/d' /etc/gai.conf
-                if [[ "$p" == "1" ]]; then
-                    echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
-                    print_success "IPv4 优先。"
-                else
-                    print_success "IPv6 优先。"
-                fi
-                log_action "IP priority changed"
-                pause ;;
+                case $p in
+                    1)
+                        [[ ! -f /etc/gai.conf ]] && touch /etc/gai.conf
+                        sed -i '/^#\?precedence ::ffff:0:0\/96  100/d' /etc/gai.conf
+                        echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
+                        print_success "IPv4 优先。"
+                        log_action "IP priority changed: ipv4"
+                        pause
+                        ;;
+                    2)
+                        [[ ! -f /etc/gai.conf ]] && touch /etc/gai.conf
+                        sed -i '/^#\?precedence ::ffff:0:0\/96  100/d' /etc/gai.conf
+                        print_success "IPv6 优先。"
+                        log_action "IP priority changed: ipv6"
+                        pause
+                        ;;
+                    0|q|Q|"") ;;
+                    *) print_error "无效选择"; pause ;;
+                esac
+                ;;
             3) net_iperf3 ;;
             4) net_diag ;;
             0|q) break ;;
@@ -3656,9 +3674,13 @@ web_cf_dns_update() {
     echo "1. 仅解析 IPv4 (A)
 2. 仅解析 IPv6 (AAAA)
 3. 双栈解析 (A + AAAA)
-0. 跳过"
+0. 返回上一级"
     read -e -r -p "请选择: " mode
-    if [[ "$mode" == "0" ]]; then return; fi
+    case "$mode" in
+        1|2|3) ;;
+        0|q|Q|"") return ;;
+        *) print_error "无效选择，请输入 1/2/3，或输入 0 返回"; pause; return ;;
+    esac
     # 选择 IPv6 但未检测到时给予提示
     if [[ ("$mode" == "2" || "$mode" == "3") && -z "$ipv6" ]]; then
         print_warn "未检测到 IPv6 地址，AAAA 记录将跳过"
@@ -3931,16 +3953,14 @@ web_add_domain() {
     print_title "添加域名配置 (SSL + Nginx)"
     web_env_check || { pause; return; }
 
-    # ══════════════════════════════════════════════════════════════
-    #  配置收集阶段
-    # ══════════════════════════════════════════════════════════════
-    echo -e "\n${C_CYAN}━━━ 收集配置信息 ━━━${C_RESET}\n"
+    # 配置收集阶段
+    echo -e "\n${C_CYAN}=== 收集配置信息 ===${C_RESET}\n"
 
     # 1. CF API Token
     local CF_API_TOKEN=""
     print_guide "输入 Cloudflare API Token"
     echo -e "  ${C_GRAY}权限需要: Zone.DNS + Zone.SSL${C_RESET}"
-    echo -e "  ${C_GRAY}创建: CF 后台 → My Profile → API Tokens → Create Token${C_RESET}"
+    echo -e "  ${C_GRAY}创建: CF 后台 -> My Profile -> API Tokens -> Create Token${C_RESET}"
     if ! _cf_read_token "CF_API_TOKEN"; then
         pause; return
     fi
@@ -3984,9 +4004,9 @@ web_add_domain() {
     # 3. 子域名前缀
     local sub_prefix="" DOMAIN=""
     print_guide "输入子域名前缀"
-    echo -e "  ${C_GRAY}例如输入 www → 完整域名为 www.${root_domain}${C_RESET}"
-    echo -e "  ${C_GRAY}例如输入 panel → 完整域名为 panel.${root_domain}${C_RESET}"
-    echo -e "  ${C_GRAY}直接回车 → 使用根域名 ${root_domain}${C_RESET}"
+    echo -e "  ${C_GRAY}例如输入 www -> 完整域名为 www.${root_domain}${C_RESET}"
+    echo -e "  ${C_GRAY}例如输入 panel -> 完整域名为 panel.${root_domain}${C_RESET}"
+    echo -e "  ${C_GRAY}直接回车 -> 使用根域名 ${root_domain}${C_RESET}"
     read -e -r -p "子域名前缀 [留空=根域名]: " sub_prefix
     if [[ -z "$sub_prefix" ]]; then
         DOMAIN="$root_domain"
@@ -4114,7 +4134,7 @@ web_add_domain() {
 
     # ── DNS 解析 ──
     if [[ "$dns_mode" != "0" ]]; then
-        echo -e "\n${C_CYAN}━━━ [${step}] DNS 解析 ━━━${C_RESET}"
+        echo -e "\n${C_CYAN}=== [${step}] DNS 解析 ===${C_RESET}"
         case $dns_mode in
             1) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "A" "$ipv4" "$dns_proxied" ;;
             2) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "AAAA" "$ipv6" "$dns_proxied" ;;
@@ -4125,7 +4145,7 @@ web_add_domain() {
     fi
 
     # ── SSL 证书 ──
-    echo -e "\n${C_CYAN}━━━ [${step}] SSL 证书申请 ━━━${C_RESET}"
+    echo -e "\n${C_CYAN}=== [${step}] SSL 证书申请 ===${C_RESET}"
     mkdir -p "${CERT_PATH_PREFIX}/${DOMAIN}"
     local CLOUDFLARE_CREDENTIALS="/root/.cloudflare-${DOMAIN}.ini"
     write_file_atomic "$CLOUDFLARE_CREDENTIALS" "dns_cloudflare_api_token = $CF_API_TOKEN"
@@ -4150,7 +4170,7 @@ web_add_domain() {
 
         # ── Nginx 反向代理 ──
         if [[ $do_nginx -eq 1 ]]; then
-            echo -e "\n${C_CYAN}━━━ [${step}] Nginx 反向代理 ━━━${C_RESET}"
+            echo -e "\n${C_CYAN}=== [${step}] Nginx 反向代理 ===${C_RESET}"
             _ensure_ssl_params
             local redir_port=""
             [[ "$NGINX_HTTPS_PORT" != "443" ]] && redir_port=":${NGINX_HTTPS_PORT}"
@@ -4190,7 +4210,7 @@ server {
             ((step++))
 
             # ── 防火墙 ──
-            echo -e "\n${C_CYAN}━━━ [${step}] 防火墙 ━━━${C_RESET}"
+            echo -e "\n${C_CYAN}=== [${step}] 防火墙 ===${C_RESET}"
             if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
                 ufw allow "$NGINX_HTTP_PORT/tcp" comment "Nginx-HTTP" >/dev/null 2>&1 || true
                 ufw allow "$NGINX_HTTPS_PORT/tcp" comment "Nginx-HTTPS" >/dev/null 2>&1 || true
@@ -4202,7 +4222,7 @@ server {
         fi
 
         # ── 证书自动续签 ──
-        echo -e "\n${C_CYAN}━━━ [${step}] 证书自动续签 ━━━${C_RESET}"
+        echo -e "\n${C_CYAN}=== [${step}] 证书自动续签 ===${C_RESET}"
         mkdir -p "$CERT_HOOKS_DIR"
         local DEPLOY_HOOK_SCRIPT="${CERT_HOOKS_DIR}/renew-${DOMAIN}.sh"
         local hook_content="#!/bin/bash
@@ -4271,7 +4291,7 @@ LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
 
         # ── DDNS 动态解析 ──
         if [[ "$dns_mode" != "0" ]] && [[ ! -f "$DDNS_CONFIG_DIR/${DOMAIN}.conf" ]]; then
-            echo -e "\n${C_CYAN}━━━ [${step}] DDNS 动态解析 ━━━${C_RESET}"
+            echo -e "\n${C_CYAN}=== [${step}] DDNS 动态解析 ===${C_RESET}"
             local ddns_ipv4="false" ddns_ipv6="false"
             [[ "$dns_mode" == "1" || "$dns_mode" == "3" ]] && ddns_ipv4="true"
             [[ "$dns_mode" == "2" || "$dns_mode" == "3" ]] && ddns_ipv6="true"
@@ -5062,11 +5082,15 @@ menu_web() {
                 pause
                 ;;
             9)
-                echo "1. 证书续签日志  2. DDNS 更新日志"
-                read -e -r -p "选择: " lc
+                echo "1. 证书续签日志"
+                echo "2. DDNS 更新日志"
+                echo "0. 返回上一级"
+                read -e -r -p "选择 [0=返回]: " lc
                 case $lc in
                     1) [[ -f /var/log/cert-renew.log ]] && tail -n 50 /var/log/cert-renew.log || print_warn "无日志" ;;
                     2) [[ -f "$DDNS_LOG" ]] && tail -n 50 "$DDNS_LOG" || print_warn "无日志" ;;
+                    0|q|Q|"") continue ;;
+                    *) print_error "无效选项，请输入 1/2，或输入 0 返回" ;;
                 esac
                 pause
                 ;;
@@ -5086,26 +5110,21 @@ menu_web() {
 
 web_home_expose() {
     print_title "家宽内网服务公网暴露（一键配置）"
-    echo -e "${C_CYAN}┌─────────────────────────────────────────────────────────────┐${C_RESET}"
-    echo -e "${C_CYAN}│${C_RESET}  将家庭宽带内网服务通过 DDNS + CF + HTTPS 暴露到公网        ${C_CYAN}│${C_RESET}"
-    echo -e "${C_CYAN}│${C_RESET}  适用: Alist / Jellyfin / NAS / HomeAssistant 等            ${C_CYAN}│${C_RESET}"
-    echo -e "${C_CYAN}│${C_RESET}                                                             ${C_CYAN}│${C_RESET}"
-    echo -e "${C_CYAN}│${C_RESET}  自动完成: DNS → 证书 → Nginx → DDNS → 回源规则            ${C_CYAN}│${C_RESET}"
-    echo -e "${C_CYAN}└─────────────────────────────────────────────────────────────┘${C_RESET}"
+    echo -e "${C_CYAN}将家庭宽带内网服务通过 DDNS + CF + HTTPS 暴露到公网${C_RESET}"
+    echo -e "  适用: Alist / Jellyfin / NAS / HomeAssistant 等"
+    echo -e "  自动完成: DNS -> 证书 -> Nginx -> DDNS -> 回源规则"
 
-    # ── 依赖检查 ──
+    # 依赖检查
     web_env_check || { pause; return; }
 
-    # ══════════════════════════════════════════════════════════════
-    #  Phase 1: 一次性收集所有配置信息
-    # ══════════════════════════════════════════════════════════════
-    echo -e "\n${C_CYAN}━━━ 第一阶段: 收集配置信息 ━━━${C_RESET}\n"
+    # Phase 1: 一次性收集所有配置信息
+    echo -e "\n${C_CYAN}=== 第一阶段: 收集配置信息 ===${C_RESET}\n"
 
     # 1. CF API Token
     local token=""
     print_guide "输入 Cloudflare API Token"
     echo -e "  ${C_GRAY}权限需要: Zone.DNS + Zone.SSL${C_RESET}"
-    echo -e "  ${C_GRAY}创建: CF 后台 → My Profile → API Tokens → Create Token${C_RESET}"
+    echo -e "  ${C_GRAY}创建: CF 后台 -> My Profile -> API Tokens -> Create Token${C_RESET}"
     while [[ -z "$token" ]]; do
         read -s -r -p "API Token: " token; echo ""
     done
@@ -5151,13 +5170,13 @@ web_home_expose() {
     local zone_id="${zone_ids[$((zone_choice-1))]}"
     print_success "已选择: ${root_domain} (Zone: ${zone_id})"
 
-    # 3. (SaaS 优选已移除 — CF NS 接入不支持，需第三方 DNS)
+    # 3. (SaaS 优选已移除 - CF NS 接入不支持，需第三方 DNS)
 
     # 4. 子域名前缀
     local sub_prefix=""
     print_guide "输入子域名前缀"
-    echo -e "  ${C_GRAY}例如输入 alist → 访问地址为 alist.${root_domain}${C_RESET}"
-    echo -e "  ${C_GRAY}例如输入 nas → 访问地址为 nas.${root_domain}${C_RESET}"
+    echo -e "  ${C_GRAY}例如输入 alist -> 访问地址为 alist.${root_domain}${C_RESET}"
+    echo -e "  ${C_GRAY}例如输入 nas -> 访问地址为 nas.${root_domain}${C_RESET}"
     while [[ -z "$sub_prefix" ]]; do
         read -e -r -p "子域名前缀: " sub_prefix
         [[ -z "$sub_prefix" ]] && print_warn "不能为空"
@@ -5182,7 +5201,7 @@ web_home_expose() {
     while true; do
         read -e -r -p "后端地址 [127.0.0.1:5244]: " backend_addr
         backend_addr=${backend_addr:-"127.0.0.1:5244"}
-        # 只输入了端口号 → 自动补 127.0.0.1
+        # 只输入了端口号，自动补 127.0.0.1
         if [[ "$backend_addr" =~ ^[0-9]+$ ]]; then
             if (( backend_addr >= 1 && backend_addr <= 65535 )); then
                 backend_addr="127.0.0.1:${backend_addr}"
@@ -5239,9 +5258,7 @@ web_home_expose() {
     fi
     print_success "公网 IP: $public_ip"
 
-    # ══════════════════════════════════════════════════════════════
-    #  配置确认
-    # ══════════════════════════════════════════════════════════════
+    # 配置确认
     echo ""
     draw_line
     echo -e "${C_CYAN}配置确认:${C_RESET}"
@@ -5255,16 +5272,16 @@ web_home_expose() {
     echo ""
     echo -e "  ${C_YELLOW}将自动执行:${C_RESET}"
     local auto_step=1
-    echo -e "    ${auto_step}. DNS 解析 → ${full_domain} → ${public_ip} (CF 代理)"; ((auto_step++))
+    echo -e "    ${auto_step}. DNS 解析 -> ${full_domain} -> ${public_ip} (CF 代理)"; ((auto_step++))
     echo -e "    ${auto_step}. SSL 证书申请 (Let's Encrypt DNS 验证)"; ((auto_step++))
-    echo -e "    ${auto_step}. Nginx 反向代理 (:${https_port} → ${backend_addr})"; ((auto_step++))
+    echo -e "    ${auto_step}. Nginx 反向代理 (:${https_port} -> ${backend_addr})"; ((auto_step++))
     echo -e "    ${auto_step}. DDNS 自动更新 (每 ${ddns_interval} 分钟)"; ((auto_step++))
     echo -e "    ${auto_step}. 防火墙放行端口 ${https_port}"; ((auto_step++))
-    [[ "$https_port" != "443" ]] && { echo -e "    ${auto_step}. CF Origin Rule (用户 :443 → 回源 :${https_port})"; ((auto_step++)); }
+    [[ "$https_port" != "443" ]] && { echo -e "    ${auto_step}. CF Origin Rule (用户 :443 -> 回源 :${https_port})"; ((auto_step++)); }
     echo ""
-    echo -e "  ${C_YELLOW}[⚠ 手动操作提醒]${C_RESET}"
+    echo -e "  ${C_YELLOW}[手动操作提醒]${C_RESET}"
     echo -e "  ${C_YELLOW}  请确保路由器 (OpenWrt/爱快等) 已做端口转发:${C_RESET}"
-    echo -e "  ${C_YELLOW}  外网 ${https_port}/TCP → 内网运行 Nginx 的设备IP:${https_port}/TCP${C_RESET}"
+    echo -e "  ${C_YELLOW}  外网 ${https_port}/TCP -> 内网运行 Nginx 的设备IP:${https_port}/TCP${C_RESET}"
     if [[ "$backend_addr" != 127.0.0.1:* ]]; then
         echo -e "  ${C_YELLOW}  后端服务在其他设备 (${backend_addr})，请确保内网互通${C_RESET}"
     fi
@@ -5273,25 +5290,23 @@ web_home_expose() {
         print_warn "已取消"; pause; return
     fi
 
-    # ══════════════════════════════════════════════════════════════
-    #  Phase 2: 自动执行
-    # ══════════════════════════════════════════════════════════════
+    # Phase 2: 自动执行
     local step=1 total_steps=5
     [[ "$https_port" != "443" ]] && total_steps=$((total_steps + 1))
 
-    # ── Step: DNS 解析 ──
-    echo -e "\n${C_CYAN}━━━ [${step}/${total_steps}] DNS 解析 ━━━${C_RESET}"
+    # Step: DNS 解析
+    echo -e "\n${C_CYAN}=== [${step}/${total_steps}] DNS 解析 ===${C_RESET}"
     # 重新配置时可能残留旧 CNAME，CF 不允许同名 A/CNAME 共存，需先清除
     _cf_dns_delete "$zone_id" "$token" "CNAME" "$full_domain" >/dev/null 2>&1
-    print_info "创建 A 记录: ${full_domain} → ${public_ip} (开启 CF 代理)"
+    print_info "创建 A 记录: ${full_domain} -> ${public_ip} (开启 CF 代理)"
     if ! _cf_update_dns_record "$zone_id" "$token" "$full_domain" "A" "$public_ip" "true"; then
         print_error "DNS 记录创建失败"
         pause; return
     fi
     ((step++))
 
-    # ── Step: SSL 证书 ──
-    echo -e "\n${C_CYAN}━━━ [${step}/${total_steps}] SSL 证书申请 ━━━${C_RESET}"
+    # Step: SSL 证书
+    echo -e "\n${C_CYAN}=== [${step}/${total_steps}] SSL 证书申请 ===${C_RESET}"
     local cert_dir="${CERT_PATH_PREFIX}/${full_domain}"
     mkdir -p "$cert_dir"
     local cf_cred="/root/.cloudflare-${full_domain}.ini"
@@ -5319,8 +5334,8 @@ web_home_expose() {
     fi
     ((step++))
 
-    # ── Step: Nginx 反向代理 ──
-    echo -e "\n${C_CYAN}━━━ [${step}/${total_steps}] Nginx 反向代理 ━━━${C_RESET}"
+    # Step: Nginx 反向代理
+    echo -e "\n${C_CYAN}=== [${step}/${total_steps}] Nginx 反向代理 ===${C_RESET}"
     _ensure_ssl_params
     local redir_port=""
     [[ "$https_port" != "443" ]] && redir_port=":${https_port}"
@@ -5357,11 +5372,11 @@ server {
     if ! _nginx_deploy_conf "$full_domain" "$nginx_conf"; then
         pause; return
     fi
-    print_success "Nginx 已部署 (:${https_port} → ${backend_addr})"
+    print_success "Nginx 已部署 (:${https_port} -> ${backend_addr})"
     ((step++))
 
-    # ── Step: DDNS ──
-    echo -e "\n${C_CYAN}━━━ [${step}/${total_steps}] DDNS 动态解析 ━━━${C_RESET}"
+    # Step: DDNS
+    echo -e "\n${C_CYAN}=== [${step}/${total_steps}] DDNS 动态解析 ===${C_RESET}"
     local ddns_domain="$full_domain"
     local ddns_proxied="true"
     mkdir -p "$DDNS_CONFIG_DIR"
@@ -5380,8 +5395,8 @@ EOF
     print_success "DDNS 已配置: ${ddns_domain} (每 ${ddns_interval} 分钟)"
     ((step++))
 
-    # ── Step: 防火墙 ──
-    echo -e "\n${C_CYAN}━━━ [${step}/${total_steps}] 防火墙 ━━━${C_RESET}"
+    # Step: 防火墙
+    echo -e "\n${C_CYAN}=== [${step}/${total_steps}] 防火墙 ===${C_RESET}"
     if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
         ufw allow "${https_port}/tcp" comment "HomeExpose-${full_domain}" >/dev/null 2>&1 || true
         print_success "已放行端口 ${https_port}/tcp"
@@ -5390,10 +5405,10 @@ EOF
     fi
     ((step++))
 
-    # ── Step: Origin Rule (端口非 443 时) ──
+    # Step: Origin Rule (端口非 443 时)
     if [[ "$https_port" != "443" ]]; then
-        echo -e "\n${C_CYAN}━━━ [${step}/${total_steps}] CF Origin Rule (端口回源) ━━━${C_RESET}"
-        print_info "创建回源规则: 用户访问 :443 → CF 回源 :${https_port}"
+        echo -e "\n${C_CYAN}=== [${step}/${total_steps}] CF Origin Rule (端口回源) ===${C_RESET}"
+        print_info "创建回源规则: 用户访问 :443 -> CF 回源 :${https_port}"
         local existing
         existing=$(_cf_get_origin_ruleset "$token" "$zone_id")
         local existing_rules="[]"
@@ -5421,21 +5436,19 @@ EOF
             print_warn "Origin Rule 创建失败: $err"
             print_warn "可稍后通过菜单 [10.创建回源规则] 手动添加"
         else
-            print_success "Origin Rule 已创建 (用户 :443 → 回源 :${https_port})"
+            print_success "Origin Rule 已创建 (用户 :443 -> 回源 :${https_port})"
         fi
         ((step++))
     fi
 
-    # ── Step: SSL/TLS Full 模式 ──
+    # Step: SSL/TLS Full 模式
     print_info "设置 SSL/TLS 为 Full 模式..."
     local ssl_resp=$(_cf_api PATCH "/zones/$zone_id/settings/ssl" "$token" \
         --data '{"value":"full"}')
-    _cf_api_ok "$ssl_resp" && print_success "SSL/TLS → Full" || \
+    _cf_api_ok "$ssl_resp" && print_success "SSL/TLS -> Full" || \
         print_warn "SSL 设置: $(_cf_api_err "$ssl_resp") (可能已是 Full)"
 
-    # ══════════════════════════════════════════════════════════════
-    #  保存配置文件 + 证书续签 Hook
-    # ══════════════════════════════════════════════════════════════
+    # 保存配置文件 + 证书续签 Hook
     mkdir -p "$CONFIG_DIR" "$CERT_HOOKS_DIR"
 
     # 续签 Hook 脚本
@@ -5490,21 +5503,19 @@ LOCAL_PROXY_PASS="http://${backend_addr}"
 HOME_EXPOSE="true"
 CONFEOF
 
-    # ══════════════════════════════════════════════════════════════
-    #  完成报告
-    # ══════════════════════════════════════════════════════════════
+    # 完成报告
     echo ""
     draw_line
-    print_success "🎉 家宽公网暴露配置完成！"
+    print_success "家宽公网暴露配置完成！"
     draw_line
     echo -e "  ${C_CYAN}[访问地址]${C_RESET}"
     echo -e "    https://${full_domain}"
     echo ""
     echo -e "  ${C_CYAN}[访问链路]${C_RESET}"
-    echo -e "    用户 → ${C_GREEN}${full_domain}${C_RESET} (CF CDN 代理)"
+    echo -e "    用户 -> ${C_GREEN}${full_domain}${C_RESET} (CF CDN 代理)"
     [[ "$https_port" != "443" ]] && \
-    echo -e "      → Origin Rule :443 → :${C_GREEN}${https_port}${C_RESET}"
-    echo -e "      → 家宽路由器 → 内网 Nginx → ${C_GREEN}${backend_addr}${C_RESET}"
+    echo -e "      -> Origin Rule :443 -> :${C_GREEN}${https_port}${C_RESET}"
+    echo -e "      -> 家宽路由器 -> 内网 Nginx -> ${C_GREEN}${backend_addr}${C_RESET}"
     echo ""
     echo -e "  ${C_CYAN}[证书]${C_RESET}"
     echo -e "    公钥: ${cert_dir}/fullchain.pem"
@@ -5515,9 +5526,9 @@ CONFEOF
     echo -e "    域名: ${ddns_domain}"
     echo -e "    间隔: 每 ${ddns_interval} 分钟"
     echo ""
-    echo -e "  ${C_YELLOW}[⚠ 路由器操作 — 需要手动完成]${C_RESET}"
+    echo -e "  ${C_YELLOW}[路由器操作 - 需要手动完成]${C_RESET}"
     echo -e "    请在路由器 (OpenWrt/爱快等) 做端口转发:"
-    echo -e "    外网 ${C_GREEN}${https_port}${C_RESET}/TCP → 运行 Nginx 的设备IP:${C_GREEN}${https_port}${C_RESET}/TCP"
+    echo -e "    外网 ${C_GREEN}${https_port}${C_RESET}/TCP -> 运行 Nginx 的设备IP:${C_GREEN}${https_port}${C_RESET}/TCP"
     if [[ "$backend_addr" != 127.0.0.1:* ]]; then
         echo -e "    后端服务在 ${C_GREEN}${backend_addr}${C_RESET}，请确保内网互通"
     fi
@@ -5525,10 +5536,10 @@ CONFEOF
     draw_line
     log_action "Home expose configured: ${full_domain} -> ${backend_addr} (port=${https_port})"
 
-    # ── 可选: 内网 DNS 劫持 (解决 NAT 回环) ──
+    # 可选: 内网 DNS 劫持 (解决 NAT 回环)
     echo ""
     echo -e "${C_CYAN}内网 DNS 劫持 (解决 NAT 回环问题):${C_RESET}"
-    echo -e "  ${C_GRAY}问题: 内网设备访问 ${full_domain} → 解析到公网 IP → 路由器 → 无法回环${C_RESET}"
+    echo -e "  ${C_GRAY}问题: 内网设备访问 ${full_domain} -> 解析到公网 IP -> 路由器 -> 无法回环${C_RESET}"
     echo -e "  ${C_GRAY}解决: 在路由器 dnsmasq 添加本地解析，内网直连不走公网${C_RESET}"
     if confirm "是否自动配置路由器内网 DNS 劫持 (需 SSH 到 OpenWrt)?"; then
         # 检测网关 IP
@@ -5553,7 +5564,7 @@ CONFEOF
 
         echo -e "${C_CYAN}配置预览:${C_RESET}"
         echo -e "  路由器: ${C_GREEN}${router_ssh}${C_RESET}"
-        echo -e "  规则:   ${C_GREEN}${full_domain} → ${nginx_ip}${C_RESET}"
+        echo -e "  规则:   ${C_GREEN}${full_domain} -> ${nginx_ip}${C_RESET}"
         echo ""
         print_info "正在 SSH 到路由器配置 dnsmasq..."
 
@@ -5579,7 +5590,7 @@ uci commit dhcp
         if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
             ${router_ssh} "${uci_cmds}" 2>&1; then
             print_success "内网 DNS 劫持配置成功！"
-            echo -e "  ${C_GREEN}${full_domain} → ${nginx_ip}${C_RESET} (内网直连)"
+            echo -e "  ${C_GREEN}${full_domain} -> ${nginx_ip}${C_RESET} (内网直连)"
         else
             print_warn "SSH 配置失败，请手动在路由器上执行:"
             echo -e "  ${C_YELLOW}ssh ${router_ssh}${C_RESET}"
@@ -5951,14 +5962,14 @@ wg_check_public_ip() {
         esac
         found_any=true
         if _wg_is_private_ip "$ip"; then
-            echo -e "  ${C_YELLOW}├ ${iface}: ${ip} (内网)${C_RESET}"
+            echo -e "  ${C_YELLOW}- ${iface}: ${ip} (内网)${C_RESET}"
         else
-            echo -e "  ${C_GREEN}├ ${iface}: ${ip} (公网)${C_RESET}"
+            echo -e "  ${C_GREEN}- ${iface}: ${ip} (公网)${C_RESET}"
             found_public=true
         fi
     done < <(ip -4 addr show scope global 2>/dev/null | grep 'inet ')
     if ! $found_any; then
-        echo -e "  ${C_RED}└ 未检测到任何 scope global 的 IPv4 地址${C_RESET}"
+        echo -e "  ${C_RED}- 未检测到任何 scope global 的 IPv4 地址${C_RESET}"
         return 1
     fi
     $found_public && return 0 || return 1
@@ -8388,11 +8399,11 @@ wg_generate_clash_config() {
             draw_line
             echo -e "${C_CYAN}=== 需要添加到 YAML 的内容 ===${C_RESET}"
             draw_line
-            echo -e "${C_YELLOW}# ━━━ 第1步: 在 proxies: 段末尾添加 ━━━${C_RESET}"
+            echo -e "${C_YELLOW}# === 第1步: 在 proxies: 段末尾添加 ===${C_RESET}"
             echo "$all_proxy_yaml"
-            echo -e "${C_YELLOW}# ━━━ 第2步: 在 proxy-groups: 段末尾添加 ━━━${C_RESET}"
+            echo -e "${C_YELLOW}# === 第2步: 在 proxy-groups: 段末尾添加 ===${C_RESET}"
             echo "$wg_group_yaml"
-            echo -e "${C_YELLOW}# ━━━ 第3步: 在 rules: 段最前面添加 ━━━${C_RESET}"
+            echo -e "${C_YELLOW}# === 第3步: 在 rules: 段最前面添加 ===${C_RESET}"
             echo -n "$wg_rules_yaml"
             draw_line
             if [[ ${#all_proxy_names[@]} -gt 1 ]]; then
@@ -8553,7 +8564,6 @@ wg_generate_clash_config() {
     log_action "Clash WireGuard config generated: ${peer_name} nodes=${#all_proxy_names[@]}"
     pause
 }
-
 wg_setup_watchdog() {
     wg_check_installed || return 1
     local watchdog_script="/usr/local/bin/wg-watchdog.sh"
@@ -8840,14 +8850,14 @@ wg_server_menu() {
         fi
         local peer_count=$(wg_db_get '.peers | length')
         echo -e "  设备数: ${C_CYAN}${peer_count}${C_RESET}"
-        echo "  ── 设备管理 ──────────────────
+        echo "  [设备管理]
   1. 查看状态
   2. 添加设备
   3. 删除设备
   4. 启用/禁用设备
   5. 查看设备配置/二维码
   6. 生成 Clash/OpenClash 配置
-  ── 服务控制 ──────────────────
+  [服务控制]
   7. 启动 WireGuard
   8. 停止 WireGuard
   9. 重启 WireGuard
@@ -8857,7 +8867,7 @@ wg_server_menu() {
   13. 生成 OpenWrt 清空 WG 配置命令
   14. 服务端看门狗 (自动重启保活)
   15. Mihomo bypass 规则管理
-  ── 数据管理 ──────────────────
+  [数据管理]
   16. 导出设备配置 (JSON)
   17. 导入设备配置 (JSON)
   0. 返回上级菜单
@@ -8897,10 +8907,27 @@ wg_main_menu() {
         if wg_is_installed; then
             local role
             role=$(wg_get_role)
-            if [[ "$role" == "server" ]]; then
-                wg_server_menu; return
-            elif [[ -f "$WG_CONF" ]]; then
-                wg_set_role "server"; continue
+            if [[ "$role" == "server" || -f "$WG_CONF" ]]; then
+                [[ "$role" == "server" ]] || wg_set_role "server"
+                print_title "WireGuard VPN"
+                local srv_name
+                srv_name=$(wg_get_server_name)
+                if wg_is_running; then
+                    echo -e "  状态: ${C_GREEN}运行中${C_RESET}    接口: ${C_CYAN}${WG_INTERFACE}${C_RESET}    名称: ${C_CYAN}${srv_name}${C_RESET}"
+                else
+                    echo -e "  状态: ${C_RED}已停止${C_RESET}    接口: ${C_CYAN}${WG_INTERFACE}${C_RESET}    名称: ${C_CYAN}${srv_name}${C_RESET}"
+                fi
+                echo ""
+                echo "1. 服务端管理"
+                echo "2. 卸载 WireGuard"
+                echo "0. 返回主菜单"
+                read -e -r -p "选择: " c
+                case "$c" in
+                    1) wg_server_menu ;;
+                    2) wg_uninstall ;;
+                    0|q|Q|"") return ;;
+                    *) print_warn "无效选项"; pause ;;
+                esac
             else
                 print_warn "WireGuard 已安装但无配置文件"
                 echo "  1. 重新安装服务端
@@ -8914,12 +8941,20 @@ wg_main_menu() {
                 esac
             fi
         else
-            wg_server_install
-            wg_is_installed || return
+            print_title "WireGuard VPN"
+            echo -e "  状态: ${C_YELLOW}未安装${C_RESET}"
+            echo ""
+            echo "1. 安装 WireGuard 服务端"
+            echo "0. 返回主菜单"
+            read -e -r -p "选择: " c
+            case "$c" in
+                1) wg_server_install ;;
+                0|q|Q|"") return ;;
+                *) print_warn "无效选项"; pause ;;
+            esac
         fi
     done
 }
-
 
 # Debian/Ubuntu 环境兼容性全面检测
 # 返回 0 = 全部通过，返回 1 = 有致命项失败
@@ -10632,14 +10667,14 @@ wg_deb_server_menu() {
         fi
         local peer_count=$(wg_deb_db_get '.peers | length')
         echo -e "  设备数: ${C_CYAN}${peer_count}${C_RESET}"
-        echo "  ── 设备管理 ──────────────────
+        echo "  [设备管理]
   1. 查看状态
   2. 添加设备
   3. 删除设备
   4. 启用/禁用设备
   5. 查看设备配置/二维码
   6. 生成 Clash/OpenClash 配置
-  ── 服务控制 ──────────────────
+  [服务控制]
   7. 启动 WireGuard
   8. 停止 WireGuard
   9. 重启 WireGuard
@@ -10647,7 +10682,7 @@ wg_deb_server_menu() {
   11. 修改服务器名称
   12. 卸载 WireGuard
   13. 服务端看门狗 (自动重启保活)
-  ── 数据管理 ──────────────────
+  [数据管理]
   14. 导出设备配置 (JSON)
   15. 导入设备配置 (JSON)
   0. 返回上级菜单
@@ -10684,10 +10719,27 @@ wg_deb_main_menu() {
         if wg_deb_is_installed; then
             local role
             role=$(wg_deb_get_role)
-            if [[ "$role" == "server" ]]; then
-                wg_deb_server_menu; return
-            elif [[ -f "$WG_DEB_CONF" ]]; then
-                wg_deb_set_role "server"; continue
+            if [[ "$role" == "server" || -f "$WG_DEB_CONF" ]]; then
+                [[ "$role" == "server" ]] || wg_deb_set_role "server"
+                print_title "WireGuard VPN"
+                local srv_name
+                srv_name=$(wg_deb_get_server_name)
+                if wg_deb_is_running; then
+                    echo -e "  状态: ${C_GREEN}运行中${C_RESET}    接口: ${C_CYAN}${WG_DEB_INTERFACE}${C_RESET}    名称: ${C_CYAN}${srv_name}${C_RESET}"
+                else
+                    echo -e "  状态: ${C_RED}已停止${C_RESET}    接口: ${C_CYAN}${WG_DEB_INTERFACE}${C_RESET}    名称: ${C_CYAN}${srv_name}${C_RESET}"
+                fi
+                echo ""
+                echo "1. 服务端管理"
+                echo "2. 卸载 WireGuard"
+                echo "0. 返回主菜单"
+                read -e -r -p "选择: " c
+                case "$c" in
+                    1) wg_deb_server_menu ;;
+                    2) wg_deb_uninstall ;;
+                    0|q|Q|"") return ;;
+                    *) print_warn "无效选项"; pause ;;
+                esac
             else
                 print_warn "WireGuard 已安装但无配置文件"
                 echo "  1. 重新安装服务端
@@ -10701,8 +10753,17 @@ wg_deb_main_menu() {
                 esac
             fi
         else
-            wg_deb_server_install
-            wg_deb_is_installed || return
+            print_title "WireGuard VPN"
+            echo -e "  状态: ${C_YELLOW}未安装${C_RESET}"
+            echo ""
+            echo "1. 安装 WireGuard 服务端"
+            echo "0. 返回主菜单"
+            read -e -r -p "选择: " c
+            case "$c" in
+                1) wg_deb_server_install ;;
+                0|q|Q|"") return ;;
+                *) print_warn "无效选项"; pause ;;
+            esac
         fi
     done
 }
@@ -13777,9 +13838,14 @@ reality_install_wizard() {
         echo "1. 落地机 (sing-box VLESS REALITY)"
         echo "2. 中转机 (Realm TCP 单跳转发)"
         echo "3. 落地 + 本机中转"
-        read -e -r -p "请选择 [1]: " role_choice
+        echo "0. 返回上一级"
+        read -e -r -p "请选择 [1, 0=返回]: " role_choice
         case "${role_choice:-1}" in
-            1) role="landing" ;; 2) role="relay" ;; 3) role="both" ;; *) print_error "无效选择"; return 1 ;;
+            1) role="landing" ;;
+            2) role="relay" ;;
+            3) role="both" ;;
+            0|q|Q) return 0 ;;
+            *) print_error "无效选择"; return 1 ;;
         esac
     fi
     if [[ "$role" == "landing" || "$role" == "both" ]]; then

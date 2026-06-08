@@ -749,9 +749,14 @@ reality_install_wizard() {
         echo "1. 落地机 (sing-box VLESS REALITY)"
         echo "2. 中转机 (Realm TCP 单跳转发)"
         echo "3. 落地 + 本机中转"
-        read -e -r -p "请选择 [1]: " role_choice
+        echo "0. 返回上一级"
+        read -e -r -p "请选择 [1, 0=返回]: " role_choice
         case "${role_choice:-1}" in
-            1) role="landing" ;; 2) role="relay" ;; 3) role="both" ;; *) print_error "无效选择"; return 1 ;;
+            1) role="landing" ;;
+            2) role="relay" ;;
+            3) role="both" ;;
+            0|q|Q) return 0 ;;
+            *) print_error "无效选择"; return 1 ;;
         esac
     fi
     if [[ "$role" == "landing" || "$role" == "both" ]]; then

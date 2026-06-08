@@ -531,11 +531,15 @@ menu_web() {
                 pause
                 ;;
             9)
-                echo "1. 证书续签日志  2. DDNS 更新日志"
-                read -e -r -p "选择: " lc
+                echo "1. 证书续签日志"
+                echo "2. DDNS 更新日志"
+                echo "0. 返回上一级"
+                read -e -r -p "选择 [0=返回]: " lc
                 case $lc in
                     1) [[ -f /var/log/cert-renew.log ]] && tail -n 50 /var/log/cert-renew.log || print_warn "无日志" ;;
                     2) [[ -f "$DDNS_LOG" ]] && tail -n 50 "$DDNS_LOG" || print_warn "无日志" ;;
+                    0|q|Q|"") continue ;;
+                    *) print_error "无效选项，请输入 1/2，或输入 0 返回" ;;
                 esac
                 pause
                 ;;

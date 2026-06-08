@@ -4,16 +4,14 @@ web_add_domain() {
     print_title "添加域名配置 (SSL + Nginx)"
     web_env_check || { pause; return; }
 
-    # ══════════════════════════════════════════════════════════════
-    #  配置收集阶段
-    # ══════════════════════════════════════════════════════════════
-    echo -e "\n${C_CYAN}━━━ 收集配置信息 ━━━${C_RESET}\n"
+    # 配置收集阶段
+    echo -e "\n${C_CYAN}=== 收集配置信息 ===${C_RESET}\n"
 
     # 1. CF API Token
     local CF_API_TOKEN=""
     print_guide "输入 Cloudflare API Token"
     echo -e "  ${C_GRAY}权限需要: Zone.DNS + Zone.SSL${C_RESET}"
-    echo -e "  ${C_GRAY}创建: CF 后台 → My Profile → API Tokens → Create Token${C_RESET}"
+    echo -e "  ${C_GRAY}创建: CF 后台 -> My Profile -> API Tokens -> Create Token${C_RESET}"
     if ! _cf_read_token "CF_API_TOKEN"; then
         pause; return
     fi
@@ -57,9 +55,9 @@ web_add_domain() {
     # 3. 子域名前缀
     local sub_prefix="" DOMAIN=""
     print_guide "输入子域名前缀"
-    echo -e "  ${C_GRAY}例如输入 www → 完整域名为 www.${root_domain}${C_RESET}"
-    echo -e "  ${C_GRAY}例如输入 panel → 完整域名为 panel.${root_domain}${C_RESET}"
-    echo -e "  ${C_GRAY}直接回车 → 使用根域名 ${root_domain}${C_RESET}"
+    echo -e "  ${C_GRAY}例如输入 www -> 完整域名为 www.${root_domain}${C_RESET}"
+    echo -e "  ${C_GRAY}例如输入 panel -> 完整域名为 panel.${root_domain}${C_RESET}"
+    echo -e "  ${C_GRAY}直接回车 -> 使用根域名 ${root_domain}${C_RESET}"
     read -e -r -p "子域名前缀 [留空=根域名]: " sub_prefix
     if [[ -z "$sub_prefix" ]]; then
         DOMAIN="$root_domain"
@@ -187,7 +185,7 @@ web_add_domain() {
 
     # ── DNS 解析 ──
     if [[ "$dns_mode" != "0" ]]; then
-        echo -e "\n${C_CYAN}━━━ [${step}] DNS 解析 ━━━${C_RESET}"
+        echo -e "\n${C_CYAN}=== [${step}] DNS 解析 ===${C_RESET}"
         case $dns_mode in
             1) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "A" "$ipv4" "$dns_proxied" ;;
             2) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "AAAA" "$ipv6" "$dns_proxied" ;;
@@ -198,7 +196,7 @@ web_add_domain() {
     fi
 
     # ── SSL 证书 ──
-    echo -e "\n${C_CYAN}━━━ [${step}] SSL 证书申请 ━━━${C_RESET}"
+    echo -e "\n${C_CYAN}=== [${step}] SSL 证书申请 ===${C_RESET}"
     mkdir -p "${CERT_PATH_PREFIX}/${DOMAIN}"
     local CLOUDFLARE_CREDENTIALS="/root/.cloudflare-${DOMAIN}.ini"
     write_file_atomic "$CLOUDFLARE_CREDENTIALS" "dns_cloudflare_api_token = $CF_API_TOKEN"
@@ -223,7 +221,7 @@ web_add_domain() {
 
         # ── Nginx 反向代理 ──
         if [[ $do_nginx -eq 1 ]]; then
-            echo -e "\n${C_CYAN}━━━ [${step}] Nginx 反向代理 ━━━${C_RESET}"
+            echo -e "\n${C_CYAN}=== [${step}] Nginx 反向代理 ===${C_RESET}"
             _ensure_ssl_params
             local redir_port=""
             [[ "$NGINX_HTTPS_PORT" != "443" ]] && redir_port=":${NGINX_HTTPS_PORT}"
@@ -263,7 +261,7 @@ server {
             ((step++))
 
             # ── 防火墙 ──
-            echo -e "\n${C_CYAN}━━━ [${step}] 防火墙 ━━━${C_RESET}"
+            echo -e "\n${C_CYAN}=== [${step}] 防火墙 ===${C_RESET}"
             if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
                 ufw allow "$NGINX_HTTP_PORT/tcp" comment "Nginx-HTTP" >/dev/null 2>&1 || true
                 ufw allow "$NGINX_HTTPS_PORT/tcp" comment "Nginx-HTTPS" >/dev/null 2>&1 || true
@@ -275,7 +273,7 @@ server {
         fi
 
         # ── 证书自动续签 ──
-        echo -e "\n${C_CYAN}━━━ [${step}] 证书自动续签 ━━━${C_RESET}"
+        echo -e "\n${C_CYAN}=== [${step}] 证书自动续签 ===${C_RESET}"
         mkdir -p "$CERT_HOOKS_DIR"
         local DEPLOY_HOOK_SCRIPT="${CERT_HOOKS_DIR}/renew-${DOMAIN}.sh"
         local hook_content="#!/bin/bash
@@ -344,7 +342,7 @@ LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
 
         # ── DDNS 动态解析 ──
         if [[ "$dns_mode" != "0" ]] && [[ ! -f "$DDNS_CONFIG_DIR/${DOMAIN}.conf" ]]; then
-            echo -e "\n${C_CYAN}━━━ [${step}] DDNS 动态解析 ━━━${C_RESET}"
+            echo -e "\n${C_CYAN}=== [${step}] DDNS 动态解析 ===${C_RESET}"
             local ddns_ipv4="false" ddns_ipv6="false"
             [[ "$dns_mode" == "1" || "$dns_mode" == "3" ]] && ddns_ipv4="true"
             [[ "$dns_mode" == "2" || "$dns_mode" == "3" ]] && ddns_ipv6="true"

@@ -178,9 +178,13 @@ web_cf_dns_update() {
     echo "1. 仅解析 IPv4 (A)
 2. 仅解析 IPv6 (AAAA)
 3. 双栈解析 (A + AAAA)
-0. 跳过"
+0. 返回上一级"
     read -e -r -p "请选择: " mode
-    if [[ "$mode" == "0" ]]; then return; fi
+    case "$mode" in
+        1|2|3) ;;
+        0|q|Q|"") return ;;
+        *) print_error "无效选择，请输入 1/2/3，或输入 0 返回"; pause; return ;;
+    esac
     # 选择 IPv6 但未检测到时给予提示
     if [[ ("$mode" == "2" || "$mode" == "3") && -z "$ipv6" ]]; then
         print_warn "未检测到 IPv6 地址，AAAA 记录将跳过"

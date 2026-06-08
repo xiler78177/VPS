@@ -3,26 +3,21 @@
 
 web_home_expose() {
     print_title "家宽内网服务公网暴露（一键配置）"
-    echo -e "${C_CYAN}┌─────────────────────────────────────────────────────────────┐${C_RESET}"
-    echo -e "${C_CYAN}│${C_RESET}  将家庭宽带内网服务通过 DDNS + CF + HTTPS 暴露到公网        ${C_CYAN}│${C_RESET}"
-    echo -e "${C_CYAN}│${C_RESET}  适用: Alist / Jellyfin / NAS / HomeAssistant 等            ${C_CYAN}│${C_RESET}"
-    echo -e "${C_CYAN}│${C_RESET}                                                             ${C_CYAN}│${C_RESET}"
-    echo -e "${C_CYAN}│${C_RESET}  自动完成: DNS → 证书 → Nginx → DDNS → 回源规则            ${C_CYAN}│${C_RESET}"
-    echo -e "${C_CYAN}└─────────────────────────────────────────────────────────────┘${C_RESET}"
+    echo -e "${C_CYAN}将家庭宽带内网服务通过 DDNS + CF + HTTPS 暴露到公网${C_RESET}"
+    echo -e "  适用: Alist / Jellyfin / NAS / HomeAssistant 等"
+    echo -e "  自动完成: DNS -> 证书 -> Nginx -> DDNS -> 回源规则"
 
-    # ── 依赖检查 ──
+    # 依赖检查
     web_env_check || { pause; return; }
 
-    # ══════════════════════════════════════════════════════════════
-    #  Phase 1: 一次性收集所有配置信息
-    # ══════════════════════════════════════════════════════════════
-    echo -e "\n${C_CYAN}━━━ 第一阶段: 收集配置信息 ━━━${C_RESET}\n"
+    # Phase 1: 一次性收集所有配置信息
+    echo -e "\n${C_CYAN}=== 第一阶段: 收集配置信息 ===${C_RESET}\n"
 
     # 1. CF API Token
     local token=""
     print_guide "输入 Cloudflare API Token"
     echo -e "  ${C_GRAY}权限需要: Zone.DNS + Zone.SSL${C_RESET}"
-    echo -e "  ${C_GRAY}创建: CF 后台 → My Profile → API Tokens → Create Token${C_RESET}"
+    echo -e "  ${C_GRAY}创建: CF 后台 -> My Profile -> API Tokens -> Create Token${C_RESET}"
     while [[ -z "$token" ]]; do
         read -s -r -p "API Token: " token; echo ""
     done
@@ -68,13 +63,13 @@ web_home_expose() {
     local zone_id="${zone_ids[$((zone_choice-1))]}"
     print_success "已选择: ${root_domain} (Zone: ${zone_id})"
 
-    # 3. (SaaS 优选已移除 — CF NS 接入不支持，需第三方 DNS)
+    # 3. (SaaS 优选已移除 - CF NS 接入不支持，需第三方 DNS)
 
     # 4. 子域名前缀
     local sub_prefix=""
     print_guide "输入子域名前缀"
-    echo -e "  ${C_GRAY}例如输入 alist → 访问地址为 alist.${root_domain}${C_RESET}"
-    echo -e "  ${C_GRAY}例如输入 nas → 访问地址为 nas.${root_domain}${C_RESET}"
+    echo -e "  ${C_GRAY}例如输入 alist -> 访问地址为 alist.${root_domain}${C_RESET}"
+    echo -e "  ${C_GRAY}例如输入 nas -> 访问地址为 nas.${root_domain}${C_RESET}"
     while [[ -z "$sub_prefix" ]]; do
         read -e -r -p "子域名前缀: " sub_prefix
         [[ -z "$sub_prefix" ]] && print_warn "不能为空"
@@ -99,7 +94,7 @@ web_home_expose() {
     while true; do
         read -e -r -p "后端地址 [127.0.0.1:5244]: " backend_addr
         backend_addr=${backend_addr:-"127.0.0.1:5244"}
-        # 只输入了端口号 → 自动补 127.0.0.1
+        # 只输入了端口号，自动补 127.0.0.1
         if [[ "$backend_addr" =~ ^[0-9]+$ ]]; then
             if (( backend_addr >= 1 && backend_addr <= 65535 )); then
                 backend_addr="127.0.0.1:${backend_addr}"
@@ -156,9 +151,7 @@ web_home_expose() {
     fi
     print_success "公网 IP: $public_ip"
 
-    # ══════════════════════════════════════════════════════════════
-    #  配置确认
-    # ══════════════════════════════════════════════════════════════
+    # 配置确认
     echo ""
     draw_line
     echo -e "${C_CYAN}配置确认:${C_RESET}"
@@ -172,16 +165,16 @@ web_home_expose() {
     echo ""
     echo -e "  ${C_YELLOW}将自动执行:${C_RESET}"
     local auto_step=1
-    echo -e "    ${auto_step}. DNS 解析 → ${full_domain} → ${public_ip} (CF 代理)"; ((auto_step++))
+    echo -e "    ${auto_step}. DNS 解析 -> ${full_domain} -> ${public_ip} (CF 代理)"; ((auto_step++))
     echo -e "    ${auto_step}. SSL 证书申请 (Let's Encrypt DNS 验证)"; ((auto_step++))
-    echo -e "    ${auto_step}. Nginx 反向代理 (:${https_port} → ${backend_addr})"; ((auto_step++))
+    echo -e "    ${auto_step}. Nginx 反向代理 (:${https_port} -> ${backend_addr})"; ((auto_step++))
     echo -e "    ${auto_step}. DDNS 自动更新 (每 ${ddns_interval} 分钟)"; ((auto_step++))
     echo -e "    ${auto_step}. 防火墙放行端口 ${https_port}"; ((auto_step++))
-    [[ "$https_port" != "443" ]] && { echo -e "    ${auto_step}. CF Origin Rule (用户 :443 → 回源 :${https_port})"; ((auto_step++)); }
+    [[ "$https_port" != "443" ]] && { echo -e "    ${auto_step}. CF Origin Rule (用户 :443 -> 回源 :${https_port})"; ((auto_step++)); }
     echo ""
-    echo -e "  ${C_YELLOW}[⚠ 手动操作提醒]${C_RESET}"
+    echo -e "  ${C_YELLOW}[手动操作提醒]${C_RESET}"
     echo -e "  ${C_YELLOW}  请确保路由器 (OpenWrt/爱快等) 已做端口转发:${C_RESET}"
-    echo -e "  ${C_YELLOW}  外网 ${https_port}/TCP → 内网运行 Nginx 的设备IP:${https_port}/TCP${C_RESET}"
+    echo -e "  ${C_YELLOW}  外网 ${https_port}/TCP -> 内网运行 Nginx 的设备IP:${https_port}/TCP${C_RESET}"
     if [[ "$backend_addr" != 127.0.0.1:* ]]; then
         echo -e "  ${C_YELLOW}  后端服务在其他设备 (${backend_addr})，请确保内网互通${C_RESET}"
     fi
@@ -190,25 +183,23 @@ web_home_expose() {
         print_warn "已取消"; pause; return
     fi
 
-    # ══════════════════════════════════════════════════════════════
-    #  Phase 2: 自动执行
-    # ══════════════════════════════════════════════════════════════
+    # Phase 2: 自动执行
     local step=1 total_steps=5
     [[ "$https_port" != "443" ]] && total_steps=$((total_steps + 1))
 
-    # ── Step: DNS 解析 ──
-    echo -e "\n${C_CYAN}━━━ [${step}/${total_steps}] DNS 解析 ━━━${C_RESET}"
+    # Step: DNS 解析
+    echo -e "\n${C_CYAN}=== [${step}/${total_steps}] DNS 解析 ===${C_RESET}"
     # 重新配置时可能残留旧 CNAME，CF 不允许同名 A/CNAME 共存，需先清除
     _cf_dns_delete "$zone_id" "$token" "CNAME" "$full_domain" >/dev/null 2>&1
-    print_info "创建 A 记录: ${full_domain} → ${public_ip} (开启 CF 代理)"
+    print_info "创建 A 记录: ${full_domain} -> ${public_ip} (开启 CF 代理)"
     if ! _cf_update_dns_record "$zone_id" "$token" "$full_domain" "A" "$public_ip" "true"; then
         print_error "DNS 记录创建失败"
         pause; return
     fi
     ((step++))
 
-    # ── Step: SSL 证书 ──
-    echo -e "\n${C_CYAN}━━━ [${step}/${total_steps}] SSL 证书申请 ━━━${C_RESET}"
+    # Step: SSL 证书
+    echo -e "\n${C_CYAN}=== [${step}/${total_steps}] SSL 证书申请 ===${C_RESET}"
     local cert_dir="${CERT_PATH_PREFIX}/${full_domain}"
     mkdir -p "$cert_dir"
     local cf_cred="/root/.cloudflare-${full_domain}.ini"
@@ -236,8 +227,8 @@ web_home_expose() {
     fi
     ((step++))
 
-    # ── Step: Nginx 反向代理 ──
-    echo -e "\n${C_CYAN}━━━ [${step}/${total_steps}] Nginx 反向代理 ━━━${C_RESET}"
+    # Step: Nginx 反向代理
+    echo -e "\n${C_CYAN}=== [${step}/${total_steps}] Nginx 反向代理 ===${C_RESET}"
     _ensure_ssl_params
     local redir_port=""
     [[ "$https_port" != "443" ]] && redir_port=":${https_port}"
@@ -274,11 +265,11 @@ server {
     if ! _nginx_deploy_conf "$full_domain" "$nginx_conf"; then
         pause; return
     fi
-    print_success "Nginx 已部署 (:${https_port} → ${backend_addr})"
+    print_success "Nginx 已部署 (:${https_port} -> ${backend_addr})"
     ((step++))
 
-    # ── Step: DDNS ──
-    echo -e "\n${C_CYAN}━━━ [${step}/${total_steps}] DDNS 动态解析 ━━━${C_RESET}"
+    # Step: DDNS
+    echo -e "\n${C_CYAN}=== [${step}/${total_steps}] DDNS 动态解析 ===${C_RESET}"
     local ddns_domain="$full_domain"
     local ddns_proxied="true"
     mkdir -p "$DDNS_CONFIG_DIR"
@@ -297,8 +288,8 @@ EOF
     print_success "DDNS 已配置: ${ddns_domain} (每 ${ddns_interval} 分钟)"
     ((step++))
 
-    # ── Step: 防火墙 ──
-    echo -e "\n${C_CYAN}━━━ [${step}/${total_steps}] 防火墙 ━━━${C_RESET}"
+    # Step: 防火墙
+    echo -e "\n${C_CYAN}=== [${step}/${total_steps}] 防火墙 ===${C_RESET}"
     if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
         ufw allow "${https_port}/tcp" comment "HomeExpose-${full_domain}" >/dev/null 2>&1 || true
         print_success "已放行端口 ${https_port}/tcp"
@@ -307,10 +298,10 @@ EOF
     fi
     ((step++))
 
-    # ── Step: Origin Rule (端口非 443 时) ──
+    # Step: Origin Rule (端口非 443 时)
     if [[ "$https_port" != "443" ]]; then
-        echo -e "\n${C_CYAN}━━━ [${step}/${total_steps}] CF Origin Rule (端口回源) ━━━${C_RESET}"
-        print_info "创建回源规则: 用户访问 :443 → CF 回源 :${https_port}"
+        echo -e "\n${C_CYAN}=== [${step}/${total_steps}] CF Origin Rule (端口回源) ===${C_RESET}"
+        print_info "创建回源规则: 用户访问 :443 -> CF 回源 :${https_port}"
         local existing
         existing=$(_cf_get_origin_ruleset "$token" "$zone_id")
         local existing_rules="[]"
@@ -338,21 +329,19 @@ EOF
             print_warn "Origin Rule 创建失败: $err"
             print_warn "可稍后通过菜单 [10.创建回源规则] 手动添加"
         else
-            print_success "Origin Rule 已创建 (用户 :443 → 回源 :${https_port})"
+            print_success "Origin Rule 已创建 (用户 :443 -> 回源 :${https_port})"
         fi
         ((step++))
     fi
 
-    # ── Step: SSL/TLS Full 模式 ──
+    # Step: SSL/TLS Full 模式
     print_info "设置 SSL/TLS 为 Full 模式..."
     local ssl_resp=$(_cf_api PATCH "/zones/$zone_id/settings/ssl" "$token" \
         --data '{"value":"full"}')
-    _cf_api_ok "$ssl_resp" && print_success "SSL/TLS → Full" || \
+    _cf_api_ok "$ssl_resp" && print_success "SSL/TLS -> Full" || \
         print_warn "SSL 设置: $(_cf_api_err "$ssl_resp") (可能已是 Full)"
 
-    # ══════════════════════════════════════════════════════════════
-    #  保存配置文件 + 证书续签 Hook
-    # ══════════════════════════════════════════════════════════════
+    # 保存配置文件 + 证书续签 Hook
     mkdir -p "$CONFIG_DIR" "$CERT_HOOKS_DIR"
 
     # 续签 Hook 脚本
@@ -407,21 +396,19 @@ LOCAL_PROXY_PASS="http://${backend_addr}"
 HOME_EXPOSE="true"
 CONFEOF
 
-    # ══════════════════════════════════════════════════════════════
-    #  完成报告
-    # ══════════════════════════════════════════════════════════════
+    # 完成报告
     echo ""
     draw_line
-    print_success "🎉 家宽公网暴露配置完成！"
+    print_success "家宽公网暴露配置完成！"
     draw_line
     echo -e "  ${C_CYAN}[访问地址]${C_RESET}"
     echo -e "    https://${full_domain}"
     echo ""
     echo -e "  ${C_CYAN}[访问链路]${C_RESET}"
-    echo -e "    用户 → ${C_GREEN}${full_domain}${C_RESET} (CF CDN 代理)"
+    echo -e "    用户 -> ${C_GREEN}${full_domain}${C_RESET} (CF CDN 代理)"
     [[ "$https_port" != "443" ]] && \
-    echo -e "      → Origin Rule :443 → :${C_GREEN}${https_port}${C_RESET}"
-    echo -e "      → 家宽路由器 → 内网 Nginx → ${C_GREEN}${backend_addr}${C_RESET}"
+    echo -e "      -> Origin Rule :443 -> :${C_GREEN}${https_port}${C_RESET}"
+    echo -e "      -> 家宽路由器 -> 内网 Nginx -> ${C_GREEN}${backend_addr}${C_RESET}"
     echo ""
     echo -e "  ${C_CYAN}[证书]${C_RESET}"
     echo -e "    公钥: ${cert_dir}/fullchain.pem"
@@ -432,9 +419,9 @@ CONFEOF
     echo -e "    域名: ${ddns_domain}"
     echo -e "    间隔: 每 ${ddns_interval} 分钟"
     echo ""
-    echo -e "  ${C_YELLOW}[⚠ 路由器操作 — 需要手动完成]${C_RESET}"
+    echo -e "  ${C_YELLOW}[路由器操作 - 需要手动完成]${C_RESET}"
     echo -e "    请在路由器 (OpenWrt/爱快等) 做端口转发:"
-    echo -e "    外网 ${C_GREEN}${https_port}${C_RESET}/TCP → 运行 Nginx 的设备IP:${C_GREEN}${https_port}${C_RESET}/TCP"
+    echo -e "    外网 ${C_GREEN}${https_port}${C_RESET}/TCP -> 运行 Nginx 的设备IP:${C_GREEN}${https_port}${C_RESET}/TCP"
     if [[ "$backend_addr" != 127.0.0.1:* ]]; then
         echo -e "    后端服务在 ${C_GREEN}${backend_addr}${C_RESET}，请确保内网互通"
     fi
@@ -442,10 +429,10 @@ CONFEOF
     draw_line
     log_action "Home expose configured: ${full_domain} -> ${backend_addr} (port=${https_port})"
 
-    # ── 可选: 内网 DNS 劫持 (解决 NAT 回环) ──
+    # 可选: 内网 DNS 劫持 (解决 NAT 回环)
     echo ""
     echo -e "${C_CYAN}内网 DNS 劫持 (解决 NAT 回环问题):${C_RESET}"
-    echo -e "  ${C_GRAY}问题: 内网设备访问 ${full_domain} → 解析到公网 IP → 路由器 → 无法回环${C_RESET}"
+    echo -e "  ${C_GRAY}问题: 内网设备访问 ${full_domain} -> 解析到公网 IP -> 路由器 -> 无法回环${C_RESET}"
     echo -e "  ${C_GRAY}解决: 在路由器 dnsmasq 添加本地解析，内网直连不走公网${C_RESET}"
     if confirm "是否自动配置路由器内网 DNS 劫持 (需 SSH 到 OpenWrt)?"; then
         # 检测网关 IP
@@ -470,7 +457,7 @@ CONFEOF
 
         echo -e "${C_CYAN}配置预览:${C_RESET}"
         echo -e "  路由器: ${C_GREEN}${router_ssh}${C_RESET}"
-        echo -e "  规则:   ${C_GREEN}${full_domain} → ${nginx_ip}${C_RESET}"
+        echo -e "  规则:   ${C_GREEN}${full_domain} -> ${nginx_ip}${C_RESET}"
         echo ""
         print_info "正在 SSH 到路由器配置 dnsmasq..."
 
@@ -496,7 +483,7 @@ uci commit dhcp
         if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
             ${router_ssh} "${uci_cmds}" 2>&1; then
             print_success "内网 DNS 劫持配置成功！"
-            echo -e "  ${C_GREEN}${full_domain} → ${nginx_ip}${C_RESET} (内网直连)"
+            echo -e "  ${C_GREEN}${full_domain} -> ${nginx_ip}${C_RESET} (内网直连)"
         else
             print_warn "SSH 配置失败，请手动在路由器上执行:"
             echo -e "  ${C_YELLOW}ssh ${router_ssh}${C_RESET}"

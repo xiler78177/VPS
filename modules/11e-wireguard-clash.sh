@@ -122,11 +122,11 @@ wg_generate_clash_config() {
             draw_line
             echo -e "${C_CYAN}=== 需要添加到 YAML 的内容 ===${C_RESET}"
             draw_line
-            echo -e "${C_YELLOW}# ━━━ 第1步: 在 proxies: 段末尾添加 ━━━${C_RESET}"
+            echo -e "${C_YELLOW}# === 第1步: 在 proxies: 段末尾添加 ===${C_RESET}"
             echo "$all_proxy_yaml"
-            echo -e "${C_YELLOW}# ━━━ 第2步: 在 proxy-groups: 段末尾添加 ━━━${C_RESET}"
+            echo -e "${C_YELLOW}# === 第2步: 在 proxy-groups: 段末尾添加 ===${C_RESET}"
             echo "$wg_group_yaml"
-            echo -e "${C_YELLOW}# ━━━ 第3步: 在 rules: 段最前面添加 ━━━${C_RESET}"
+            echo -e "${C_YELLOW}# === 第3步: 在 rules: 段最前面添加 ===${C_RESET}"
             echo -n "$wg_rules_yaml"
             draw_line
             if [[ ${#all_proxy_names[@]} -gt 1 ]]; then
@@ -287,4 +287,3 @@ wg_generate_clash_config() {
     log_action "Clash WireGuard config generated: ${peer_name} nodes=${#all_proxy_names[@]}"
     pause
 }
-

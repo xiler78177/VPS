@@ -25,14 +25,14 @@ wg_check_public_ip() {
         esac
         found_any=true
         if _wg_is_private_ip "$ip"; then
-            echo -e "  ${C_YELLOW}├ ${iface}: ${ip} (内网)${C_RESET}"
+            echo -e "  ${C_YELLOW}- ${iface}: ${ip} (内网)${C_RESET}"
         else
-            echo -e "  ${C_GREEN}├ ${iface}: ${ip} (公网)${C_RESET}"
+            echo -e "  ${C_GREEN}- ${iface}: ${ip} (公网)${C_RESET}"
             found_public=true
         fi
     done < <(ip -4 addr show scope global 2>/dev/null | grep 'inet ')
     if ! $found_any; then
-        echo -e "  ${C_RED}└ 未检测到任何 scope global 的 IPv4 地址${C_RESET}"
+        echo -e "  ${C_RED}- 未检测到任何 scope global 的 IPv4 地址${C_RESET}"
         return 1
     fi
     $found_public && return 0 || return 1

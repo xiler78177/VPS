@@ -61,29 +61,30 @@ net_dns() {
     else
         cat /etc/resolv.conf
     fi
-    echo -e "${C_CYAN}━━━ DNS 预设方案 ━━━${C_RESET}"
-    echo -e "  ${C_YELLOW}── 境外通用 ──${C_RESET}"
+    echo -e "${C_CYAN}=== DNS 预设方案 ===${C_RESET}"
+    echo -e "  ${C_YELLOW}-- 境外通用 --${C_RESET}"
     echo "  1. Cloudflare          1.1.1.1 1.0.0.1
   2. Google              8.8.8.8 8.8.4.4
   3. Cloudflare + Google 1.1.1.1 8.8.8.8
 "
-    echo -e "  ${C_YELLOW}── 境内通用 ──${C_RESET}"
+    echo -e "  ${C_YELLOW}-- 境内通用 --${C_RESET}"
     echo "  4. 阿里 DNS            223.5.5.5 223.6.6.6
   5. 腾讯 DNS            119.29.29.29 119.28.28.28
   6. 114 DNS             114.114.114.114 114.114.115.115
 "
-    echo -e "  ${C_YELLOW}── IPv6 ──${C_RESET}"
+    echo -e "  ${C_YELLOW}-- IPv6 --${C_RESET}"
     echo "  7. Cloudflare IPv6     2606:4700:4700::1111 2606:4700:4700::1001
   8. Google IPv6         2001:4860:4860::8888 2001:4860:4860::8844
   9. 阿里 IPv6           2400:3200::1 2400:3200:baba::1
 "
-    echo -e "  ${C_YELLOW}── 混合方案 ──${C_RESET}"
+    echo -e "  ${C_YELLOW}-- 混合方案 --${C_RESET}"
     echo "  10. 境外双栈 (CF v4+v6)       1.1.1.1 2606:4700:4700::1111
   11. 境内双栈 (阿里 v4+v6)     223.5.5.5 2400:3200::1
   12. 境内+境外混合              223.5.5.5 1.1.1.1
-  0. 自定义输入
+  13. 自定义输入
+  0. 返回上一级
 "
-    read -e -r -p "选择方案 [0]: " dns_choice
+    read -e -r -p "选择方案 [0=返回]: " dns_choice
     dns_choice=${dns_choice:-0}
     local dns=""
     case $dns_choice in
@@ -99,11 +100,12 @@ net_dns() {
         10) dns="1.1.1.1 2606:4700:4700::1111" ;;
         11) dns="223.5.5.5 2400:3200::1" ;;
         12) dns="223.5.5.5 1.1.1.1" ;;
-        0)
+        13)
             echo -e "${C_YELLOW}输入 DNS IP (空格隔开)，输入 0 取消${C_RESET}"
             read -e -r -p "DNS: " dns
             [[ -z "$dns" || "$dns" == "0" ]] && return
             ;;
+        0|q|Q) return ;;
         *) print_error "无效选择"; pause; return ;;
     esac
     [[ -z "$dns" ]] && return
@@ -211,24 +213,36 @@ menu_net() {
 2. IPv4/IPv6 优先级
 3. iPerf3 测速
 4. 网络诊断 (Ping/MTR/端口测试)
-0. 返回
+0. 返回上一级
 "
         read -e -r -p "选择: " c
         case $c in
             1) net_dns ;;
-            2) 
-                echo "1. 优先 IPv4  2. 优先 IPv6"
+            2)
+                echo "1. 优先 IPv4"
+                echo "2. 优先 IPv6"
+                echo "0. 返回上一级"
                 read -e -r -p "选: " p
-                [[ ! -f /etc/gai.conf ]] && touch /etc/gai.conf
-                sed -i '/^#\?precedence ::ffff:0:0\/96  100/d' /etc/gai.conf
-                if [[ "$p" == "1" ]]; then
-                    echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
-                    print_success "IPv4 优先。"
-                else
-                    print_success "IPv6 优先。"
-                fi
-                log_action "IP priority changed"
-                pause ;;
+                case $p in
+                    1)
+                        [[ ! -f /etc/gai.conf ]] && touch /etc/gai.conf
+                        sed -i '/^#\?precedence ::ffff:0:0\/96  100/d' /etc/gai.conf
+                        echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
+                        print_success "IPv4 优先。"
+                        log_action "IP priority changed: ipv4"
+                        pause
+                        ;;
+                    2)
+                        [[ ! -f /etc/gai.conf ]] && touch /etc/gai.conf
+                        sed -i '/^#\?precedence ::ffff:0:0\/96  100/d' /etc/gai.conf
+                        print_success "IPv6 优先。"
+                        log_action "IP priority changed: ipv6"
+                        pause
+                        ;;
+                    0|q|Q|"") ;;
+                    *) print_error "无效选择"; pause ;;
+                esac
+                ;;
             3) net_iperf3 ;;
             4) net_diag ;;
             0|q) break ;;

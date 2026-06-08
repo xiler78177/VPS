@@ -265,14 +265,14 @@ wg_deb_server_menu() {
         fi
         local peer_count=$(wg_deb_db_get '.peers | length')
         echo -e "  设备数: ${C_CYAN}${peer_count}${C_RESET}"
-        echo "  ── 设备管理 ──────────────────
+        echo "  [设备管理]
   1. 查看状态
   2. 添加设备
   3. 删除设备
   4. 启用/禁用设备
   5. 查看设备配置/二维码
   6. 生成 Clash/OpenClash 配置
-  ── 服务控制 ──────────────────
+  [服务控制]
   7. 启动 WireGuard
   8. 停止 WireGuard
   9. 重启 WireGuard
@@ -280,7 +280,7 @@ wg_deb_server_menu() {
   11. 修改服务器名称
   12. 卸载 WireGuard
   13. 服务端看门狗 (自动重启保活)
-  ── 数据管理 ──────────────────
+  [数据管理]
   14. 导出设备配置 (JSON)
   15. 导入设备配置 (JSON)
   0. 返回上级菜单
@@ -317,10 +317,27 @@ wg_deb_main_menu() {
         if wg_deb_is_installed; then
             local role
             role=$(wg_deb_get_role)
-            if [[ "$role" == "server" ]]; then
-                wg_deb_server_menu; return
-            elif [[ -f "$WG_DEB_CONF" ]]; then
-                wg_deb_set_role "server"; continue
+            if [[ "$role" == "server" || -f "$WG_DEB_CONF" ]]; then
+                [[ "$role" == "server" ]] || wg_deb_set_role "server"
+                print_title "WireGuard VPN"
+                local srv_name
+                srv_name=$(wg_deb_get_server_name)
+                if wg_deb_is_running; then
+                    echo -e "  状态: ${C_GREEN}运行中${C_RESET}    接口: ${C_CYAN}${WG_DEB_INTERFACE}${C_RESET}    名称: ${C_CYAN}${srv_name}${C_RESET}"
+                else
+                    echo -e "  状态: ${C_RED}已停止${C_RESET}    接口: ${C_CYAN}${WG_DEB_INTERFACE}${C_RESET}    名称: ${C_CYAN}${srv_name}${C_RESET}"
+                fi
+                echo ""
+                echo "1. 服务端管理"
+                echo "2. 卸载 WireGuard"
+                echo "0. 返回主菜单"
+                read -e -r -p "选择: " c
+                case "$c" in
+                    1) wg_deb_server_menu ;;
+                    2) wg_deb_uninstall ;;
+                    0|q|Q|"") return ;;
+                    *) print_warn "无效选项"; pause ;;
+                esac
             else
                 print_warn "WireGuard 已安装但无配置文件"
                 echo "  1. 重新安装服务端
@@ -334,8 +351,17 @@ wg_deb_main_menu() {
                 esac
             fi
         else
-            wg_deb_server_install
-            wg_deb_is_installed || return
+            print_title "WireGuard VPN"
+            echo -e "  状态: ${C_YELLOW}未安装${C_RESET}"
+            echo ""
+            echo "1. 安装 WireGuard 服务端"
+            echo "0. 返回主菜单"
+            read -e -r -p "选择: " c
+            case "$c" in
+                1) wg_deb_server_install ;;
+                0|q|Q|"") return ;;
+                *) print_warn "无效选项"; pause ;;
+            esac
         fi
     done
 }
