@@ -11815,6 +11815,36 @@ _email_toml_get_var() {
     grep -E "^${key}[[:space:]]*=" "$toml" | head -1 | sed -E 's/^[^=]+=[[:space:]]*"?([^"]*)"?.*/\1/'
 }
 
+_email_manage_update_admin_passwords_var() {
+    local admin_json="$1"
+    local toml="$EMAIL_INSTALL_DIR/worker/wrangler.toml"
+    [[ -f "$toml" ]] || return 1
+
+    cp -a "$toml" "${toml}.adminpw.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+    if grep -qE '^[[:space:]]*ADMIN_PASSWORDS[[:space:]]*=' "$toml"; then
+        awk -v line="ADMIN_PASSWORDS = ${admin_json}" '
+            /^[[:space:]]*ADMIN_PASSWORDS[[:space:]]*=/ { print line; next }
+            { print }
+        ' "$toml" > "${toml}.tmp" && mv "${toml}.tmp" "$toml"
+    else
+        awk -v line="ADMIN_PASSWORDS = ${admin_json}" '
+            BEGIN { inserted=0 }
+            /^\[vars\]/ { print; print line; inserted=1; next }
+            { print }
+            END {
+                if (!inserted) {
+                    print ""
+                    print "[vars]"
+                    print line
+                }
+            }
+        ' "$toml" > "${toml}.tmp" && mv "${toml}.tmp" "$toml"
+    fi
+    chmod 600 "$toml"
+    _email_export_wrangler_env
+    email_run "更新 ADMIN_PASSWORDS 普通变量并重新部署 Worker" npx wrangler deploy
+}
+
 # ── 1. 修改管理员密码 ──
 email_manage_change_admin_password() {
     print_title "修改管理员密码"
@@ -11839,7 +11869,11 @@ email_manage_change_admin_password() {
     # 与 14c 一致：JSON 数组字面量 ["pw"]，不要 | tostring
     admin_json=$(jq -nc --arg p "$new_pw" '[$p]')
     if ! email_run "写入 ADMIN_PASSWORDS secret" _email_cf_worker_secret_put "$EMAIL_WORKER_NAME" "ADMIN_PASSWORDS" "$admin_json"; then
-        print_error "secret 写入失败"; pause; return
+        print_warn "secret 写入失败，尝试兼容旧部署的 ADMIN_PASSWORDS 普通变量"
+        if ! _email_manage_update_admin_passwords_var "$admin_json"; then
+            print_error "管理员密码更新失败"
+            pause; return
+        fi
     fi
     email_save_admin_password "$new_pw"
     echo ""

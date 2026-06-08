@@ -299,6 +299,46 @@ fi
 view_body=$(awk '/^email_view_log\(\)/,/^}/' "$BUILT")
 echo "$view_body" | grep -q '_email_redact_secrets' && pass "P2-4: email_view_log tail 走脱敏管道" || fail "P2-4: 日志菜单未脱敏"
 
+# P2-5: ADMIN_PASSWORDS 已存在 var binding 时，改密码不能只写 secret
+declare -F _email_manage_update_admin_passwords_var >/dev/null && pass "P2-5: 已定义 ADMIN_PASSWORDS var 回退 helper" || fail "P2-5: 缺 ADMIN_PASSWORDS var 回退 helper"
+admin_var_body=$(awk '/^_email_manage_update_admin_passwords_var\(\)/,/^}/' "$BUILT")
+echo "$admin_var_body" | grep -q 'wrangler.toml' && pass "P2-5: 回退 helper 更新 wrangler.toml" || fail "P2-5: 回退 helper 未更新 wrangler.toml"
+echo "$admin_var_body" | grep -q 'wrangler deploy' && pass "P2-5: 回退 helper 重新部署 Worker" || fail "P2-5: 回退 helper 未 redeploy Worker"
+mgr_body=$(awk '/^email_manage_change_admin_password\(\)/,/^}/' "$BUILT")
+echo "$mgr_body" | grep -q '_email_manage_update_admin_passwords_var' && pass "P2-5: 改密码失败时回退 var binding" || fail "P2-5: 改密码未回退 var binding"
+echo "$mgr_body" | grep -q '普通变量' && pass "P2-5: 改密码提示 var binding 兼容路径" || fail "P2-5: 缺 var binding 提示"
+tmp_email_install=$(mktemp -d)
+tmp_email_lib=$(mktemp)
+tmp_email_script=$(mktemp)
+sed "s|^readonly EMAIL_INSTALL_DIR=.*|EMAIL_INSTALL_DIR=\"$tmp_email_install\"|" "$LIB" > "$tmp_email_lib"
+cat > "$tmp_email_script" <<'EMAIL_ADMIN_VAR_TEST'
+    source "$1" >/dev/null 2>&1 || exit 90
+    email_run() {
+        printf '%s\n' "$*" > "$EMAIL_INSTALL_DIR/deploy.args"
+        return 0
+    }
+    _email_export_wrangler_env() { return 0; }
+    mkdir -p "$EMAIL_INSTALL_DIR/worker"
+    cat > "$EMAIL_INSTALL_DIR/worker/wrangler.toml" <<'EOF'
+name = "demo-worker"
+
+[vars]
+PREFIX = ""
+  ADMIN_PASSWORDS = ["old-pass"]
+DOMAINS = ["example.com"]
+EOF
+    _email_manage_update_admin_passwords_var '["new-pass"]' || exit 1
+    [[ $(grep -cE '^[[:space:]]*ADMIN_PASSWORDS[[:space:]]*=' "$EMAIL_INSTALL_DIR/worker/wrangler.toml") -eq 1 ]] || exit 2
+    grep -qE '^ADMIN_PASSWORDS[[:space:]]*=[[:space:]]*\["new-pass"\]$' "$EMAIL_INSTALL_DIR/worker/wrangler.toml" || exit 3
+    grep -q 'npx wrangler deploy' "$EMAIL_INSTALL_DIR/deploy.args" || exit 4
+EMAIL_ADMIN_VAR_TEST
+if bash "$tmp_email_script" "$tmp_email_lib"; then
+    pass "P2-5: 回退 helper 实测替换缩进 ADMIN_PASSWORDS 并 redeploy"
+else
+    fail "P2-5: 回退 helper 未正确替换缩进 ADMIN_PASSWORDS"
+fi
+rm -rf "$tmp_email_install" "$tmp_email_lib" "$tmp_email_script"
+
 # P3-5: 测试自身 grep 排除注释
 if grep -q "grep -v '^\\[\\[:space:\\]\\]\\*#'" "$0"; then
     pass "P3-5: smoke_p0p1p2 grep 排除注释行（自检）"
