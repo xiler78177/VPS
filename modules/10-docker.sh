@@ -203,6 +203,23 @@ docker_images_manage() {
     pause
 }
 
+docker_print_stats_table() {
+    local stats_output=""
+    stats_output=$(docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}" 2>/dev/null || true)
+    [[ -z "$stats_output" ]] && { print_warn "暂无资源占用数据"; return; }
+
+    if command_exists column; then
+        printf '%s\n' "$stats_output" | column -t -s $'\t'
+        return
+    fi
+
+    printf "  %-24s %-10s %s\n" "名称" "CPU" "内存"
+    while IFS=$'\t' read -r name cpu mem; do
+        [[ -z "$name" ]] && continue
+        printf "  %-24s %-10s %s\n" "$name" "$cpu" "$mem"
+    done <<< "$stats_output"
+}
+
 docker_containers_manage() {
     if ! command_exists docker; then
         print_error "Docker 未安装。"; pause; return
@@ -235,7 +252,7 @@ docker_containers_manage() {
         if [[ -n "$running_ids" ]]; then
             echo ""
             echo -e "${C_CYAN}[资源占用]${C_RESET}"
-            docker stats --no-stream --format "  {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}" 2>/dev/null | column -t -s $'\t'
+            docker_print_stats_table
         fi
         echo ""
         echo -e "${C_CYAN}操作:${C_RESET} 1.启动 2.停止 3.重启 4.日志 5.删除  6.停止所有 7.删除所有  0.返回"

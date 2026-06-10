@@ -414,6 +414,50 @@ echo "$web_body" | grep -q '0. 返回上一级' && pass "P2-UI: Web 日志选择
 echo "$reality_install_body" | grep -q '0. 返回上一级' && pass "P2-UI: Reality 安装角色选择有返回选项" || fail "P2-UI: Reality 安装角色选择缺返回选项"
 
 echo ""
+echo "== review #9 Docker 兼容性回归 =="
+# 精简系统可能没有 util-linux 的 column；Docker 容器管理资源占用区不能因此报错
+docker_body=$(awk '/^docker_containers_manage\(\)/,/^}/' "$BUILT")
+if echo "$docker_body" | grep -q 'column -t'; then
+    fail "P1-Docker: 容器资源占用仍硬依赖 column"
+else
+    pass "P1-Docker: 容器资源占用不硬依赖 column"
+fi
+docker_mock_dir=$(mktemp -d)
+cat > "$docker_mock_dir/docker" <<'DOCKERMOCK'
+#!/bin/bash
+case "$1" in
+  ps)
+    shift
+    if [[ "$1" == "-a" ]]; then
+      echo -e "abc123\tweb\tnginx:latest\tUp 5 minutes\t0.0.0.0:80->80/tcp"
+    elif [[ "$1" == "-q" ]]; then
+      echo "abc123"
+    elif [[ "$1" == "-aq" ]]; then
+      echo "abc123"
+    fi
+    ;;
+  stats)
+    echo -e "web\t0.10%\t12MiB / 512MiB"
+    ;;
+esac
+DOCKERMOCK
+chmod +x "$docker_mock_dir/docker"
+docker_output=$(
+    PATH="$docker_mock_dir" "$BASH" -c '
+        source "$1" >/dev/null 2>&1
+        print_title() { :; }
+        pause() { :; }
+        printf "0\n" | docker_containers_manage
+    ' _ "$LIB" 2>&1
+)
+rm -rf "$docker_mock_dir"
+if echo "$docker_output" | grep -q 'column: command not found'; then
+    fail "P1-Docker: 缺少 column 时仍会报 command not found"
+else
+    pass "P1-Docker: 缺少 column 时资源占用区正常输出"
+fi
+
+echo ""
 echo "== 结果 =="
 echo "  PASS=$PASS  FAIL=$FAIL"
 rm -f "$LIB"
