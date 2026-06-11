@@ -149,8 +149,7 @@ server {
     return 301 https://\$host${redir_port}\$request_uri;
 }
 server {
-    listen $HTTPS_PORT ssl http2;
-    listen [::]:$HTTPS_PORT ssl http2;
+$(_nginx_tls_http2_block "$HTTPS_PORT")
     server_name $DOMAIN;
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
@@ -221,8 +220,7 @@ server {
     return 301 https://\$host${redir_port}\$request_uri;
 }
 server {
-    listen $HTTPS_PORT ssl http2;
-    listen [::]:$HTTPS_PORT ssl http2;
+$(_nginx_tls_http2_block "$HTTPS_PORT")
     server_name $DOMAIN;
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
@@ -254,8 +252,7 @@ server {
     return 301 https://\$host${redir_port}\$request_uri;
 }
 server {
-    listen $HTTPS_PORT ssl http2;
-    listen [::]:$HTTPS_PORT ssl http2;
+$(_nginx_tls_http2_block "$HTTPS_PORT")
     server_name $DOMAIN;
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
@@ -289,8 +286,7 @@ server {
     return 301 https://\$host${redir_port}\$request_uri;
 }
 server {
-    listen $HTTPS_PORT ssl http2;
-    listen [::]:$HTTPS_PORT ssl http2;
+$(_nginx_tls_http2_block "$HTTPS_PORT")
     server_name $DOMAIN;
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
@@ -331,8 +327,7 @@ server {
     return 301 https://\$host${redir_port}\$request_uri;
 }
 server {
-    listen $HTTPS_PORT ssl http2;
-    listen [::]:$HTTPS_PORT ssl http2;
+$(_nginx_tls_http2_block "$HTTPS_PORT")
     server_name $DOMAIN;
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;

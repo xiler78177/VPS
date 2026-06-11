@@ -129,14 +129,16 @@ _email_deploy_check_env() {
     done
 
     if ! command_exists node; then
-        email_run "安装 Node.js 22" bash -c '
-            curl -fsSL https://deb.nodesource.com/setup_22.x | bash - >/dev/null 2>&1
+        email_run "安装 Node.js LTS" bash -c '
+            curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - >/dev/null 2>&1
             apt-get install -y -qq nodejs
         ' || { print_error "Node.js 安装失败，请手动安装"; return 1; }
     fi
+    if command_exists corepack; then
+        email_run "启用 corepack" corepack enable || true
+    fi
     command_exists pnpm || email_run "安装 pnpm" npm install -g pnpm || return 1
-    command_exists wrangler || email_run "安装 wrangler" npm install -g wrangler || return 1
-    print_success "环境检查通过 (node=$(node -v 2>/dev/null) pnpm=$(pnpm -v 2>/dev/null) wrangler=$(wrangler --version 2>/dev/null | head -1))"
+    print_success "环境检查通过 (node=$(node -v 2>/dev/null) pnpm=$(pnpm -v 2>/dev/null) wrangler=项目本地依赖)"
 }
 
 # ── 2. 交互式收集（Token 隐藏 / 管理员密码不回显）──
@@ -316,11 +318,12 @@ _email_deploy_clone_project() {
 # ── 4. D1 数据库 ──
 _email_deploy_setup_d1() {
     cd "$EMAIL_INSTALL_DIR/worker" || return 1
+    email_run "安装 Worker 依赖" pnpm install --no-frozen-lockfile || return 1
 
     local out
     print_info "创建 D1 数据库 $EMAIL_D1_NAME..."
-    if ! out=$(wrangler d1 create "$EMAIL_D1_NAME" 2>&1); then
-        email_log "wrangler d1 create failed: $out"
+    if ! out=$(_email_wrangler d1 create "$EMAIL_D1_NAME" 2>&1); then
+        email_log "D1 create failed: $out"
         print_error "D1 创建失败"; tail -n 10 "$EMAIL_LOG_FILE" | sed 's/^/  /'
         return 1
     fi
@@ -347,7 +350,7 @@ _email_deploy_setup_d1() {
         local base
         base=$(basename "$p")
         email_run "应用 D1 schema: $base" \
-            wrangler d1 execute "$EMAIL_D1_NAME" --file="$p" --remote || return 1
+            _email_wrangler d1 execute "$EMAIL_D1_NAME" --file="$p" --remote || return 1
         EMAIL_PATCHES_APPLIED="${EMAIL_PATCHES_APPLIED} ${base}"
     done
     EMAIL_PATCHES_APPLIED="${EMAIL_PATCHES_APPLIED# }"
@@ -429,8 +432,8 @@ EOF
 # ── 6. 部署 Worker ──
 _email_deploy_worker() {
     cd "$EMAIL_INSTALL_DIR/worker" || return 1
-    email_run "安装 Worker 依赖" npm install --no-audit --no-fund || return 1
-    email_run "部署 Worker (${EMAIL_API_DOMAIN})" npx wrangler deploy || return 1
+    email_run "安装 Worker 依赖" pnpm install --no-frozen-lockfile || return 1
+    email_run "部署 Worker (${EMAIL_API_DOMAIN})" _email_wrangler deploy || return 1
 }
 
 # ── 7. 写 secrets：ADMIN_PASSWORDS + Resend Token（走 API 不走 wrangler）──
@@ -480,7 +483,7 @@ _email_deploy_pages() {
     fi
 
     email_run "部署 Pages (${EMAIL_PAGES_PROJECT})" \
-        npx wrangler pages deploy --project-name "$EMAIL_PAGES_PROJECT" \
+        _email_wrangler pages deploy --project-name "$EMAIL_PAGES_PROJECT" \
             --branch production --commit-dirty=true || return 1
 
     EMAIL_PAGES_DOMAIN=$(_email_cf_pages_get_subdomain "$EMAIL_PAGES_PROJECT" 2>/dev/null)

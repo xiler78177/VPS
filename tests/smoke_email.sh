@@ -4,6 +4,7 @@ set -u
 
 BUILT="/tmp/v4-built.sh"
 LIB="/tmp/v4-lib.sh"
+TMP_EMAIL_ROOT=$(mktemp -d)
 PASS=0; FAIL=0
 
 pass() { echo "  [PASS] $1"; PASS=$((PASS+1)); }
@@ -14,9 +15,20 @@ cat >> "$LIB" <<'STUB'
 install_package() { return 0; }
 auto_deps() { return 0; }
 STUB
+sed -i \
+    -e "s|^readonly EMAIL_STATE_DIR=.*|readonly EMAIL_STATE_DIR=\"$TMP_EMAIL_ROOT/state\"|" \
+    -e "s|^readonly EMAIL_ADMIN_FILE=.*|readonly EMAIL_ADMIN_FILE=\"$TMP_EMAIL_ROOT/email-admin.txt\"|" \
+    -e "s|^readonly EMAIL_LOG_FILE=.*|readonly EMAIL_LOG_FILE=\"$TMP_EMAIL_ROOT/email.log\"|" \
+    -e "s|^readonly EMAIL_INSTALL_DIR=.*|readonly EMAIL_INSTALL_DIR=\"$TMP_EMAIL_ROOT/install\"|" \
+    "$LIB"
 
 # shellcheck disable=SC1090
 source "$LIB" >/dev/null 2>&1 || { echo "source 失败"; exit 1; }
+if [[ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]]; then
+    # 本地 Git Bash/非 root 环境没有 root owner；只在本地跳过 owner 检查，远端 root 冒烟仍走严格校验。
+    PLATFORM="openwrt"
+    chown() { return 0; }
+fi
 
 echo "== Test 1: state quote / write / load roundtrip =="
 # 给一组刁钻字段
@@ -134,4 +146,5 @@ echo ""
 echo "== 结果 =="
 echo "  PASS=$PASS  FAIL=$FAIL"
 rm -f "$LIB" "$EMAIL_STATE_FILE"
+rm -rf "$TMP_EMAIL_ROOT"
 exit $FAIL

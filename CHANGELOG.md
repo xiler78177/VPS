@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+### Changed
+- **[P1] Nginx HTTP/2 配置改为版本感知生成**（review #10）：Nginx 1.25.1+ 已将 `listen ... http2` 标记为 deprecated，推荐独立 `http2 on;`；但 Debian/Ubuntu 稳定仓库仍可能是旧版 Nginx，旧版不识别 `http2 on;`。修复：新增 `_nginx_tls_http2_block <port>`，运行时按 `nginx -v` 选择新/旧语法；`添加域名`、`反向代理网站`、`家宽公网暴露` 三类生成模板统一调用该 helper，Cloudflare Origin Rules 的手工提示也更新为新语法说明。
+- **[P1] Docker 安装流程对齐官方 Debian/Ubuntu 文档**（review #10）：安装 Docker CE 前先移除官方列出的冲突包 `docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc`；Docker Compose 菜单改为优先安装官方 `docker-compose-plugin`，仅在 plugin 安装失败时 fallback 到 standalone 二进制；standalone fallback 增加 `uname -m` 到 Compose release 资产名的架构映射。
+- **[P1] 临时邮箱 Wrangler/Node 链路对齐 Cloudflare 与上游项目**（review #10）：环境检查不再全局 `npm install -g wrangler`，改为使用上游 `worker/pages/frontend` 子项目内的 `node_modules/.bin/wrangler`；NodeSource 安装脚本从固定 `setup_22.x` 改为 `setup_lts.x`；Worker 依赖安装从 `npm install` 改为 `pnpm install --no-frozen-lockfile`，与上游 `packageManager: pnpm@10.10.0` 和 `wrangler` devDependency 保持一致。首次部署、D1 migration、改管理员密码 fallback、改 DOMAINS、升级、重部署均统一走 `_email_wrangler` helper。
+
+### Tests
+- **新增 review #10 官方兼容性回归**：覆盖 Nginx HTTP/2 版本感知 helper、dist 不再硬编码 deprecated `listen ... http2`、Docker 冲突包移除、Compose plugin 优先、standalone 架构映射、NodeSource LTS、临时邮箱项目本地 Wrangler。
+- **本地测试脚本隔离增强**：`smoke_email.sh` / `smoke_remote.sh` 在非 root Git Bash 环境下自动使用临时 state/log/admin/install 路径并 mock 必要的 root/UFW 条件；远端 root 环境仍保留原 owner/mode/UFW 严格路径，便于同一套测试同时覆盖本地开发与服务器冒烟。
+- 本轮本地验证（Windows Git Bash，`/tmp/v4-built.sh`）：`smoke_p0p1p2.sh` 109/109 PASS、`smoke_email.sh` 14/14 PASS、`smoke_remote.sh` 13/13 PASS、`reality_module_static_test.sh` PASS、`reality_sni_enhancement_test.sh` PASS、`ddns_ip_detection_test.sh` PASS、`nginx_body_size_defaults_test.sh` PASS；`dist/v4-built.sh` 已重建并通过 `bash -n`。
+
 ### Fixed
 - **[P2] 子域名引导文案误导用户走到失败路径**（review #8）：review #7 的 MX 替换警告里推荐"使用专用子域名（如 `tmp.example.com`），重启脚本时填入子域名即可避免影响主域邮件"，但脚本随后用用户输入的 `EMAIL_DOMAIN` 直接精确查 Cloudflare Zone (`zones?name=$EMAIL_DOMAIN`)；多数用户的 Cloudflare 上只有 `example.com` 一个 Zone，没有把 `tmp.example.com` 独立托管 → 部署会在"获取 Zone ID"阶段失败。修复：(a) 文案改为"使用一个未托管邮件的专用域名作为 EMAIL_DOMAIN（例如新购的 .top/.xyz 等便宜域名）"；(b) 显式说明"如需用子域名，必须先在 Cloudflare 控制台把该子域名独立托管/委派为新 Zone，否则脚本会在获取 Zone ID 时失败"。不改代码流程（单 EMAIL_DOMAIN 模型与上游 dreamhunter2333 一致；拆分 Zone/收信域名会引入 catch-all → 收件规则的复杂度，工程代价远高于文案修复）。
 

@@ -358,7 +358,8 @@ web_cf_origin_rule_create() {
     draw_line
     echo -e "${C_CYAN}服务器端操作提示:${C_RESET}"
     echo "  1. Nginx 监听端口改为 ${port}:"
-    echo "     listen ${port} ssl http2;"
+    echo "     listen ${port} ssl;"
+    echo "     http2 on;   # Nginx 1.25.1+；旧版可继续使用 listen ... ssl + HTTP/2 参数"
     echo "  2. 防火墙放行:"
     echo "     ufw allow ${port}/tcp"
     echo "  3. 如果服务器在 NAT 后面（如家宽），路由器需要转发外网 ${port} → 内网 ${port}"

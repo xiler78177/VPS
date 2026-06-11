@@ -303,7 +303,7 @@ echo "$view_body" | grep -q '_email_redact_secrets' && pass "P2-4: email_view_lo
 declare -F _email_manage_update_admin_passwords_var >/dev/null && pass "P2-5: 已定义 ADMIN_PASSWORDS var 回退 helper" || fail "P2-5: 缺 ADMIN_PASSWORDS var 回退 helper"
 admin_var_body=$(awk '/^_email_manage_update_admin_passwords_var\(\)/,/^}/' "$BUILT")
 echo "$admin_var_body" | grep -q 'wrangler.toml' && pass "P2-5: 回退 helper 更新 wrangler.toml" || fail "P2-5: 回退 helper 未更新 wrangler.toml"
-echo "$admin_var_body" | grep -q 'wrangler deploy' && pass "P2-5: 回退 helper 重新部署 Worker" || fail "P2-5: 回退 helper 未 redeploy Worker"
+echo "$admin_var_body" | grep -q '_email_wrangler deploy' && pass "P2-5: 回退 helper 重新部署 Worker" || fail "P2-5: 回退 helper 未 redeploy Worker"
 mgr_body=$(awk '/^email_manage_change_admin_password\(\)/,/^}/' "$BUILT")
 echo "$mgr_body" | grep -q '_email_manage_update_admin_passwords_var' && pass "P2-5: 改密码失败时回退 var binding" || fail "P2-5: 改密码未回退 var binding"
 echo "$mgr_body" | grep -q '普通变量' && pass "P2-5: 改密码提示 var binding 兼容路径" || fail "P2-5: 缺 var binding 提示"
@@ -330,7 +330,7 @@ EOF
     _email_manage_update_admin_passwords_var '["new-pass"]' || exit 1
     [[ $(grep -cE '^[[:space:]]*ADMIN_PASSWORDS[[:space:]]*=' "$EMAIL_INSTALL_DIR/worker/wrangler.toml") -eq 1 ]] || exit 2
     grep -qE '^ADMIN_PASSWORDS[[:space:]]*=[[:space:]]*\["new-pass"\]$' "$EMAIL_INSTALL_DIR/worker/wrangler.toml" || exit 3
-    grep -q 'npx wrangler deploy' "$EMAIL_INSTALL_DIR/deploy.args" || exit 4
+    grep -q '_email_wrangler deploy' "$EMAIL_INSTALL_DIR/deploy.args" || exit 4
 EMAIL_ADMIN_VAR_TEST
 if bash "$tmp_email_script" "$tmp_email_lib"; then
     pass "P2-5: 回退 helper 实测替换缩进 ADMIN_PASSWORDS 并 redeploy"
@@ -412,6 +412,45 @@ reality_install_body=$(awk '/^reality_install_wizard\(\)/,/^}/' "$BUILT")
 echo "$f2b_body" | grep -q '0. 返回上一级' && pass "P2-UI: Fail2ban 服务控制有返回选项" || fail "P2-UI: Fail2ban 服务控制缺返回选项"
 echo "$web_body" | grep -q '0. 返回上一级' && pass "P2-UI: Web 日志选择有返回选项" || fail "P2-UI: Web 日志选择缺返回选项"
 echo "$reality_install_body" | grep -q '0. 返回上一级' && pass "P2-UI: Reality 安装角色选择有返回选项" || fail "P2-UI: Reality 安装角色选择缺返回选项"
+
+echo ""
+echo "== review #10 官方兼容性回归 =="
+# Nginx 1.25.1+ 弃用 listen ... http2；旧版 Nginx 又不支持 http2 on，因此生成配置必须走版本感知 helper。
+declare -F _nginx_tls_http2_block >/dev/null && pass "P1-Web: Nginx HTTP/2 版本感知 helper 已定义" || fail "P1-Web: 缺 _nginx_tls_http2_block"
+if grep -E 'listen .* ssl http2;' "$BUILT" >/dev/null; then
+    fail "P1-Web: dist 仍硬编码 deprecated listen ... http2"
+else
+    pass "P1-Web: dist 不再硬编码 deprecated listen ... http2"
+fi
+grep -q 'http2 on;' "$BUILT" && pass "P1-Web: dist 支持 Nginx 新版 http2 on 语法" || fail "P1-Web: 缺 http2 on 新语法"
+
+# Docker 官方 Debian/Ubuntu 安装文档要求先移除冲突包；Compose 官方推荐 plugin 优先。
+docker_install_body=$(awk '/^docker_install\(\)/,/^}/' "$BUILT")
+echo "$docker_install_body" | grep -q 'docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc' \
+    && pass "P1-Docker: 安装前移除官方冲突包列表" \
+    || fail "P1-Docker: Docker 安装缺官方冲突包移除"
+compose_install_body=$(awk '/^docker_compose_install\(\)/,/^}/' "$BUILT")
+echo "$compose_install_body" | grep -q 'docker-compose-plugin' \
+    && pass "P1-Docker: Compose 安装优先 plugin" \
+    || fail "P1-Docker: Compose 未优先安装 plugin"
+echo "$compose_install_body" | grep -q '_docker_compose_standalone_arch' \
+    && pass "P2-Docker: standalone fallback 有架构映射" \
+    || fail "P2-Docker: standalone fallback 缺架构映射"
+
+# Cloudflare 官方推荐项目本地 Wrangler；上游 temp-email 也把 wrangler 放在 package.json devDependencies。
+declare -F _email_wrangler >/dev/null && pass "P1-Email: 项目本地 Wrangler helper 已定义" || fail "P1-Email: 缺 _email_wrangler"
+env_body=$(awk '/^_email_deploy_check_env\(\)/,/^}/' "$BUILT")
+echo "$env_body" | grep -q 'setup_lts.x' && pass "P2-Email: NodeSource 使用 LTS 安装脚本" || fail "P2-Email: Node 安装仍固定旧主版本"
+if echo "$env_body" | grep -q 'npm install -g wrangler'; then
+    fail "P1-Email: 环境检查仍全局安装 wrangler"
+else
+    pass "P1-Email: 环境检查不再全局安装 wrangler"
+fi
+if grep -E '(^|[^[:alnum:]_])wrangler d1|npx wrangler' "$BUILT" >/dev/null; then
+    fail "P1-Email: 仍有绕过 helper 的 wrangler 调用"
+else
+    pass "P1-Email: wrangler 调用统一经 helper"
+fi
 
 echo ""
 echo "== review #9 Docker 兼容性回归 =="

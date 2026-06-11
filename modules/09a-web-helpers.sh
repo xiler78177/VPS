@@ -191,6 +191,31 @@ add_header Strict-Transport-Security \"max-age=15768000\" always;"
     write_file_atomic "/etc/nginx/snippets/ssl-params.conf" "$ssl_params"
 }
 
+# 生成 HTTPS listen + HTTP/2 配置块。
+# Nginx 1.25.1 起官方将 `listen ... http2` 标记为 deprecated，推荐独立 `http2 on;`。
+# Debian/Ubuntu 稳定仓库仍可能是旧版 Nginx，旧版又不认识 `http2 on;`，因此按运行时版本选择语法。
+_nginx_tls_http2_block() {
+    local port="$1" version raw major minor patch
+    raw=$(nginx -v 2>&1 || true)
+    version=$(echo "$raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    major=${version%%.*}
+    minor=${version#*.}; minor=${minor%%.*}
+    patch=${version##*.}
+
+    if [[ -n "$version" ]] && {
+        (( major > 1 )) ||
+        (( major == 1 && minor > 25 )) ||
+        (( major == 1 && minor == 25 && patch >= 1 ))
+    }; then
+        printf '    listen %s ssl;\n' "$port"
+        printf '    listen [::]:%s ssl;\n' "$port"
+        printf '    http2 on;\n'
+    else
+        printf '    listen %s ssl %s;\n' "$port" "http2"
+        printf '    listen [::]:%s ssl %s;\n' "$port" "http2"
+    fi
+}
+
 # Nginx 配置部署（写入 + 测试 + 加载，失败自动回滚）
 # 用法: _nginx_deploy_conf "域名" "配置内容" 成功返回0，失败返回1
 _nginx_deploy_conf() {

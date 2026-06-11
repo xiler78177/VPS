@@ -1,4 +1,12 @@
 # modules/10-docker.sh - Docker 管理
+docker_remove_conflicting_packages() {
+    # Docker 官方 Debian/Ubuntu 安装文档要求先移除这些可能冲突的发行版包。
+    # 失败不阻断：部分精简系统未安装 apt 包数据库或包名不存在。
+    local conflicts=(docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc)
+    print_info "移除可能冲突的旧 Docker/Compose 包..."
+    apt-get remove -y "${conflicts[@]}" >/dev/null 2>&1 || true
+}
+
 docker_install() {
     print_title "Docker 安装"
     if command_exists docker; then
@@ -8,6 +16,8 @@ docker_install() {
     fi
     print_info "正在安装 Docker..."
     update_apt_cache
+    # 官方冲突包列表：docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc
+    docker_remove_conflicting_packages
     install_package "ca-certificates" "silent"
     install_package "curl" "silent"
     install_package "gnupg" "silent"
@@ -83,31 +93,59 @@ docker_uninstall() {
     pause
 }
 
+_docker_compose_standalone_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "x86_64" ;;
+        aarch64|arm64) echo "aarch64" ;;
+        armv7l|armv7*) echo "armv7" ;;
+        *) uname -m ;;
+    esac
+}
+
 docker_compose_install() {
-    print_title "Docker Compose 独立安装"
+    print_title "Docker Compose 安装"
     if command_exists docker && docker compose version >/dev/null 2>&1; then
         print_warn "Docker Compose (Plugin) 已安装。"
         docker compose version
         pause; return
     fi
-    if command_exists docker-compose; then
+    if command_exists docker-compose && ! command_exists docker; then
         print_warn "Docker Compose (Standalone) 已安装。"
         docker-compose --version
         pause; return
     fi
-    print_info "正在安装 Docker Compose..."
+    if command_exists docker-compose; then
+        print_warn "检测到旧 standalone docker-compose，但当前官方推荐 Compose Plugin；将优先安装 plugin。"
+    fi
+
+    print_info "正在安装 Docker Compose Plugin..."
+    update_apt_cache
+    if apt-get install -y docker-compose-plugin >/dev/null 2>&1 && command_exists docker && docker compose version >/dev/null 2>&1; then
+        print_success "Docker Compose Plugin 安装成功。"
+        docker compose version
+        log_action "Docker Compose plugin installed"
+        pause; return
+    fi
+
+    print_warn "Compose Plugin 安装失败，尝试 standalone fallback。"
     
     # 自动获取最新版本，失败时使用固定版本作为 fallback
     local compose_version
-    compose_version=$(curl -s --max-time 10 https://api.github.com/repos/docker/compose/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null)
+    if command_exists jq; then
+        compose_version=$(curl -s --max-time 10 https://api.github.com/repos/docker/compose/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null)
+    else
+        compose_version=$(curl -s --max-time 10 https://api.github.com/repos/docker/compose/releases/latest 2>/dev/null | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' | head -1 | cut -d'"' -f4)
+    fi
     [[ -z "$compose_version" ]] && compose_version="v2.24.5"
     print_info "版本: $compose_version"
-    local compose_url="https://github.com/docker/compose/releases/download/${compose_version}/docker-compose-linux-$(uname -m)"
-    if curl -L "$compose_url" -o /usr/local/bin/docker-compose 2>/dev/null; then
+    local compose_arch
+    compose_arch=$(_docker_compose_standalone_arch)
+    local compose_url="https://github.com/docker/compose/releases/download/${compose_version}/docker-compose-linux-${compose_arch}"
+    if curl -fL --retry 3 "$compose_url" -o /usr/local/bin/docker-compose 2>/dev/null; then
         chmod +x /usr/local/bin/docker-compose
-        print_success "Docker Compose 安装成功。"
+        print_success "Docker Compose Standalone 安装成功。"
         docker-compose --version
-        log_action "Docker Compose installed"
+        log_action "Docker Compose standalone installed"
     else
         print_error "下载失败。"
     fi

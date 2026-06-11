@@ -154,6 +154,25 @@ _email_export_wrangler_env() {
     export CLOUDFLARE_ACCOUNT_ID="${CF_ACCOUNT_ID:-}"
 }
 
+# 统一调用上游项目本地 Wrangler。
+# Cloudflare 官方推荐 Wrangler 作为项目依赖安装；cloudflare_temp_email 的 worker/frontend/pages
+# package.json 也都把 wrangler 放在 devDependencies，避免全局 wrangler 与项目锁定版本漂移。
+_email_wrangler() {
+    local candidate
+    for candidate in \
+        "./node_modules/.bin/wrangler" \
+        "$EMAIL_INSTALL_DIR/worker/node_modules/.bin/wrangler" \
+        "$EMAIL_INSTALL_DIR/frontend/node_modules/.bin/wrangler" \
+        "$EMAIL_INSTALL_DIR/pages/node_modules/.bin/wrangler"; do
+        if [[ -x "$candidate" ]]; then
+            "$candidate" "$@"
+            return $?
+        fi
+    done
+    print_error "未找到项目本地 Wrangler，请先安装对应子项目依赖。"
+    return 127
+}
+
 email_save_admin_password() {
     local pw="$1"
     (

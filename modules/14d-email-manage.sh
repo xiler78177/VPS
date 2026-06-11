@@ -70,7 +70,9 @@ _email_manage_update_admin_passwords_var() {
     fi
     chmod 600 "$toml"
     _email_export_wrangler_env
-    email_run "更新 ADMIN_PASSWORDS 普通变量并重新部署 Worker" npx wrangler deploy
+    cd "$EMAIL_INSTALL_DIR/worker" || return 1
+    email_run "Worker 依赖" pnpm install --no-frozen-lockfile || return 1
+    email_run "更新 ADMIN_PASSWORDS 普通变量并重新部署 Worker" _email_wrangler deploy
 }
 
 # ── 1. 修改管理员密码 ──
@@ -162,7 +164,8 @@ email_manage_domains() {
     echo "  DOMAINS = $new_arr"
 
     cd "$EMAIL_INSTALL_DIR/worker" || return
-    if email_run "重新部署 Worker" npx wrangler deploy; then
+    email_run "Worker 依赖" pnpm install --no-frozen-lockfile || { pause; return; }
+    if email_run "重新部署 Worker" _email_wrangler deploy; then
         print_success "Worker 已更新，新域名已生效"
         log_action "Email DOMAINS updated: $new_arr"
     else
@@ -283,6 +286,8 @@ email_manage_upgrade() {
     confirm "确认升级到 $latest?" || return
 
     email_run "checkout $latest" git -C "$EMAIL_INSTALL_DIR" checkout --quiet "$latest" || { pause; return; }
+    cd "$EMAIL_INSTALL_DIR/worker" || return
+    email_run "Worker 依赖" pnpm install --no-frozen-lockfile || { pause; return; }
 
     # 增量 D1 migration：跑 patches_applied 中没出现过的
     local applied_str="${EMAIL_PATCHES_APPLIED:-} "
@@ -299,7 +304,7 @@ email_manage_upgrade() {
         print_info "发现 ${#new_patches[@]} 个新 D1 migration"
         for p in "${new_patches[@]}"; do
             base=$(basename "$p")
-            if email_run "应用 $base" wrangler d1 execute "$EMAIL_D1_NAME" --file="$p" --remote; then
+            if email_run "应用 $base" _email_wrangler d1 execute "$EMAIL_D1_NAME" --file="$p" --remote; then
                 EMAIL_PATCHES_APPLIED="${EMAIL_PATCHES_APPLIED} ${base}"
             else
                 print_error "patch $base 失败，已中止升级（worker 未重新部署）"
@@ -312,8 +317,7 @@ email_manage_upgrade() {
     fi
 
     cd "$EMAIL_INSTALL_DIR/worker" || return
-    email_run "Worker 依赖" npm install --no-audit --no-fund || { pause; return; }
-    email_run "部署 Worker $latest" npx wrangler deploy || { pause; return; }
+    email_run "部署 Worker $latest" _email_wrangler deploy || { pause; return; }
 
     cd "$EMAIL_INSTALL_DIR/frontend" || return
     export VITE_API_BASE="https://${EMAIL_API_DOMAIN}"
@@ -327,7 +331,7 @@ email_manage_upgrade() {
         && print_success "Pages service binding 已确认: ${EMAIL_WORKER_NAME}" \
         || print_warn "pages/wrangler.toml service 未同步（请手工检查）"
     email_run "Pages 依赖" pnpm install --no-frozen-lockfile || { pause; return; }
-    email_run "部署 Pages" npx wrangler pages deploy --project-name "$EMAIL_PAGES_PROJECT" \
+    email_run "部署 Pages" _email_wrangler pages deploy --project-name "$EMAIL_PAGES_PROJECT" \
         --branch production --commit-dirty=true || { pause; return; }
 
     EMAIL_INSTALL_VERSION="$latest"
@@ -344,8 +348,8 @@ email_manage_redeploy() {
     confirm "确认重新部署当前版本 ${EMAIL_INSTALL_VERSION}?" || return
 
     cd "$EMAIL_INSTALL_DIR/worker" || return
-    email_run "Worker 依赖" npm install --no-audit --no-fund || { pause; return; }
-    email_run "部署 Worker" npx wrangler deploy || { pause; return; }
+    email_run "Worker 依赖" pnpm install --no-frozen-lockfile || { pause; return; }
+    email_run "部署 Worker" _email_wrangler deploy || { pause; return; }
 
     cd "$EMAIL_INSTALL_DIR/frontend" || return
     export VITE_API_BASE="https://${EMAIL_API_DOMAIN}"
@@ -356,7 +360,7 @@ email_manage_redeploy() {
     _email_patch_pages_service_binding "$EMAIL_INSTALL_DIR/pages" \
         && print_success "Pages service binding 已确认: ${EMAIL_WORKER_NAME}" \
         || print_warn "pages/wrangler.toml service 未同步（请手工检查）"
-    email_run "部署 Pages" npx wrangler pages deploy --project-name "$EMAIL_PAGES_PROJECT" \
+    email_run "部署 Pages" _email_wrangler pages deploy --project-name "$EMAIL_PAGES_PROJECT" \
         --branch production --commit-dirty=true || { pause; return; }
 
     print_success "重新部署完成"

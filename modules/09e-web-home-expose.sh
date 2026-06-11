@@ -241,8 +241,7 @@ server {
     return 301 https://\$host${redir_port}\$request_uri;
 }
 server {
-    listen ${https_port} ssl http2;
-    listen [::]:${https_port} ssl http2;
+$(_nginx_tls_http2_block "$https_port")
     server_name ${full_domain};
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;

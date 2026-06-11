@@ -3304,6 +3304,31 @@ add_header Strict-Transport-Security \"max-age=15768000\" always;"
     write_file_atomic "/etc/nginx/snippets/ssl-params.conf" "$ssl_params"
 }
 
+# 生成 HTTPS listen + HTTP/2 配置块。
+# Nginx 1.25.1 起官方将 `listen ... http2` 标记为 deprecated，推荐独立 `http2 on;`。
+# Debian/Ubuntu 稳定仓库仍可能是旧版 Nginx，旧版又不认识 `http2 on;`，因此按运行时版本选择语法。
+_nginx_tls_http2_block() {
+    local port="$1" version raw major minor patch
+    raw=$(nginx -v 2>&1 || true)
+    version=$(echo "$raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    major=${version%%.*}
+    minor=${version#*.}; minor=${minor%%.*}
+    patch=${version##*.}
+
+    if [[ -n "$version" ]] && {
+        (( major > 1 )) ||
+        (( major == 1 && minor > 25 )) ||
+        (( major == 1 && minor == 25 && patch >= 1 ))
+    }; then
+        printf '    listen %s ssl;\n' "$port"
+        printf '    listen [::]:%s ssl;\n' "$port"
+        printf '    http2 on;\n'
+    else
+        printf '    listen %s ssl %s;\n' "$port" "http2"
+        printf '    listen [::]:%s ssl %s;\n' "$port" "http2"
+    fi
+}
+
 # Nginx 配置部署（写入 + 测试 + 加载，失败自动回滚）
 # 用法: _nginx_deploy_conf "域名" "配置内容" 成功返回0，失败返回1
 _nginx_deploy_conf() {
@@ -3854,7 +3879,8 @@ web_cf_origin_rule_create() {
     draw_line
     echo -e "${C_CYAN}服务器端操作提示:${C_RESET}"
     echo "  1. Nginx 监听端口改为 ${port}:"
-    echo "     listen ${port} ssl http2;"
+    echo "     listen ${port} ssl;"
+    echo "     http2 on;   # Nginx 1.25.1+；旧版可继续使用 listen ... ssl + HTTP/2 参数"
     echo "  2. 防火墙放行:"
     echo "     ufw allow ${port}/tcp"
     echo "  3. 如果服务器在 NAT 后面（如家宽），路由器需要转发外网 ${port} → 内网 ${port}"
@@ -4183,8 +4209,7 @@ server {
     return 301 https://\$host${redir_port}\$request_uri;
 }
 server {
-    listen $NGINX_HTTPS_PORT ssl http2;
-    listen [::]:$NGINX_HTTPS_PORT ssl http2;
+$(_nginx_tls_http2_block "$NGINX_HTTPS_PORT")
     server_name $DOMAIN;
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
@@ -4700,8 +4725,7 @@ server {
     return 301 https://\$host${redir_port}\$request_uri;
 }
 server {
-    listen $HTTPS_PORT ssl http2;
-    listen [::]:$HTTPS_PORT ssl http2;
+$(_nginx_tls_http2_block "$HTTPS_PORT")
     server_name $DOMAIN;
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
@@ -4772,8 +4796,7 @@ server {
     return 301 https://\$host${redir_port}\$request_uri;
 }
 server {
-    listen $HTTPS_PORT ssl http2;
-    listen [::]:$HTTPS_PORT ssl http2;
+$(_nginx_tls_http2_block "$HTTPS_PORT")
     server_name $DOMAIN;
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
@@ -4805,8 +4828,7 @@ server {
     return 301 https://\$host${redir_port}\$request_uri;
 }
 server {
-    listen $HTTPS_PORT ssl http2;
-    listen [::]:$HTTPS_PORT ssl http2;
+$(_nginx_tls_http2_block "$HTTPS_PORT")
     server_name $DOMAIN;
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
@@ -4840,8 +4862,7 @@ server {
     return 301 https://\$host${redir_port}\$request_uri;
 }
 server {
-    listen $HTTPS_PORT ssl http2;
-    listen [::]:$HTTPS_PORT ssl http2;
+$(_nginx_tls_http2_block "$HTTPS_PORT")
     server_name $DOMAIN;
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
@@ -4882,8 +4903,7 @@ server {
     return 301 https://\$host${redir_port}\$request_uri;
 }
 server {
-    listen $HTTPS_PORT ssl http2;
-    listen [::]:$HTTPS_PORT ssl http2;
+$(_nginx_tls_http2_block "$HTTPS_PORT")
     server_name $DOMAIN;
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
@@ -5348,8 +5368,7 @@ server {
     return 301 https://\$host${redir_port}\$request_uri;
 }
 server {
-    listen ${https_port} ssl http2;
-    listen [::]:${https_port} ssl http2;
+$(_nginx_tls_http2_block "$https_port")
     server_name ${full_domain};
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
@@ -5603,6 +5622,14 @@ uci commit dhcp
     fi
     pause
 }
+docker_remove_conflicting_packages() {
+    # Docker 官方 Debian/Ubuntu 安装文档要求先移除这些可能冲突的发行版包。
+    # 失败不阻断：部分精简系统未安装 apt 包数据库或包名不存在。
+    local conflicts=(docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc)
+    print_info "移除可能冲突的旧 Docker/Compose 包..."
+    apt-get remove -y "${conflicts[@]}" >/dev/null 2>&1 || true
+}
+
 docker_install() {
     print_title "Docker 安装"
     if command_exists docker; then
@@ -5612,6 +5639,8 @@ docker_install() {
     fi
     print_info "正在安装 Docker..."
     update_apt_cache
+    # 官方冲突包列表：docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc
+    docker_remove_conflicting_packages
     install_package "ca-certificates" "silent"
     install_package "curl" "silent"
     install_package "gnupg" "silent"
@@ -5687,31 +5716,59 @@ docker_uninstall() {
     pause
 }
 
+_docker_compose_standalone_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "x86_64" ;;
+        aarch64|arm64) echo "aarch64" ;;
+        armv7l|armv7*) echo "armv7" ;;
+        *) uname -m ;;
+    esac
+}
+
 docker_compose_install() {
-    print_title "Docker Compose 独立安装"
+    print_title "Docker Compose 安装"
     if command_exists docker && docker compose version >/dev/null 2>&1; then
         print_warn "Docker Compose (Plugin) 已安装。"
         docker compose version
         pause; return
     fi
-    if command_exists docker-compose; then
+    if command_exists docker-compose && ! command_exists docker; then
         print_warn "Docker Compose (Standalone) 已安装。"
         docker-compose --version
         pause; return
     fi
-    print_info "正在安装 Docker Compose..."
+    if command_exists docker-compose; then
+        print_warn "检测到旧 standalone docker-compose，但当前官方推荐 Compose Plugin；将优先安装 plugin。"
+    fi
+
+    print_info "正在安装 Docker Compose Plugin..."
+    update_apt_cache
+    if apt-get install -y docker-compose-plugin >/dev/null 2>&1 && command_exists docker && docker compose version >/dev/null 2>&1; then
+        print_success "Docker Compose Plugin 安装成功。"
+        docker compose version
+        log_action "Docker Compose plugin installed"
+        pause; return
+    fi
+
+    print_warn "Compose Plugin 安装失败，尝试 standalone fallback。"
     
     # 自动获取最新版本，失败时使用固定版本作为 fallback
     local compose_version
-    compose_version=$(curl -s --max-time 10 https://api.github.com/repos/docker/compose/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null)
+    if command_exists jq; then
+        compose_version=$(curl -s --max-time 10 https://api.github.com/repos/docker/compose/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null)
+    else
+        compose_version=$(curl -s --max-time 10 https://api.github.com/repos/docker/compose/releases/latest 2>/dev/null | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' | head -1 | cut -d'"' -f4)
+    fi
     [[ -z "$compose_version" ]] && compose_version="v2.24.5"
     print_info "版本: $compose_version"
-    local compose_url="https://github.com/docker/compose/releases/download/${compose_version}/docker-compose-linux-$(uname -m)"
-    if curl -L "$compose_url" -o /usr/local/bin/docker-compose 2>/dev/null; then
+    local compose_arch
+    compose_arch=$(_docker_compose_standalone_arch)
+    local compose_url="https://github.com/docker/compose/releases/download/${compose_version}/docker-compose-linux-${compose_arch}"
+    if curl -fL --retry 3 "$compose_url" -o /usr/local/bin/docker-compose 2>/dev/null; then
         chmod +x /usr/local/bin/docker-compose
-        print_success "Docker Compose 安装成功。"
+        print_success "Docker Compose Standalone 安装成功。"
         docker-compose --version
-        log_action "Docker Compose installed"
+        log_action "Docker Compose standalone installed"
     else
         print_error "下载失败。"
     fi
@@ -10939,6 +10996,25 @@ _email_export_wrangler_env() {
     export CLOUDFLARE_ACCOUNT_ID="${CF_ACCOUNT_ID:-}"
 }
 
+# 统一调用上游项目本地 Wrangler。
+# Cloudflare 官方推荐 Wrangler 作为项目依赖安装；cloudflare_temp_email 的 worker/frontend/pages
+# package.json 也都把 wrangler 放在 devDependencies，避免全局 wrangler 与项目锁定版本漂移。
+_email_wrangler() {
+    local candidate
+    for candidate in \
+        "./node_modules/.bin/wrangler" \
+        "$EMAIL_INSTALL_DIR/worker/node_modules/.bin/wrangler" \
+        "$EMAIL_INSTALL_DIR/frontend/node_modules/.bin/wrangler" \
+        "$EMAIL_INSTALL_DIR/pages/node_modules/.bin/wrangler"; do
+        if [[ -x "$candidate" ]]; then
+            "$candidate" "$@"
+            return $?
+        fi
+    done
+    print_error "未找到项目本地 Wrangler，请先安装对应子项目依赖。"
+    return 127
+}
+
 email_save_admin_password() {
     local pw="$1"
     (
@@ -11364,14 +11440,16 @@ _email_deploy_check_env() {
     done
 
     if ! command_exists node; then
-        email_run "安装 Node.js 22" bash -c '
-            curl -fsSL https://deb.nodesource.com/setup_22.x | bash - >/dev/null 2>&1
+        email_run "安装 Node.js LTS" bash -c '
+            curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - >/dev/null 2>&1
             apt-get install -y -qq nodejs
         ' || { print_error "Node.js 安装失败，请手动安装"; return 1; }
     fi
+    if command_exists corepack; then
+        email_run "启用 corepack" corepack enable || true
+    fi
     command_exists pnpm || email_run "安装 pnpm" npm install -g pnpm || return 1
-    command_exists wrangler || email_run "安装 wrangler" npm install -g wrangler || return 1
-    print_success "环境检查通过 (node=$(node -v 2>/dev/null) pnpm=$(pnpm -v 2>/dev/null) wrangler=$(wrangler --version 2>/dev/null | head -1))"
+    print_success "环境检查通过 (node=$(node -v 2>/dev/null) pnpm=$(pnpm -v 2>/dev/null) wrangler=项目本地依赖)"
 }
 
 # ── 2. 交互式收集（Token 隐藏 / 管理员密码不回显）──
@@ -11551,11 +11629,12 @@ _email_deploy_clone_project() {
 # ── 4. D1 数据库 ──
 _email_deploy_setup_d1() {
     cd "$EMAIL_INSTALL_DIR/worker" || return 1
+    email_run "安装 Worker 依赖" pnpm install --no-frozen-lockfile || return 1
 
     local out
     print_info "创建 D1 数据库 $EMAIL_D1_NAME..."
-    if ! out=$(wrangler d1 create "$EMAIL_D1_NAME" 2>&1); then
-        email_log "wrangler d1 create failed: $out"
+    if ! out=$(_email_wrangler d1 create "$EMAIL_D1_NAME" 2>&1); then
+        email_log "D1 create failed: $out"
         print_error "D1 创建失败"; tail -n 10 "$EMAIL_LOG_FILE" | sed 's/^/  /'
         return 1
     fi
@@ -11582,7 +11661,7 @@ _email_deploy_setup_d1() {
         local base
         base=$(basename "$p")
         email_run "应用 D1 schema: $base" \
-            wrangler d1 execute "$EMAIL_D1_NAME" --file="$p" --remote || return 1
+            _email_wrangler d1 execute "$EMAIL_D1_NAME" --file="$p" --remote || return 1
         EMAIL_PATCHES_APPLIED="${EMAIL_PATCHES_APPLIED} ${base}"
     done
     EMAIL_PATCHES_APPLIED="${EMAIL_PATCHES_APPLIED# }"
@@ -11664,8 +11743,8 @@ EOF
 # ── 6. 部署 Worker ──
 _email_deploy_worker() {
     cd "$EMAIL_INSTALL_DIR/worker" || return 1
-    email_run "安装 Worker 依赖" npm install --no-audit --no-fund || return 1
-    email_run "部署 Worker (${EMAIL_API_DOMAIN})" npx wrangler deploy || return 1
+    email_run "安装 Worker 依赖" pnpm install --no-frozen-lockfile || return 1
+    email_run "部署 Worker (${EMAIL_API_DOMAIN})" _email_wrangler deploy || return 1
 }
 
 # ── 7. 写 secrets：ADMIN_PASSWORDS + Resend Token（走 API 不走 wrangler）──
@@ -11715,7 +11794,7 @@ _email_deploy_pages() {
     fi
 
     email_run "部署 Pages (${EMAIL_PAGES_PROJECT})" \
-        npx wrangler pages deploy --project-name "$EMAIL_PAGES_PROJECT" \
+        _email_wrangler pages deploy --project-name "$EMAIL_PAGES_PROJECT" \
             --branch production --commit-dirty=true || return 1
 
     EMAIL_PAGES_DOMAIN=$(_email_cf_pages_get_subdomain "$EMAIL_PAGES_PROJECT" 2>/dev/null)
@@ -11920,7 +11999,9 @@ _email_manage_update_admin_passwords_var() {
     fi
     chmod 600 "$toml"
     _email_export_wrangler_env
-    email_run "更新 ADMIN_PASSWORDS 普通变量并重新部署 Worker" npx wrangler deploy
+    cd "$EMAIL_INSTALL_DIR/worker" || return 1
+    email_run "Worker 依赖" pnpm install --no-frozen-lockfile || return 1
+    email_run "更新 ADMIN_PASSWORDS 普通变量并重新部署 Worker" _email_wrangler deploy
 }
 
 # ── 1. 修改管理员密码 ──
@@ -12012,7 +12093,8 @@ email_manage_domains() {
     echo "  DOMAINS = $new_arr"
 
     cd "$EMAIL_INSTALL_DIR/worker" || return
-    if email_run "重新部署 Worker" npx wrangler deploy; then
+    email_run "Worker 依赖" pnpm install --no-frozen-lockfile || { pause; return; }
+    if email_run "重新部署 Worker" _email_wrangler deploy; then
         print_success "Worker 已更新，新域名已生效"
         log_action "Email DOMAINS updated: $new_arr"
     else
@@ -12133,6 +12215,8 @@ email_manage_upgrade() {
     confirm "确认升级到 $latest?" || return
 
     email_run "checkout $latest" git -C "$EMAIL_INSTALL_DIR" checkout --quiet "$latest" || { pause; return; }
+    cd "$EMAIL_INSTALL_DIR/worker" || return
+    email_run "Worker 依赖" pnpm install --no-frozen-lockfile || { pause; return; }
 
     # 增量 D1 migration：跑 patches_applied 中没出现过的
     local applied_str="${EMAIL_PATCHES_APPLIED:-} "
@@ -12149,7 +12233,7 @@ email_manage_upgrade() {
         print_info "发现 ${#new_patches[@]} 个新 D1 migration"
         for p in "${new_patches[@]}"; do
             base=$(basename "$p")
-            if email_run "应用 $base" wrangler d1 execute "$EMAIL_D1_NAME" --file="$p" --remote; then
+            if email_run "应用 $base" _email_wrangler d1 execute "$EMAIL_D1_NAME" --file="$p" --remote; then
                 EMAIL_PATCHES_APPLIED="${EMAIL_PATCHES_APPLIED} ${base}"
             else
                 print_error "patch $base 失败，已中止升级（worker 未重新部署）"
@@ -12162,8 +12246,7 @@ email_manage_upgrade() {
     fi
 
     cd "$EMAIL_INSTALL_DIR/worker" || return
-    email_run "Worker 依赖" npm install --no-audit --no-fund || { pause; return; }
-    email_run "部署 Worker $latest" npx wrangler deploy || { pause; return; }
+    email_run "部署 Worker $latest" _email_wrangler deploy || { pause; return; }
 
     cd "$EMAIL_INSTALL_DIR/frontend" || return
     export VITE_API_BASE="https://${EMAIL_API_DOMAIN}"
@@ -12177,7 +12260,7 @@ email_manage_upgrade() {
         && print_success "Pages service binding 已确认: ${EMAIL_WORKER_NAME}" \
         || print_warn "pages/wrangler.toml service 未同步（请手工检查）"
     email_run "Pages 依赖" pnpm install --no-frozen-lockfile || { pause; return; }
-    email_run "部署 Pages" npx wrangler pages deploy --project-name "$EMAIL_PAGES_PROJECT" \
+    email_run "部署 Pages" _email_wrangler pages deploy --project-name "$EMAIL_PAGES_PROJECT" \
         --branch production --commit-dirty=true || { pause; return; }
 
     EMAIL_INSTALL_VERSION="$latest"
@@ -12194,8 +12277,8 @@ email_manage_redeploy() {
     confirm "确认重新部署当前版本 ${EMAIL_INSTALL_VERSION}?" || return
 
     cd "$EMAIL_INSTALL_DIR/worker" || return
-    email_run "Worker 依赖" npm install --no-audit --no-fund || { pause; return; }
-    email_run "部署 Worker" npx wrangler deploy || { pause; return; }
+    email_run "Worker 依赖" pnpm install --no-frozen-lockfile || { pause; return; }
+    email_run "部署 Worker" _email_wrangler deploy || { pause; return; }
 
     cd "$EMAIL_INSTALL_DIR/frontend" || return
     export VITE_API_BASE="https://${EMAIL_API_DOMAIN}"
@@ -12206,7 +12289,7 @@ email_manage_redeploy() {
     _email_patch_pages_service_binding "$EMAIL_INSTALL_DIR/pages" \
         && print_success "Pages service binding 已确认: ${EMAIL_WORKER_NAME}" \
         || print_warn "pages/wrangler.toml service 未同步（请手工检查）"
-    email_run "部署 Pages" npx wrangler pages deploy --project-name "$EMAIL_PAGES_PROJECT" \
+    email_run "部署 Pages" _email_wrangler pages deploy --project-name "$EMAIL_PAGES_PROJECT" \
         --branch production --commit-dirty=true || { pause; return; }
 
     print_success "重新部署完成"
