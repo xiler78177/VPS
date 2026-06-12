@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [v14.2] — 2026-06-12
+
 ### Fixed
 - **[P1/P2] 第二轮审计剩余 WireGuard/基础稳定性修复**（review #36）：
   - Debian WireGuard watchdog 生成脚本内写入固定 `WG_DEB_INTERFACE`，接口检测与 `wg-quick@...` unit 均使用常量，不再因单引号 heredoc 留下运行期未定义变量。
