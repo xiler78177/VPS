@@ -38,13 +38,9 @@ get_public_ipv6() {
 ddns_rebuild_cron() {
     cron_remove_job "ddns-update.sh"
     if [[ -d "$DDNS_CONFIG_DIR" ]] && ls "$DDNS_CONFIG_DIR"/*.conf &>/dev/null 2>&1; then
-        local min=59
-        for conf in "$DDNS_CONFIG_DIR"/*.conf; do
-            [[ -f "$conf" ]] || continue
-            local iv=$(grep '^DDNS_INTERVAL=' "$conf" | cut -d'"' -f2)
-            [[ -n "$iv" && "$iv" =~ ^[0-9]+$ && "$iv" -ge 1 && "$iv" -le 59 && "$iv" -lt "$min" ]] && min=$iv
-        done
-        cron_add_job "ddns-update.sh" "*/$min * * * * $DDNS_UPDATE_SCRIPT >/dev/null 2>&1"
+        # cron 的 */59 语义是每小时第 0/59 分钟触发（中间会出现 1 分钟间隔），
+        # 因此统一每分钟唤醒，再由 ddns-update.sh 按每份配置的 DDNS_INTERVAL 节流。
+        cron_add_job "ddns-update.sh" "* * * * * $DDNS_UPDATE_SCRIPT >/dev/null 2>&1"
     fi
 }
 
@@ -62,6 +58,11 @@ else
 fi
 DDNS_CONFIG_DIR="/etc/ddns"
 DDNS_LOG="/var/log/ddns.log"
+DDNS_STAMP_DIR="/var/lib/ddns"
+mkdir -p "$DDNS_STAMP_DIR" 2>/dev/null || {
+    DDNS_STAMP_DIR="/tmp/ddns-state"
+    mkdir -p "$DDNS_STAMP_DIR" 2>/dev/null || true
+}
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$DDNS_LOG"; }
 
 extract_ipv4() {
@@ -103,9 +104,14 @@ get_ip() {
 }
 
 update_cf() {
-    local domain=$1 rt=$2 ip=$3 token=$4 zone=$5 proxied=$6
-    local resp=$(curl -s "https://api.cloudflare.com/client/v4/zones/$zone/dns_records?type=$rt&name=$domain" \
+    local domain=$1 rt=$2 ip=$3 token=$4 zone=$5 proxied=${6:-false}
+    [[ "$proxied" == "true" || "$proxied" == "false" ]] || proxied="false"
+    local resp=$(curl -s --connect-timeout 10 --max-time 30 "https://api.cloudflare.com/client/v4/zones/$zone/dns_records?type=$rt&name=$domain" \
         -H "Authorization: Bearer $token" -H "Content-Type: application/json")
+    if [[ "$(echo "$resp" | jq -r ".success // false" 2>/dev/null)" != "true" ]]; then
+        log "[$domain] $rt lookup failed"
+        return 1
+    fi
     local rid=$(echo "$resp" | jq -r '.result[0].id // empty')
     local dns_ip=$(echo "$resp" | jq -r '.result[0].content // empty')
     [[ "$ip" == "$dns_ip" ]] && return 0
@@ -113,7 +119,7 @@ update_cf() {
     local method="POST" url="https://api.cloudflare.com/client/v4/zones/$zone/dns_records"
     [[ -n "$rid" ]] && { method="PUT"; url="$url/$rid"; }
     
-    resp=$(curl -s -X $method "$url" -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+    resp=$(curl -s --connect-timeout 10 --max-time 30 -X "$method" "$url" -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
         --data "{\"type\":\"$rt\",\"name\":\"$domain\",\"content\":\"$ip\",\"ttl\":1,\"proxied\":$proxied}")
     [[ "$(echo "$resp" | jq -r '.success')" == "true" ]] && { log "[$domain] $rt: $dns_ip -> $ip"; return 0; }
     log "[$domain] $rt update failed"; return 1
@@ -161,12 +167,33 @@ parse_ddns_conf() {
         log "必填字段缺失，跳过: $conf"
         return 1
     }
+    DDNS_IPV4=${DDNS_IPV4:-false}
+    DDNS_IPV6=${DDNS_IPV6:-false}
+    DDNS_PROXIED=${DDNS_PROXIED:-false}
+    [[ "$DDNS_IPV4" == "true" || "$DDNS_IPV4" == "false" ]] || DDNS_IPV4="false"
+    [[ "$DDNS_IPV6" == "true" || "$DDNS_IPV6" == "false" ]] || DDNS_IPV6="false"
+    [[ "$DDNS_PROXIED" == "true" || "$DDNS_PROXIED" == "false" ]] || DDNS_PROXIED="false"
+    return 0
+}
+
+ddns_should_run() {
+    local conf="$1" interval="${DDNS_INTERVAL:-5}" now last="" stamp_name stamp
+    [[ "$interval" =~ ^[0-9]+$ && "$interval" -ge 1 && "$interval" -le 59 ]] || interval=5
+    stamp_name=$(basename "$conf" | sed 's/[^A-Za-z0-9_.-]/_/g')
+    stamp="$DDNS_STAMP_DIR/${stamp_name}.stamp"
+    now=$(date +%s)
+    [[ -f "$stamp" ]] && read -r last < "$stamp" || true
+    if [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < interval * 60 )); then
+        return 1
+    fi
+    printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
     return 0
 }
 
 for conf in "$DDNS_CONFIG_DIR"/*.conf; do
     [ -f "$conf" ] || continue
     parse_ddns_conf "$conf" || continue
+    ddns_should_run "$conf" || continue
     [[ "$DDNS_IPV4" == "true" ]] && { ip=$(get_ip 4); [[ -n "$ip" ]] && update_cf "$DDNS_DOMAIN" A "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED"; }
     [[ "$DDNS_IPV6" == "true" ]] && { ip=$(get_ip 6); [[ -n "$ip" ]] && update_cf "$DDNS_DOMAIN" AAAA "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED"; }
 done
@@ -187,15 +214,14 @@ ddns_setup() {
         interval=5
     fi
     mkdir -p "$DDNS_CONFIG_DIR"
-    cat > "$DDNS_CONFIG_DIR/${domain}.conf" << EOF
-DDNS_DOMAIN="$domain"
-DDNS_TOKEN="$token"
-DDNS_ZONE_ID="$zone_id"
-DDNS_IPV4="$ipv4"
-DDNS_IPV6="$ipv6"
-DDNS_PROXIED="$proxied"
-DDNS_INTERVAL="$interval"
-EOF
+    local ddns_conf_content="DDNS_DOMAIN=\"$domain\"
+DDNS_TOKEN=\"$token\"
+DDNS_ZONE_ID=\"$zone_id\"
+DDNS_IPV4=\"$ipv4\"
+DDNS_IPV6=\"$ipv6\"
+DDNS_PROXIED=\"$proxied\"
+DDNS_INTERVAL=\"$interval\""
+    write_file_atomic "$DDNS_CONFIG_DIR/${domain}.conf" "$ddns_conf_content" || { print_error "DDNS 配置写入失败"; return 1; }
     chmod 600 "$DDNS_CONFIG_DIR/${domain}.conf"
     ddns_create_script
     ddns_rebuild_cron
@@ -211,15 +237,14 @@ ddns_setup_noninteractive() {
         interval=5
     fi
     mkdir -p "$DDNS_CONFIG_DIR"
-    cat > "$DDNS_CONFIG_DIR/${domain}.conf" << EOF
-DDNS_DOMAIN="$domain"
-DDNS_TOKEN="$token"
-DDNS_ZONE_ID="$zone_id"
-DDNS_IPV4="$ipv4"
-DDNS_IPV6="$ipv6"
-DDNS_PROXIED="$proxied"
-DDNS_INTERVAL="$interval"
-EOF
+    local ddns_conf_content="DDNS_DOMAIN=\"$domain\"
+DDNS_TOKEN=\"$token\"
+DDNS_ZONE_ID=\"$zone_id\"
+DDNS_IPV4=\"$ipv4\"
+DDNS_IPV6=\"$ipv6\"
+DDNS_PROXIED=\"$proxied\"
+DDNS_INTERVAL=\"$interval\""
+    write_file_atomic "$DDNS_CONFIG_DIR/${domain}.conf" "$ddns_conf_content" || { print_error "DDNS 配置写入失败"; return 1; }
     chmod 600 "$DDNS_CONFIG_DIR/${domain}.conf"
     ddns_create_script
     ddns_rebuild_cron
@@ -234,9 +259,8 @@ ddns_list() {
     draw_line
     for conf in "$DDNS_CONFIG_DIR"/*.conf; do
         [[ -f "$conf" ]] || continue
-        validate_conf_file "$conf" || continue
         DDNS_DOMAIN="" DDNS_TOKEN="" DDNS_ZONE_ID="" DDNS_IPV4="" DDNS_IPV6="" DDNS_PROXIED="" DDNS_INTERVAL=""
-        source "$conf"
+        parse_ddns_conf "$conf" || continue
         printf "%-30s %-6s %-6s %-8s %s\n" "$DDNS_DOMAIN" \
             "$([[ "$DDNS_IPV4" == "true" ]] && echo "✓" || echo "-")" \
             "$([[ "$DDNS_IPV6" == "true" ]] && echo "✓" || echo "-")" \
@@ -254,9 +278,9 @@ ddns_delete() {
     local i=1 domains=() files=()
     for conf in "$DDNS_CONFIG_DIR"/*.conf; do
         [[ -f "$conf" ]] || continue
-        validate_conf_file "$conf" || continue
         DDNS_DOMAIN="" DDNS_TOKEN="" DDNS_ZONE_ID="" DDNS_IPV4="" DDNS_IPV6="" DDNS_PROXIED="" DDNS_INTERVAL=""
-        source "$conf"; domains+=("$DDNS_DOMAIN"); files+=("$conf")
+        parse_ddns_conf "$conf" || continue
+        domains+=("$DDNS_DOMAIN"); files+=("$conf")
         echo "$i. $DDNS_DOMAIN"; ((i++))
     done
     echo "0. 返回"

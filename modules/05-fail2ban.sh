@@ -185,8 +185,8 @@ f2b_setup() {
     fi
 
     # 迁移：清理旧的 UFW 封禁规则
-    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
-        local old_f2b_rules=$(ufw status numbered 2>/dev/null | grep -ciE "f2b|fail2ban" || echo 0)
+    if ufw_is_active; then
+        local old_f2b_rules=$(ufw status numbered 2>/dev/null | grep -ciE "f2b|fail2ban")
         if [[ "$old_f2b_rules" -gt 0 ]]; then
             print_warn "检测到 UFW 中有 ${old_f2b_rules} 条 Fail2ban 旧规则"
             print_info "新配置使用 ipset 替代 UFW 封禁，旧规则已无用且拖慢系统"
@@ -252,26 +252,49 @@ logpath = /var/log/nginx/access.log"
 f2b_migrate_ufw_to_ipset() {
     print_info "正在清理 UFW 中的 Fail2ban 旧规则..."
     systemctl stop fail2ban 2>/dev/null || true
-    local ufw_rules="/etc/ufw/user.rules"
-    local ufw_rules6="/etc/ufw/user6.rules"
-    local total_removed=0
-    for rf in "$ufw_rules" "$ufw_rules6"; do
-        [[ -f "$rf" ]] || continue
-        cp "$rf" "${rf}.bak.$(date +%s)"
-        local before=$(wc -l < "$rf")
-        sed -i '/f2b-/d; /Fail2ban/Id' "$rf"
-        local after=$(wc -l < "$rf")
-        local removed=$((before - after))
-        total_removed=$((total_removed + removed))
-        [[ $removed -gt 0 ]] && print_info "$(basename "$rf"): 清理 ${removed} 行"
-    done
-    ufw reload >/dev/null 2>&1 || true
-    if [[ $total_removed -gt 0 ]]; then
-        print_success "已清理 ${total_removed} 行 UFW 旧规则"
-        log_action "Migrated fail2ban: cleaned $total_removed lines from UFW rules, switched to ipset"
-    else
-        print_info "无需清理"
+    if ! command_exists ufw; then
+        print_warn "UFW 未安装，跳过旧规则清理"
+        return 0
     fi
+    local rule_numbers=() line rule_no i total_removed=0
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^\[[[:space:]]*([0-9]+)\] ]]; then
+            rule_no="${BASH_REMATCH[1]}"
+            if [[ "$line" =~ f2b- || "$line" =~ [Ff]ail2ban ]]; then
+                rule_numbers+=("$rule_no")
+            fi
+        fi
+    done < <(ufw status numbered 2>/dev/null)
+    if [[ ${#rule_numbers[@]} -eq 0 ]]; then
+        print_info "无需清理"
+        return 0
+    fi
+    for ((i=${#rule_numbers[@]}-1; i>=0; i--)); do
+        if printf 'y\n' | ufw delete "${rule_numbers[$i]}" >/dev/null 2>&1; then
+            ((total_removed++)) || true
+        else
+            print_warn "UFW 规则 #${rule_numbers[$i]} 删除失败"
+        fi
+    done
+    if ! ufw reload >/dev/null 2>&1; then
+        print_error "UFW reload 失败，请检查规则状态"
+        return 1
+    fi
+    if [[ $total_removed -gt 0 ]]; then
+        print_success "已清理 ${total_removed} 条 UFW 旧规则"
+        log_action "Migrated fail2ban: deleted $total_removed UFW rules, switched to ipset"
+    else
+        print_warn "未能删除任何 UFW 旧规则"
+    fi
+}
+
+_f2b_active_jails() {
+    fail2ban-client status 2>/dev/null | awk -F: '/Jail list/ {gsub(/[[:space:]]/, "", $2); gsub(/,/, " ", $2); print $2; exit}'
+}
+
+_f2b_banned_ips_for_jail() {
+    local jail="$1"
+    fail2ban-client status "$jail" 2>/dev/null | awk -F: '/Banned IP/ {print $2}' | xargs
 }
 
 f2b_status() {
@@ -323,13 +346,26 @@ f2b_unban() {
         return
     fi
     echo -e "${C_CYAN}当前封禁的 IP:${C_RESET}"
-    local banned=$(fail2ban-client status sshd 2>/dev/null | grep "Banned IP" | cut -d: -f2 | xargs)
-    if [[ -z "$banned" ]] || [[ "$banned" == "0" ]]; then
+    local jails jail ip ips total=0
+    jails=$(_f2b_active_jails)
+    if [[ -z "$jails" ]]; then
+        print_warn "没有活跃的 jail。"
+        pause
+        return
+    fi
+    for jail in $jails; do
+        ips=$(_f2b_banned_ips_for_jail "$jail")
+        for ip in $ips; do
+            [[ -z "$ip" || "$ip" == "0" ]] && continue
+            total=$((total + 1))
+            printf "%2d. [%s] %s\n" "$total" "$jail" "$ip"
+        done
+    done
+    if [[ "$total" -eq 0 ]]; then
         print_warn "当前没有被封禁的 IP。"
         pause
         return
     fi
-    echo "$banned" | tr ' ' '\n' | nl -w2 -s'. '
     echo ""
     echo "输入选项:
   - 输入 IP 地址解封单个
@@ -340,10 +376,14 @@ f2b_unban() {
         return
     elif [[ "$input" == "all" ]]; then
         if confirm "确认解封所有 IP?"; then
-            for ip in $banned; do
-                fail2ban-client set sshd unbanip "$ip" 2>/dev/null && \
-                    print_success "已解封: $ip" || \
-                    print_error "解封失败: $ip"
+            for jail in $jails; do
+                ips=$(_f2b_banned_ips_for_jail "$jail")
+                for ip in $ips; do
+                    [[ -z "$ip" || "$ip" == "0" ]] && continue
+                    fail2ban-client set "$jail" unbanip "$ip" 2>/dev/null && \
+                        print_success "已解封: $ip (jail=$jail)" || \
+                        print_error "解封失败: $ip (jail=$jail)"
+                done
             done
             log_action "Fail2ban: unbanned all IPs"
         fi
@@ -352,11 +392,21 @@ f2b_unban() {
             print_error "无效的 IP 地址格式。"
             pause; return
         fi
-        if fail2ban-client set sshd unbanip "$input" 2>/dev/null; then
-            print_success "已解封: $input"
+        local ok=0
+        for jail in $jails; do
+            ips=$(_f2b_banned_ips_for_jail "$jail")
+            [[ " $ips " == *" $input "* ]] || continue
+            if fail2ban-client set "$jail" unbanip "$input" 2>/dev/null; then
+                print_success "已解封: $input (jail=$jail)"
+                ok=1
+            else
+                print_error "解封失败: $input (jail=$jail)"
+            fi
+        done
+        if [[ "$ok" -eq 1 ]]; then
             log_action "Fail2ban: unbanned $input"
         else
-            print_error "解封失败，请检查 IP 是否正确。"
+            print_error "解封失败，请检查 IP 是否仍在任一 jail 中。"
         fi
     fi
     pause

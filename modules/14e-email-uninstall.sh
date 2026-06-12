@@ -1,6 +1,7 @@
 # modules/14e-email-uninstall.sh - 完全自动回收（Worker/Pages/D1/DNS/Catch-all）
 
 email_uninstall() {
+    trap '_email_clear_sensitive_env' RETURN
     print_title "完全卸载 Cloudflare Temp Email"
 
     # 不再硬卡 EMAIL_INSTALLED=1 — 只要 state 文件能加载，即视为有可回收的远端资源（涵盖部署中途失败的场景）
@@ -76,21 +77,27 @@ email_uninstall() {
 
     echo ""
     print_info "开始回收远程资源..."
+    local uninstall_failed=0
 
     # 1. 关闭 catch-all
     if [[ "${EMAIL_CATCH_ALL_ENABLED:-0}" == "1" && -n "$EMAIL_ZONE_ID" ]]; then
         if email_run "禁用 Email Routing catch-all" _email_cf_catch_all_disable "$EMAIL_ZONE_ID"; then
             EMAIL_CATCH_ALL_ENABLED=0
+        else
+            uninstall_failed=1
         fi
     fi
 
     # 2. DNS 记录（按 state 中记录的 ID 删除）
-    [[ -n "$EMAIL_ZONE_ID" ]] && _email_uninstall_delete_dns
+    if [[ -n "$EMAIL_ZONE_ID" ]]; then
+        _email_uninstall_delete_dns || uninstall_failed=1
+    fi
 
     # 3. Worker
     if [[ -n "$EMAIL_WORKER_NAME" ]]; then
         if email_run "删除 Worker ${EMAIL_WORKER_NAME}" _email_cf_worker_delete "$EMAIL_WORKER_NAME"; then :; else
             print_warn "Worker 删除失败（可能已不存在）"
+            uninstall_failed=1
         fi
     fi
 
@@ -98,6 +105,7 @@ email_uninstall() {
     if [[ -n "$EMAIL_PAGES_PROJECT" ]]; then
         if email_run "删除 Pages ${EMAIL_PAGES_PROJECT}" _email_cf_pages_project_delete "$EMAIL_PAGES_PROJECT"; then :; else
             print_warn "Pages 删除失败（可能已不存在）"
+            uninstall_failed=1
         fi
     fi
 
@@ -105,11 +113,22 @@ email_uninstall() {
     if [[ -n "$EMAIL_D1_ID" ]]; then
         if email_run "删除 D1 ${EMAIL_D1_NAME}" _email_cf_d1_delete "$EMAIL_D1_ID"; then :; else
             print_warn "D1 删除失败 — 请登录 Dashboard 手动删除 ${EMAIL_D1_NAME}"
+            uninstall_failed=1
         fi
     fi
 
     # 6. 本地目录与状态（先保存日志要用到的字段，再清 state）
     local _log_domain="${EMAIL_DOMAIN:-unknown}"
+    if [[ "$uninstall_failed" -ne 0 ]]; then
+        email_state_write 2>/dev/null || true
+        print_error "远端资源未完全删除，已保留本地目录和 state，避免丢失资源 ID。"
+        print_warn "请根据上方失败项处理后重新执行卸载。"
+        log_action "Cloudflare Temp Email uninstall incomplete: $_log_domain"
+        unset CF_API_TOKEN CLOUDFLARE_API_TOKEN
+        pause
+        return 1
+    fi
+
     rm -rf "$EMAIL_INSTALL_DIR"
     rm -f "$EMAIL_ADMIN_FILE"
     print_success "本地目录已删除: $EMAIL_INSTALL_DIR"
@@ -127,6 +146,7 @@ email_uninstall() {
 
 _email_uninstall_delete_dns() {
     local zid="$EMAIL_ZONE_ID"
+    local failed=0
     local pairs=(
         "EMAIL_DNS_FRONTEND_ID:CNAME(前端)"
         "EMAIL_DNS_MX1_ID:MX(route1)"
@@ -147,6 +167,7 @@ _email_uninstall_delete_dns() {
             print_success "已删 DNS: $label"
         else
             print_warn "DNS 删除失败: $label (id=$rid)"
+            failed=1
         fi
     done
 
@@ -159,4 +180,5 @@ _email_uninstall_delete_dns() {
         _email_cf_dns_purge "$zid" "MX"  "send.${EMAIL_DOMAIN}" 2>/dev/null || true
         _email_cf_dns_purge "$zid" "TXT" "_dmarc.${EMAIL_DOMAIN}" 2>/dev/null || true
     fi
+    return "$failed"
 }

@@ -4,6 +4,187 @@
 
 ## [Unreleased]
 
+### Fixed
+- **[P1/P2] 第二轮审计剩余 WireGuard/基础稳定性修复**（review #36）：
+  - Debian WireGuard watchdog 生成脚本内写入固定 `WG_DEB_INTERFACE`，接口检测与 `wg-quick@...` unit 均使用常量，不再因单引号 heredoc 留下运行期未定义变量。
+  - DDNS cron 改为每分钟唤醒，由 `ddns-update.sh` 按每份配置的 `DDNS_INTERVAL` 节流，修正 `*/59` 在 cron 中不是“每 59 分钟”的语义偏差。
+  - OpenWrt `install_package` 不再把包名前缀当命令检测；sysctl 调优块改用显式 begin/end 标记删除；OpenWrt 主日志改用持久化路径。
+  - WireGuard 清理不再粗暴删除全部 `prio 100` 策略路由；OpenWrt/Debian 下一可用 IP 查重改为固定字符串精确匹配。
+  - Debian 添加 peer 不再在 DB 写入前冗余初写客户端配置；OpenWrt/Debian 卸载不再删除外部 `/etc/wireguard/*.key`；清理未调用的迁移/list/upsert 死函数。
+  - OpenWrt/Debian peer 增删启停/导入路径新增热应用 helper，使用 `wg syncconf` 更新运行配置，避免整隧道 restart 造成在线 peer 集体断流。
+  - Debian WireGuard Clash 配置生成改为 `wg_deb_generate_clash_config` wrapper，OpenWrt/Debian 共用 `_wg_generate_clash_config_impl`，不再隐式跨线调用 OpenWrt 函数。
+  - WireGuard 11/12 的 DB/role 路径与读写/锁实现收敛到 `WG_SHARED_*` 和 `wg_shared_db_*`，把原先“同路径但假隔离”的共享状态改为显式共享。
+  - DDNS 管理端列表/删除不再 `source "$conf"`，统一复用白名单解析器；Web 公网 IP 缓存复用全局 `CACHED_IPV4/CACHED_IPV6`。
+  - 邮箱管理修复低危细节：`ADMIN_PASSWORDS` 普通变量保留反斜杠字面量，`DOMAINS` 解析失败时拒绝覆盖，Resend 状态颜色正确输出，升级日志记录旧版本→新版本。
+  - Docker 安装时 GPG URL 与 apt source 使用同一官方 repo OS，停止/删除所有容器改为显式分支；Reality/Web 去除固定 `/tmp` 日志文件并修复 `reality_status` 管道退出码遮蔽；OpenWrt DNS uci 写入/提交失败会中止并提示。
+
+- **[P2] 第二轮审计剩余低/中危修复**（review #35）：
+  - DDNS cron 的 Cloudflare DNS POST/PUT 请求补齐 `--connect-timeout` / `--max-time` 并引用 method，避免更新请求长期阻塞或 shell 展开异常。
+  - UFW 删除规则菜单真实过滤 Fail2ban/f2b 规则，并在删除前校验端口范围；SSH 公钥删除改为整行固定字符串过滤，不再用 `sed` 分隔符拼接 key。
+  - OpenWrt `rc.local` 插入 helper 与网关部署命令支持带空格/注释的 `exit 0` 锚点，避免规则被追加到 `exit 0` 后而开机不生效。
+  - GeoIP cron IPv4 下载失败路径同步清理已创建的 IPv6 临时文件。
+  - `_sshd_set_directive` 与 Reality sing-box 配置 apply 的临时文件接入统一中断清理，并使用 `.tmp/.bak.server-manage.*` 命名。
+  - Debian WireGuard systemd unit 名统一使用 `WG_DEB_INTERFACE` 常量，不再硬编码 `wg-quick@wg0`。
+
+- **[P1] 第二轮审计剩余安全/稳定性修复**（review #34）：
+  - `geoip_update` 对 `_geoip_apply` 失败改为 fail-closed，避免下载成功但规则加载失败时仍写入更新时间并提示“完成”。
+  - `refresh_ssh_port` 支持保留多个 OpenSSH `Port`，UFW 初始化/重置会放行全部 SSH 监听端口；系统信息也复用统一解析结果。
+  - `menu_update` 补齐本次新装 `fail2ban` 跟踪，手动依赖修复不会引用未赋值变量，也会停掉安装后默认启动的 jail。
+  - `_fail2ban_set_sshd_port` 未命中 `[sshd]` jail 时返回失败，不再静默假成功。
+  - OpenWrt/Debian WireGuard 服务端配置写入前收紧 `umask 077`，减少 `wg0.conf` 私钥文件创建权限窗口。
+  - 新增 `validate_wg_allowed_ips`，自定义 WireGuard AllowedIPs 支持裸 IP 与 CIDR 混合；非法输入回退为仅 VPN 内网，不再回退全局代理。
+  - Debian WireGuard 安装仅在 DB 写入成功后设置 server role，并补齐服务端修改、peer 启停/删除、路由联动的 DB 写入失败检查。
+  - iPerf3 清理不再用 `pkill -f` 子串匹配；OpenWrt DNS 设置不再硬编码 `network.wan`；Reality 无 `shuf` 时的随机端口 fallback 不再受 `$RANDOM` 32767 上限截断。
+
+- **[P1] 第二轮审计 Reality/Docker 剩余修复**（review #33）：
+  - 删除 Reality/Realm 节点信息时回收已放行的 Reality/Realm UFW 端口规则，并保留 `REALITY_BACKUP_DIR`，不再 `rm -rf` 整个配置目录导致备份自删。
+  - Reality SNI 校验增加 `openssl s_client -verify_return_error`，证书校验失败会真实返回失败。
+  - Realm 与 Docker Compose standalone 下载后增加 sha256 校验，校验缺失或失败时拒绝安装，避免截断/篡改二进制落盘。
+  - Docker 容器日志跟随时临时接管 `Ctrl+C`，退出日志后返回菜单，不再触发全局中断退出整个脚本。
+  - Docker 卸载同步清理脚本写入的 systemd proxy drop-in 与 `/etc/docker`，避免重装后旧代理配置静默复活。
+
+- **[P1] 第二轮审计邮箱剩余高优先修复**（review #32）：
+  - 邮箱部署、卸载和管理入口设置敏感环境变量 RETURN 清理，统一清除 `CF_*` 与 `CLOUDFLARE_*`，避免 Cloudflare 凭据被后续子进程继承。
+  - NodeSource 安装链路去掉裸 `curl | bash`，改为下载脚本后在 `bash -o pipefail` 环境中执行，curl/setup 失败不会被后续 `apt-get install` 掩盖。
+  - 首次 Worker 部署前在 `wrangler.toml` 写入 `ADMIN_PASSWORDS` 兜底变量，随后再写 secret，避免 secret 写入失败时公网 Worker 出现无管理员密码窗口。
+  - Pages service binding patch 改为临时修改后恢复 `pages/wrangler.toml`，不再用 `sed -i` 长期 dirty git tracked 文件，避免后续 `git checkout` 升级冲突。
+  - 已安装状态下禁止直接覆盖部署，改为提示使用管理菜单升级/重部署或先完整卸载，避免生成新随机 D1/Pages 后丢失旧资源 ID。
+
+- **[P1] 第二轮审计邮箱高优先修复**（review #31）：
+  - 临时邮箱卸载时如 Worker/Pages/D1/DNS/Catch-all 任一远端资源删除失败，不再删除本地项目、管理员密码文件或清空 state；保留资源 ID 供用户修复权限/网络后重试卸载。
+  - D1 patch 升级每成功应用一个 migration 即立即写回 `EMAIL_PATCHES_APPLIED`，后续 patch 失败时可安全重跑，不会重复执行已成功的 ALTER TABLE。
+  - `_email_cf_worker_exists` 改为三态返回：存在/不存在/未知；Worker 名选择在存在性未知时 fail-closed，避免 Cloudflare API 失败或权限不足时误用默认名覆盖生产 Worker。
+
+- **[P1] 第二轮审计剩余高优先修复**（review #30）：
+  - Reality 初次安装路径改为先渲染到内存，再复用 `reality_apply_singbox_config` 做临时文件校验、原子替换与失败回滚，不再直写最终 `sing-box` 配置。
+  - OpenWrt WireGuard 网关部署命令中的 `/etc/rc.local` 持久化块改为 `awk` + 临时文件插入，避免 BusyBox `sed i\` 多行插入兼容性问题。
+  - Web/Cloudflare DNS 公网 IP 探测改用统一 `get_public_ipv4/get_public_ipv6` helper，并在写入 DNS 前用 `validate_ip` 区分 IPv4/IPv6，避免劫持页或错误页被当作 A/AAAA 记录。
+
+- **[P1] 第二轮审计 Web 反代替换修复**（review #29）：
+  - 新增 `_replace_proxy_pass_backend`，通过 `match` + `substr` 拼接替换 `proxy_pass` 后端，避免 gawk `sub()` replacement 中 `&` 展开为整段匹配。
+  - 修改反向代理后端时改用安全 helper，`&` 等字符按字面量写入，并继续保留临时文件 + `nginx -t` 回滚链路。
+
+- **[P2] 第二轮审计测试/工作区可靠性修复**（review #28）：
+  - `tests/smoke_p0p1p2.sh` 开头强制使用 UTF-8 locale，避免 C/POSIX locale 下中文 UTF-8 字节被线框字符 grep 误判。
+  - `.gitattributes` 增加 Markdown LF 规则，并统一关键 `sh/md` 工作区文件为 LF，避免直接 scp 到 VPS 执行脚本时触发 `$'\r': command not found`。
+
+- **[P1] 第二轮审计 WireGuard 导入修复**（review #27）：
+  - OpenWrt / Debian 两条 WireGuard 导入链路保留 `route_mode` 字段，跨机迁移 custom peer 后不会被后续自动路由刷新覆盖。
+  - 新增 WireGuard key 字面量校验，导入时校验 private/public/PSK、`client_allowed_ips`、`lan_subnets`、peer 类型与路由模式；Debian 导入同步补齐 name/IP 校验，拒绝恶意 JSON 字段进入配置、UCI/nft/部署命令。
+
+- **[P1] 第二轮审计行级安全修复**（review #26）：
+  - SSH 端口监听检测只匹配 `:port` 结尾，避免 `1022/2022/8022` 被误判为 `22`，降低改 SSH 端口后误删旧防火墙规则的锁外风险。
+  - 家宽公网暴露的路由器 DNS 劫持流程新增 `nginx_ip` IP 校验，并把 `router_ssh` 作为单个 SSH 目标参数传递，避免输入拼入远程 root 命令。
+  - Reality 落地/中转重复安装时按包含关系合并 `landing+relay` 角色；落地安装会先读取已有 relay 状态，中转安装不再把一体机降级为纯 relay。
+
+- **[P0] 第二轮审计 fix_broken 回归修复**（review #25）：
+  - GeoIP weekly update 写回 `GEOIP_LAST_UPDATE` 时保留 `KEY="value"` 格式，避免首次 cron 更新后 `geoip-apply.sh` 因安全解析失败而静默跳过所有 GeoIP 规则。
+  - DDNS 交互/非交互创建配置时恢复所有字段的双引号输出，确保新建配置能被 `ddns-update.sh` 白名单解析器接受，自动更新不再退化为无效配置。
+
+- **[P1] 审计报告 WireGuard 运行时修复**（review #24）：
+  - Debian 修改 WireGuard 出口网卡后会清理旧网卡上的 NAT MASQUERADE 规则，避免 `wg-quick restart` 使用新配置 PostDown 时遗留旧出口 NAT。
+  - OpenWrt watchdog 不再只用 `wg_bypass` 子串判断 bypass 是否完整；改为分别自愈 `wg_bypass_iface` 与各 VPN/LAN 子网 `wg_bypass_subnet` 规则。
+  - OpenWrt Mihomo bypass/端口放行的 `/etc/rc.local` 持久化新增块插入 helper，不再依赖 BusyBox `sed i\` 多行插入兼容性。
+
+- **[P1] 审计报告 WireGuard Clash 注入修复**（review #23）：
+  - Clash YAML 自动注入在原配置缺少 `proxy-groups:` 时会补齐顶级 `proxy-groups:` key，再插入 WireGuard 分组，避免把分组条目追加到 `rules:` 下生成损坏 YAML。
+  - `proxy-providers` 订阅域名提取改为显式 awk 状态机，不再使用起止都匹配顶级 key 的范围表达式，避免起始行即终止导致 DNS 直连策略从未注入。
+  - 含 WireGuard 私钥/PSK 的 Clash YAML 输出使用 `umask 077` 创建并 `chmod 600` 收紧，避免 `/tmp` 默认 644 泄露敏感配置。
+
+- **[P1] 审计报告 WireGuard 路由与状态修复**（review #22）：
+  - 新增通用 CIDR / CIDR 列表校验，OpenWrt 与 Debian 修改服务端 LAN 子网时会先校验格式，并在变更后联动刷新 peer `AllowedIPs`。
+  - 标准 peer 的自定义路由会持久化 `route_mode=custom`，网关增删或 LAN 变更触发的自动路由刷新会跳过自定义路由 peer，避免覆盖用户手工路由。
+  - OpenWrt `wg_setup_watchdog "true"` 支持非交互自动安装，不再进入已启用管理界面、确认提示或 pause。
+  - Debian WireGuard 服务端安装、添加 peer、导入 peer 对数据库写入失败显式 fail-closed；添加 peer 失败会清理已生成客户端配置，导入失败计入跳过而非虚增成功数。
+  - WireGuard 导出 peer 的 `mktemp` 模板改为 BusyBox 兼容格式，不再使用 `XXXXXX.json` 这类非尾部 X 模板。
+  - OpenWrt / Debian 主菜单不再仅凭 `wg0.conf` 存在强制把角色改为 server，需存在 server state 私钥才自动识别服务端。
+
+- **[P1] 审计报告 Web 剩余项修复**（review #21）：
+  - Cloudflare Zone 列表新增 `_cf_list_zones` 分页 helper，添加域名、家宽暴露、Zone ID fallback 均改为读取全量分页，避免 Token 可管理域名超过 50 个时漏选。
+  - 反向代理复用父域证书前新增 SAN 覆盖校验，仅当证书精确覆盖目标域名或通配符覆盖单级子域时才自动复用。
+  - 子域反代不再把任意父域证书提示为“可用主域证书”；未覆盖目标域名时明确提示用户先申请匹配证书或手动指定证书。
+
+- **[P1] 审计报告 Web 安全回归修复**（review #20）：
+  - Nginx reload 失败不再自动 fallback 到 restart，避免端口/配置异常时把全站 stop 后无法拉起。
+  - `_nginx_deploy_conf` 覆盖部署新增旧配置备份与失败恢复；`nginx -t` 或 reload 失败时恢复原 `sites-available` / `sites-enabled`，不再删除正常站点配置。
+  - Web 域名查看/删除序号校验补齐 `< 1` 判断，拒绝 `00` 等会被 bash 当成负索引的输入。
+  - 覆盖重配域名时同步更新既有 DDNS 配置，避免新 Token/新解析参数不落盘导致后续 DDNS 静默失败。
+  - 修改反向代理后端地址改为安全替换 `proxy_pass` 行，正确处理 `&` / `|` 等替换特殊字符。
+
+- **[P1] 审计报告 GeoIP IPv6 防绕过修复**（review #19）：
+  - GeoIP 国家白/黑名单新增 IPv6 数据源与 `.zone6` 数据下载，自动更新脚本同步下载 IPv4/IPv6，任一失败即中止应用，避免半更新导致策略漂移。
+  - `_geoip_apply` 新增 `family inet6` 的 IPv6 ipset 与 `ip6tables` 链；IPv6 可用但缺少 `ip6tables` 时拒绝应用规则，避免 IPv6 绕过白/黑名单。
+  - 白名单模式下 IPv6 链与 IPv4 一样默认 DROP，仅对匹配国家集合放行；黑名单模式下匹配国家集合 DROP。
+  - GeoIP 清理与开机持久化 apply 脚本同步覆盖 IPv6 链和集合，重启后不会退回 IPv4-only。
+
+- **[P2] 审计报告 OpenWrt 系统优化修复**（review #18）：
+  - OpenWrt 修改主机名改为通过 `uci set system.@system[0].hostname` + `uci commit system` 持久化，并检查写入失败；不再只写 `/etc/hostname` 后提示成功。
+  - OpenWrt 修改时区改为同时写入 `zonename` 与 POSIX `timezone`，并提交 `system` 配置；非 OpenWrt 的软链接回退路径会先检查 `/usr/share/zoneinfo/$z` 是否存在，避免创建悬空 `/etc/localtime`。
+  - BBR 开启流程检查 `sysctl -p` 返回值，并在应用后复验 `net.ipv4.tcp_congestion_control` 是否实际为 `bbr`；失败时明确报错，不再假报成功。
+
+- **[P1] 审计报告安全防护修复**（review #17）：
+  - Fail2ban 旧 UFW 规则迁移不再直接 `sed` 修改 `/etc/ufw/user.rules` / `user6.rules`，改为通过 `ufw status numbered` 定位并用 `ufw delete` 删除，且不再吞掉 `ufw reload` 失败。
+  - `auto_deps` 新安装 `fail2ban` 且安装前未运行时，会立即 `disable --now`/stop，避免发行版默认 `sshd` jail 静默启用后误封 SSH。
+  - `ufw_setup` 与 `ufw_safe_reset` 在放行 SSH 前强制 `refresh_ssh_port` 并校验端口，避免使用过期 `CURRENT_SSH_PORT` 导致锁外。
+  - Fail2ban 解封菜单新增活跃 jail 枚举，展示和解封遍历所有 jail，不再只处理 `sshd`，可恢复 nginx 等 jail 的误封。
+
+- **[P1] 审计报告核心基础剩余修复**（review #16）：
+  - 主菜单系统信息不再在前台串行刷新公网 IPv4/IPv6 与 ipinfo；缓存缺失或过期时先用旧缓存/占位值渲染菜单，再后台刷新，避免无网环境主菜单卡顿。
+  - 最近登录记录的公网 IP 归属地改为 24 小时缓存 + 后台查询；首次缺缓存时显示“待查询”，不再在菜单渲染路径实时访问 `ip-api.com`。
+  - `write_file_atomic` 新增临时文件注册/注销；`handle_interrupt` 统一清理本进程登记的 `.tmp.server-manage.*` 临时文件，避免中断后在任意目标目录残留。
+  - DNS 修改的 `/etc/resolv.conf` 写入改走 `write_file_atomic`，不再创建未注册的 `/etc/resolv.conf.tmp.*`。
+  - `build.sh` 删除 Reality 运行时 source 块时改用显式 `BUILD-OMIT` 起止边界，不再依赖“注释标记到首个顶格 `fi`”的脆弱 sed 范围。
+
+- **[P1] 审计报告核心基础修复**（review #15）：
+  - `confirm()` 在非交互 stdin / EOF 场景下不再把空输入当作默认确认，避免管道、cron、远程批处理误触发破坏性操作。
+  - `--reality` CLI 入口补齐与菜单一致的 OpenWrt 平台拦截，在 OpenWrt 上通过 `feature_blocked` 明确拒绝 Sing-box Reality 节点功能。
+  - `cron_add_job` / `cron_remove_job` 改用固定字符串匹配删除任务，并检查 `crontab` 安装失败返回码，避免正则误删相似任务或把安装失败误判为成功。
+  - DDNS cron 的 Cloudflare `proxied` 字段补齐默认值与布尔归一化；配置缺省、空值或非法值时统一写入 JSON `false`，避免生成非法请求体。
+
+- **[P1] 审计报告 Reality 高风险修复**（review #14）：
+  - Reality UUID / Key 轮换改为先渲染到临时配置并执行 `sing-box check`，通过后再替换最终配置并重启；`check` 或 `restart` 失败均回滚/保留旧配置，且不写入新 state 或客户端链接。
+  - `rotate_key` 增加落地机参数完整性与 `REALITY_PORT` 校验，避免空端口渲染出非法 JSON 并覆盖好配置。
+  - Realm 中转安装/重装前先 `reality_load_state`，同机已有落地机时保留 UUID、私钥、公钥、SNI、ShortID 等落地机参数，避免中转 state 覆盖清空落地配置。
+
+- **[P2] 审计报告第三批安全细节修复**（review #13）：
+  - `_sshd_set_directive` 改为只修改首个 `Match` 块之前的全局指令；无全局指令时插入到首个 `Match` 前，避免破坏用户例外规则。
+  - SSH 改端口同步 Fail2ban 时新增 `_fail2ban_set_sshd_port`，仅更新 `[sshd]` jail 的 `port`，不再误改 nginx/http 等其他 jail。
+  - 网络诊断端口测试新增 `validate_host`，并改为通过 `bash -c` 参数传递 host/port，避免把 host 拼进 `/dev/tcp` 命令字符串。
+  - `validate_ip` 加强 IPv6 校验，拒绝多个 `::` 的非法地址。
+  - DDNS 配置文件改走 `write_file_atomic` 后再 `chmod 600`，避免 token 文件先以默认 umask 创建再收紧权限的窗口；DDNS cron 的 Cloudflare GET 失败会返回失败，不再误判记录不存在。
+
+- **[P1] 审计报告第二批锁外/Cloudflare 高风险问题修复**（review #12）：
+  - SSH 改端口新增 `ssh.socket` / `sshd.socket` socket activation 检测；socket 模式下同步写入 systemd socket drop-in，并在删除旧 UFW 端口规则前用真实监听端口检测确认新端口已可用。
+  - 禁用密码登录前检查至少一个可登录用户存在 `authorized_keys`；禁用 Root 登录前检查存在非 root sudo 用户；两条流程均用 `sshd -T` 复验 `PasswordAuthentication` / `PermitRootLogin` 的最终有效值，失败即回滚。
+  - GeoIP 下载改为 `curl -f` + 临时文件 + 非空内容校验，任一国家下载失败不再继续应用；`_geoip_apply` 拒绝空集合并检查 `ipset restore/swap`，cron 更新失败会中止且保留旧集合。
+  - Cloudflare Origin Rules GET 增加超时、重试、curl 返回码和 `success` 校验；家宽一键流程在读取失败时跳过自动 PUT，避免把全量 entrypoint ruleset 误替换为空/单条规则。
+  - DNS/Origin Rules 的 Cloudflare GET 读取失败与“不存在”分离，DNS 更新不会在 GET 失败时误判记录不存在并创建重复记录。
+
+- **[P1] 审计报告第一批高风险问题修复**（review #11）：
+  - 修复 `email_run` 失败命令返回码被 `if` 复合语句吞掉的问题；失败时现在返回真实退出码，避免部署/升级/卸载链路把失败误判为成功。
+  - 新增通用 `validate_dns_label`，并在 Web「添加域名」与「家宽公网暴露」入口校验子域名前缀，阻断路径、Nginx、crontab 等后续注入面；临时邮箱 `_email_validate_dns_label` 改为复用通用 helper。
+  - 修复 OpenWrt WireGuard `wg_add_peer` 添加网关后展示部署命令时未定义 `target_idx` 的问题，改为使用新增 peer 的真实索引。
+  - 导入 OpenWrt WireGuard peer 时新增 name 白名单与 IP 格式校验，避免篡改 JSON 触发路径穿越或脏数据入库。
+  - `print_warn` / `print_error` 改为输出到 stderr，避免命令替换吞掉诊断文本或污染 stdout 返回值。
+  - 新增 `ufw_is_active` 并统一替换 `ufw status | grep "Status: active"`，避免 locale 导致 UFW active 检测失真。
+  - 清理 `grep -c ... || echo 0` 反模式，避免无匹配时得到 `0\n0` 触发算术错误。
+
+### Tests
+- 新增 review #24 WireGuard 运行时回归：覆盖 Debian 出口网卡变更清理旧 NAT、OpenWrt watchdog 分别检查 iface/subnet bypass、rc.local 持久化不再使用 BusyBox 不兼容 sed 多行插入。
+- 新增 review #23 WireGuard Clash 回归：覆盖缺少 `proxy-groups:` 时补顶级 key、`proxy-providers` 显式状态机提取、Clash YAML 输出权限 0600。
+- 新增 review #22 WireGuard 回归：覆盖 CIDR 校验、服务端 LAN 变更联动刷新 peer routes、自定义路由不被覆盖、OpenWrt watchdog auto mode、Debian DB 写入失败处理、BusyBox `mktemp` 模板、主菜单 server 角色识别条件。
+- 新增 review #21 Web 剩余回归：覆盖 Zone 分页 helper、添加域名/家宽暴露/Zone fallback 使用分页列表、通配符证书只匹配单级子域、反代复用父域证书前校验 SAN。
+- 新增 review #20 Web 回归：覆盖 `_nginx_reload` 不 restart、`_nginx_deploy_conf` 失败恢复旧配置、`00` 序号拒绝、覆盖重配 DDNS 配置更新、反代后端安全替换特殊字符。
+- 新增 review #19 GeoIP IPv6 回归：覆盖 IPv6 数据源、`.zone6` 下载、`family inet6` ipset、`ip6tables` 链、IPv6 清理与持久化 apply 脚本。
+- 新增 review #18 OpenWrt 系统优化回归：覆盖主机名/时区通过 UCI 持久化、非 OpenWrt zoneinfo 存在性检查、BBR `sysctl -p` 返回值与应用后复验。
+- 新增 review #17 安全防护回归：覆盖 Fail2ban UFW 旧规则迁移不直接改规则文件、`ufw reload` 失败不吞、`auto_deps` 新装 fail2ban 后停用、UFW setup/reset 刷新 SSH 端口、Fail2ban 多 jail 解封。
+- 新增 review #16 核心基础剩余回归：覆盖主菜单异步网络缓存、登录 IP 归属地缓存/后台查询、临时文件注册清理、DNS resolv.conf 原子写、Reality source 块显式构建省略边界。
+- 新增 review #15 核心基础回归：覆盖非 tty `confirm` 不自动确认、`--reality` CLI OpenWrt guard、cron 固定字符串删除与 crontab 失败返回、DDNS `proxied` 缺省/非法值归一化。
+- 新增 review #14 Reality 回归：覆盖轮换函数必须使用临时配置 + checked apply helper、失败不覆盖旧配置、restart 失败回滚、`rotate_key` 端口校验、Realm 中转安装先加载既有 state。
+- 新增 review #13 回归：覆盖 `Match` 块保护、Fail2ban `[sshd]` 定向更新、端口测试 host 校验/命令注入防护、非法 IPv6、多处 DDNS token 原子写与 Cloudflare GET success 判定。
+- 新增 review #12 回归：覆盖 SSH socket activation 监听校验、禁用密码/root 登录前置校验与 `sshd -T` 复验、GeoIP fail-closed 自动更新、Origin Rules 读取失败保护、Cloudflare DNS GET success 判定。
+- 新增 review #11 回归：覆盖 `email_run` 真实失败码、Web DNS label 校验、WG 新增 peer 索引、WG 导入 name/ip 校验、stderr 输出、UFW locale helper、`grep -c` 反模式清理。
+
 ### Changed
 - **[P1] Nginx HTTP/2 配置改为版本感知生成**（review #10）：Nginx 1.25.1+ 已将 `listen ... http2` 标记为 deprecated，推荐独立 `http2 on;`；但 Debian/Ubuntu 稳定仓库仍可能是旧版 Nginx，旧版不识别 `http2 on;`。修复：新增 `_nginx_tls_http2_block <port>`，运行时按 `nginx -v` 选择新/旧语法；`添加域名`、`反向代理网站`、`家宽公网暴露` 三类生成模板统一调用该 helper，Cloudflare Origin Rules 的手工提示也更新为新语法说明。
 - **[P1] Docker 安装流程对齐官方 Debian/Ubuntu 文档**（review #10）：安装 Docker CE 前先移除官方列出的冲突包 `docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc`；Docker Compose 菜单改为优先安装官方 `docker-compose-plugin`，仅在 plugin 安装失败时 fallback 到 standalone 二进制；standalone fallback 增加 `uname -m` 到 Compose release 资产名的架构映射。

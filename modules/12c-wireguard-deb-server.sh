@@ -141,8 +141,7 @@ wg_deb_server_install() {
     # ── [6/7] 写入数据库 + 生成配置 ──
     print_info "[6/7] 写入配置..."
     wg_deb_db_init
-    wg_deb_set_role "server"
-    wg_deb_db_set --arg sname "$server_name" \
+    if ! wg_deb_db_set --arg sname "$server_name" \
               --arg pk "$server_privkey" \
               --arg pub "$server_pubkey" \
               --arg ip "$server_ip" \
@@ -169,7 +168,11 @@ wg_deb_server_install() {
         ddns_domain: $ddns,
         server_lan_subnet: $lan,
         default_iface: $iface
-    } | .schema_version = 2'
+    } | .schema_version = 2'; then
+        print_error "数据库写入失败，已中止安装"
+        pause; return 1
+    fi
+    wg_deb_set_role "server"
 
     # 生成 wg0.conf
     wg_deb_rebuild_conf
@@ -182,12 +185,12 @@ wg_deb_server_install() {
 
     # ── [7/7] 启动服务 ──
     print_info "[7/7] 启动 WireGuard..."
-    systemctl enable wg-quick@wg0 >/dev/null 2>&1
-    systemctl start wg-quick@wg0 >/dev/null 2>&1
+    systemctl enable wg-quick@${WG_DEB_INTERFACE} >/dev/null 2>&1
+    systemctl start wg-quick@${WG_DEB_INTERFACE} >/dev/null 2>&1
     sleep 2
 
     # 放行 WG UDP 端口 (ufw 如果启用)
-    if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
+    if ufw_is_active; then
         ufw allow "$wg_port"/udp >/dev/null 2>&1
         print_info "已在 UFW 放行 ${wg_port}/udp"
     fi
@@ -197,7 +200,7 @@ wg_deb_server_install() {
     if wg_deb_is_running; then
         print_success "WireGuard 服务端安装并启动成功！"
     else
-        print_warn "WireGuard 已安装，但启动可能失败，请检查: journalctl -u wg-quick@wg0"
+        print_warn "WireGuard 已安装，但启动可能失败，请检查: journalctl -u wg-quick@${WG_DEB_INTERFACE}"
     fi
     echo -e "  角色:       ${C_GREEN}服务端 (Server)${C_RESET}"
     echo -e "  监听地址:   ${C_GREEN}${listen_addr}:${wg_port}/udp${C_RESET}"
@@ -225,25 +228,29 @@ wg_deb_server_install() {
 wg_deb_modify_server() {
     wg_deb_check_server || return 1
     print_title "修改 WireGuard 服务端配置"
-    local cur_port cur_dns cur_ep cur_lan cur_iface
+    local cur_port cur_dns cur_ep cur_lan cur_iface cur_subnet
     cur_port=$(wg_deb_db_get '.server.port')
     cur_dns=$(wg_deb_db_get '.server.dns')
     cur_ep=$(wg_deb_db_get '.server.endpoint')
     cur_lan=$(wg_deb_db_get '.server.server_lan_subnet // empty')
     cur_iface=$(wg_deb_db_get '.server.default_iface // empty')
+    cur_subnet=$(wg_deb_db_get '.server.subnet')
     [[ -z "$cur_iface" || "$cur_iface" == "null" ]] && cur_iface=$(wg_deb_detect_default_iface)
     echo -e "  当前端口:   ${C_GREEN}${cur_port}${C_RESET}"
     echo -e "  当前 DNS:   ${C_GREEN}${cur_dns}${C_RESET}"
     echo -e "  当前端点:   ${C_GREEN}${cur_ep}${C_RESET}"
     echo -e "  出口网卡:   ${C_GREEN}${cur_iface}${C_RESET}"
     [[ -n "$cur_lan" && "$cur_lan" != "null" ]] && echo -e "  当前 LAN:   ${C_GREEN}${cur_lan}${C_RESET}"
-    local changed=false
+    local changed=false lan_changed=false iface_changed=false
 
     read -e -r -p "新监听端口 [${cur_port}]: " new_port
     new_port=${new_port:-$cur_port}
     if [[ "$new_port" != "$cur_port" ]]; then
         if validate_port "$new_port"; then
-            wg_deb_db_set --argjson p "$new_port" '.server.port = $p'
+            if ! wg_deb_db_set --argjson p "$new_port" '.server.port = $p'; then
+                print_error "数据库写入失败，端口未修改"
+                pause; return 1
+            fi
             changed=true
             print_info "端口将更改为 ${new_port}"
         else
@@ -255,7 +262,10 @@ wg_deb_modify_server() {
     read -e -r -p "新客户端 DNS [${cur_dns}]: " new_dns
     new_dns=${new_dns:-$cur_dns}
     if [[ "$new_dns" != "$cur_dns" ]]; then
-        wg_deb_db_set --arg d "$new_dns" '.server.dns = $d'
+        if ! wg_deb_db_set --arg d "$new_dns" '.server.dns = $d'; then
+            print_error "数据库写入失败，DNS 未修改"
+            pause; return 1
+        fi
         changed=true
         print_info "DNS 将更改为 ${new_dns}"
     fi
@@ -263,7 +273,10 @@ wg_deb_modify_server() {
     read -e -r -p "新公网端点 [${cur_ep}]: " new_ep
     new_ep=${new_ep:-$cur_ep}
     if [[ "$new_ep" != "$cur_ep" ]]; then
-        wg_deb_db_set --arg e "$new_ep" '.server.endpoint = $e'
+        if ! wg_deb_db_set --arg e "$new_ep" '.server.endpoint = $e'; then
+            print_error "数据库写入失败，端点未修改"
+            pause; return 1
+        fi
         changed=true
         print_info "端点将更改为 ${new_ep}"
     fi
@@ -271,16 +284,29 @@ wg_deb_modify_server() {
     read -e -r -p "新服务端 LAN 子网 [${cur_lan:-无}]: " new_lan
     new_lan=${new_lan:-$cur_lan}
     if [[ "$new_lan" != "$cur_lan" ]]; then
-        wg_deb_db_set --arg l "$new_lan" '.server.server_lan_subnet = $l'
-        changed=true
-        print_info "LAN 子网将更改为 ${new_lan}"
+        if ! validate_cidr_list "$new_lan"; then
+            print_warn "LAN 子网格式无效，保持原值"
+            new_lan="$cur_lan"
+        else
+            if ! wg_deb_db_set --arg l "$new_lan" '.server.server_lan_subnet = $l'; then
+                print_error "数据库写入失败，LAN 子网未修改"
+                pause; return 1
+            fi
+            changed=true
+            lan_changed=true
+            print_info "LAN 子网将更改为 ${new_lan}"
+        fi
     fi
 
     read -e -r -p "出口网卡 [${cur_iface}]: " new_iface
     new_iface=${new_iface:-$cur_iface}
     if [[ "$new_iface" != "$cur_iface" ]]; then
-        wg_deb_db_set --arg i "$new_iface" '.server.default_iface = $i'
+        if ! wg_deb_db_set --arg i "$new_iface" '.server.default_iface = $i'; then
+            print_error "数据库写入失败，出口网卡未修改"
+            pause; return 1
+        fi
         changed=true
+        iface_changed=true
         print_info "出口网卡将更改为 ${new_iface}"
     fi
 
@@ -289,18 +315,24 @@ wg_deb_modify_server() {
         pause; return
     fi
 
+    if [[ "$lan_changed" == "true" ]] && ! _wg_deb_update_peer_routes; then
+        print_error "联动更新客户端路由失败"
+        pause; return 1
+    fi
+
     wg_deb_rebuild_conf
     wg_deb_regenerate_client_confs
 
     # UFW 端口变更
-    if [[ "$new_port" != "$cur_port" ]] && command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
+    if [[ "$new_port" != "$cur_port" ]] && ufw_is_active; then
         ufw delete allow "$cur_port"/udp >/dev/null 2>&1
         ufw allow "$new_port"/udp >/dev/null 2>&1
     fi
 
     # 重启服务使配置生效
-    systemctl restart wg-quick@wg0 >/dev/null 2>&1
+    systemctl restart wg-quick@${WG_DEB_INTERFACE} >/dev/null 2>&1
     sleep 2
+    [[ "$iface_changed" == "true" ]] && _wg_deb_cleanup_nat_iface "$cur_subnet" "$cur_iface"
 
     print_success "服务端配置已更新"
     log_action "WireGuard(deb) server config modified: port=${new_port} dns=${new_dns} endpoint=${new_ep} lan=${new_lan:-none} iface=${new_iface}"
@@ -337,9 +369,9 @@ wg_deb_server_status() {
     # systemd 服务状态
     echo ""
     local svc_status
-    svc_status=$(systemctl is-active wg-quick@wg0 2>/dev/null || echo "unknown")
+    svc_status=$(systemctl is-active wg-quick@${WG_DEB_INTERFACE} 2>/dev/null || echo "unknown")
     local svc_enabled
-    svc_enabled=$(systemctl is-enabled wg-quick@wg0 2>/dev/null || echo "unknown")
+    svc_enabled=$(systemctl is-enabled wg-quick@${WG_DEB_INTERFACE} 2>/dev/null || echo "unknown")
     echo -e "  systemd:  active=${C_CYAN}${svc_status}${C_RESET}  enabled=${C_CYAN}${svc_enabled}${C_RESET}"
 
     echo ""
@@ -430,13 +462,13 @@ wg_deb_start() {
         return 0
     fi
     print_info "正在启动 WireGuard..."
-    systemctl start wg-quick@wg0 >/dev/null 2>&1
+    systemctl start wg-quick@${WG_DEB_INTERFACE} >/dev/null 2>&1
     sleep 2
     if wg_deb_is_running; then
         print_success "WireGuard 已启动"
         log_action "WireGuard(deb) started"
     else
-        print_error "启动失败，请检查: journalctl -u wg-quick@wg0 -n 20"
+        print_error "启动失败，请检查: journalctl -u wg-quick@${WG_DEB_INTERFACE} -n 20"
         log_action "WireGuard(deb) start failed"
     fi
 }
@@ -447,7 +479,7 @@ wg_deb_stop() {
         return 0
     fi
     print_info "正在停止 WireGuard..."
-    systemctl stop wg-quick@wg0 >/dev/null 2>&1
+    systemctl stop wg-quick@${WG_DEB_INTERFACE} >/dev/null 2>&1
     sleep 1
     if ! wg_deb_is_running; then
         print_success "WireGuard 已停止"
@@ -459,13 +491,13 @@ wg_deb_stop() {
 
 wg_deb_restart() {
     print_info "正在重启 WireGuard..."
-    systemctl restart wg-quick@wg0 >/dev/null 2>&1
+    systemctl restart wg-quick@${WG_DEB_INTERFACE} >/dev/null 2>&1
     sleep 2
     if wg_deb_is_running; then
         print_success "WireGuard 已重启"
         log_action "WireGuard(deb) restarted"
     else
-        print_error "重启失败，请检查: journalctl -u wg-quick@wg0 -n 20"
+        print_error "重启失败，请检查: journalctl -u wg-quick@${WG_DEB_INTERFACE} -n 20"
         log_action "WireGuard(deb) restart failed"
     fi
 }
@@ -490,14 +522,14 @@ wg_deb_uninstall() {
     fi
 
     print_info "[1/5] 停止 WireGuard 服务..."
-    systemctl stop wg-quick@wg0 2>/dev/null || true
-    systemctl disable wg-quick@wg0 2>/dev/null || true
+    systemctl stop wg-quick@${WG_DEB_INTERFACE} 2>/dev/null || true
+    systemctl disable wg-quick@${WG_DEB_INTERFACE} 2>/dev/null || true
     # 确保接口已删除
     ip link set "$WG_DEB_INTERFACE" down 2>/dev/null || true
     ip link delete "$WG_DEB_INTERFACE" 2>/dev/null || true
 
     print_info "[2/5] 清理防火墙规则..."
-    if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
+    if ufw_is_active; then
         local wg_port
         wg_port=$(wg_deb_db_get '.server.port' 2>/dev/null)
         [[ -n "$wg_port" && "$wg_port" != "null" ]] && ufw delete allow "$wg_port"/udp >/dev/null 2>&1
@@ -515,7 +547,6 @@ wg_deb_uninstall() {
     rm -f "$WG_DEB_DB_FILE" 2>/dev/null || true
     rm -rf "$WG_DEB_DB_DIR" 2>/dev/null || true
     rm -f "$WG_DEB_ROLE_FILE" 2>/dev/null || true
-    rm -f /etc/wireguard/*.key 2>/dev/null || true
     rm -f /etc/sysctl.d/99-wireguard.conf 2>/dev/null || true
     rmdir /etc/wireguard 2>/dev/null || true
 

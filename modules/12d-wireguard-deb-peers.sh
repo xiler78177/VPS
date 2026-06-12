@@ -48,7 +48,7 @@ wg_deb_add_peer() {
                 read -e -r -p "LAN 网段: " lan_subnets
                 if [[ -z "$lan_subnets" ]]; then
                     print_warn "网关设备必须指定 LAN 网段"
-                elif ! echo "$lan_subnets" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+'; then
+                elif ! validate_cidr_list "$lan_subnets"; then
                     print_warn "格式无效，示例: 192.168.123.0/24"
                     lan_subnets=""
                 fi
@@ -65,7 +65,7 @@ wg_deb_add_peer() {
     esac
 
     # ── 路由模式 ──
-    local client_allowed_ips server_subnet server_lan
+    local client_allowed_ips server_subnet server_lan route_mode="managed"
     server_subnet=$(wg_deb_db_get '.server.subnet')
     server_lan=$(wg_deb_db_get '.server.server_lan_subnet // empty')
 
@@ -122,9 +122,10 @@ wg_deb_add_peer() {
         read -e -r -p "选择 [1]: " route_mode
         route_mode=${route_mode:-1}
         case $route_mode in
-            1) client_allowed_ips="0.0.0.0/0, ::/0" ;;
-            2) client_allowed_ips="$server_subnet" ;;
+            1) client_allowed_ips="0.0.0.0/0, ::/0"; route_mode="full" ;;
+            2) client_allowed_ips="$server_subnet"; route_mode="vpn" ;;
             3)
+                route_mode="managed"
                 client_allowed_ips="$server_subnet"
                 [[ -n "$server_lan" && "$server_lan" != "null" ]] && client_allowed_ips="${client_allowed_ips}, ${server_lan}"
                 [[ -n "$all_lan_subnets" ]] && client_allowed_ips="${client_allowed_ips}, ${all_lan_subnets}"
@@ -132,8 +133,15 @@ wg_deb_add_peer() {
             4)
                 read -e -r -p "输入允许的 IP 范围 (逗号分隔): " client_allowed_ips
                 [[ -z "$client_allowed_ips" ]] && client_allowed_ips="0.0.0.0/0, ::/0"
+                if validate_wg_allowed_ips "$client_allowed_ips"; then
+                    route_mode="custom"
+                else
+                    print_warn "自定义路由格式无效，回退为仅 VPN 内网"
+                    client_allowed_ips="$server_subnet"
+                    route_mode="vpn"
+                fi
                 ;;
-            *) client_allowed_ips="0.0.0.0/0, ::/0" ;;
+            *) client_allowed_ips="0.0.0.0/0, ::/0"; route_mode="full" ;;
         esac
     fi
 
@@ -144,27 +152,11 @@ wg_deb_add_peer() {
     sport=$(wg_deb_db_get '.server.port')
     sdns=$(wg_deb_db_get '.server.dns')
     mask=$(echo "$server_subnet" | cut -d'/' -f2)
-    local dns_line=""
-    [[ "$is_gateway" != "true" ]] && dns_line="DNS = ${sdns}"
-    local client_conf="[Interface]
-PrivateKey = ${peer_privkey}
-Address = ${peer_ip}/${mask}
-${dns_line}
-[Peer]
-PublicKey = ${spub}
-PresharedKey = ${psk}
-Endpoint = ${sep}:${sport}
-AllowedIPs = ${client_allowed_ips}
-PersistentKeepalive = 25"
-    client_conf=$(echo "$client_conf" | sed '/^$/N;/^\n$/d')
-    mkdir -p "$WG_DEB_CLIENT_DIR"
     local conf_file="${WG_DEB_CLIENT_DIR}/${peer_name}.conf"
-    write_file_atomic "$conf_file" "$client_conf"
-    chmod 600 "$conf_file"
 
     # ── 写入数据库 ──
     local now; now=$(date '+%Y-%m-%d %H:%M:%S')
-    wg_deb_db_set --arg name "$peer_name" \
+    if ! wg_deb_db_set --arg name "$peer_name" \
               --arg ip "$peer_ip" \
               --arg privkey "$peer_privkey" \
               --arg pubkey "$peer_pubkey" \
@@ -174,6 +166,7 @@ PersistentKeepalive = 25"
               --arg gw "$is_gateway" \
               --arg lans "$lan_subnets" \
               --arg ptype "$peer_type" \
+              --arg route_mode "$route_mode" \
     '.peers += [{
         name: $name,
         ip: $ip,
@@ -185,23 +178,24 @@ PersistentKeepalive = 25"
         created: $created,
         is_gateway: ($gw == "true"),
         lan_subnets: $lans,
-        peer_type: $ptype
-    }]'
+        peer_type: $ptype,
+        route_mode: $route_mode
+    }]'; then
+        rm -f "$conf_file"
+        print_error "数据库写入失败，已清理生成的客户端配置"
+        pause; return 1
+    fi
 
     # ── 网关设备: 联动更新其他 peer 的 allowed_ips ──
     if [[ "$is_gateway" == "true" && -n "$lan_subnets" ]]; then
-        _wg_deb_update_peer_routes
+        if ! _wg_deb_update_peer_routes; then
+            print_error "联动更新客户端路由失败"
+            pause; return 1
+        fi
     fi
 
-    # ── 重建配置并应用 ──
-    wg_deb_rebuild_conf
-    wg_deb_regenerate_client_confs
-
-    # 重启使新 peer 生效
-    if wg_deb_is_running; then
-        systemctl restart wg-quick@wg0 >/dev/null 2>&1
-        sleep 1
-    fi
+    # ── 重建配置并热应用 ──
+    wg_deb_apply_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
 
     # ── 结果展示 ──
     draw_line
@@ -223,7 +217,7 @@ PersistentKeepalive = 25"
         echo ""
         read -e -r -p "是否立即生成 Clash/Mihomo 客户端配置? [Y/n]: " _gen_clash
         _gen_clash=${_gen_clash:-Y}
-        [[ "$_gen_clash" =~ ^[Yy]$ ]] && wg_generate_clash_config
+        [[ "$_gen_clash" =~ ^[Yy]$ ]] && wg_deb_generate_clash_config
     elif [[ "$peer_type" == "gateway" ]]; then
         echo -e "\n${C_YELLOW}[网关设备部署提示]${C_RESET}"
         echo "  • LAN 内设备无需安装任何 VPN 客户端，网关自动代理"
@@ -257,6 +251,8 @@ _wg_deb_update_peer_routes() {
         local _is_gw=$(wg_deb_db_get ".peers[$_pi].is_gateway // false")
         local _own=$(wg_deb_db_get ".peers[$_pi].lan_subnets // empty")
         local _ptype=$(wg_deb_db_get ".peers[$_pi].peer_type // \"standard\"")
+        local _route_mode=$(wg_deb_db_get ".peers[$_pi].route_mode // empty")
+        [[ "$_route_mode" == "custom" ]] && { _pi=$((_pi + 1)); continue; }
 
         if [[ "$_is_gw" == "true" ]]; then
             local _other="" _IFS_BAK="$IFS"; IFS=','
@@ -270,96 +266,21 @@ _wg_deb_update_peer_routes() {
             local _new="$server_subnet"
             [[ -n "$server_lan" && "$server_lan" != "null" ]] && _new="${_new}, ${server_lan}"
             [[ -n "$_other" ]] && _new="${_new}, ${_other}"
-            wg_deb_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a'
+            if ! wg_deb_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a'; then
+                print_error "数据库写入失败，客户端路由未完整更新"
+                return 1
+            fi
         else
             local _new="$server_subnet"
             [[ -n "$server_lan" && "$server_lan" != "null" ]] && _new="${_new}, ${server_lan}"
             [[ -n "$_all_lans" ]] && _new="${_new}, ${_all_lans}"
-            wg_deb_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a'
+            if ! wg_deb_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a'; then
+                print_error "数据库写入失败，客户端路由未完整更新"
+                return 1
+            fi
         fi
         _pi=$((_pi + 1))
     done
-}
-
-wg_deb_list_peers() {
-    wg_deb_check_server || return 1
-    print_title "WireGuard 设备列表"
-    local peer_count
-    peer_count=$(wg_deb_db_get '.peers | length')
-    if [[ "$peer_count" -eq 0 || "$peer_count" == "null" ]]; then
-        print_warn "暂无设备"
-        pause; return
-    fi
-    local wg_dump=""
-    wg_deb_is_running && wg_dump=$(wg show "$WG_DEB_INTERFACE" dump 2>/dev/null | tail -n +2)
-    printf "${C_CYAN}%-4s %-14s %-14s %-8s %-8s %-10s %-10s %s${C_RESET}\n" \
-        "#" "名称" "IP" "类型" "状态" "↓接收" "↑发送" "最近握手"
-    draw_line
-    local i=0
-    while [[ $i -lt $peer_count ]]; do
-        local name ip pubkey enabled peer_type
-        name=$(wg_deb_db_get ".peers[$i].name")
-        ip=$(wg_deb_db_get ".peers[$i].ip")
-        pubkey=$(wg_deb_db_get ".peers[$i].public_key")
-        enabled=$(wg_deb_db_get ".peers[$i].enabled")
-        peer_type=$(wg_deb_db_get ".peers[$i].peer_type // \"standard\"")
-        local type_str
-        case "$peer_type" in
-            clash)   type_str="${C_CYAN}Clash${C_RESET}" ;;
-            gateway) type_str="${C_YELLOW}网关${C_RESET}" ;;
-            *)       type_str="标准" ;;
-        esac
-        local status_str
-        if [[ "$enabled" != "true" ]]; then
-            status_str="${C_GRAY}禁用${C_RESET}"
-        else
-            status_str="${C_GREEN}启用${C_RESET}"
-        fi
-        local rx_bytes="0" tx_bytes="0" last_handshake="从未"
-        if [[ -n "$wg_dump" ]]; then
-            local peer_line
-            peer_line=$(echo "$wg_dump" | grep "^${pubkey}" 2>/dev/null)
-            if [[ -n "$peer_line" ]]; then
-                rx_bytes=$(echo "$peer_line" | awk '{print $6}')
-                tx_bytes=$(echo "$peer_line" | awk '{print $7}')
-                local hs_epoch
-                hs_epoch=$(echo "$peer_line" | awk '{print $5}')
-                if [[ -n "$hs_epoch" && "$hs_epoch" != "0" ]]; then
-                    local now_epoch diff
-                    now_epoch=$(date +%s)
-                    diff=$((now_epoch - hs_epoch))
-                    if [[ $diff -lt 60 ]]; then
-                        last_handshake="${diff}秒前"
-                        status_str="${C_GREEN}在线${C_RESET}"
-                    elif [[ $diff -lt 3600 ]]; then
-                        last_handshake="$((diff / 60))分前"
-                    elif [[ $diff -lt 86400 ]]; then
-                        last_handshake="$((diff / 3600))时前"
-                    else
-                        last_handshake="$((diff / 86400))天前"
-                    fi
-                fi
-            fi
-        fi
-        printf "%-4s %-14s %-14s %-8b %-8b %-10s %-10s %s\n" \
-            "$((i + 1))" "$name" "$ip" "$type_str" "$status_str" \
-            "$(wg_deb_format_bytes "$rx_bytes")" "$(wg_deb_format_bytes "$tx_bytes")" "$last_handshake"
-        i=$((i + 1))
-    done
-    echo -e "${C_CYAN}共 ${peer_count} 个设备${C_RESET}"
-    # 显示网关 LAN 信息
-    local gw_found=0 gi=0
-    while [[ $gi -lt $peer_count ]]; do
-        local gw_check=$(wg_deb_db_get ".peers[$gi].is_gateway // false")
-        if [[ "$gw_check" == "true" ]]; then
-            [[ $gw_found -eq 0 ]] && { echo -e "${C_CYAN}网关设备 LAN 网段:${C_RESET}"; gw_found=1; }
-            local gw_name=$(wg_deb_db_get ".peers[$gi].name")
-            local gw_lans=$(wg_deb_db_get ".peers[$gi].lan_subnets // empty")
-            echo -e "  ${gw_name}: ${C_GREEN}${gw_lans:-未设置}${C_RESET}"
-        fi
-        gi=$((gi + 1))
-    done
-    pause
 }
 
 wg_deb_toggle_peer() {
@@ -373,21 +294,21 @@ wg_deb_toggle_peer() {
     current_state=$(wg_deb_db_get ".peers[$target_idx].enabled")
     if [[ "$current_state" == "true" ]]; then
         if confirm "确认禁用设备 '${target_name}'？"; then
-            wg_deb_db_set --argjson idx "$target_idx" '.peers[$idx].enabled = false'
-            wg_deb_rebuild_conf
-            if wg_deb_is_running; then
-                systemctl restart wg-quick@wg0 >/dev/null 2>&1
+            if ! wg_deb_db_set --argjson idx "$target_idx" '.peers[$idx].enabled = false'; then
+                print_error "数据库写入失败，设备状态未修改"
+                pause; return 1
             fi
+            wg_deb_apply_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
             print_success "设备 '${target_name}' 已禁用"
             log_action "WireGuard(deb) peer disabled: ${target_name}"
         fi
     else
         if confirm "确认启用设备 '${target_name}'？"; then
-            wg_deb_db_set --argjson idx "$target_idx" '.peers[$idx].enabled = true'
-            wg_deb_rebuild_conf
-            if wg_deb_is_running; then
-                systemctl restart wg-quick@wg0 >/dev/null 2>&1
+            if ! wg_deb_db_set --argjson idx "$target_idx" '.peers[$idx].enabled = true'; then
+                print_error "数据库写入失败，设备状态未修改"
+                pause; return 1
             fi
+            wg_deb_apply_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
             print_success "设备 '${target_name}' 已启用"
             log_action "WireGuard(deb) peer enabled: ${target_name}"
         fi
@@ -407,21 +328,21 @@ wg_deb_delete_peer() {
     fi
     local _del_gw=$(wg_deb_db_get ".peers[$target_idx].is_gateway // false")
     local _del_lans=$(wg_deb_db_get ".peers[$target_idx].lan_subnets // empty")
-    wg_deb_db_set --argjson idx "$target_idx" 'del(.peers[$idx])'
+    if ! wg_deb_db_set --argjson idx "$target_idx" 'del(.peers[$idx])'; then
+        print_error "数据库写入失败，设备未删除"
+        pause; return 1
+    fi
 
     # 网关删除后联动更新其他 peer
     if [[ "$_del_gw" == "true" && -n "$_del_lans" && "$_del_lans" != "null" ]]; then
-        _wg_deb_update_peer_routes
+        if ! _wg_deb_update_peer_routes; then
+            print_error "联动更新客户端路由失败"
+            pause; return 1
+        fi
     fi
 
     rm -f "${WG_DEB_CLIENT_DIR}/${target_name}.conf"
-    wg_deb_rebuild_conf
-    wg_deb_regenerate_client_confs
-
-    # 重启使配置生效
-    if wg_deb_is_running; then
-        systemctl restart wg-quick@wg0 >/dev/null 2>&1
-    fi
+    wg_deb_apply_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
 
     print_success "设备 '${target_name}' 已删除"
     log_action "WireGuard(deb) peer deleted: ${target_name}"
@@ -451,7 +372,7 @@ wg_deb_show_peer_conf() {
         echo -e "  (Clash 客户端不使用 .conf 文件，请生成 Clash YAML 配置)"
         echo ""
         if confirm "是否生成 Clash/Mihomo 配置?"; then
-            wg_generate_clash_config
+            wg_deb_generate_clash_config
         fi
     else
         draw_line

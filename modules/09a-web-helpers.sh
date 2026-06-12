@@ -171,7 +171,7 @@ _safe_source_conf() {
 # Nginx 安全重载
 _nginx_reload() {
     if is_systemd; then
-        systemctl reload nginx || systemctl restart nginx
+        systemctl reload nginx
     else
         nginx -s reload 2>/dev/null || service nginx reload
     fi
@@ -222,17 +222,50 @@ _nginx_deploy_conf() {
     local domain="$1" conf_content="$2"
     local avail="/etc/nginx/sites-available/${domain}.conf"
     local enabled="/etc/nginx/sites-enabled/${domain}.conf"
-    write_file_atomic "$avail" "$conf_content"
-    ln -sf "$avail" "$enabled"
-    if nginx -t >/dev/null 2>&1; then
-        _nginx_reload
-        return 0
-    else
-        print_error "Nginx 配置测试失败！"
-        nginx -t 2>&1 | tail -5
-        rm -f "$enabled" "$avail"
-        return 1
+    local backup_avail="" backup_enabled="" old_enabled_target=""
+    local had_avail=0 had_enabled=0 enabled_was_symlink=0
+
+    if [[ -e "$avail" ]]; then
+        had_avail=1
+        backup_avail=$(mktemp "/etc/nginx/sites-available/.${domain}.conf.bak.XXXXXX") || return 1
+        cp -a "$avail" "$backup_avail" || { rm -f "$backup_avail"; return 1; }
     fi
+    if [[ -L "$enabled" ]]; then
+        had_enabled=1
+        enabled_was_symlink=1
+        old_enabled_target=$(readlink "$enabled" 2>/dev/null || true)
+    elif [[ -e "$enabled" ]]; then
+        had_enabled=1
+        backup_enabled=$(mktemp "/etc/nginx/sites-enabled/.${domain}.conf.bak.XXXXXX") || { rm -f "$backup_avail"; return 1; }
+        cp -a "$enabled" "$backup_enabled" || { rm -f "$backup_avail" "$backup_enabled"; return 1; }
+    fi
+
+    write_file_atomic "$avail" "$conf_content" || { print_error "写入 Nginx 配置失败"; rm -f "$backup_avail" "$backup_enabled"; return 1; }
+    ln -sfn "$avail" "$enabled" || { print_error "启用 Nginx 配置失败"; rm -f "$backup_avail" "$backup_enabled"; return 1; }
+
+    if nginx -t >/dev/null 2>&1 && _nginx_reload; then
+        rm -f "$backup_avail" "$backup_enabled"
+        return 0
+    fi
+
+    print_error "Nginx 配置测试或重载失败，正在恢复旧配置！"
+    nginx -t 2>&1 | tail -5
+    rm -f "$enabled"
+    if [[ "$had_enabled" -eq 1 ]]; then
+        if [[ "$enabled_was_symlink" -eq 1 && -n "$old_enabled_target" ]]; then
+            ln -s "$old_enabled_target" "$enabled"
+        elif [[ -n "$backup_enabled" && -e "$backup_enabled" ]]; then
+            mv "$backup_enabled" "$enabled"
+        fi
+    fi
+    if [[ "$had_avail" -eq 1 && -n "$backup_avail" && -e "$backup_avail" ]]; then
+        mv "$backup_avail" "$avail"
+    else
+        rm -f "$avail"
+    fi
+    nginx -t >/dev/null 2>&1 && _nginx_reload >/dev/null 2>&1 || true
+    rm -f "$backup_avail" "$backup_enabled"
+    return 1
 }
 
 web_env_check() {

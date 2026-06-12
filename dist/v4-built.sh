@@ -2,12 +2,14 @@
 
 readonly VERSION="v14.1"
 readonly SCRIPT_NAME="server-manage"
-readonly LOG_FILE="/var/log/${SCRIPT_NAME}.log"
 readonly CONFIG_FILE="/etc/${SCRIPT_NAME}.conf"
 readonly CACHE_DIR="/var/cache/${SCRIPT_NAME}"
 readonly CACHE_FILE="${CACHE_DIR}/sysinfo.cache"
 readonly CACHE_TTL=300 
 readonly CERT_HOOKS_DIR="/root/cert-hooks"
+readonly WG_SHARED_DB_DIR="/etc/wireguard/db"
+readonly WG_SHARED_DB_FILE="${WG_SHARED_DB_DIR}/wg-data.json"
+readonly WG_SHARED_ROLE_FILE="/etc/wireguard/.role"
 readonly WG_DEFAULT_PORT=50000
 readonly WG_MTU_DIRECT=1420
 PLATFORM="debian"
@@ -23,9 +25,15 @@ detect_platform() {
         esac
     elif command -v opkg &>/dev/null; then
         PLATFORM="openwrt"
-    fi
+fi
 }
 detect_platform
+
+if [[ "$PLATFORM" == "openwrt" ]]; then
+    readonly LOG_FILE="/root/.server-manage/log/${SCRIPT_NAME}.log"
+else
+    readonly LOG_FILE="/var/log/${SCRIPT_NAME}.log"
+fi
 
 feature_blocked() {
     echo -e "${C_YELLOW}[!] 功能不可用: $1${C_RESET}"
@@ -57,6 +65,7 @@ DOCKER_PROXY_CONF="${DOCKER_PROXY_DIR}/http-proxy.conf"
 # 注意：$CONFIG_FILE 的安全加载在 01-utils.sh 末尾完成（需依赖 validate_conf_file）
 
 CURRENT_SSH_PORT=""
+CURRENT_SSH_PORTS=""
 APT_UPDATED=0
 
 CACHED_IPV4=""
@@ -104,9 +113,12 @@ print_title() {
 print_info() { echo -e "${C_BLUE}[i]${C_RESET} $1"; }
 print_guide() { echo -e "${C_GREEN}>>${C_RESET} $1"; }
 print_success() { echo -e "${C_GREEN}[✓]${C_RESET} $1"; }
-print_warn() { echo -e "${C_YELLOW}[!]${C_RESET} $1"; }
-print_error() { echo -e "${C_RED}[✗]${C_RESET} $1"; }
+print_warn() { echo -e "${C_YELLOW}[!]${C_RESET} $1" >&2; }
+print_error() { echo -e "${C_RED}[✗]${C_RESET} $1" >&2; }
 log_action() {
+    local log_dir
+    log_dir=$(dirname "$LOG_FILE")
+    [[ -d "$log_dir" ]] || mkdir -p "$log_dir" 2>/dev/null || return 0
     # 日志轮转: 超过 5MB 自动归档
     if [[ -f "$LOG_FILE" ]]; then
         local log_size
@@ -138,24 +150,65 @@ pause() {
     echo ""
 }
 
+SERVER_MANAGE_TMPFILES=()
+
+_tmp_register() {
+    local tmpfile="${1:-}"
+    [[ -n "$tmpfile" ]] || return 0
+    SERVER_MANAGE_TMPFILES+=("$tmpfile")
+}
+
+_tmp_unregister() {
+    local remove="${1:-}" tmpfile
+    local kept=()
+    [[ -n "$remove" ]] || return 0
+    for tmpfile in "${SERVER_MANAGE_TMPFILES[@]}"; do
+        [[ "$tmpfile" == "$remove" ]] || kept+=("$tmpfile")
+    done
+    SERVER_MANAGE_TMPFILES=("${kept[@]}")
+}
+
+_cleanup_tmpfiles() {
+    local tmpfile
+    for tmpfile in "${SERVER_MANAGE_TMPFILES[@]}"; do
+        # 仅清理本脚本登记过、且文件名符合本脚本临时文件模式的路径。
+        case "$tmpfile" in
+            */.tmp.server-manage.*|*/.bak.server-manage.*|/etc/resolv.conf.tmp.*)
+                rm -f -- "$tmpfile" 2>/dev/null || true
+                ;;
+        esac
+    done
+    SERVER_MANAGE_TMPFILES=()
+    # 兼容旧版本可能残留在 /etc 下的同名前缀临时文件。
+    rm -f /etc/.tmp.server-manage.* 2>/dev/null || true
+}
+
 write_file_atomic() {
-    local filepath="$1" content="$2" tmpfile
-    mkdir -p "$(dirname "$filepath")"
-    tmpfile=$(mktemp "$(dirname "$filepath")/.tmp.server-manage.XXXXXX")
-    printf "%s\n" "$content" > "$tmpfile"
+    local filepath="$1" content="$2" tmpfile dir
+    dir="$(dirname "$filepath")"
+    mkdir -p "$dir" || return 1
+    tmpfile=$(mktemp "${dir}/.tmp.server-manage.XXXXXX") || return 1
+    _tmp_register "$tmpfile"
+    if ! printf "%s\n" "$content" > "$tmpfile"; then
+        rm -f -- "$tmpfile" 2>/dev/null || true
+        _tmp_unregister "$tmpfile"
+        return 1
+    fi
     if [[ -f "$filepath" ]]; then
         chmod --reference="$filepath" "$tmpfile" 2>/dev/null || true
         chown --reference="$filepath" "$tmpfile" 2>/dev/null || true
     fi
     if ! mv "$tmpfile" "$filepath"; then
-        rm -f "$tmpfile"
+        rm -f -- "$tmpfile" 2>/dev/null || true
+        _tmp_unregister "$tmpfile"
         return 1
     fi
+    _tmp_unregister "$tmpfile"
+    return 0
 }
 
 handle_interrupt() {
-    # 仅清理本脚本创建的临时文件，避免误删其他服务的文件
-    rm -f /etc/.tmp.server-manage.* 2>/dev/null
+    _cleanup_tmpfiles
     echo ""
     print_warn "操作已取消 (用户中断)。"
     exit 130
@@ -207,7 +260,17 @@ _require_cmd() {
 
 # 统一重启 sshd 的工具函数（兼容 sshd/ssh 两种服务名）
 _restart_sshd() {
-    is_systemd && { systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; return $?; }
+    if is_systemd; then
+        # Ubuntu 22.10+ 可能由 ssh.socket/sshd.socket 做 socket activation，重启服务本身不会改监听端口。
+        local socket_unit
+        if socket_unit=$(_ssh_socket_unit); then
+            systemctl restart "$socket_unit" 2>/dev/null || return 1
+            systemctl try-restart sshd 2>/dev/null || systemctl try-restart ssh 2>/dev/null || true
+            return 0
+        fi
+        systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
+        return $?
+    fi
     return 1
 }
 
@@ -216,6 +279,98 @@ is_systemd() {
     [[ -d /run/systemd/system ]] || return 1
     [[ "$(ps -p 1 -o comm= 2>/dev/null)" == "systemd" ]] || return 1
     return 0
+}
+
+_ssh_socket_unit() {
+    is_systemd || return 1
+    local unit
+    for unit in ssh.socket sshd.socket; do
+        systemctl is-active --quiet "$unit" 2>/dev/null && { echo "$unit"; return 0; }
+        systemctl is-enabled --quiet "$unit" 2>/dev/null && { echo "$unit"; return 0; }
+    done
+    return 1
+}
+
+_ssh_socket_activation_active() {
+    _ssh_socket_unit >/dev/null
+}
+
+_ssh_port_is_listening() {
+    local port="$1"
+    validate_port "$port" || return 1
+    if command_exists ss; then
+        ss -H -tlpn 2>/dev/null | awk -v p="$port" '
+            { addr=$4; if (addr ~ (":" p "$")) found=1 }
+            END { exit found ? 0 : 1 }
+        '
+        return $?
+    fi
+    if command_exists netstat; then
+        netstat -tlpn 2>/dev/null | awk -v p="$port" '
+            NR > 2 { addr=$4; if (addr ~ (":" p "$")) found=1 }
+            END { exit found ? 0 : 1 }
+        '
+        return $?
+    fi
+    return 1
+}
+
+_sshd_effective_value() {
+    local key="${1,,}"
+    command_exists sshd || return 1
+    sshd -T 2>/dev/null | awk -v k="$key" 'tolower($1)==k {print tolower($2); exit}'
+}
+
+_ssh_authorized_keys_file_has_key() {
+    local file="$1"
+    [[ -f "$file" && -s "$file" ]] || return 1
+    grep -Eq '^[[:space:]]*(ssh-(rsa|ed25519|dss)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256))[[:space:]]+[A-Za-z0-9+/=]+' "$file" 2>/dev/null
+}
+
+_ssh_authorized_keys_available() {
+    local root_home="${SSH_ROOT_HOME:-/root}"
+    local passwd_file="${SSH_PASSWD_FILE:-/etc/passwd}"
+    _ssh_authorized_keys_file_has_key "${root_home}/.ssh/authorized_keys" && return 0
+    [[ -f "$passwd_file" ]] || return 1
+    local user _x uid gid gecos home shell
+    while IFS=: read -r user _x uid gid gecos home shell; do
+        [[ -z "$user" || "$user" == "root" ]] && continue
+        [[ -z "$home" || "$shell" =~ (nologin|false)$ ]] && continue
+        _ssh_authorized_keys_file_has_key "${home}/.ssh/authorized_keys" && return 0
+    done < "$passwd_file"
+    return 1
+}
+
+_ssh_non_root_sudo_available() {
+    local passwd_file="${SSH_PASSWD_FILE:-/etc/passwd}"
+    local group_file="${SSH_GROUP_FILE:-/etc/group}"
+    [[ -f "$passwd_file" && -f "$group_file" ]] || return 1
+    local sudo_users=" " sudo_gids=" " group _x gid members member
+    while IFS=: read -r group _x gid members; do
+        case "$group" in
+            sudo|wheel)
+                sudo_gids+="${gid} "
+                IFS=',' read -ra _sudo_member_arr <<< "$members"
+                for member in "${_sudo_member_arr[@]}"; do
+                    [[ -n "$member" ]] && sudo_users+="${member} "
+                done
+                ;;
+        esac
+    done < "$group_file"
+    local user uid gecos home shell
+    while IFS=: read -r user _x uid gid gecos home shell; do
+        [[ -z "$user" || "$user" == "root" ]] && continue
+        [[ -z "$shell" || "$shell" =~ (nologin|false)$ ]] && continue
+        if [[ "$sudo_users" == *" ${user} "* || "$sudo_gids" == *" ${gid} "* ]]; then
+            return 0
+        fi
+    done < "$passwd_file"
+    return 1
+}
+
+ufw_is_active() {
+    command_exists ufw || return 1
+    LANG=C ufw status 2>/dev/null | grep -qi 'Status: active'
 }
 
 # 统一设置 sshd_config 的某个 directive：命中则替换，未命中则追加
@@ -233,21 +388,61 @@ _sshd_set_directive() {
             confirm "继续修改 ${file}（drop-in 可能覆盖此设置）?" || return 1
         fi
     fi
-    if grep -qE "^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+" "$file"; then
-        sed -i -E "s|^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+.*|${key} ${value}|" "$file"
-    else
-        printf '\n# server-manage: appended %s\n%s %s\n' "$key" "$key" "$value" >> "$file"
+
+    local tmpfile
+    tmpfile=$(mktemp "$(dirname "$file")/.tmp.server-manage.sshd-directive.XXXXXX") || return 1
+    _tmp_register "$tmpfile"
+    awk -v key="$key" -v value="$value" '
+        BEGIN { done=0; inserted=0; key_l=tolower(key) }
+        /^[[:space:]]*Match([[:space:]]|$)/ {
+            if (!done && !inserted) {
+                print key " " value
+                done=1
+                inserted=1
+            }
+            print
+            in_match=1
+            next
+        }
+        !in_match && tolower($0) ~ "^[[:space:]]*#?[[:space:]]*" key_l "[[:space:]]+" {
+            if (!done) {
+                print key " " value
+                done=1
+            }
+            next
+        }
+        { print }
+        END {
+            if (!done) {
+                print ""
+                print "# server-manage: appended " key
+                print key " " value
+            }
+        }
+    ' "$file" > "$tmpfile" || { rm -f "$tmpfile"; _tmp_unregister "$tmpfile"; return 1; }
+    chmod --reference="$file" "$tmpfile" 2>/dev/null || true
+    chown --reference="$file" "$tmpfile" 2>/dev/null || true
+    if ! mv "$tmpfile" "$file"; then
+        rm -f "$tmpfile" 2>/dev/null || true
+        _tmp_unregister "$tmpfile"
+        return 1
     fi
+    _tmp_unregister "$tmpfile"
 }
 
 refresh_ssh_port() {
-    local p=""
+    local p="" ports=() seen=" "
     # 优先用 sshd -T 解析有效配置（覆盖 /etc/ssh/sshd_config + sshd_config.d/*.conf 全部 drop-in）
     if command_exists sshd; then
-        p=$(sshd -T 2>/dev/null | awk 'tolower($1)=="port"{print $2; exit}')
+        while IFS= read -r p; do
+            if validate_port "$p" && [[ "$seen" != *" $p "* ]]; then
+                ports+=("$p")
+                seen+="$p "
+            fi
+        done < <(sshd -T 2>/dev/null | awk 'tolower($1)=="port"{print $2}')
     fi
     # 回退：grep 主配 + drop-in（按字母序，后者优先）
-    if [[ ! "$p" =~ ^[0-9]+$ ]]; then
+    if [[ ${#ports[@]} -eq 0 ]]; then
         local files=("$SSHD_CONFIG") f
         if [[ -d /etc/ssh/sshd_config.d ]]; then
             while IFS= read -r f; do
@@ -257,20 +452,30 @@ refresh_ssh_port() {
         for f in "${files[@]}"; do
             [[ -f "$f" ]] || continue
             local cand
-            cand=$(grep -iE "^\s*Port\s+" "$f" 2>/dev/null | tail -n 1 | awk '{print $2}')
-            [[ "$cand" =~ ^[0-9]+$ ]] && p="$cand"
+            while IFS= read -r cand; do
+                if validate_port "$cand" && [[ "$seen" != *" $cand "* ]]; then
+                    ports+=("$cand")
+                    seen+="$cand "
+                fi
+            done < <(grep -iE "^\s*Port\s+" "$f" 2>/dev/null | awk '{print $2}')
         done
     fi
-    if [[ "$p" =~ ^[0-9]+$ ]]; then
-        CURRENT_SSH_PORT="$p"
+    if [[ ${#ports[@]} -gt 0 ]]; then
+        CURRENT_SSH_PORT="${ports[0]}"
+        CURRENT_SSH_PORTS="${ports[*]}"
     else
         CURRENT_SSH_PORT=$DEFAULT_SSH_PORT
+        CURRENT_SSH_PORTS=$DEFAULT_SSH_PORT
     fi
 }
 
 confirm() {
     local prompt="$1"
     local reply
+    if [[ ! -t 0 ]]; then
+        print_warn "非交互终端无法确认: ${prompt}"
+        return 1
+    fi
     while true; do
         read -e -r -p "$(echo -e "${C_YELLOW}${prompt} [Y/n]:${C_RESET} ")" reply
         case "${reply,,}" in
@@ -286,6 +491,18 @@ validate_port() {
     [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
 }
 
+validate_dns_label() {
+    local label="${1:-}"
+    [[ "$label" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
+}
+
+validate_host() {
+    local host="${1:-}"
+    [[ -n "$host" && ${#host} -le 253 ]] || return 1
+    validate_ip "$host" && return 0
+    [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$ ]]
+}
+
 validate_ip() {
     local ip=$1
     # IPv4 验证
@@ -299,13 +516,79 @@ validate_ip() {
         done
         return 0
     fi
-    # IPv6 验证：必须包含冒号，仅允许十六进制和冒号，长度合理，不允许连续3个冒号
+    # IPv6 验证：必须包含冒号，仅允许十六进制和冒号，长度合理；最多允许一个 :: 压缩段
     if [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$ip" == *:* ]]; then
         [[ ${#ip} -le 39 ]] || return 1
         [[ ! "$ip" == *:::* ]] || return 1
+        local double_colon_count
+        double_colon_count=$(grep -o '::' <<< "$ip" | wc -l | tr -d ' ')
+        [[ "$double_colon_count" -le 1 ]] || return 1
+        IFS=':' read -ra _ipv6_parts <<< "$ip"
+        local part nonempty=0
+        for part in "${_ipv6_parts[@]}"; do
+            [[ -z "$part" ]] && continue
+            [[ ${#part} -le 4 ]] || return 1
+            ((nonempty++)) || true
+        done
+        if [[ "$double_colon_count" -eq 1 ]]; then
+            [[ "$nonempty" -le 7 ]] || return 1
+        else
+            [[ "$nonempty" -eq 8 ]] || return 1
+        fi
         return 0
     fi
     return 1
+}
+
+validate_cidr() {
+    local cidr="${1:-}" ip prefix
+    [[ "$cidr" == */* ]] || return 1
+    ip="${cidr%/*}"
+    prefix="${cidr##*/}"
+    [[ -n "$ip" && "$prefix" =~ ^[0-9]+$ ]] || return 1
+    validate_ip "$ip" || return 1
+    if [[ "$ip" == *:* ]]; then
+        (( prefix >= 0 && prefix <= 128 ))
+    else
+        (( prefix >= 0 && prefix <= 32 ))
+    fi
+}
+
+validate_cidr_list() {
+    local list="${1:-}" item
+    [[ -n "$list" && "$list" != "null" ]] || return 0
+    local IFS=','
+    local -a _cidr_items
+    read -ra _cidr_items <<< "$list"
+    for item in "${_cidr_items[@]}"; do
+        item=$(echo "$item" | xargs)
+        [[ -n "$item" ]] || return 1
+        validate_cidr "$item" || return 1
+    done
+    return 0
+}
+
+validate_wg_allowed_ips() {
+    local list="${1:-}" item
+    [[ -n "$list" && "$list" != "null" ]] || return 1
+    local IFS=','
+    local -a _allowed_items
+    read -ra _allowed_items <<< "$list"
+    for item in "${_allowed_items[@]}"; do
+        item=$(echo "$item" | xargs)
+        [[ -n "$item" ]] || return 1
+        if [[ "$item" == */* ]]; then
+            validate_cidr "$item" || return 1
+        else
+            validate_ip "$item" || return 1
+        fi
+    done
+    return 0
+}
+
+validate_wg_key() {
+    local key="${1:-}"
+    [[ "$key" =~ ^[A-Za-z0-9+/]{43}=$ ]]
 }
 
 validate_domain() {
@@ -401,8 +684,12 @@ cron_remove_job() {
     local pattern="$1"
     local cron_tmp
     cron_tmp=$(mktemp) || return 1
-    crontab -l 2>/dev/null | grep -v "$pattern" > "$cron_tmp" || true
-    crontab "$cron_tmp" 2>/dev/null
+    crontab -l 2>/dev/null | grep -Fv -- "$pattern" > "$cron_tmp" || true
+    if ! crontab "$cron_tmp" 2>/dev/null; then
+        print_error "更新 crontab 失败"
+        rm -f "$cron_tmp"
+        return 1
+    fi
     rm -f "$cron_tmp"
 }
 
@@ -410,9 +697,13 @@ cron_add_job() {
     local pattern="$1" line="$2"
     local cron_tmp
     cron_tmp=$(mktemp) || return 1
-    crontab -l 2>/dev/null | grep -v "$pattern" > "$cron_tmp" || true
+    crontab -l 2>/dev/null | grep -Fv -- "$pattern" > "$cron_tmp" || true
     echo "$line" >> "$cron_tmp"
-    crontab "$cron_tmp" 2>/dev/null
+    if ! crontab "$cron_tmp" 2>/dev/null; then
+        print_error "更新 crontab 失败"
+        rm -f "$cron_tmp"
+        return 1
+    fi
     rm -f "$cron_tmp"
 }
 
@@ -485,13 +776,9 @@ get_public_ipv6() {
 ddns_rebuild_cron() {
     cron_remove_job "ddns-update.sh"
     if [[ -d "$DDNS_CONFIG_DIR" ]] && ls "$DDNS_CONFIG_DIR"/*.conf &>/dev/null 2>&1; then
-        local min=59
-        for conf in "$DDNS_CONFIG_DIR"/*.conf; do
-            [[ -f "$conf" ]] || continue
-            local iv=$(grep '^DDNS_INTERVAL=' "$conf" | cut -d'"' -f2)
-            [[ -n "$iv" && "$iv" =~ ^[0-9]+$ && "$iv" -ge 1 && "$iv" -le 59 && "$iv" -lt "$min" ]] && min=$iv
-        done
-        cron_add_job "ddns-update.sh" "*/$min * * * * $DDNS_UPDATE_SCRIPT >/dev/null 2>&1"
+        # cron 的 */59 语义是每小时第 0/59 分钟触发（中间会出现 1 分钟间隔），
+        # 因此统一每分钟唤醒，再由 ddns-update.sh 按每份配置的 DDNS_INTERVAL 节流。
+        cron_add_job "ddns-update.sh" "* * * * * $DDNS_UPDATE_SCRIPT >/dev/null 2>&1"
     fi
 }
 
@@ -509,6 +796,11 @@ else
 fi
 DDNS_CONFIG_DIR="/etc/ddns"
 DDNS_LOG="/var/log/ddns.log"
+DDNS_STAMP_DIR="/var/lib/ddns"
+mkdir -p "$DDNS_STAMP_DIR" 2>/dev/null || {
+    DDNS_STAMP_DIR="/tmp/ddns-state"
+    mkdir -p "$DDNS_STAMP_DIR" 2>/dev/null || true
+}
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$DDNS_LOG"; }
 
 extract_ipv4() {
@@ -550,9 +842,14 @@ get_ip() {
 }
 
 update_cf() {
-    local domain=$1 rt=$2 ip=$3 token=$4 zone=$5 proxied=$6
-    local resp=$(curl -s "https://api.cloudflare.com/client/v4/zones/$zone/dns_records?type=$rt&name=$domain" \
+    local domain=$1 rt=$2 ip=$3 token=$4 zone=$5 proxied=${6:-false}
+    [[ "$proxied" == "true" || "$proxied" == "false" ]] || proxied="false"
+    local resp=$(curl -s --connect-timeout 10 --max-time 30 "https://api.cloudflare.com/client/v4/zones/$zone/dns_records?type=$rt&name=$domain" \
         -H "Authorization: Bearer $token" -H "Content-Type: application/json")
+    if [[ "$(echo "$resp" | jq -r ".success // false" 2>/dev/null)" != "true" ]]; then
+        log "[$domain] $rt lookup failed"
+        return 1
+    fi
     local rid=$(echo "$resp" | jq -r '.result[0].id // empty')
     local dns_ip=$(echo "$resp" | jq -r '.result[0].content // empty')
     [[ "$ip" == "$dns_ip" ]] && return 0
@@ -560,7 +857,7 @@ update_cf() {
     local method="POST" url="https://api.cloudflare.com/client/v4/zones/$zone/dns_records"
     [[ -n "$rid" ]] && { method="PUT"; url="$url/$rid"; }
     
-    resp=$(curl -s -X $method "$url" -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+    resp=$(curl -s --connect-timeout 10 --max-time 30 -X "$method" "$url" -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
         --data "{\"type\":\"$rt\",\"name\":\"$domain\",\"content\":\"$ip\",\"ttl\":1,\"proxied\":$proxied}")
     [[ "$(echo "$resp" | jq -r '.success')" == "true" ]] && { log "[$domain] $rt: $dns_ip -> $ip"; return 0; }
     log "[$domain] $rt update failed"; return 1
@@ -608,12 +905,33 @@ parse_ddns_conf() {
         log "必填字段缺失，跳过: $conf"
         return 1
     }
+    DDNS_IPV4=${DDNS_IPV4:-false}
+    DDNS_IPV6=${DDNS_IPV6:-false}
+    DDNS_PROXIED=${DDNS_PROXIED:-false}
+    [[ "$DDNS_IPV4" == "true" || "$DDNS_IPV4" == "false" ]] || DDNS_IPV4="false"
+    [[ "$DDNS_IPV6" == "true" || "$DDNS_IPV6" == "false" ]] || DDNS_IPV6="false"
+    [[ "$DDNS_PROXIED" == "true" || "$DDNS_PROXIED" == "false" ]] || DDNS_PROXIED="false"
+    return 0
+}
+
+ddns_should_run() {
+    local conf="$1" interval="${DDNS_INTERVAL:-5}" now last="" stamp_name stamp
+    [[ "$interval" =~ ^[0-9]+$ && "$interval" -ge 1 && "$interval" -le 59 ]] || interval=5
+    stamp_name=$(basename "$conf" | sed 's/[^A-Za-z0-9_.-]/_/g')
+    stamp="$DDNS_STAMP_DIR/${stamp_name}.stamp"
+    now=$(date +%s)
+    [[ -f "$stamp" ]] && read -r last < "$stamp" || true
+    if [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < interval * 60 )); then
+        return 1
+    fi
+    printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
     return 0
 }
 
 for conf in "$DDNS_CONFIG_DIR"/*.conf; do
     [ -f "$conf" ] || continue
     parse_ddns_conf "$conf" || continue
+    ddns_should_run "$conf" || continue
     [[ "$DDNS_IPV4" == "true" ]] && { ip=$(get_ip 4); [[ -n "$ip" ]] && update_cf "$DDNS_DOMAIN" A "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED"; }
     [[ "$DDNS_IPV6" == "true" ]] && { ip=$(get_ip 6); [[ -n "$ip" ]] && update_cf "$DDNS_DOMAIN" AAAA "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED"; }
 done
@@ -634,15 +952,14 @@ ddns_setup() {
         interval=5
     fi
     mkdir -p "$DDNS_CONFIG_DIR"
-    cat > "$DDNS_CONFIG_DIR/${domain}.conf" << EOF
-DDNS_DOMAIN="$domain"
-DDNS_TOKEN="$token"
-DDNS_ZONE_ID="$zone_id"
-DDNS_IPV4="$ipv4"
-DDNS_IPV6="$ipv6"
-DDNS_PROXIED="$proxied"
-DDNS_INTERVAL="$interval"
-EOF
+    local ddns_conf_content="DDNS_DOMAIN=\"$domain\"
+DDNS_TOKEN=\"$token\"
+DDNS_ZONE_ID=\"$zone_id\"
+DDNS_IPV4=\"$ipv4\"
+DDNS_IPV6=\"$ipv6\"
+DDNS_PROXIED=\"$proxied\"
+DDNS_INTERVAL=\"$interval\""
+    write_file_atomic "$DDNS_CONFIG_DIR/${domain}.conf" "$ddns_conf_content" || { print_error "DDNS 配置写入失败"; return 1; }
     chmod 600 "$DDNS_CONFIG_DIR/${domain}.conf"
     ddns_create_script
     ddns_rebuild_cron
@@ -658,15 +975,14 @@ ddns_setup_noninteractive() {
         interval=5
     fi
     mkdir -p "$DDNS_CONFIG_DIR"
-    cat > "$DDNS_CONFIG_DIR/${domain}.conf" << EOF
-DDNS_DOMAIN="$domain"
-DDNS_TOKEN="$token"
-DDNS_ZONE_ID="$zone_id"
-DDNS_IPV4="$ipv4"
-DDNS_IPV6="$ipv6"
-DDNS_PROXIED="$proxied"
-DDNS_INTERVAL="$interval"
-EOF
+    local ddns_conf_content="DDNS_DOMAIN=\"$domain\"
+DDNS_TOKEN=\"$token\"
+DDNS_ZONE_ID=\"$zone_id\"
+DDNS_IPV4=\"$ipv4\"
+DDNS_IPV6=\"$ipv6\"
+DDNS_PROXIED=\"$proxied\"
+DDNS_INTERVAL=\"$interval\""
+    write_file_atomic "$DDNS_CONFIG_DIR/${domain}.conf" "$ddns_conf_content" || { print_error "DDNS 配置写入失败"; return 1; }
     chmod 600 "$DDNS_CONFIG_DIR/${domain}.conf"
     ddns_create_script
     ddns_rebuild_cron
@@ -681,9 +997,8 @@ ddns_list() {
     draw_line
     for conf in "$DDNS_CONFIG_DIR"/*.conf; do
         [[ -f "$conf" ]] || continue
-        validate_conf_file "$conf" || continue
         DDNS_DOMAIN="" DDNS_TOKEN="" DDNS_ZONE_ID="" DDNS_IPV4="" DDNS_IPV6="" DDNS_PROXIED="" DDNS_INTERVAL=""
-        source "$conf"
+        parse_ddns_conf "$conf" || continue
         printf "%-30s %-6s %-6s %-8s %s\n" "$DDNS_DOMAIN" \
             "$([[ "$DDNS_IPV4" == "true" ]] && echo "✓" || echo "-")" \
             "$([[ "$DDNS_IPV6" == "true" ]] && echo "✓" || echo "-")" \
@@ -701,9 +1016,9 @@ ddns_delete() {
     local i=1 domains=() files=()
     for conf in "$DDNS_CONFIG_DIR"/*.conf; do
         [[ -f "$conf" ]] || continue
-        validate_conf_file "$conf" || continue
         DDNS_DOMAIN="" DDNS_TOKEN="" DDNS_ZONE_ID="" DDNS_IPV4="" DDNS_IPV6="" DDNS_PROXIED="" DDNS_INTERVAL=""
-        source "$conf"; domains+=("$DDNS_DOMAIN"); files+=("$conf")
+        parse_ddns_conf "$conf" || continue
+        domains+=("$DDNS_DOMAIN"); files+=("$conf")
         echo "$i. $DDNS_DOMAIN"; ((i++))
     done
     echo "0. 返回"
@@ -750,6 +1065,61 @@ load_cache() {
     return 1
 }
 
+_sysinfo_conf_escape() {
+    local value="${1:-}"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//\$/\\$}"
+    value="${value//\`/\\\`}"
+    printf '%s' "$value"
+}
+
+_network_cache_defaults() {
+    CACHED_IPV4="${CACHED_IPV4:-N/A}"
+    CACHED_IPV6="${CACHED_IPV6:-未配置}"
+    CACHED_ISP="${CACHED_ISP:-N/A}"
+    CACHED_LOCATION="${CACHED_LOCATION:-N/A}"
+}
+
+load_cache_stale() {
+    [[ -f "$CACHE_FILE" ]] || return 1
+    validate_conf_file "$CACHE_FILE" 2>/dev/null || return 1
+    source "$CACHE_FILE" 2>/dev/null || return 1
+    _network_cache_defaults
+    return 0
+}
+
+_network_cache_refresh_background() {
+    mkdir -p "$CACHE_DIR" 2>/dev/null || return 0
+    local lock_file="${CACHE_DIR}/sysinfo.refresh.lock"
+    if command_exists flock; then
+        (
+            exec 201>"$lock_file" || exit 0
+            flock -n 201 || exit 0
+            refresh_network_cache
+        ) >/dev/null 2>&1 &
+    else
+        (
+            mkdir "${lock_file}.d" 2>/dev/null || exit 0
+            trap 'rmdir "${lock_file}.d" 2>/dev/null || true' EXIT
+            refresh_network_cache
+        ) >/dev/null 2>&1 &
+    fi
+}
+
+ensure_network_cache_async() {
+    if load_cache; then
+        return 0
+    fi
+    if load_cache_stale; then
+        _network_cache_refresh_background
+        return 0
+    fi
+    _network_cache_defaults
+    _network_cache_refresh_background
+    return 0
+}
+
 refresh_network_cache() {
     CACHED_IPV4=$(get_public_ipv4 || echo "N/A")
     CACHED_IPV6=$(get_public_ipv6 || echo "")
@@ -761,13 +1131,16 @@ refresh_network_cache() {
     local city=$(echo "$ipinfo" | grep -o '"city"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
     CACHED_LOCATION="${country:-N/A} ${city:-}"
     mkdir -p "$CACHE_DIR"
-    cat > "$CACHE_FILE" << EOF
-CACHED_IPV4="$CACHED_IPV4"
-CACHED_IPV6="$CACHED_IPV6"
-CACHED_ISP="$CACHED_ISP"
-CACHED_LOCATION="$CACHED_LOCATION"
+    local cache_content
+    cache_content=$(cat << EOF
+CACHED_IPV4="$(_sysinfo_conf_escape "$CACHED_IPV4")"
+CACHED_IPV6="$(_sysinfo_conf_escape "$CACHED_IPV6")"
+CACHED_ISP="$(_sysinfo_conf_escape "$CACHED_ISP")"
+CACHED_LOCATION="$(_sysinfo_conf_escape "$CACHED_LOCATION")"
 EOF
-    chmod 600 "$CACHE_FILE"
+)
+    write_file_atomic "$CACHE_FILE" "$cache_content" || return 1
+    chmod 600 "$CACHE_FILE" 2>/dev/null || true
 }
 get_ip_location() {
     local ip="$1"
@@ -797,8 +1170,57 @@ get_ip_location() {
     echo "查询失败"
 }
 
+_ip_location_cache_path() {
+    local ip="$1" safe_ip
+    safe_ip=$(printf '%s' "$ip" | tr -c 'A-Za-z0-9_.-' '_')
+    printf '%s/ip-location-%s.cache' "$CACHE_DIR" "$safe_ip"
+}
+
+_ip_location_refresh_background() {
+    local ip="$1" cache_file="$2" lock_file="${cache_file}.lock"
+    mkdir -p "$CACHE_DIR" 2>/dev/null || return 0
+    if command_exists flock; then
+        (
+            exec 202>"$lock_file" || exit 0
+            flock -n 202 || exit 0
+            local location
+            location=$(get_ip_location "$ip")
+            [[ -n "$location" ]] || location="查询失败"
+            write_file_atomic "$cache_file" "$location"
+        ) >/dev/null 2>&1 &
+    else
+        (
+            mkdir "${lock_file}.d" 2>/dev/null || exit 0
+            trap 'rmdir "${lock_file}.d" 2>/dev/null || true' EXIT
+            local location
+            location=$(get_ip_location "$ip")
+            [[ -n "$location" ]] || location="查询失败"
+            write_file_atomic "$cache_file" "$location"
+        ) >/dev/null 2>&1 &
+    fi
+}
+
+get_ip_location_cached() {
+    local ip="$1" cache_file file_mtime cache_age
+    if [[ "$ip" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|fe80:|::1|fc00:|fd00:) ]]; then
+        echo "本地网络"
+        return 0
+    fi
+    cache_file=$(_ip_location_cache_path "$ip")
+    if [[ -s "$cache_file" ]]; then
+        file_mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null || echo 0)
+        cache_age=$(($(date +%s) - file_mtime))
+        if [[ "$cache_age" -lt 86400 ]]; then
+            head -n 1 "$cache_file"
+            return 0
+        fi
+    fi
+    _ip_location_refresh_background "$ip" "$cache_file"
+    echo "待查询"
+}
+
 show_dual_column_sysinfo() {
-    load_cache || refresh_network_cache
+    ensure_network_cache_async
     local hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "unknown")
     local os_info=$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2 | head -c 35)
     local kernel=$(uname -r | head -c 20)
@@ -860,9 +1282,9 @@ show_dual_column_sysinfo() {
         if(d>0)printf "%d天%d时%d分",d,h,m;else if(h>0)printf "%d时%d分",h,m;else printf "%d分",m}' /proc/uptime)
     local sys_time=$(date "+%m-%d %H:%M")
     local timezone=$(timedatectl 2>/dev/null | awk '/Time zone/{print $3}' || echo "UTC")
-    local ssh_port=$(grep -E "^Port\s" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
-    [[ -z "$ssh_port" ]] && ssh_port="22"
-    local ufw_st="○"; command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active" && ufw_st="●"
+    refresh_ssh_port
+    local ssh_port="${CURRENT_SSH_PORTS:-${CURRENT_SSH_PORT:-22}}"
+    local ufw_st="○"; command -v ufw &>/dev/null && ufw_is_active && ufw_st="●"
     local f2b_st="○"; systemctl is-active fail2ban &>/dev/null && f2b_st="●"
     local nginx_st="○"; systemctl is-active nginx &>/dev/null && nginx_st="●"
     local docker_st="○"; systemctl is-active docker &>/dev/null && docker_st="●"
@@ -909,7 +1331,7 @@ show_dual_column_sysinfo() {
                 local login_time=$(echo "$login_line" | awk '{print $4, $5, $6}')
                 local login_display=""
                 if [[ -n "$login_ip" && "$login_ip" =~ ^[0-9a-f.:]+$ ]]; then
-                    local ip_loc=$(get_ip_location "$login_ip")
+                    local ip_loc=$(get_ip_location_cached "$login_ip")
                     login_display="${login_user}@${login_ip} (${ip_loc}) ${login_time}"
                 else
                     login_display="${login_user} ${login_time}"
@@ -929,14 +1351,21 @@ ufw_setup() {
         print_warn "检测到 firewalld 正在运行，请先禁用它。"
         return
     fi
+    refresh_ssh_port
+    local _ssh_port
+    for _ssh_port in $CURRENT_SSH_PORTS; do
+        validate_port "$_ssh_port" || { print_error "无法确认当前 SSH 端口，拒绝启用 UFW"; pause; return 1; }
+    done
     print_info "配置默认规则..."
     ufw default deny incoming >/dev/null
     ufw default allow outgoing >/dev/null
-    ufw allow "$CURRENT_SSH_PORT/tcp" comment "SSH-Access" >/dev/null
+    for _ssh_port in $CURRENT_SSH_PORTS; do
+        ufw allow "$_ssh_port/tcp" comment "SSH-Access" >/dev/null
+    done
     if confirm "启用 UFW 可能导致 SSH 断开(若端口配置错误)，确认启用?"; then
         echo "y" | ufw enable
         print_success "UFW 已启用。"
-        log_action "UFW enabled with SSH port $CURRENT_SSH_PORT"
+        log_action "UFW enabled with SSH ports $CURRENT_SSH_PORTS"
     fi
     pause
 }
@@ -945,7 +1374,7 @@ ufw_del() {
     _require_cmd ufw "UFW" || return
     print_title "删除 UFW 规则"
     echo -e "${C_CYAN}当前放行的端口 (已过滤 Fail2ban 规则):${C_RESET}"
-    ufw status | grep "ALLOW" | awk '{print $1}' | sort -t'/' -k1,1n -u
+    ufw status | grep "ALLOW" | grep -viE 'fail2ban|f2b' | awk '{print $1}' | sort -t'/' -k1,1n -u
     echo -e "${C_YELLOW}格式: 端口 或 端口/协议 (如 80, 443/tcp, 53/udp)${C_RESET}"
     echo -e "${C_YELLOW}多个用空格分隔，不指定协议则同时删除 tcp 和 udp${C_RESET}"
     read -e -r -p "要删除的规则: " rules
@@ -954,6 +1383,10 @@ ufw_del() {
         if [[ "$rule" =~ ^([0-9]+)(/tcp|/udp)?$ ]]; then
             local port="${BASH_REMATCH[1]}"
             local proto="${BASH_REMATCH[2]}"
+            if ! validate_port "$port"; then
+                print_error "端口无效: $port"
+                continue
+            fi
             if [[ -n "$proto" ]]; then
                 ufw delete allow "${port}${proto}" 2>/dev/null && print_success "已删除: ${port}${proto}" || print_warn "${port}${proto} 不存在"
             else
@@ -972,13 +1405,20 @@ ufw_safe_reset() {
     _require_cmd ufw "UFW" || return
     if confirm "这将重置所有规则！脚本会尝试保留当前 SSH 端口，确定吗？"; then
         print_info "正在重置..."
+        refresh_ssh_port
+        local _ssh_port
+        for _ssh_port in $CURRENT_SSH_PORTS; do
+            validate_port "$_ssh_port" || { print_error "无法确认当前 SSH 端口，拒绝重置 UFW"; pause; return 1; }
+        done
         echo "y" | ufw disable >/dev/null
         echo "y" | ufw reset >/dev/null
         ufw default deny incoming >/dev/null
         ufw default allow outgoing >/dev/null
-        ufw allow "$CURRENT_SSH_PORT/tcp" comment "SSH-Access" >/dev/null
+        for _ssh_port in $CURRENT_SSH_PORTS; do
+            ufw allow "$_ssh_port/tcp" comment "SSH-Access" >/dev/null
+        done
         echo "y" | ufw enable >/dev/null
-        print_success "重置完成。SSH 端口 $CURRENT_SSH_PORT 已放行。"
+        print_success "重置完成。SSH 端口 ${CURRENT_SSH_PORTS} 已放行。"
         log_action "UFW reset completed"
     fi
     pause
@@ -1042,7 +1482,7 @@ firewall_allow_tcp_port() {
         return 2
     fi
 
-    if ! ufw status 2>/dev/null | grep -q "Status: active"; then
+    if ! ufw_is_active; then
         print_warn "UFW 已安装但未启用 — 本脚本不会在业务流程里自动启用 UFW。"
         print_info "如需本地防火墙保护，请进入【防火墙管理】→ 安装并启用 UFW；"
         print_info "或在云厂商安全组放行 ${port}/tcp。"
@@ -1074,7 +1514,9 @@ readonly GEOIP_CONF_DIR="/etc/server-manage"
 readonly GEOIP_CONF="${GEOIP_CONF_DIR}/geoip.conf"
 readonly GEOIP_DATA_DIR="${GEOIP_CONF_DIR}/geoip-data"
 readonly GEOIP_CHAIN="GEOIP_FILTER"
+readonly GEOIP6_CHAIN="GEOIP6_FILTER"
 readonly GEOIP_URL="https://www.ipdeny.com/ipblocks/data/aggregated"
+readonly GEOIP6_URL="https://www.ipdeny.com/ipv6/ipaddresses/aggregated"
 
 _geoip_country_name() {
     case "${1^^}" in
@@ -1098,63 +1540,161 @@ _geoip_download() {
     for cc in $countries; do
         cc="${cc,,}"
         local url="${GEOIP_URL}/${cc}-aggregated.zone"
+        local url6="${GEOIP6_URL}/${cc}-aggregated.zone"
         local dest="${GEOIP_DATA_DIR}/${cc}.zone"
-        if curl -sSL --connect-timeout 10 --max-time 30 -o "$dest" "$url" 2>/dev/null; then
-            local count=$(grep -c '^[0-9]' "$dest" 2>/dev/null || echo 0)
+        local dest6="${GEOIP_DATA_DIR}/${cc}.zone6"
+        local tmp tmp6 count count6
+        tmp=$(mktemp "${GEOIP_DATA_DIR}/.${cc}.zone.XXXXXX") || { print_error "${cc^^}: 创建临时文件失败"; ((fail++)) || true; continue; }
+        if curl -fsSL --connect-timeout 10 --max-time 30 -o "$tmp" "$url" 2>/dev/null; then
+            count=$(grep -c '^[0-9]' "$tmp" 2>/dev/null)
             if [[ "$count" -gt 0 ]]; then
-                echo -e "  ${C_GREEN}✓${C_RESET} ${cc^^} ($(_geoip_country_name "$cc")): ${count} 条 IP 段"
+                mv "$tmp" "$dest"
+                echo -e "  ${C_GREEN}✓${C_RESET} ${cc^^} ($(_geoip_country_name "$cc")) IPv4: ${count} 条 IP 段"
                 ((ok++)) || true
             else
-                print_warn "${cc^^}: 文件为空或格式异常"
-                rm -f "$dest"; ((fail++)) || true
+                print_warn "${cc^^}: 文件为空或格式异常，保留旧数据"
+                rm -f "$tmp"
+                ((fail++)) || true
             fi
         else
-            print_error "${cc^^}: 下载失败"
+            print_error "${cc^^}: 下载失败，保留旧数据"
+            rm -f "$tmp"
+            ((fail++)) || true
+        fi
+        tmp6=$(mktemp "${GEOIP_DATA_DIR}/.${cc}.zone6.XXXXXX") || { print_error "${cc^^}: 创建 IPv6 临时文件失败"; ((fail++)) || true; continue; }
+        if curl -fsSL --connect-timeout 10 --max-time 30 -o "$tmp6" "$url6" 2>/dev/null; then
+            count6=$(grep -c ':' "$tmp6" 2>/dev/null)
+            if [[ "$count6" -gt 0 ]]; then
+                mv "$tmp6" "$dest6"
+                echo -e "  ${C_GREEN}✓${C_RESET} ${cc^^} ($(_geoip_country_name "$cc")) IPv6: ${count6} 条 IP 段"
+            else
+                print_warn "${cc^^}: IPv6 文件为空或格式异常，保留旧数据"
+                rm -f "$tmp6"
+                ((fail++)) || true
+            fi
+        else
+            print_error "${cc^^}: IPv6 下载失败，保留旧数据"
+            rm -f "$tmp6"
             ((fail++)) || true
         fi
     done
-    [[ $ok -gt 0 ]] && return 0 || return 1
+    [[ $fail -eq 0 ]] && [[ $ok -gt 0 ]]
 }
 
 _geoip_apply() {
     local mode="$1" countries="$2"
     local set_name="geoip_${mode}"
     local tmp_set="${set_name}_tmp"
+    local set6_name="geoip_${mode}6"
+    local tmp6_set="${set6_name}_tmp"
+    local total_entries=0 total6_entries=0
+    for cc in $countries; do
+        local f="${GEOIP_DATA_DIR}/${cc,,}.zone"
+        if [[ -f "$f" ]]; then
+            local count
+            count=$(grep -c '^[0-9]' "$f" 2>/dev/null)
+            total_entries=$((total_entries + count))
+        fi
+        local f6="${GEOIP_DATA_DIR}/${cc,,}.zone6"
+        if [[ -f "$f6" ]]; then
+            local count6
+            count6=$(grep -c ':' "$f6" 2>/dev/null)
+            total6_entries=$((total6_entries + count6))
+        fi
+    done
+    if [[ "$total_entries" -le 0 ]]; then
+        print_error "GeoIP 有效 IP 段为空，拒绝应用规则以避免清空集合。"
+        return 1
+    fi
+    if [[ -e /proc/net/if_inet6 ]] && ! command_exists ip6tables; then
+        print_error "检测到 IPv6 栈但缺少 ip6tables，拒绝应用 GeoIP 以避免 IPv6 绕过。"
+        return 1
+    fi
     # Bulk load into temp set
-    ipset create "$tmp_set" hash:net maxelem 131072 2>/dev/null || ipset flush "$tmp_set"
+    ipset create "$tmp_set" hash:net maxelem 131072 2>/dev/null || ipset flush "$tmp_set" || return 1
     for cc in $countries; do
         local f="${GEOIP_DATA_DIR}/${cc,,}.zone"
         [[ -f "$f" ]] || continue
-        sed -e '/^#/d' -e '/^$/d' -e '/^[^0-9]/d' -e "s/^/add ${tmp_set} /" "$f" | ipset restore -exist 2>/dev/null
+        if ! sed -e '/^#/d' -e '/^$/d' -e '/^[^0-9]/d' -e "s/^/add ${tmp_set} /" "$f" | ipset restore -exist 2>/dev/null; then
+            print_error "GeoIP 写入 ipset 失败: ${cc}"
+            ipset destroy "$tmp_set" 2>/dev/null || true
+            return 1
+        fi
     done
     # Atomic swap
     ipset create "$set_name" hash:net maxelem 131072 2>/dev/null || true
-    ipset swap "$tmp_set" "$set_name"
+    if ! ipset swap "$tmp_set" "$set_name"; then
+        print_error "GeoIP ipset swap 失败，保留旧集合。"
+        ipset destroy "$tmp_set" 2>/dev/null || true
+        return 1
+    fi
     ipset destroy "$tmp_set" 2>/dev/null || true
+    if command_exists ip6tables; then
+        ipset create "$tmp6_set" hash:net family inet6 maxelem 131072 2>/dev/null || ipset flush "$tmp6_set" || return 1
+        for cc in $countries; do
+            local f6="${GEOIP_DATA_DIR}/${cc,,}.zone6"
+            [[ -f "$f6" ]] || continue
+            if ! sed -e '/^#/d' -e '/^$/d' -e '/:/!d' -e "s/^/add ${tmp6_set} /" "$f6" | ipset restore -exist 2>/dev/null; then
+                print_error "GeoIP 写入 IPv6 ipset 失败: ${cc}"
+                ipset destroy "$tmp6_set" 2>/dev/null || true
+                return 1
+            fi
+        done
+        ipset create "$set6_name" hash:net family inet6 maxelem 131072 2>/dev/null || true
+        if ! ipset swap "$tmp6_set" "$set6_name"; then
+            print_error "GeoIP IPv6 ipset swap 失败，保留旧集合。"
+            ipset destroy "$tmp6_set" 2>/dev/null || true
+            return 1
+        fi
+        ipset destroy "$tmp6_set" 2>/dev/null || true
+        if [[ "$total6_entries" -le 0 ]]; then
+            print_warn "GeoIP IPv6 数据为空；白名单模式将默认拦截公网 IPv6。"
+        fi
+    fi
     # Build iptables chain
-    iptables -N "$GEOIP_CHAIN" 2>/dev/null || iptables -F "$GEOIP_CHAIN"
-    iptables -A "$GEOIP_CHAIN" -i lo -j RETURN
-    iptables -A "$GEOIP_CHAIN" -s 127.0.0.0/8 -j RETURN
-    iptables -A "$GEOIP_CHAIN" -s 10.0.0.0/8 -j RETURN
-    iptables -A "$GEOIP_CHAIN" -s 172.16.0.0/12 -j RETURN
-    iptables -A "$GEOIP_CHAIN" -s 192.168.0.0/16 -j RETURN
-    iptables -A "$GEOIP_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+    iptables -N "$GEOIP_CHAIN" 2>/dev/null || iptables -F "$GEOIP_CHAIN" || return 1
+    iptables -A "$GEOIP_CHAIN" -i lo -j RETURN || return 1
+    iptables -A "$GEOIP_CHAIN" -s 127.0.0.0/8 -j RETURN || return 1
+    iptables -A "$GEOIP_CHAIN" -s 10.0.0.0/8 -j RETURN || return 1
+    iptables -A "$GEOIP_CHAIN" -s 172.16.0.0/12 -j RETURN || return 1
+    iptables -A "$GEOIP_CHAIN" -s 192.168.0.0/16 -j RETURN || return 1
+    iptables -A "$GEOIP_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN || return 1
     if [[ "$mode" == "whitelist" ]]; then
-        iptables -A "$GEOIP_CHAIN" -m set --match-set "$set_name" src -j RETURN
-        iptables -A "$GEOIP_CHAIN" -j DROP
+        iptables -A "$GEOIP_CHAIN" -m set --match-set "$set_name" src -j RETURN || return 1
+        iptables -A "$GEOIP_CHAIN" -j DROP || return 1
     else
-        iptables -A "$GEOIP_CHAIN" -m set --match-set "$set_name" src -j DROP
+        iptables -A "$GEOIP_CHAIN" -m set --match-set "$set_name" src -j DROP || return 1
     fi
     # Insert into INPUT chain at position 1 (before UFW)
-    iptables -C INPUT -j "$GEOIP_CHAIN" 2>/dev/null || iptables -I INPUT 1 -j "$GEOIP_CHAIN"
+    iptables -C INPUT -j "$GEOIP_CHAIN" 2>/dev/null || iptables -I INPUT 1 -j "$GEOIP_CHAIN" || return 1
+    if command_exists ip6tables; then
+        ip6tables -N "$GEOIP6_CHAIN" 2>/dev/null || ip6tables -F "$GEOIP6_CHAIN" || return 1
+        ip6tables -A "$GEOIP6_CHAIN" -i lo -j RETURN || return 1
+        ip6tables -A "$GEOIP6_CHAIN" -s ::1/128 -j RETURN || return 1
+        ip6tables -A "$GEOIP6_CHAIN" -s fc00::/7 -j RETURN || return 1
+        ip6tables -A "$GEOIP6_CHAIN" -s fe80::/10 -j RETURN || return 1
+        ip6tables -A "$GEOIP6_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN || return 1
+        if [[ "$mode" == "whitelist" ]]; then
+            ip6tables -A "$GEOIP6_CHAIN" -m set --match-set "$set6_name" src -j RETURN || return 1
+            ip6tables -A "$GEOIP6_CHAIN" -j DROP || return 1
+        else
+            ip6tables -A "$GEOIP6_CHAIN" -m set --match-set "$set6_name" src -j DROP || return 1
+        fi
+        ip6tables -C INPUT -j "$GEOIP6_CHAIN" 2>/dev/null || ip6tables -I INPUT 1 -j "$GEOIP6_CHAIN" || return 1
+    fi
 }
 
 _geoip_clear() {
     iptables -D INPUT -j "$GEOIP_CHAIN" 2>/dev/null || true
     iptables -F "$GEOIP_CHAIN" 2>/dev/null || true
     iptables -X "$GEOIP_CHAIN" 2>/dev/null || true
+    ip6tables -D INPUT -j "$GEOIP6_CHAIN" 2>/dev/null || true
+    ip6tables -F "$GEOIP6_CHAIN" 2>/dev/null || true
+    ip6tables -X "$GEOIP6_CHAIN" 2>/dev/null || true
     ipset destroy geoip_whitelist 2>/dev/null || true
     ipset destroy geoip_blacklist 2>/dev/null || true
+    ipset destroy geoip_whitelist6 2>/dev/null || true
+    ipset destroy geoip_blacklist6 2>/dev/null || true
 }
 
 _geoip_install_persistence() {
@@ -1164,6 +1704,7 @@ _geoip_install_persistence() {
 CONF="/etc/server-manage/geoip.conf"
 DATA="/etc/server-manage/geoip-data"
 CHAIN="GEOIP_FILTER"
+CHAIN6="GEOIP6_FILTER"
 [ -f "$CONF" ] || exit 0
 
 # 安全解析：拒绝 source，避免被替换为恶意 conf 触发 root 命令执行
@@ -1190,30 +1731,74 @@ done < "$CONF"
 [[ "$GEOIP_MODE" =~ ^(whitelist|blacklist)$ ]] || exit 0
 set_name="geoip_${GEOIP_MODE}"
 tmp_set="${set_name}_tmp"
-ipset create "$tmp_set" hash:net maxelem 131072 2>/dev/null || ipset flush "$tmp_set"
+set6_name="geoip_${GEOIP_MODE}6"
+tmp6_set="${set6_name}_tmp"
+total_entries=0
+total6_entries=0
 for cc in $GEOIP_COUNTRIES; do
     [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || continue
     f="${DATA}/${cc,,}.zone"
     [ -f "$f" ] || continue
-    sed -e '/^#/d' -e '/^$/d' -e '/^[^0-9]/d' -e "s/^/add ${tmp_set} /" "$f" | ipset restore -exist 2>/dev/null
+    count=$(grep -c '^[0-9]' "$f" 2>/dev/null)
+    total_entries=$((total_entries + count))
+    f6="${DATA}/${cc,,}.zone6"
+    [ -f "$f6" ] || continue
+    count6=$(grep -c ':' "$f6" 2>/dev/null)
+    total6_entries=$((total6_entries + count6))
+done
+[ "$total_entries" -gt 0 ] || exit 1
+[ -e /proc/net/if_inet6 ] && ! command -v ip6tables >/dev/null 2>&1 && exit 1
+ipset create "$tmp_set" hash:net maxelem 131072 2>/dev/null || ipset flush "$tmp_set" || exit 1
+for cc in $GEOIP_COUNTRIES; do
+    [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || continue
+    f="${DATA}/${cc,,}.zone"
+    [ -f "$f" ] || continue
+    sed -e '/^#/d' -e '/^$/d' -e '/^[^0-9]/d' -e "s/^/add ${tmp_set} /" "$f" | ipset restore -exist 2>/dev/null || { ipset destroy "$tmp_set" 2>/dev/null || true; exit 1; }
 done
 ipset create "$set_name" hash:net maxelem 131072 2>/dev/null || true
-ipset swap "$tmp_set" "$set_name"
+ipset swap "$tmp_set" "$set_name" || { ipset destroy "$tmp_set" 2>/dev/null || true; exit 1; }
 ipset destroy "$tmp_set" 2>/dev/null || true
-iptables -N "$CHAIN" 2>/dev/null || iptables -F "$CHAIN"
-iptables -A "$CHAIN" -i lo -j RETURN
-iptables -A "$CHAIN" -s 127.0.0.0/8 -j RETURN
-iptables -A "$CHAIN" -s 10.0.0.0/8 -j RETURN
-iptables -A "$CHAIN" -s 172.16.0.0/12 -j RETURN
-iptables -A "$CHAIN" -s 192.168.0.0/16 -j RETURN
-iptables -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
-if [ "$GEOIP_MODE" = "whitelist" ]; then
-    iptables -A "$CHAIN" -m set --match-set "$set_name" src -j RETURN
-    iptables -A "$CHAIN" -j DROP
-else
-    iptables -A "$CHAIN" -m set --match-set "$set_name" src -j DROP
+if command -v ip6tables >/dev/null 2>&1; then
+    ipset create "$tmp6_set" hash:net family inet6 maxelem 131072 2>/dev/null || ipset flush "$tmp6_set" || exit 1
+    for cc in $GEOIP_COUNTRIES; do
+        [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || continue
+        f6="${DATA}/${cc,,}.zone6"
+        [ -f "$f6" ] || continue
+        sed -e '/^#/d' -e '/^$/d' -e '/:/!d' -e "s/^/add ${tmp6_set} /" "$f6" | ipset restore -exist 2>/dev/null || { ipset destroy "$tmp6_set" 2>/dev/null || true; exit 1; }
+    done
+    ipset create "$set6_name" hash:net family inet6 maxelem 131072 2>/dev/null || true
+    ipset swap "$tmp6_set" "$set6_name" || { ipset destroy "$tmp6_set" 2>/dev/null || true; exit 1; }
+    ipset destroy "$tmp6_set" 2>/dev/null || true
 fi
-iptables -C INPUT -j "$CHAIN" 2>/dev/null || iptables -I INPUT 1 -j "$CHAIN"
+iptables -N "$CHAIN" 2>/dev/null || iptables -F "$CHAIN" || exit 1
+iptables -A "$CHAIN" -i lo -j RETURN || exit 1
+iptables -A "$CHAIN" -s 127.0.0.0/8 -j RETURN || exit 1
+iptables -A "$CHAIN" -s 10.0.0.0/8 -j RETURN || exit 1
+iptables -A "$CHAIN" -s 172.16.0.0/12 -j RETURN || exit 1
+iptables -A "$CHAIN" -s 192.168.0.0/16 -j RETURN || exit 1
+iptables -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN || exit 1
+if [ "$GEOIP_MODE" = "whitelist" ]; then
+    iptables -A "$CHAIN" -m set --match-set "$set_name" src -j RETURN || exit 1
+    iptables -A "$CHAIN" -j DROP || exit 1
+else
+    iptables -A "$CHAIN" -m set --match-set "$set_name" src -j DROP || exit 1
+fi
+iptables -C INPUT -j "$CHAIN" 2>/dev/null || iptables -I INPUT 1 -j "$CHAIN" || exit 1
+if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -N "$CHAIN6" 2>/dev/null || ip6tables -F "$CHAIN6" || exit 1
+    ip6tables -A "$CHAIN6" -i lo -j RETURN || exit 1
+    ip6tables -A "$CHAIN6" -s ::1/128 -j RETURN || exit 1
+    ip6tables -A "$CHAIN6" -s fc00::/7 -j RETURN || exit 1
+    ip6tables -A "$CHAIN6" -s fe80::/10 -j RETURN || exit 1
+    ip6tables -A "$CHAIN6" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN || exit 1
+    if [ "$GEOIP_MODE" = "whitelist" ]; then
+        ip6tables -A "$CHAIN6" -m set --match-set "$set6_name" src -j RETURN || exit 1
+        ip6tables -A "$CHAIN6" -j DROP || exit 1
+    else
+        ip6tables -A "$CHAIN6" -m set --match-set "$set6_name" src -j DROP || exit 1
+    fi
+    ip6tables -C INPUT -j "$CHAIN6" 2>/dev/null || ip6tables -I INPUT 1 -j "$CHAIN6" || exit 1
+fi
 APPLY_EOF
     chmod 700 /usr/local/bin/geoip-apply.sh
     # Update script (cron weekly)
@@ -1222,6 +1807,7 @@ APPLY_EOF
 CONF="/etc/server-manage/geoip.conf"
 DATA="/etc/server-manage/geoip-data"
 URL="https://www.ipdeny.com/ipblocks/data/aggregated"
+URL6="https://www.ipdeny.com/ipv6/ipaddresses/aggregated"
 [ -f "$CONF" ] || exit 0
 
 # 安全解析（同 apply 脚本）
@@ -1239,13 +1825,38 @@ while IFS= read -r line || [ -n "$line" ]; do
 done < "$CONF"
 [ -z "$GEOIP_COUNTRIES" ] && exit 0
 
+mkdir -p "$DATA"
 for cc in $GEOIP_COUNTRIES; do
     [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || continue
     cc="${cc,,}"
-    curl -sSL --connect-timeout 10 --max-time 30 \
-        -o "${DATA}/${cc}.zone" "${URL}/${cc}-aggregated.zone" 2>/dev/null
+    tmp=$(mktemp "${DATA}/.${cc}.zone.XXXXXX") || exit 1
+    tmp6=$(mktemp "${DATA}/.${cc}.zone6.XXXXXX") || { rm -f "$tmp"; exit 1; }
+    if curl -fsSL --connect-timeout 10 --max-time 30 -o "$tmp" "${URL}/${cc}-aggregated.zone" 2>/dev/null; then
+        count=$(grep -c '^[0-9]' "$tmp" 2>/dev/null)
+        if [ "$count" -gt 0 ]; then
+            mv "$tmp" "${DATA}/${cc}.zone" || { rm -f "$tmp"; exit 1; }
+        else
+            rm -f "$tmp" "$tmp6"
+            exit 1
+        fi
+    else
+        rm -f "$tmp" "$tmp6"
+        exit 1
+    fi
+    if curl -fsSL --connect-timeout 10 --max-time 30 -o "$tmp6" "${URL6}/${cc}-aggregated.zone" 2>/dev/null; then
+        count6=$(grep -c ':' "$tmp6" 2>/dev/null)
+        if [ "$count6" -gt 0 ]; then
+            mv "$tmp6" "${DATA}/${cc}.zone6" || { rm -f "$tmp6"; exit 1; }
+        else
+            rm -f "$tmp6"
+            exit 1
+        fi
+    else
+        rm -f "$tmp6"
+        exit 1
+    fi
 done
-/usr/local/bin/geoip-apply.sh
+/usr/local/bin/geoip-apply.sh || exit 1
 sed -i "s/^GEOIP_LAST_UPDATE=.*/GEOIP_LAST_UPDATE=\"$(date +%Y-%m-%d)\"/" "$CONF"
 UPDATE_EOF
     chmod 700 /usr/local/bin/geoip-update.sh
@@ -1342,11 +1953,14 @@ geoip_setup() {
         print_error "所有国家数据下载失败"; pause; return
     fi
     print_info "正在应用防火墙规则..."
-    _geoip_apply "$mode" "$countries"
+    if ! _geoip_apply "$mode" "$countries"; then
+        print_error "GeoIP 规则应用失败，未写入持久化配置。"
+        pause; return
+    fi
     local total=0
     for cc in $countries; do
         local f="${GEOIP_DATA_DIR}/${cc,,}.zone"
-        [[ -f "$f" ]] && total=$((total + $(grep -c '^[0-9]' "$f" 2>/dev/null || echo 0)))
+        [[ -f "$f" ]] && total=$((total + $(grep -c '^[0-9]' "$f" 2>/dev/null)))
     done
     mkdir -p "$GEOIP_CONF_DIR"
     cat > "$GEOIP_CONF" << EOF
@@ -1381,7 +1995,7 @@ geoip_status() {
     for cc in $GEOIP_COUNTRIES; do
         local f="${GEOIP_DATA_DIR}/${cc,,}.zone"
         if [[ -f "$f" ]]; then
-            local count=$(grep -c '^[0-9]' "$f" 2>/dev/null || echo 0)
+            local count=$(grep -c '^[0-9]' "$f" 2>/dev/null)
             printf "  %-4s %-10s %s 条\n" "${cc}" "$(_geoip_country_name "$cc")" "$count"
             total=$((total + count))
         fi
@@ -1394,7 +2008,7 @@ geoip_status() {
     echo ""
     echo -e "${C_CYAN}[ipset 集合]${C_RESET}"
     if ipset list "$set_name" 2>/dev/null | head -5; then
-        local entries=$(ipset list "$set_name" 2>/dev/null | grep -c '^[0-9]' || echo 0)
+        local entries=$(ipset list "$set_name" 2>/dev/null | grep -c '^[0-9]')
         echo "  已加载条目: ${entries}"
     else
         print_warn "ipset 集合不存在"
@@ -1411,7 +2025,10 @@ geoip_update() {
     print_info "正在更新 IP 数据 (${GEOIP_COUNTRIES})..."
     if _geoip_download "$GEOIP_COUNTRIES"; then
         print_info "正在重新加载规则..."
-        _geoip_apply "$GEOIP_MODE" "$GEOIP_COUNTRIES"
+        if ! _geoip_apply "$GEOIP_MODE" "$GEOIP_COUNTRIES"; then
+            print_error "GeoIP 规则重新加载失败，已保留旧规则"
+            pause; return 1
+        fi
         sed -i "s/^GEOIP_LAST_UPDATE=.*/GEOIP_LAST_UPDATE=\"$(date +%Y-%m-%d)\"/" "$GEOIP_CONF"
         print_success "更新完成"
         log_action "GeoIP data updated: $GEOIP_COUNTRIES"
@@ -1726,8 +2343,8 @@ f2b_setup() {
     fi
 
     # 迁移：清理旧的 UFW 封禁规则
-    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
-        local old_f2b_rules=$(ufw status numbered 2>/dev/null | grep -ciE "f2b|fail2ban" || echo 0)
+    if ufw_is_active; then
+        local old_f2b_rules=$(ufw status numbered 2>/dev/null | grep -ciE "f2b|fail2ban")
         if [[ "$old_f2b_rules" -gt 0 ]]; then
             print_warn "检测到 UFW 中有 ${old_f2b_rules} 条 Fail2ban 旧规则"
             print_info "新配置使用 ipset 替代 UFW 封禁，旧规则已无用且拖慢系统"
@@ -1793,26 +2410,49 @@ logpath = /var/log/nginx/access.log"
 f2b_migrate_ufw_to_ipset() {
     print_info "正在清理 UFW 中的 Fail2ban 旧规则..."
     systemctl stop fail2ban 2>/dev/null || true
-    local ufw_rules="/etc/ufw/user.rules"
-    local ufw_rules6="/etc/ufw/user6.rules"
-    local total_removed=0
-    for rf in "$ufw_rules" "$ufw_rules6"; do
-        [[ -f "$rf" ]] || continue
-        cp "$rf" "${rf}.bak.$(date +%s)"
-        local before=$(wc -l < "$rf")
-        sed -i '/f2b-/d; /Fail2ban/Id' "$rf"
-        local after=$(wc -l < "$rf")
-        local removed=$((before - after))
-        total_removed=$((total_removed + removed))
-        [[ $removed -gt 0 ]] && print_info "$(basename "$rf"): 清理 ${removed} 行"
-    done
-    ufw reload >/dev/null 2>&1 || true
-    if [[ $total_removed -gt 0 ]]; then
-        print_success "已清理 ${total_removed} 行 UFW 旧规则"
-        log_action "Migrated fail2ban: cleaned $total_removed lines from UFW rules, switched to ipset"
-    else
-        print_info "无需清理"
+    if ! command_exists ufw; then
+        print_warn "UFW 未安装，跳过旧规则清理"
+        return 0
     fi
+    local rule_numbers=() line rule_no i total_removed=0
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^\[[[:space:]]*([0-9]+)\] ]]; then
+            rule_no="${BASH_REMATCH[1]}"
+            if [[ "$line" =~ f2b- || "$line" =~ [Ff]ail2ban ]]; then
+                rule_numbers+=("$rule_no")
+            fi
+        fi
+    done < <(ufw status numbered 2>/dev/null)
+    if [[ ${#rule_numbers[@]} -eq 0 ]]; then
+        print_info "无需清理"
+        return 0
+    fi
+    for ((i=${#rule_numbers[@]}-1; i>=0; i--)); do
+        if printf 'y\n' | ufw delete "${rule_numbers[$i]}" >/dev/null 2>&1; then
+            ((total_removed++)) || true
+        else
+            print_warn "UFW 规则 #${rule_numbers[$i]} 删除失败"
+        fi
+    done
+    if ! ufw reload >/dev/null 2>&1; then
+        print_error "UFW reload 失败，请检查规则状态"
+        return 1
+    fi
+    if [[ $total_removed -gt 0 ]]; then
+        print_success "已清理 ${total_removed} 条 UFW 旧规则"
+        log_action "Migrated fail2ban: deleted $total_removed UFW rules, switched to ipset"
+    else
+        print_warn "未能删除任何 UFW 旧规则"
+    fi
+}
+
+_f2b_active_jails() {
+    fail2ban-client status 2>/dev/null | awk -F: '/Jail list/ {gsub(/[[:space:]]/, "", $2); gsub(/,/, " ", $2); print $2; exit}'
+}
+
+_f2b_banned_ips_for_jail() {
+    local jail="$1"
+    fail2ban-client status "$jail" 2>/dev/null | awk -F: '/Banned IP/ {print $2}' | xargs
 }
 
 f2b_status() {
@@ -1864,13 +2504,26 @@ f2b_unban() {
         return
     fi
     echo -e "${C_CYAN}当前封禁的 IP:${C_RESET}"
-    local banned=$(fail2ban-client status sshd 2>/dev/null | grep "Banned IP" | cut -d: -f2 | xargs)
-    if [[ -z "$banned" ]] || [[ "$banned" == "0" ]]; then
+    local jails jail ip ips total=0
+    jails=$(_f2b_active_jails)
+    if [[ -z "$jails" ]]; then
+        print_warn "没有活跃的 jail。"
+        pause
+        return
+    fi
+    for jail in $jails; do
+        ips=$(_f2b_banned_ips_for_jail "$jail")
+        for ip in $ips; do
+            [[ -z "$ip" || "$ip" == "0" ]] && continue
+            total=$((total + 1))
+            printf "%2d. [%s] %s\n" "$total" "$jail" "$ip"
+        done
+    done
+    if [[ "$total" -eq 0 ]]; then
         print_warn "当前没有被封禁的 IP。"
         pause
         return
     fi
-    echo "$banned" | tr ' ' '\n' | nl -w2 -s'. '
     echo ""
     echo "输入选项:
   - 输入 IP 地址解封单个
@@ -1881,10 +2534,14 @@ f2b_unban() {
         return
     elif [[ "$input" == "all" ]]; then
         if confirm "确认解封所有 IP?"; then
-            for ip in $banned; do
-                fail2ban-client set sshd unbanip "$ip" 2>/dev/null && \
-                    print_success "已解封: $ip" || \
-                    print_error "解封失败: $ip"
+            for jail in $jails; do
+                ips=$(_f2b_banned_ips_for_jail "$jail")
+                for ip in $ips; do
+                    [[ -z "$ip" || "$ip" == "0" ]] && continue
+                    fail2ban-client set "$jail" unbanip "$ip" 2>/dev/null && \
+                        print_success "已解封: $ip (jail=$jail)" || \
+                        print_error "解封失败: $ip (jail=$jail)"
+                done
             done
             log_action "Fail2ban: unbanned all IPs"
         fi
@@ -1893,11 +2550,21 @@ f2b_unban() {
             print_error "无效的 IP 地址格式。"
             pause; return
         fi
-        if fail2ban-client set sshd unbanip "$input" 2>/dev/null; then
-            print_success "已解封: $input"
+        local ok=0
+        for jail in $jails; do
+            ips=$(_f2b_banned_ips_for_jail "$jail")
+            [[ " $ips " == *" $input "* ]] || continue
+            if fail2ban-client set "$jail" unbanip "$input" 2>/dev/null; then
+                print_success "已解封: $input (jail=$jail)"
+                ok=1
+            else
+                print_error "解封失败: $input (jail=$jail)"
+            fi
+        done
+        if [[ "$ok" -eq 1 ]]; then
             log_action "Fail2ban: unbanned $input"
         else
-            print_error "解封失败，请检查 IP 是否正确。"
+            print_error "解封失败，请检查 IP 是否仍在任一 jail 中。"
         fi
     fi
     pause
@@ -2054,6 +2721,38 @@ menu_f2b() {
         esac
     done
 }
+# 仅更新 Fail2ban [sshd] jail 的 port，避免误改 nginx/http 等其他 jail。
+_fail2ban_set_sshd_port() {
+    local jail_file="$1" port="$2"
+    [[ -f "$jail_file" ]] || return 1
+    validate_port "$port" || return 1
+    local tmpfile
+    tmpfile=$(mktemp "$(dirname "$jail_file")/.tmp.fail2ban-sshd.XXXXXX") || return 1
+    awk -v port="$port" '
+        BEGIN { seen_sshd=0 }
+        /^\[[^]]+\]/ {
+            if (in_sshd && !done) { print "port = " port; done=1 }
+            in_sshd=($0 == "[sshd]")
+            if (in_sshd) seen_sshd=1
+            print
+            next
+        }
+        in_sshd && /^[[:space:]]*port[[:space:]]*=/ {
+            print "port = " port
+            done=1
+            next
+        }
+        { print }
+        END {
+            if (in_sshd && !done) print "port = " port
+            if (!seen_sshd) exit 2
+        }
+    ' "$jail_file" > "$tmpfile" || { rm -f "$tmpfile"; return 1; }
+    chmod --reference="$jail_file" "$tmpfile" 2>/dev/null || true
+    chown --reference="$jail_file" "$tmpfile" 2>/dev/null || true
+    mv "$tmpfile" "$jail_file"
+}
+
 ssh_change_port() {
     print_title "修改 SSH 端口"
     refresh_ssh_port
@@ -2090,6 +2789,16 @@ ssh_change_port() {
         esac
     fi
 
+    local socket_unit="" socket_dropin="" socket_backup="" socket_created=0
+    if _ssh_socket_activation_active; then
+        socket_unit=$(_ssh_socket_unit)
+        print_warn "检测到 systemd ${socket_unit} socket activation。"
+        print_warn "仅修改 sshd_config 不会改变真实监听端口，必须同步修改 ${socket_unit}。"
+        if ! confirm "是否同步修改 ${socket_unit} 监听端口为 ${port}？"; then
+            pause; return
+        fi
+    fi
+
     # 检查端口是否已被其他服务占用
     if command_exists ss && ss -tlpn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}$"; then
         local occupier=$(ss -tlpn 2>/dev/null | awk -v p=":${port}$" '$4 ~ p {print $NF}' | head -1)
@@ -2101,9 +2810,28 @@ ssh_change_port() {
 
     local backup_file="${target_conf}.bak.$(date +%s)"
     cp "$target_conf" "$backup_file"
+
+    if [[ -n "$socket_unit" ]]; then
+        local socket_dropin_dir="/etc/systemd/system/${socket_unit}.d"
+        socket_dropin="${socket_dropin_dir}/server-manage-port.conf"
+        mkdir -p "$socket_dropin_dir"
+        if [[ -f "$socket_dropin" ]]; then
+            socket_backup="${socket_dropin}.bak.$(date +%s)"
+            cp "$socket_dropin" "$socket_backup"
+        else
+            socket_created=1
+        fi
+        cat > "$socket_dropin" <<EOF
+[Socket]
+ListenStream=
+ListenStream=${port}
+EOF
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+
     # 先放行新端口（防止改完连不上）
     local ufw_opened=0
-    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+    if ufw_is_active; then
         ufw allow "$port/tcp" comment "SSH-New" >/dev/null
         ufw_opened=1
         print_success "UFW 已放行新端口 $port。"
@@ -2120,6 +2848,10 @@ ssh_change_port() {
     if ! sshd -t 2>/dev/null; then
         print_error "sshd 配置校验失败！已回滚。"
         mv "$backup_file" "$target_conf"
+        if [[ -n "$socket_unit" ]]; then
+            if [[ -n "$socket_backup" ]]; then mv "$socket_backup" "$socket_dropin" 2>/dev/null || true; elif [[ $socket_created -eq 1 ]]; then rm -f "$socket_dropin"; fi
+            systemctl daemon-reload 2>/dev/null || true
+        fi
         [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
         pause; return
     fi
@@ -2127,36 +2859,65 @@ ssh_change_port() {
     if ! _restart_sshd; then
         print_error "重启失败！已回滚配置。"
         mv "$backup_file" "$target_conf" 2>/dev/null || true
+        if [[ -n "$socket_unit" ]]; then
+            if [[ -n "$socket_backup" ]]; then mv "$socket_backup" "$socket_dropin" 2>/dev/null || true; elif [[ $socket_created -eq 1 ]]; then rm -f "$socket_dropin"; fi
+            systemctl daemon-reload 2>/dev/null || true
+        fi
         [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
         _restart_sshd || true
         pause; return
     fi
 
-    # 重启后用 sshd -T 重新校验端口是否真的生效（drop-in 覆盖等）
-    local effective_port
-    effective_port=$(sshd -T 2>/dev/null | awk 'tolower($1)=="port"{print $2; exit}')
-    if [[ "$effective_port" != "$port" ]]; then
-        print_error "重启后 sshd -T 解析端口仍为 ${effective_port:-未知}，与目标 $port 不一致。"
-        print_error "可能仍被其他 drop-in 文件覆盖。已回滚配置，UFW 规则保持原状。"
+    local listen_ok=0 _try
+    for _try in 1 2 3 4 5; do
+        if _ssh_port_is_listening "$port"; then
+            listen_ok=1
+            break
+        fi
+        sleep 1
+    done
+    if [[ $listen_ok -ne 1 ]]; then
+        print_error "重启后未检测到 SSH 在新端口 ${port}/tcp 监听，已回滚配置。"
         mv "$backup_file" "$target_conf" 2>/dev/null || true
-        _restart_sshd || true
+        if [[ -n "$socket_unit" ]]; then
+            if [[ -n "$socket_backup" ]]; then mv "$socket_backup" "$socket_dropin" 2>/dev/null || true; elif [[ $socket_created -eq 1 ]]; then rm -f "$socket_dropin"; fi
+            systemctl daemon-reload 2>/dev/null || true
+        fi
         [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
+        _restart_sshd || true
         pause; return
     fi
 
-    print_success "SSH 重启成功，sshd -T 已确认生效端口: $port"
+    # 非 socket activation 模式下，再用 sshd -T 校验配置解析端口；socket 模式以真实监听为准。
+    if [[ -z "$socket_unit" ]]; then
+        local effective_port
+        effective_port=$(sshd -T 2>/dev/null | awk 'tolower($1)=="port"{print $2; exit}')
+        if [[ "$effective_port" != "$port" ]]; then
+            print_error "重启后 sshd -T 解析端口仍为 ${effective_port:-未知}，与目标 $port 不一致。"
+            print_error "可能仍被其他 drop-in 文件覆盖。已回滚配置，UFW 规则保持原状。"
+            mv "$backup_file" "$target_conf" 2>/dev/null || true
+            [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
+            _restart_sshd || true
+            pause; return
+        fi
+    fi
+
+    print_success "SSH 重启成功，已确认新端口真实监听: $port"
     if [[ $ufw_opened -eq 1 ]]; then
         ufw delete allow "$CURRENT_SSH_PORT/tcp" 2>/dev/null || true
     fi
     # 同步更新 Fail2ban jail 端口
     if [[ -f "$FAIL2BAN_JAIL_LOCAL" ]]; then
-        sed -i "s/^port = .*/port = $port/" "$FAIL2BAN_JAIL_LOCAL"
-        systemctl restart fail2ban 2>/dev/null || true
-        print_info "Fail2ban 已同步新端口 $port"
+        if _fail2ban_set_sshd_port "$FAIL2BAN_JAIL_LOCAL" "$port"; then
+            systemctl restart fail2ban 2>/dev/null || true
+            print_info "Fail2ban [sshd] 已同步新端口 $port"
+        else
+            print_warn "Fail2ban [sshd] 端口同步失败，请手动检查 $FAIL2BAN_JAIL_LOCAL"
+        fi
     fi
     CURRENT_SSH_PORT=$port
-    log_action "SSH port changed to $port (file=$target_conf)"
-    rm -f "$backup_file"
+    log_action "SSH port changed to $port (file=$target_conf socket=${socket_unit:-none})"
+    rm -f "$backup_file" "$socket_backup"
     pause
 }
 
@@ -2248,8 +3009,22 @@ ssh_keys() {
         if [[ "$didx" =~ ^[0-9]+$ ]] && [[ "$didx" -ge 1 && "$didx" -le ${#keys[@]} ]]; then
             local target_key="${keys[$((didx-1))]}"
             if confirm "确认删除第 ${didx} 个公钥?"; then
-                local escaped_key=$(printf '%s\n' "$target_key" | sed 's/[.[\*^$/]/\\&/g')
-                sed -i "\|${escaped_key}|d" "$ak"
+                local tmp_ak grep_rc
+                tmp_ak=$(mktemp "$(dirname "$ak")/.tmp.server-manage.authorized-keys.XXXXXX") || { print_error "创建临时文件失败"; pause; return; }
+                _tmp_register "$tmp_ak"
+                grep -Fvx -- "$target_key" "$ak" > "$tmp_ak"
+                grep_rc=$?
+                if [[ $grep_rc -gt 1 ]]; then
+                    rm -f "$tmp_ak"
+                    _tmp_unregister "$tmp_ak"
+                    print_error "删除失败"
+                    pause; return
+                fi
+                cat "$tmp_ak" > "$ak" || { rm -f "$tmp_ak"; _tmp_unregister "$tmp_ak"; print_error "写入失败"; pause; return; }
+                rm -f "$tmp_ak"
+                _tmp_unregister "$tmp_ak"
+                chmod 600 "$ak"
+                chown "$user:$user" "$ak" 2>/dev/null || true
                 print_success "已删除。"
                 log_action "SSH key deleted for user $user (index=$didx)"
             fi
@@ -2300,6 +3075,11 @@ ssh_keys() {
         fi
         ;;
     5)
+        if ! _ssh_authorized_keys_available; then
+            print_error "未检测到任何可登录用户的 authorized_keys，禁止关闭密码登录以避免锁外。"
+            print_info "请先通过 [导入公钥] 部署并测试密钥登录。"
+            pause; return
+        fi
         if confirm "确认已测试密钥登录成功？"; then
             local backup_file="${SSHD_CONFIG}.bak.$(date +%s)"
             cp "$SSHD_CONFIG" "$backup_file"
@@ -2309,9 +3089,22 @@ ssh_keys() {
                 mv "$backup_file" "$SSHD_CONFIG"
                 pause; return
             fi
-            _restart_sshd || true
+            local effective_password_auth
+            effective_password_auth=$(_sshd_effective_value "passwordauthentication")
+            if [[ "$effective_password_auth" != "no" ]]; then
+                print_error "sshd -T 复验失败：PasswordAuthentication 实际为 ${effective_password_auth:-未知}，未生效。"
+                print_error "可能被 /etc/ssh/sshd_config.d/*.conf 覆盖，已回滚。"
+                mv "$backup_file" "$SSHD_CONFIG"
+                pause; return
+            fi
+            if ! _restart_sshd; then
+                print_error "SSH 重启失败，已回滚。"
+                mv "$backup_file" "$SSHD_CONFIG"
+                _restart_sshd || true
+                pause; return
+            fi
             rm -f "$backup_file"
-            print_success "密码登录已禁用。"
+            print_success "密码登录已禁用，并已通过 sshd -T 复验。"
             log_action "SSH password authentication disabled"
         fi
         ;;
@@ -2343,18 +3136,36 @@ menu_ssh() {
                 fi
                 pause ;;
             3)
+                if ! _ssh_non_root_sudo_available; then
+                    print_error "未检测到非 root sudo 用户，禁止禁用 Root 登录以避免锁外。"
+                    print_info "请先通过 [创建 Sudo 用户] 创建并测试可登录用户。"
+                    pause; continue
+                fi
                 if confirm "禁用 Root 登录？"; then
                     local backup_file="${SSHD_CONFIG}.bak.$(date +%s)"
                     cp "$SSHD_CONFIG" "$backup_file"
-                    _sshd_set_directive "PermitRootLogin" "no" "$SSHD_CONFIG" || { mv "$backup_file" "$SSHD_CONFIG"; pause; break; }
+                    _sshd_set_directive "PermitRootLogin" "no" "$SSHD_CONFIG" || { mv "$backup_file" "$SSHD_CONFIG"; pause; continue; }
                     if ! sshd -t 2>/dev/null; then
                         print_error "sshd 配置校验失败！已回滚。"
                         mv "$backup_file" "$SSHD_CONFIG"
-                        pause; break
+                        pause; continue
                     fi
-                    _restart_sshd || true
+                    local effective_root_login
+                    effective_root_login=$(_sshd_effective_value "permitrootlogin")
+                    if [[ "$effective_root_login" != "no" ]]; then
+                        print_error "sshd -T 复验失败：PermitRootLogin 实际为 ${effective_root_login:-未知}，未生效。"
+                        print_error "可能被 /etc/ssh/sshd_config.d/*.conf 覆盖，已回滚。"
+                        mv "$backup_file" "$SSHD_CONFIG"
+                        pause; continue
+                    fi
+                    if ! _restart_sshd; then
+                        print_error "SSH 重启失败，已回滚。"
+                        mv "$backup_file" "$SSHD_CONFIG"
+                        _restart_sshd || true
+                        pause; continue
+                    fi
                     rm -f "$backup_file"
-                    print_success "Root 登录已禁用。"
+                    print_success "Root 登录已禁用，并已通过 sshd -T 复验。"
                     log_action "SSH root login disabled"
                 fi
                 pause ;;
@@ -2376,7 +3187,7 @@ menu_update() {
     local FULL_DEPS="curl wget jq unzip openssl ca-certificates ufw fail2ban ipset iproute2 net-tools procps"
     local ufw_was_active=0
     local f2b_was_active=0
-    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+    if ufw_is_active; then
         ufw_was_active=1
     fi
     if systemctl is-active fail2ban &>/dev/null; then
@@ -2392,6 +3203,7 @@ menu_update() {
     local installed=0
     local failed=0
     local ok_count=0
+    local f2b_newly_installed=0
     for pkg in $FULL_DEPS; do
         if dpkg -s "$pkg" &>/dev/null; then
             echo -e "  ${C_GREEN}✓${C_RESET} $pkg (正常)"
@@ -2401,6 +3213,7 @@ menu_update() {
             if (DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" >/dev/null 2>&1); then
                 echo -e "${C_GREEN}成功${C_RESET}"
                 ((installed++)) || true
+                [[ "$pkg" == "fail2ban" ]] && f2b_newly_installed=1
             else
                 echo -e "${C_RED}失败${C_RESET}"
                 ((failed++)) || true
@@ -2419,6 +3232,10 @@ menu_update() {
     fi
     if [[ $f2b_was_active -eq 1 ]]; then
         systemctl start fail2ban >/dev/null 2>&1 || true
+    elif [[ $f2b_newly_installed -eq 1 ]]; then
+        # Debian/Ubuntu 安装 fail2ban 后可能立即启动默认 sshd jail。
+        # 自动依赖检查只负责安装，不应静默启用封禁策略。
+        systemctl disable --now fail2ban >/dev/null 2>&1 || systemctl stop fail2ban >/dev/null 2>&1 || true
     fi
     echo "================================================================================"
     log_action "Dependencies checked/repaired manually"
@@ -2458,7 +3275,7 @@ auto_deps() {
     print_info "正在检查并安装基础依赖..."
     local ufw_was_active=0
     local f2b_was_active=0
-    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+    if ufw_is_active; then
         ufw_was_active=1
     fi
     if systemctl is-active fail2ban &>/dev/null; then
@@ -2507,6 +3324,9 @@ auto_deps() {
     fi
     if [[ $f2b_was_active -eq 1 ]]; then
         systemctl start fail2ban >/dev/null 2>&1 || true
+    elif [[ $f2b_newly_installed -eq 1 ]]; then
+        # apt 安装 fail2ban 后可能立即启动默认 sshd jail；自动依赖检查不启用策略。
+        systemctl disable --now fail2ban >/dev/null 2>&1 || systemctl stop fail2ban >/dev/null 2>&1 || true
     fi
     # 保存状态
     _deps_save_state "$FULL_DEPS"
@@ -2525,7 +3345,7 @@ install_package() {
     local pkg="$1"
     local silent="${2:-}"
     if [[ "$PLATFORM" == "openwrt" ]]; then
-        if command -v "${pkg%%-*}" &>/dev/null 2>&1 || opkg list-installed 2>/dev/null | grep -q "^${pkg} "; then
+        if opkg list-installed 2>/dev/null | grep -q "^${pkg} "; then
             [[ "$silent" != "silent" ]] && print_warn "$pkg 已安装，跳过。"
             return 0
         fi
@@ -2618,11 +3438,22 @@ opt_hostname() {
     fi
     # 先保存旧主机名，再执行修改
     local old_name=$(hostname 2>/dev/null)
-    if command_exists hostnamectl; then
-        hostnamectl set-hostname "$new_name"
+    if [[ "$PLATFORM" == "openwrt" ]]; then
+        if ! command_exists uci; then
+            print_error "OpenWrt 缺少 uci，无法持久化主机名。"
+            pause; return 1
+        fi
+        if ! uci set system.@system[0].hostname="$new_name" || ! uci commit system; then
+            print_error "OpenWrt 主机名写入 uci 失败。"
+            pause; return 1
+        fi
+        hostname "$new_name" 2>/dev/null || true
+        /etc/init.d/system reload >/dev/null 2>&1 || true
+    elif command_exists hostnamectl; then
+        hostnamectl set-hostname "$new_name" || { print_error "hostnamectl 设置失败。"; pause; return 1; }
     else
-        hostname "$new_name"
-        echo "$new_name" > /etc/hostname
+        hostname "$new_name" || { print_error "临时主机名设置失败。"; pause; return 1; }
+        echo "$new_name" > /etc/hostname || { print_error "/etc/hostname 写入失败。"; pause; return 1; }
     fi
 
     # 安全替换 /etc/hosts 中的旧主机名
@@ -2710,9 +3541,20 @@ opt_bbr() {
         sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
         echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
         echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-        sysctl -p >/dev/null
-        print_success "BBR 已开启。"
-        log_action "BBR enabled"
+        if sysctl -p >/dev/null 2>&1; then
+            local verify_cc
+            verify_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+            if [[ "$verify_cc" == "bbr" ]]; then
+                print_success "BBR 已开启。"
+                log_action "BBR enabled"
+            else
+                print_error "BBR 未实际生效 (当前: $verify_cc)，请检查内核是否支持。"
+                log_action "BBR enable failed: verify_cc=$verify_cc" "ERROR"
+            fi
+        else
+            print_error "sysctl -p 执行失败，BBR 未应用。"
+            log_action "BBR enable failed: sysctl -p" "ERROR"
+        fi
     fi
     pause
 }
@@ -2720,17 +3562,33 @@ opt_bbr() {
 select_timezone() {
     echo "1.上海 2.香港 3.东京 4.纽约 5.伦敦 6.UTC"
     read -e -r -p "选择: " t
-    local z
+    local z tz
     case $t in
-        1) z="Asia/Shanghai" ;; 2) z="Asia/Hong_Kong" ;; 3) z="Asia/Tokyo" ;;
-        4) z="America/New_York" ;; 5) z="Europe/London" ;; 6) z="UTC" ;;
+        1) z="Asia/Shanghai"; tz="CST-8" ;;
+        2) z="Asia/Hong_Kong"; tz="HKT-8" ;;
+        3) z="Asia/Tokyo"; tz="JST-9" ;;
+        4) z="America/New_York"; tz="EST5EDT,M3.2.0,M11.1.0" ;;
+        5) z="Europe/London"; tz="GMT0BST,M3.5.0/1,M10.5.0" ;;
+        6) z="UTC"; tz="UTC0" ;;
         *) print_error "无效选择"; return 1 ;;
     esac
-    # 优先使用 timedatectl（systemd 系统），回退到软链接
-    if command_exists timedatectl; then
-        timedatectl set-timezone "$z"
+    if [[ "$PLATFORM" == "openwrt" ]]; then
+        if ! command_exists uci; then
+            print_error "OpenWrt 缺少 uci，无法持久化时区。"
+            return 1
+        fi
+        if ! uci set system.@system[0].zonename="$z" || \
+           ! uci set system.@system[0].timezone="$tz" || \
+           ! uci commit system; then
+            print_error "OpenWrt 时区写入 uci 失败。"
+            return 1
+        fi
+        /etc/init.d/system reload >/dev/null 2>&1 || true
+    elif command_exists timedatectl; then
+        timedatectl set-timezone "$z" || { print_error "timedatectl 设置时区失败。"; return 1; }
     else
-        ln -sf /usr/share/zoneinfo/$z /etc/localtime
+        [[ -f "/usr/share/zoneinfo/$z" ]] || { print_error "zoneinfo 不存在: /usr/share/zoneinfo/$z"; return 1; }
+        ln -sf "/usr/share/zoneinfo/$z" /etc/localtime || { print_error "写入 /etc/localtime 失败。"; return 1; }
     fi
     print_success "时区已设为 $z"
     log_action "Timezone changed to $z"
@@ -2766,10 +3624,11 @@ opt_sysctl() {
     # Backup before modifying
     [[ ! -f /etc/sysctl.conf.pre-tuning ]] && cp /etc/sysctl.conf /etc/sysctl.conf.pre-tuning
     local params=""
+    local block_start="# BEGIN server-manage sysctl tuning"
+    local block_end="# END server-manage sysctl tuning"
     case $sc in
     1)
-        params="
-# server-manage sysctl tuning: proxy/tunnel
+        params="${block_start}: proxy/tunnel
 fs.file-max = 1048576
 net.core.somaxconn = 4096
 net.core.netdev_max_backlog = 4096
@@ -2785,11 +3644,11 @@ net.ipv4.tcp_max_tw_buckets = 32768
 net.ipv4.tcp_syncookies = 1
 net.ipv4.ip_forward = 1
 net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216"
+net.ipv4.tcp_wmem = 4096 65536 16777216
+${block_end}"
         ;;
     2)
-        params="
-# server-manage sysctl tuning: web server
+        params="${block_start}: web server
 fs.file-max = 524288
 net.core.somaxconn = 8192
 net.core.netdev_max_backlog = 8192
@@ -2800,23 +3659,24 @@ net.ipv4.tcp_keepalive_time = 300
 net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_keepalive_probes = 3
 net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_max_tw_buckets = 65536"
+net.ipv4.tcp_max_tw_buckets = 65536
+${block_end}"
         ;;
     3)
-        params="
-# server-manage sysctl tuning: conservative
+        params="${block_start}: conservative
 fs.file-max = 262144
 net.core.somaxconn = 2048
 net.ipv4.tcp_max_syn_backlog = 2048
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_fin_timeout = 30"
+net.ipv4.tcp_fin_timeout = 30
+${block_end}"
         ;;
     *) print_error "无效选择"; pause; return ;;
     esac
-    # Remove old tuning block and append new
-    sed -i '/^# server-manage sysctl tuning/,/^$/d' /etc/sysctl.conf
-    echo "$params" >> /etc/sysctl.conf
+    # Remove old tuning block and append new. 旧版本没有 END 标记，保留兼容删除。
+    sed -i '/^# BEGIN server-manage sysctl tuning/,/^# END server-manage sysctl tuning/d; /^# server-manage sysctl tuning/,/^$/d' /etc/sysctl.conf
+    printf '\n%s\n' "$params" >> /etc/sysctl.conf
     if sysctl -p >/dev/null 2>&1; then
         print_success "内核参数已应用 (无需重启)。"
         log_action "Sysctl tuning applied: preset=$sc"
@@ -2851,7 +3711,6 @@ menu_opt() {
         esac
     done
 }
-
 net_iperf3() {
     print_title "iPerf3 测速"
     install_package "iperf3"
@@ -2862,7 +3721,7 @@ net_iperf3() {
         pause; return
     fi
     local ufw_opened=0
-        if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+        if ufw_is_active; then
         if ! ufw status 2>/dev/null | grep -q "$port/tcp"; then
             ufw allow "$port/tcp" comment "iPerf3-Temp" >/dev/null
             ufw_opened=1
@@ -2891,7 +3750,6 @@ net_iperf3() {
             kill "$iperf_pid" 2>/dev/null || true
             wait "$iperf_pid" 2>/dev/null || true
         fi
-        pkill -f "iperf3 -s -p $port" 2>/dev/null || true
         if [[ $ufw_opened -eq 1 ]]; then
             ufw delete allow "$port/tcp" >/dev/null 2>&1 || true
             print_info "防火墙规则已移除。"
@@ -2971,14 +3829,18 @@ net_dns() {
         fi
     done
     if [[ "$PLATFORM" == "openwrt" ]]; then
-        uci delete network.wan.dns 2>/dev/null || true
+        local network_wan="wan" network_lan="lan" dns_iface
+        dns_iface="$network_wan"
+        uci -q get "network.${dns_iface}" >/dev/null 2>&1 || dns_iface="$network_lan"
+        uci -q get "network.${dns_iface}" >/dev/null 2>&1 || { print_error "未找到 OpenWrt wan/lan 网络接口"; pause; return 1; }
+        uci delete "network.${dns_iface}.dns" 2>/dev/null || true
         for ip in $dns; do
-            uci add_list network.wan.dns="$ip"
+            uci add_list "network.${dns_iface}.dns=$ip" || { print_error "写入 OpenWrt DNS 失败: $ip"; pause; return 1; }
         done
-        uci set network.wan.peerdns='0'
-        uci commit network
+        uci set "network.${dns_iface}.peerdns=0" || { print_error "设置 OpenWrt peerdns 失败"; pause; return 1; }
+        uci commit network || { print_error "提交 OpenWrt network 配置失败"; pause; return 1; }
         /etc/init.d/network reload 2>/dev/null || true
-        print_success "DNS 已通过 uci 修改 (持久化)。"
+        print_success "DNS 已通过 uci 修改 (接口: ${dns_iface}, 持久化)。"
     elif is_systemd && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         local res_conf="/etc/systemd/resolved.conf"
         grep -q '^\[Resolve\]' "$res_conf" || echo -e "\n[Resolve]" >> "$res_conf"
@@ -2987,12 +3849,11 @@ net_dns() {
         systemctl restart systemd-resolved
         print_success "DNS 已修改。"
     else
-        local tmp_resolv
-        tmp_resolv=$(mktemp /etc/resolv.conf.tmp.XXXXXX)
+        local resolv_content=""
         for ip in $dns; do
-            echo "nameserver $ip" >> "$tmp_resolv"
+            resolv_content+="nameserver $ip"$'\n'
         done
-        mv "$tmp_resolv" /etc/resolv.conf
+        write_file_atomic /etc/resolv.conf "${resolv_content%$'\n'}" || { print_error "写入 /etc/resolv.conf 失败"; pause; return 1; }
         print_success "DNS 已修改。"
     fi
     log_action "DNS changed to: $dns"
@@ -3034,6 +3895,9 @@ net_diag() {
     3)
         read -e -r -p "目标 IP/域名: " host
         [[ -z "$host" ]] && return
+        if ! validate_host "$host"; then
+            print_error "目标主机格式无效（仅支持 IP 或普通域名）"; pause; return
+        fi
         read -e -r -p "端口: " port
         if ! validate_port "$port"; then
             print_error "端口无效"; pause; return
@@ -3046,7 +3910,7 @@ net_diag() {
                 print_error "端口不可达或超时"
             fi
         else
-            if timeout 5 bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null; then
+            if timeout 5 bash -c 'echo >/dev/tcp/"$1"/"$2"' _ "$host" "$port" 2>/dev/null; then
                 print_success "端口可达"
             else
                 print_error "端口不可达或超时"
@@ -3284,7 +4148,7 @@ _safe_source_conf() {
 # Nginx 安全重载
 _nginx_reload() {
     if is_systemd; then
-        systemctl reload nginx || systemctl restart nginx
+        systemctl reload nginx
     else
         nginx -s reload 2>/dev/null || service nginx reload
     fi
@@ -3335,17 +4199,50 @@ _nginx_deploy_conf() {
     local domain="$1" conf_content="$2"
     local avail="/etc/nginx/sites-available/${domain}.conf"
     local enabled="/etc/nginx/sites-enabled/${domain}.conf"
-    write_file_atomic "$avail" "$conf_content"
-    ln -sf "$avail" "$enabled"
-    if nginx -t >/dev/null 2>&1; then
-        _nginx_reload
-        return 0
-    else
-        print_error "Nginx 配置测试失败！"
-        nginx -t 2>&1 | tail -5
-        rm -f "$enabled" "$avail"
-        return 1
+    local backup_avail="" backup_enabled="" old_enabled_target=""
+    local had_avail=0 had_enabled=0 enabled_was_symlink=0
+
+    if [[ -e "$avail" ]]; then
+        had_avail=1
+        backup_avail=$(mktemp "/etc/nginx/sites-available/.${domain}.conf.bak.XXXXXX") || return 1
+        cp -a "$avail" "$backup_avail" || { rm -f "$backup_avail"; return 1; }
     fi
+    if [[ -L "$enabled" ]]; then
+        had_enabled=1
+        enabled_was_symlink=1
+        old_enabled_target=$(readlink "$enabled" 2>/dev/null || true)
+    elif [[ -e "$enabled" ]]; then
+        had_enabled=1
+        backup_enabled=$(mktemp "/etc/nginx/sites-enabled/.${domain}.conf.bak.XXXXXX") || { rm -f "$backup_avail"; return 1; }
+        cp -a "$enabled" "$backup_enabled" || { rm -f "$backup_avail" "$backup_enabled"; return 1; }
+    fi
+
+    write_file_atomic "$avail" "$conf_content" || { print_error "写入 Nginx 配置失败"; rm -f "$backup_avail" "$backup_enabled"; return 1; }
+    ln -sfn "$avail" "$enabled" || { print_error "启用 Nginx 配置失败"; rm -f "$backup_avail" "$backup_enabled"; return 1; }
+
+    if nginx -t >/dev/null 2>&1 && _nginx_reload; then
+        rm -f "$backup_avail" "$backup_enabled"
+        return 0
+    fi
+
+    print_error "Nginx 配置测试或重载失败，正在恢复旧配置！"
+    nginx -t 2>&1 | tail -5
+    rm -f "$enabled"
+    if [[ "$had_enabled" -eq 1 ]]; then
+        if [[ "$enabled_was_symlink" -eq 1 && -n "$old_enabled_target" ]]; then
+            ln -s "$old_enabled_target" "$enabled"
+        elif [[ -n "$backup_enabled" && -e "$backup_enabled" ]]; then
+            mv "$backup_enabled" "$enabled"
+        fi
+    fi
+    if [[ "$had_avail" -eq 1 && -n "$backup_avail" && -e "$backup_avail" ]]; then
+        mv "$backup_avail" "$avail"
+    else
+        rm -f "$avail"
+    fi
+    nginx -t >/dev/null 2>&1 && _nginx_reload >/dev/null 2>&1 || true
+    rm -f "$backup_avail" "$backup_enabled"
+    return 1
 }
 
 web_env_check() {
@@ -3542,8 +4439,45 @@ _cf_api() {
     return 1
 }
 
-_cf_api_ok() { [[ "$(jq -r '.success' <<< "$1")" == "true" ]]; }
-_cf_api_err() { jq -r '.errors[0].message // "未知错误"' <<< "$1"; }
+_cf_api_ok() { [[ "$(jq -r '.success // false' 2>/dev/null <<< "$1")" == "true" ]]; }
+_cf_api_err() { jq -r '.errors[0].message // "未知错误"' 2>/dev/null <<< "$1" || echo "未知错误"; }
+
+# 分页读取 Token 可见的 Cloudflare Zones。
+# 参数:
+#   $1 token
+#   $2 附加 query（可选，如 status=active）
+#   $3 per_page（可选，默认 50）
+_cf_list_zones() {
+    local token="$1" query="${2:-}" per_page="${3:-50}"
+    local page=1 resp all='[]' total_pages count endpoint
+
+    while true; do
+        endpoint="/zones?per_page=${per_page}&page=${page}"
+        [[ -n "$query" ]] && endpoint="${endpoint}&${query}"
+        resp=$(_cf_api GET "$endpoint" "$token")
+        if ! _cf_api_ok "$resp"; then
+            echo "$resp"
+            return 1
+        fi
+
+        all=$(jq -c --argjson acc "$all" '$acc + (.result // [])' <<< "$resp" 2>/dev/null) || {
+            echo '{"success":false,"errors":[{"message":"解析 Zone 分页响应失败"}]}'
+            return 1
+        }
+        total_pages=$(jq -r '.result_info.total_pages // empty' <<< "$resp" 2>/dev/null)
+        count=$(jq -r '.result | length' <<< "$resp" 2>/dev/null)
+
+        if [[ "$total_pages" =~ ^[0-9]+$ ]]; then
+            (( page >= total_pages )) && break
+        else
+            [[ "$count" =~ ^[0-9]+$ ]] || count=0
+            (( count < per_page )) && break
+        fi
+        page=$((page + 1))
+    done
+
+    jq -n --argjson result "$all" '{success:true, errors:[], messages:[], result:$result}'
+}
 
 # CF API Token 验证
 _cf_verify_token() {
@@ -3587,7 +4521,7 @@ _cf_get_zone_id() {
         current="${current#*.}"
     done
     # Fallback: 列出所有 zone，本地匹配 (解决二级域名 zone 查找问题)
-    local resp=$(_cf_api GET "/zones?per_page=50" "$token")
+    local resp=$(_cf_list_zones "$token")
     if _cf_api_ok "$resp"; then
         local try="$domain"
         while [[ "$try" == *"."* ]]; do
@@ -3599,22 +4533,13 @@ _cf_get_zone_id() {
     return 1
 }
 
-_cf_dns_upsert() {
-    local zone_id=$1 token=$2 type=$3 name=$4 content=$5 proxied=${6:-false}
-    local resp=$(_cf_api GET "/zones/$zone_id/dns_records?type=$type&name=$name" "$token")
-    local rid=$(echo "$resp" | jq -r '.result[0].id // empty')
-    local data=$(jq -n --arg type "$type" --arg name "$name" --arg content "$content" --argjson proxied "$proxied" \
-        '{type:$type, name:$name, content:$content, ttl:1, proxied:$proxied}')
-    if [[ -n "$rid" ]]; then
-        _cf_api PUT "/zones/$zone_id/dns_records/$rid" "$token" --data "$data"
-    else
-        _cf_api POST "/zones/$zone_id/dns_records" "$token" --data "$data"
-    fi
-}
-
 _cf_dns_delete() {
     local zone_id=$1 token=$2 type=$3 name=$4
     local resp=$(_cf_api GET "/zones/$zone_id/dns_records?type=$type&name=$name" "$token")
+    if ! _cf_api_ok "$resp"; then
+        print_error "读取 DNS 记录失败: $(_cf_api_err "$resp")"
+        return 1
+    fi
     local rid=$(echo "$resp" | jq -r '.result[0].id // empty')
     [[ -n "$rid" ]] && _cf_api DELETE "/zones/$zone_id/dns_records/$rid" "$token"
 }
@@ -3625,6 +4550,10 @@ _cf_update_dns_record() {
     [[ -z "$ip" ]] && return 0
     print_info "处理 $type 记录 -> $ip (代理: $proxied)"
     local records=$(_cf_api GET "/zones/$zone_id/dns_records?type=$type&name=$domain" "$token")
+    if ! _cf_api_ok "$records"; then
+        print_error "读取 $type 记录失败: $(_cf_api_err "$records")"
+        return 1
+    fi
     local record_id=$(jq -r '.result[0].id // empty' <<< "$records")
     local count=$(jq -r '.result | length' <<< "$records")
     [[ "$count" -gt 1 ]] && print_warn "警告: 存在 ${count} 条 $type 记录，仅更新第一条。建议手动清理多余记录。"
@@ -3683,15 +4612,25 @@ web_cf_dns_update() {
     command_exists jq || install_package "jq" "silent"
     print_info "正在探测本机公网 IP..."
     local ipv4 ipv6
-    if [[ -n "${_CACHED_IPV4:-}" || -n "${_CACHED_IPV6:-}" ]]; then
-        ipv4="$_CACHED_IPV4"; ipv6="$_CACHED_IPV6"
+    if [[ ( -n "${CACHED_IPV4:-}" && "${CACHED_IPV4:-}" != "N/A" ) || ( -n "${CACHED_IPV6:-}" && "${CACHED_IPV6:-}" != "N/A" ) ]]; then
+        ipv4="${CACHED_IPV4:-}"; ipv6="${CACHED_IPV6:-}"
     else
-        ipv4=$(curl -4 -s --max-time 5 https://4.ipw.cn 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv4=""
-        ipv6=$(curl -6 -s --max-time 5 https://6.ipw.cn 2>/dev/null || curl -6 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv6=""
-        _CACHED_IPV4="$ipv4"; _CACHED_IPV6="$ipv6"
+        ipv4=$(get_public_ipv4 2>/dev/null || true)
+        ipv6=$(get_public_ipv6 2>/dev/null || true)
     fi
-    # IPv6 格式校验：必须包含冒号
-    [[ -n "$ipv6" && ! "$ipv6" =~ : ]] && { print_warn "IPv6 探测结果异常 ($ipv6)，已忽略"; ipv6=""; }
+    if [[ -n "$ipv4" ]]; then
+        if ! validate_ip "$ipv4" || [[ "$ipv4" == *:* ]]; then
+            print_warn "IPv4 探测结果异常 ($ipv4)，已忽略"
+            ipv4=""
+        fi
+    fi
+    if [[ -n "$ipv6" ]]; then
+        if ! validate_ip "$ipv6" || [[ "$ipv6" != *:* ]]; then
+            print_warn "IPv6 探测结果异常 ($ipv6)，已忽略"
+            ipv6=""
+        fi
+    fi
+    CACHED_IPV4="$ipv4"; CACHED_IPV6="$ipv6"
     echo "----------------------------------------"
     echo "IPv4: ${ipv4:-[✗] 未检测到}"
     echo "IPv6: ${ipv6:-[✗] 未检测到}"
@@ -3760,13 +4699,29 @@ web_cf_dns_update() {
 _cf_get_origin_ruleset() {
     local token="$1" zone_id="$2"
     local url="https://api.cloudflare.com/client/v4/zones/${zone_id}/rulesets/phases/http_request_origin/entrypoint"
-    local resp=$(curl -s -w "\n%{http_code}" -X GET "$url" \
-        -H "Authorization: Bearer $token" -H "Content-Type: application/json")
-    local code=$(echo "$resp" | tail -1)
-    local body=$(echo "$resp" | sed '$d')
+    local attempt resp code body curl_rc
+    for attempt in 1 2 3; do
+        resp=$(curl -sS --connect-timeout 10 --max-time 30 -w "
+%{http_code}" -X GET "$url"             -H "Authorization: Bearer $token" -H "Content-Type: application/json" 2>/dev/null)
+        curl_rc=$?
+        if [[ $curl_rc -eq 0 && -n "$resp" ]]; then
+            code=$(echo "$resp" | tail -1)
+            body=$(echo "$resp" | sed '$d')
+            [[ "$code" =~ ^[0-9]{3}$ ]] && break
+        fi
+        [[ $attempt -lt 3 ]] && sleep $((attempt * 2))
+    done
+    if [[ ${curl_rc:-1} -ne 0 || ! "${code:-}" =~ ^[0-9]{3}$ ]]; then
+        echo '{"success":false,"errors":[{"message":"Origin Rules 读取失败或超时"}]}'
+        return 1
+    fi
     if [[ "$code" == "200" ]]; then
+        if _cf_api_ok "$body"; then
+            echo "$body"
+            return 0
+        fi
         echo "$body"
-        return 0
+        return 1
     elif [[ "$code" == "404" ]]; then
         return 0
     else
@@ -3900,7 +4855,11 @@ web_cf_origin_rule_list() {
     if [[ -z "$zone_id" ]]; then
         print_error "未找到 Zone ID"; pause; return
     fi
-    local resp=$(_cf_get_origin_ruleset "$token" "$zone_id")
+    local resp
+    if ! resp=$(_cf_get_origin_ruleset "$token" "$zone_id"); then
+        print_error "读取回源规则失败: $(echo "$resp" | jq -r '.errors[0].message // "未知错误"')"
+        pause; return
+    fi
     if [[ -z "$resp" ]]; then
         print_warn "该域名下没有任何回源规则"
         pause; return
@@ -3935,7 +4894,11 @@ web_cf_origin_rule_delete() {
     if [[ -z "$zone_id" ]]; then
         print_error "未找到 Zone ID"; pause; return
     fi
-    local resp=$(_cf_get_origin_ruleset "$token" "$zone_id")
+    local resp
+    if ! resp=$(_cf_get_origin_ruleset "$token" "$zone_id"); then
+        print_error "读取回源规则失败: $(echo "$resp" | jq -r '.errors[0].message // "未知错误"')"
+        pause; return
+    fi
     if [[ -z "$resp" ]]; then
         print_warn "没有任何回源规则"; pause; return
     fi
@@ -3994,7 +4957,7 @@ web_add_domain() {
     # 2. 选择域名 (自动列出 Token 可管理的域名)
     print_info "获取 Token 可管理的域名列表..."
     local zones_json zone_list=() zone_ids=()
-    zones_json=$(_cf_api GET "/zones?per_page=50&status=active" "$CF_API_TOKEN")
+    zones_json=$(_cf_list_zones "$CF_API_TOKEN" "status=active")
     if ! _cf_api_ok "$zones_json"; then
         print_error "获取域名列表失败: $(_cf_api_err "$zones_json")"
         pause; return
@@ -4033,12 +4996,18 @@ web_add_domain() {
     echo -e "  ${C_GRAY}例如输入 www -> 完整域名为 www.${root_domain}${C_RESET}"
     echo -e "  ${C_GRAY}例如输入 panel -> 完整域名为 panel.${root_domain}${C_RESET}"
     echo -e "  ${C_GRAY}直接回车 -> 使用根域名 ${root_domain}${C_RESET}"
-    read -e -r -p "子域名前缀 [留空=根域名]: " sub_prefix
-    if [[ -z "$sub_prefix" ]]; then
-        DOMAIN="$root_domain"
-    else
-        DOMAIN="${sub_prefix}.${root_domain}"
-    fi
+    while true; do
+        read -e -r -p "子域名前缀 [留空=根域名]: " sub_prefix
+        if [[ -z "$sub_prefix" ]]; then
+            DOMAIN="$root_domain"
+            break
+        fi
+        if validate_dns_label "$sub_prefix"; then
+            DOMAIN="${sub_prefix}.${root_domain}"
+            break
+        fi
+        print_error "子域名前缀格式无效（仅小写字母、数字、短横；首尾不能为短横，1-63 字符）"
+    done
 
     # 检查是否已有配置
     if [[ -f "${CONFIG_DIR}/${DOMAIN}.conf" ]]; then
@@ -4098,10 +5067,21 @@ web_add_domain() {
     # 5. DNS 解析
     print_info "探测本机公网 IP..."
     local ipv4 ipv6
-    ipv4=$(curl -4 -s --max-time 5 https://4.ipw.cn 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv4=""
-    ipv6=$(curl -6 -s --max-time 5 https://6.ipw.cn 2>/dev/null || curl -6 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv6=""
-    _CACHED_IPV4="$ipv4"; _CACHED_IPV6="$ipv6"
-    [[ -n "$ipv6" && ! "$ipv6" =~ : ]] && { print_warn "IPv6 探测异常 ($ipv6)，已忽略"; ipv6=""; }
+    ipv4=$(get_public_ipv4 2>/dev/null || true)
+    ipv6=$(get_public_ipv6 2>/dev/null || true)
+    if [[ -n "$ipv4" ]]; then
+        if ! validate_ip "$ipv4" || [[ "$ipv4" == *:* ]]; then
+            print_warn "IPv4 探测异常 ($ipv4)，已忽略"
+            ipv4=""
+        fi
+    fi
+    if [[ -n "$ipv6" ]]; then
+        if ! validate_ip "$ipv6" || [[ "$ipv6" != *:* ]]; then
+            print_warn "IPv6 探测异常 ($ipv6)，已忽略"
+            ipv6=""
+        fi
+    fi
+    CACHED_IPV4="$ipv4"; CACHED_IPV6="$ipv6"
     echo "  IPv4: ${ipv4:-[✗] 未检测到}"
     echo "  IPv6: ${ipv6:-[✗] 未检测到}"
     local dns_mode=""
@@ -4236,7 +5216,7 @@ $(_nginx_tls_http2_block "$NGINX_HTTPS_PORT")
 
             # ── 防火墙 ──
             echo -e "\n${C_CYAN}=== [${step}] 防火墙 ===${C_RESET}"
-            if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+            if ufw_is_active; then
                 ufw allow "$NGINX_HTTP_PORT/tcp" comment "Nginx-HTTP" >/dev/null 2>&1 || true
                 ufw allow "$NGINX_HTTPS_PORT/tcp" comment "Nginx-HTTPS" >/dev/null 2>&1 || true
                 print_success "防火墙规则已更新"
@@ -4315,7 +5295,7 @@ LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
         ((step++))
 
         # ── DDNS 动态解析 ──
-        if [[ "$dns_mode" != "0" ]] && [[ ! -f "$DDNS_CONFIG_DIR/${DOMAIN}.conf" ]]; then
+        if [[ "$dns_mode" != "0" ]]; then
             echo -e "\n${C_CYAN}=== [${step}] DDNS 动态解析 ===${C_RESET}"
             local ddns_ipv4="false" ddns_ipv6="false"
             [[ "$dns_mode" == "1" || "$dns_mode" == "3" ]] && ddns_ipv4="true"
@@ -4382,7 +5362,7 @@ web_view_config() {
     echo "0. 返回"
     read -e -r -p "请输入序号: " idx
     if [[ "$idx" == "0" || -z "$idx" ]]; then return; fi
-    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -gt ${#domains[@]} ]]; then
+    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -lt 1 || "$idx" -gt ${#domains[@]} ]]; then
         print_error "无效序号。"
         pause; return
     fi
@@ -4484,7 +5464,7 @@ web_delete_domain() {
     echo "0. 返回"
     read -e -r -p "请输入序号删除: " idx
     if [[ "$idx" == "0" || -z "$idx" ]]; then return; fi
-    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -gt ${#domains[@]} ]]; then
+    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -lt 1 || "$idx" -gt ${#domains[@]} ]]; then
         print_error "无效序号。"
         pause; return
     fi
@@ -4576,6 +5556,58 @@ web_cert_overview() {
     pause
 }
 
+_replace_proxy_pass_backend() {
+    local new_backend="${1:-}" conf_file="${2:-}"
+    [[ -n "$new_backend" && -f "$conf_file" ]] || return 1
+    NEW_BACKEND="$new_backend" awk '
+        BEGIN { new_backend = ENVIRON["NEW_BACKEND"] }
+        /^[[:space:]]*proxy_pass[[:space:]]+/ {
+            if (match($0, /proxy_pass[[:space:]]+[^;]+;/)) {
+                $0 = substr($0, 1, RSTART - 1) "proxy_pass " new_backend ";" substr($0, RSTART + RLENGTH)
+            }
+        }
+        { print }
+    ' "$conf_file"
+}
+
+_cert_name_matches_domain() {
+    local pattern="${1:-}" domain="${2:-}" suffix left
+    pattern="${pattern%.}"
+    domain="${domain%.}"
+    pattern="${pattern,,}"
+    domain="${domain,,}"
+    [[ -z "$pattern" || -z "$domain" ]] && return 1
+
+    [[ "$pattern" == "$domain" ]] && return 0
+
+    # RFC 6125 常见语义：*.example.com 只覆盖 api.example.com，
+    # 不覆盖 example.com 或 deep.api.example.com。
+    if [[ "$pattern" == \*.* ]]; then
+        suffix="${pattern#\*.}"
+        [[ -z "$suffix" || "$suffix" == *"*"* ]] && return 1
+        [[ "$domain" == *".${suffix}" ]] || return 1
+        left="${domain%.${suffix}}"
+        [[ -n "$left" && "$left" != *.* ]] && return 0
+    fi
+    return 1
+}
+
+_cert_covers_domain() {
+    local cert_file="${1:-}" domain="${2:-}" entry name
+    [[ -f "$cert_file" && -n "$domain" ]] || return 1
+    command -v openssl >/dev/null 2>&1 || return 1
+
+    while IFS= read -r entry; do
+        [[ "$entry" == *DNS:* ]] || continue
+        name="${entry#*DNS:}"
+        name="${name%%[[:space:]]*}"
+        name="${name%,}"
+        [[ -z "$name" ]] && continue
+        _cert_name_matches_domain "$name" "$domain" && return 0
+    done < <(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null | tr ',' '\n')
+    return 1
+}
+
 web_reverse_proxy_site() {
     local prefill_backend="${1:-}"
     print_title "添加反向代理网站"
@@ -4633,10 +5665,16 @@ web_reverse_proxy_site() {
     else
         # 尝试查找通配符证书或主域证书
         local parent_domain=$(echo "$DOMAIN" | sed 's/^[^.]*\.//')
-        if [[ -f "${CERT_PATH_PREFIX}/${parent_domain}/fullchain.pem" ]]; then
-            cert_dir="${CERT_PATH_PREFIX}/${parent_domain}"
-            print_success "使用主域证书: ${cert_dir}"
-            has_cert=1
+        local parent_cert="${CERT_PATH_PREFIX}/${parent_domain}/fullchain.pem"
+        local parent_key="${CERT_PATH_PREFIX}/${parent_domain}/privkey.pem"
+        if [[ -f "$parent_cert" && -f "$parent_key" ]]; then
+            if _cert_covers_domain "$parent_cert" "$DOMAIN"; then
+                cert_dir="${CERT_PATH_PREFIX}/${parent_domain}"
+                print_success "使用覆盖 ${DOMAIN} 的父域/通配符证书: ${cert_dir}"
+                has_cert=1
+            else
+                print_warn "检测到父域证书 ${CERT_PATH_PREFIX}/${parent_domain}，但证书 SAN 不覆盖 ${DOMAIN}，不能复用。"
+            fi
         fi
     fi
     if [[ $has_cert -eq 0 ]]; then
@@ -4930,7 +5968,7 @@ $(_nginx_tls_http2_block "$HTTPS_PORT")
     print_success "Nginx 反代配置已生效。"
     
     # 防火墙规则
-    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+    if ufw_is_active; then
         ufw allow "$HTTP_PORT/tcp" comment "ReverseProxy-HTTP" >/dev/null 2>&1 || true
         ufw allow "$HTTPS_PORT/tcp" comment "ReverseProxy-HTTPS" >/dev/null 2>&1 || true
         print_success "防火墙规则已更新。"
@@ -5005,7 +6043,14 @@ web_edit_reverse_proxy() {
         pause; return
     fi
     cp "$target_conf" "${target_conf}.bak"
-    sed -i "s|proxy_pass ${current_backend};|proxy_pass ${new_backend};|g" "$target_conf"
+    local tmp_conf
+    tmp_conf=$(mktemp "${target_conf}.tmp.XXXXXX") || { print_error "创建临时配置失败"; pause; return; }
+    if ! _replace_proxy_pass_backend "$new_backend" "$target_conf" > "$tmp_conf"; then
+        rm -f "$tmp_conf"
+        print_error "更新配置失败"
+        pause; return
+    fi
+    mv "$tmp_conf" "$target_conf"
     if nginx -t >/dev/null 2>&1; then
         _nginx_reload
         rm -f "${target_conf}.bak"
@@ -5078,16 +6123,17 @@ menu_web() {
                 read -e -r -p "选择 [1]: " renew_mode
                 renew_mode=${renew_mode:-1}
                 print_info "正在续签..."
+                local renew_log="/var/log/certbot-renew.log"
                 if [[ "$renew_mode" == "2" ]]; then
                     print_warn "强制续签: Let's Encrypt 限制每周 5 次相同证书"
                     if confirm "确认强制续签?"; then
-                        certbot renew --force-renewal 2>&1 | tee /tmp/certbot-renew.log
+                        certbot renew --force-renewal 2>&1 | tee "$renew_log"
                         local renew_rc=${PIPESTATUS[0]}
                     else
                         pause; continue
                     fi
                 else
-                    certbot renew 2>&1 | tee /tmp/certbot-renew.log
+                    certbot renew 2>&1 | tee "$renew_log"
                     local renew_rc=${PIPESTATUS[0]}
                 fi
                 if [[ ${renew_rc:-1} -ne 0 ]]; then
@@ -5157,7 +6203,7 @@ web_home_expose() {
     # 2. 选择域名 (自动列出 Token 可管理的域名)
     print_info "获取 Token 可管理的域名列表..."
     local zones_json zone_list=() zone_ids=()
-    zones_json=$(_cf_api GET "/zones?per_page=50&status=active" "$token")
+    zones_json=$(_cf_list_zones "$token" "status=active")
     if ! _cf_api_ok "$zones_json"; then
         print_error "获取域名列表失败: $(_cf_api_err "$zones_json")"
         pause; return
@@ -5197,9 +6243,15 @@ web_home_expose() {
     print_guide "输入子域名前缀"
     echo -e "  ${C_GRAY}例如输入 alist -> 访问地址为 alist.${root_domain}${C_RESET}"
     echo -e "  ${C_GRAY}例如输入 nas -> 访问地址为 nas.${root_domain}${C_RESET}"
-    while [[ -z "$sub_prefix" ]]; do
+    while true; do
         read -e -r -p "子域名前缀: " sub_prefix
-        [[ -z "$sub_prefix" ]] && print_warn "不能为空"
+        if [[ -z "$sub_prefix" ]]; then
+            print_warn "不能为空"
+            continue
+        fi
+        validate_dns_label "$sub_prefix" && break
+        print_error "子域名前缀格式无效（仅小写字母、数字、短横；首尾不能为短横，1-63 字符）"
+        sub_prefix=""
     done
     local full_domain="${sub_prefix}.${root_domain}"
 
@@ -5399,15 +6451,14 @@ $(_nginx_tls_http2_block "$https_port")
     local ddns_domain="$full_domain"
     local ddns_proxied="true"
     mkdir -p "$DDNS_CONFIG_DIR"
-    cat > "$DDNS_CONFIG_DIR/${ddns_domain}.conf" << EOF
-DDNS_DOMAIN="${ddns_domain}"
+    local ddns_conf_content="DDNS_DOMAIN="${ddns_domain}"
 DDNS_TOKEN="${token}"
 DDNS_ZONE_ID="${zone_id}"
 DDNS_IPV4="true"
 DDNS_IPV6="false"
 DDNS_PROXIED="${ddns_proxied}"
-DDNS_INTERVAL="${ddns_interval}"
-EOF
+DDNS_INTERVAL="${ddns_interval}""
+    write_file_atomic "$DDNS_CONFIG_DIR/${ddns_domain}.conf" "$ddns_conf_content" || { print_error "DDNS 配置写入失败"; pause; return; }
     chmod 600 "$DDNS_CONFIG_DIR/${ddns_domain}.conf"
     ddns_create_script
     ddns_rebuild_cron
@@ -5416,7 +6467,7 @@ EOF
 
     # Step: 防火墙
     echo -e "\n${C_CYAN}=== [${step}/${total_steps}] 防火墙 ===${C_RESET}"
-    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+    if ufw_is_active; then
         ufw allow "${https_port}/tcp" comment "HomeExpose-${full_domain}" >/dev/null 2>&1 || true
         print_success "已放行端口 ${https_port}/tcp"
     else
@@ -5429,12 +6480,16 @@ EOF
         echo -e "\n${C_CYAN}=== [${step}/${total_steps}] CF Origin Rule (端口回源) ===${C_RESET}"
         print_info "创建回源规则: 用户访问 :443 -> CF 回源 :${https_port}"
         local existing
-        existing=$(_cf_get_origin_ruleset "$token" "$zone_id")
-        local existing_rules="[]"
-        if [[ -n "$existing" ]]; then
-            existing_rules=$(echo "$existing" | jq '.result.rules // []')
-        fi
-        # 移除同域名旧规则
+        if ! existing=$(_cf_get_origin_ruleset "$token" "$zone_id"); then
+            print_warn "Origin Rules 读取失败，已跳过自动创建，避免覆盖该 Zone 的既有回源规则。"
+            print_warn "可稍后通过菜单 [10.创建回源规则] 手动添加"
+            ((step++))
+        else
+            local existing_rules="[]"
+            if [[ -n "$existing" ]]; then
+                existing_rules=$(echo "$existing" | jq '.result.rules // []')
+            fi
+            # 移除同域名旧规则
         local filtered_rules=$(echo "$existing_rules" | jq --arg d "$full_domain" \
             '[.[] | select(.expression != ("http.host eq \"" + $d + "\""))]')
         # 构建新规则
@@ -5451,13 +6506,14 @@ EOF
             }')
         local final_rules=$(echo "$filtered_rules" | jq --argjson new "$new_rule" '. + [$new]')
         local err
-        if ! err=$(_cf_put_origin_ruleset "$token" "$zone_id" "$final_rules"); then
-            print_warn "Origin Rule 创建失败: $err"
-            print_warn "可稍后通过菜单 [10.创建回源规则] 手动添加"
-        else
-            print_success "Origin Rule 已创建 (用户 :443 -> 回源 :${https_port})"
+            if ! err=$(_cf_put_origin_ruleset "$token" "$zone_id" "$final_rules"); then
+                print_warn "Origin Rule 创建失败: $err"
+                print_warn "可稍后通过菜单 [10.创建回源规则] 手动添加"
+            else
+                print_success "Origin Rule 已创建 (用户 :443 -> 回源 :${https_port})"
+            fi
+            ((step++))
         fi
-        ((step++))
     fi
 
     # Step: SSL/TLS Full 模式
@@ -5580,6 +6636,12 @@ CONFEOF
             read -e -r -p "内网 IP: " nginx_ip
             [[ -z "$nginx_ip" ]] && { print_warn "跳过 DNS 劫持配置"; pause; return; }
         fi
+        if ! validate_ip "$nginx_ip"; then
+            print_error "内网 IP 无效: ${nginx_ip}"
+            print_warn "跳过 DNS 劫持配置"
+            pause
+            return 0
+        fi
 
         echo -e "${C_CYAN}配置预览:${C_RESET}"
         echo -e "  路由器: ${C_GREEN}${router_ssh}${C_RESET}"
@@ -5605,9 +6667,9 @@ uci set dhcp.@domain[-1].name='${full_domain}'
 uci set dhcp.@domain[-1].ip='${nginx_ip}'
 uci commit dhcp
 /etc/init.d/dnsmasq restart
-"
+	"
         if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
-            ${router_ssh} "${uci_cmds}" 2>&1; then
+            "$router_ssh" "${uci_cmds}" 2>&1; then
             print_success "内网 DNS 劫持配置成功！"
             echo -e "  ${C_GREEN}${full_domain} -> ${nginx_ip}${C_RESET} (内网直连)"
         else
@@ -5648,18 +6710,18 @@ docker_install() {
     mkdir -p "$keyring_dir"
     local docker_gpg="$keyring_dir/docker.gpg"
     local os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+    local docker_repo_os="${os_id}"
+    [[ "$docker_repo_os" != "ubuntu" && "$docker_repo_os" != "debian" ]] && docker_repo_os="debian"
     if [[ ! -f "$docker_gpg" ]]; then
         print_info "添加 Docker GPG 密钥..."
-        # 根据实际系统选择正确的 GPG URL
-        local gpg_os="${os_id}"
-        [[ "$gpg_os" != "ubuntu" && "$gpg_os" != "debian" ]] && gpg_os="debian"
-        if ! curl -fsSL "https://download.docker.com/linux/${gpg_os}/gpg" | gpg --dearmor -o "$docker_gpg" 2>/dev/null; then
+        # 根据实际系统选择正确的官方仓库 OS；非 Debian/Ubuntu 系回退到 debian 时，
+        # GPG URL 与 apt source 必须保持一致。
+        if ! curl -fsSL "https://download.docker.com/linux/${docker_repo_os}/gpg" | gpg --dearmor -o "$docker_gpg" 2>/dev/null; then
             print_error "GPG 密钥下载失败。"
             pause; return
         fi
         chmod a+r "$docker_gpg"
     fi
-    local os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
     local version_codename=$(grep 'VERSION_CODENAME' /etc/os-release | cut -d= -f2)
     if [[ -z "$version_codename" ]]; then
         version_codename=$(grep 'UBUNTU_CODENAME' /etc/os-release | cut -d= -f2)
@@ -5672,7 +6734,7 @@ docker_install() {
     local docker_list="/etc/apt/sources.list.d/docker.list"
     if [[ ! -f "$docker_list" ]]; then
         print_info "添加 Docker 软件源..."
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=$docker_gpg] https://download.docker.com/linux/$os_id $version_codename stable" > "$docker_list"
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=$docker_gpg] https://download.docker.com/linux/${docker_repo_os} $version_codename stable" > "$docker_list"
     fi
     apt-get update -qq 2>/dev/null || true
     if apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null 2>&1; then
@@ -5705,9 +6767,13 @@ docker_uninstall() {
     print_info "正在卸载软件包..."
     apt-get purge -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null 2>&1 || true
     apt-get autoremove -y >/dev/null 2>&1 || true
+    rm -f "$DOCKER_PROXY_CONF"
+    rm -rf "$DOCKER_PROXY_DIR"
     if confirm "是否删除所有 Docker 数据 (/var/lib/docker)?"; then
-        rm -rf /var/lib/docker /var/lib/containerd
+        rm -rf /var/lib/docker /var/lib/containerd /etc/docker
         print_success "数据已删除。"
+    else
+        rm -rf /etc/docker
     fi
     rm -f /etc/apt/sources.list.d/docker.list
     rm -f /etc/apt/keyrings/docker.gpg
@@ -5764,14 +6830,22 @@ docker_compose_install() {
     local compose_arch
     compose_arch=$(_docker_compose_standalone_arch)
     local compose_url="https://github.com/docker/compose/releases/download/${compose_version}/docker-compose-linux-${compose_arch}"
-    if curl -fL --retry 3 "$compose_url" -o /usr/local/bin/docker-compose 2>/dev/null; then
-        chmod +x /usr/local/bin/docker-compose
+    local tmp_bin tmp_sha hash
+    tmp_bin=$(mktemp /tmp/docker-compose.XXXXXX) || { print_error "创建临时文件失败"; pause; return; }
+    tmp_sha=$(mktemp /tmp/docker-compose.sha256.XXXXXX) || { rm -f "$tmp_bin"; print_error "创建临时文件失败"; pause; return; }
+    if curl -fL --retry 3 "$compose_url" -o "$tmp_bin" 2>/dev/null \
+        && curl -fL --retry 3 "${compose_url}.sha256" -o "$tmp_sha" 2>/dev/null \
+        && hash=$(awk '{print $1; exit}' "$tmp_sha") \
+        && [[ "$hash" =~ ^[a-fA-F0-9]{64}$ ]] \
+        && printf '%s  %s\n' "$hash" "$tmp_bin" | sha256sum -c - >/dev/null; then
+        install -m 0755 "$tmp_bin" /usr/local/bin/docker-compose
         print_success "Docker Compose Standalone 安装成功。"
         docker-compose --version
         log_action "Docker Compose standalone installed"
     else
         print_error "下载失败。"
     fi
+    rm -f "$tmp_bin" "$tmp_sha"
     pause
 }
 
@@ -5924,7 +6998,13 @@ docker_containers_manage() {
         if [[ "$action" == "6" ]]; then
             if confirm "停止所有容器?"; then
                 local rq=$(docker ps -q)
-                [[ -n "$rq" ]] && docker stop $rq && print_success "已停止" || print_warn "无运行中容器"
+                if [[ -z "$rq" ]]; then
+                    print_warn "无运行中容器"
+                elif docker stop $rq >/dev/null; then
+                    print_success "已停止"
+                else
+                    print_error "停止失败"
+                fi
                 log_action "Docker all containers stopped"
             fi
             pause; continue
@@ -5932,7 +7012,13 @@ docker_containers_manage() {
         if [[ "$action" == "7" ]]; then
             if confirm "删除所有容器? (危险)"; then
                 local aq=$(docker ps -aq)
-                [[ -n "$aq" ]] && docker rm -f $aq && print_success "已删除" || print_warn "无容器"
+                if [[ -z "$aq" ]]; then
+                    print_warn "无容器"
+                elif docker rm -f $aq >/dev/null; then
+                    print_success "已删除"
+                else
+                    print_error "删除失败"
+                fi
                 log_action "Docker all containers removed"
             fi
             pause; continue
@@ -5950,7 +7036,12 @@ docker_containers_manage() {
             1) docker start "$target_id" && print_success "已启动: $target_name" || print_error "启动失败" ;;
             2) docker stop "$target_id" && print_success "已停止: $target_name" || print_error "停止失败" ;;
             3) docker restart "$target_id" && print_success "已重启: $target_name" || print_error "重启失败" ;;
-            4) print_info "按 Ctrl+C 退出日志..."; docker logs --tail 50 -f "$target_id" ;;
+            4)
+                print_info "按 Ctrl+C 退出日志并返回菜单..."
+                trap - INT
+                docker logs --tail 50 -f "$target_id" || true
+                trap 'handle_interrupt' INT
+                ;;
             5)
                 if confirm "确认删除容器 $target_name?"; then
                     docker rm -f "$target_id" && print_success "已删除: $target_name" || print_error "删除失败"
@@ -6213,15 +7304,15 @@ wg_check_openwrt_compat() {
 #   11e -> Clash/OpenClash config
 #   11g -> watchdog + import/export + menus
 readonly WG_INTERFACE="wg0"
-readonly WG_DB_DIR="/etc/wireguard/db"
-readonly WG_DB_FILE="${WG_DB_DIR}/wg-data.json"
+readonly WG_DB_DIR="${WG_SHARED_DB_DIR}"
+readonly WG_DB_FILE="${WG_SHARED_DB_FILE}"
 readonly WG_CONF="/etc/wireguard/${WG_INTERFACE}.conf"
-readonly WG_ROLE_FILE="/etc/wireguard/.role"
+readonly WG_ROLE_FILE="${WG_SHARED_ROLE_FILE}"
 
-wg_db_init() {
-    mkdir -p "$WG_DB_DIR"
-    [[ -f "$WG_DB_FILE" ]] && return 0
-    cat > "$WG_DB_FILE" << 'WGEOF'
+wg_shared_db_init() {
+    mkdir -p "$WG_SHARED_DB_DIR"
+    [[ -f "$WG_SHARED_DB_FILE" ]] && return 0
+    cat > "$WG_SHARED_DB_FILE" << 'WGEOF'
 {
   "role": "",
   "server": {},
@@ -6229,48 +7320,14 @@ wg_db_init() {
   "client": {}
 }
 WGEOF
-    chmod 600 "$WG_DB_FILE"
+    chmod 600 "$WG_SHARED_DB_FILE"
 }
 
-wg_db_migrate() {
-    [[ ! -f "$WG_DB_FILE" ]] && return 0
-    local ver
-    ver=$(wg_db_get '.schema_version // 0')
-    [[ "$ver" -ge 2 ]] && return 0
-    print_info "数据库迁移: v${ver} → v2 ..."
-    # 删除 overseas 相关字段
-    wg_db_set 'del(.server.deploy_mode, .server.tunnel_type,
-        .server.vless_port, .server.vless_uuid, .server.vless_network,
-        .server.vless_flow, .server.reality_public_key,
-        .server.reality_private_key, .server.reality_short_id,
-        .server.reality_sni, .server.reality_dest)' 2>/dev/null || true
-    # 为每个 peer 补充 peer_type
-    local pc i=0
-    pc=$(wg_db_get '.peers | length')
-    while [[ $i -lt ${pc:-0} ]]; do
-        local existing_type
-        existing_type=$(wg_db_get ".peers[$i].peer_type // empty")
-        if [[ -z "$existing_type" || "$existing_type" == "null" ]]; then
-            local is_gw
-            is_gw=$(wg_db_get ".peers[$i].is_gateway // false")
-            if [[ "$is_gw" == "true" ]]; then
-                wg_db_set --argjson idx "$i" '.peers[$idx].peer_type = "gateway"'
-            else
-                wg_db_set --argjson idx "$i" '.peers[$idx].peer_type = "standard"'
-            fi
-        fi
-        i=$((i + 1))
-    done
-    # 设置版本号
-    wg_db_set '.schema_version = 2'
-    print_success "数据库迁移完成"
-}
+wg_shared_db_get() { jq -r "$@" "$WG_SHARED_DB_FILE" 2>/dev/null; }
 
-wg_db_get() { jq -r "$@" "$WG_DB_FILE" 2>/dev/null; }
-
-wg_db_set() {
+wg_shared_db_set() {
     local tmp
-    tmp=$(mktemp "${WG_DB_DIR}/.tmp.XXXXXX") || { print_error "无法创建临时文件"; return 1; }
+    tmp=$(mktemp "${WG_SHARED_DB_DIR}/.tmp.XXXXXX") || { print_error "无法创建临时文件"; return 1; }
     (
         if [[ "$PLATFORM" == "openwrt" ]]; then
             local _retry=0
@@ -6282,31 +7339,38 @@ wg_db_set() {
         else
             flock -w 5 200 || { rm -f "$tmp"; print_error "无法获取数据库锁"; return 1; }
         fi
-        if jq "$@" "$WG_DB_FILE" > "$tmp" 2>/dev/null; then
-            mv "$tmp" "$WG_DB_FILE"; chmod 600 "$WG_DB_FILE"
+        if jq "$@" "$WG_SHARED_DB_FILE" > "$tmp" 2>/dev/null; then
+            mv "$tmp" "$WG_SHARED_DB_FILE"; chmod 600 "$WG_SHARED_DB_FILE"
         else
             rm -f "$tmp"; print_error "数据库写入失败"; return 1
         fi
-    ) 200>"${WG_DB_FILE}.lock"
+    ) 200>"${WG_SHARED_DB_FILE}.lock"
 }
 
-wg_get_role() {
+wg_shared_get_role() {
     local role=""
-    [[ -f "$WG_ROLE_FILE" ]] && role=$(cat "$WG_ROLE_FILE" 2>/dev/null)
-    [[ -z "$role" && -f "$WG_DB_FILE" ]] && role=$(wg_db_get '.role // empty')
-    if [[ -z "$role" && -f "$WG_DB_FILE" ]]; then
-        local spk=$(wg_db_get '.server.private_key // empty')
+    [[ -f "$WG_SHARED_ROLE_FILE" ]] && role=$(cat "$WG_SHARED_ROLE_FILE" 2>/dev/null)
+    [[ -z "$role" && -f "$WG_SHARED_DB_FILE" ]] && role=$(wg_shared_db_get '.role // empty')
+    if [[ -z "$role" && -f "$WG_SHARED_DB_FILE" ]]; then
+        local spk
+        spk=$(wg_shared_db_get '.server.private_key // empty')
         [[ -n "$spk" ]] && role="server"
     fi
     echo "${role:-none}"
 }
 
-wg_set_role() {
+wg_shared_set_role() {
     mkdir -p /etc/wireguard
-    echo "$1" > "$WG_ROLE_FILE"
-    chmod 600 "$WG_ROLE_FILE"
-    wg_db_set --arg r "$1" '.role = $r' 2>/dev/null || true
+    echo "$1" > "$WG_SHARED_ROLE_FILE"
+    chmod 600 "$WG_SHARED_ROLE_FILE"
+    wg_shared_db_set --arg r "$1" '.role = $r' 2>/dev/null || true
 }
+
+wg_db_init() { wg_shared_db_init; }
+wg_db_get() { wg_shared_db_get "$@"; }
+wg_db_set() { wg_shared_db_set "$@"; }
+wg_get_role() { wg_shared_get_role; }
+wg_set_role() { wg_shared_set_role "$@"; }
 
 wg_is_installed() { command_exists wg && [[ -f "$WG_DB_FILE" ]]; }
 wg_is_running()   { ip link show "$WG_INTERFACE" &>/dev/null; }
@@ -6418,7 +7482,7 @@ wg_next_ip() {
     local next
     for next in $(seq 2 254); do
         local candidate="${prefix}.${next}"
-        echo "$used_ips" | grep -qw "$candidate" || { echo "$candidate"; return 0; }
+        printf '%s\n' $used_ips | grep -Fxq -- "$candidate" || { echo "$candidate"; return 0; }
     done
     print_error "子网 IP 已耗尽"; return 1
 }
@@ -6437,6 +7501,7 @@ wg_format_bytes() {
 
 wg_rebuild_uci_conf() {
     [[ "$(wg_get_role)" != "server" ]] && return 1
+    local apply_mode="${1:-reload}"
     local priv_key port subnet server_ip mask mtu
     priv_key=$(wg_db_get '.server.private_key')
     port=$(wg_db_get '.server.port')
@@ -6504,14 +7569,34 @@ wg_rebuild_uci_conf() {
 
     uci commit network
 
-    # --- 如果 wg0 正在运行，热重载配置 ---
-    if wg_is_running; then
+    # --- 非 peer 热应用路径仍允许重启接口；peer 操作传 no_reload 后用 wg syncconf 热同步 ---
+    if wg_is_running && [[ "$apply_mode" != "no_reload" ]]; then
         ifdown wg0 2>/dev/null
         sleep 1
         ifup wg0 2>/dev/null
         sleep 1
         wg_sync_peer_routes
     fi
+}
+
+wg_apply_runtime_conf() {
+    wg_rebuild_conf || return 1
+    wg_is_running || return 0
+    local tmp
+    tmp=$(mktemp "/tmp/${SCRIPT_NAME}-wg-sync.XXXXXX") || return 1
+    awk '
+        /^\[Interface\]$/ { section="interface"; print; next }
+        /^\[Peer\]$/ { section="peer"; print; next }
+        section=="interface" && /^(PrivateKey|ListenPort|FwMark)[[:space:]]*=/ { print; next }
+        section=="peer" && /^(PublicKey|PresharedKey|AllowedIPs|Endpoint|PersistentKeepalive)[[:space:]]*=/ { print; next }
+    ' "$WG_CONF" > "$tmp"
+    if wg syncconf "$WG_INTERFACE" "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        wg_sync_peer_routes
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
 }
 
 # 同步网关 peer 的 LAN 路由到内核路由表
@@ -6552,6 +7637,9 @@ wg_rebuild_conf() {
     mask=$(echo "$subnet" | cut -d'/' -f2)
     mtu=$(wg_db_get '.server.mtu // empty')
     [[ -z "$mtu" || "$mtu" == "null" ]] && mtu=$WG_MTU_DIRECT
+    local old_umask _rc
+    old_umask=$(umask)
+    umask 077
     {
         echo "[Interface]"
         echo "PrivateKey = ${priv_key}"
@@ -6577,6 +7665,9 @@ wg_rebuild_conf() {
             i=$((i + 1))
         done
     } > "$WG_CONF"
+    _rc=$?
+    umask "$old_umask"
+    [[ $_rc -eq 0 ]] || return 1
     chmod 600 "$WG_CONF"
 }
 
@@ -6873,7 +7964,7 @@ wg_modify_server() {
     echo -e "  当前 DNS:   ${C_GREEN}${cur_dns}${C_RESET}"
     echo -e "  当前端点:   ${C_GREEN}${cur_ep}${C_RESET}"
     [[ -n "$cur_lan" && "$cur_lan" != "null" ]] && echo -e "  当前 LAN:   ${C_GREEN}${cur_lan}${C_RESET}"
-    local changed=false
+    local changed=false lan_changed=false
 
     read -e -r -p "新监听端口 [${cur_port}]: " new_port
     new_port=${new_port:-$cur_port}
@@ -6907,14 +7998,25 @@ wg_modify_server() {
     read -e -r -p "新服务端 LAN 子网 [${cur_lan:-无}]: " new_lan
     new_lan=${new_lan:-$cur_lan}
     if [[ "$new_lan" != "$cur_lan" ]]; then
-        wg_db_set --arg l "$new_lan" '.server.server_lan_subnet = $l'
-        changed=true
-        print_info "LAN 子网将更改为 ${new_lan}"
+        if ! validate_cidr_list "$new_lan"; then
+            print_warn "LAN 子网格式无效，保持原值"
+            new_lan="$cur_lan"
+        else
+            wg_db_set --arg l "$new_lan" '.server.server_lan_subnet = $l'
+            changed=true
+            lan_changed=true
+            print_info "LAN 子网将更改为 ${new_lan}"
+        fi
     fi
 
     if [[ "$changed" != "true" ]]; then
         print_info "未做任何更改"
         pause; return
+    fi
+
+    if [[ "$lan_changed" == "true" ]]; then
+        _wg_update_peer_routes
+        wg_mihomo_bypass_rebuild 2>/dev/null || true
     fi
 
     wg_rebuild_uci_conf
@@ -7125,6 +8227,32 @@ wg_restart() {
 
 # ── Mihomo bypass 函数 ──
 
+_wg_rc_local_insert_block() {
+    local rc_block="${1:-}" rc_file="${2:-/etc/rc.local}"
+    [[ -n "$rc_block" ]] || return 1
+    local tmp_block tmp_out
+    tmp_block=$(mktemp "/tmp/${SCRIPT_NAME}-wg-rc-block.XXXXXX") || return 1
+    tmp_out=$(mktemp "/tmp/${SCRIPT_NAME}-wg-rc-local.XXXXXX") || { rm -f "$tmp_block"; return 1; }
+    if [[ ! -f "$rc_file" ]]; then
+        printf '#!/bin/sh\nexit 0\n' > "$rc_file" 2>/dev/null || { rm -f "$tmp_block" "$tmp_out"; return 1; }
+        chmod +x "$rc_file" 2>/dev/null || true
+    fi
+    printf '%b\n' "$rc_block" > "$tmp_block"
+    if awk '
+        FNR == NR { block = block $0 ORS; next }
+        /^[[:space:]]*exit[[:space:]]+0([[:space:]]*(#.*)?)?$/ && !inserted { printf "%s", block; inserted=1 }
+        { print }
+        END { if (!inserted) printf "%s", block }
+    ' "$tmp_block" "$rc_file" > "$tmp_out"; then
+        cat "$tmp_out" > "$rc_file"
+        chmod +x "$rc_file" 2>/dev/null || true
+        rm -f "$tmp_block" "$tmp_out"
+        return 0
+    fi
+    rm -f "$tmp_block" "$tmp_out"
+    return 1
+}
+
 wg_setup_mihomo_bypass() {
     local wg_subnet="${1:-$(wg_db_get '.server.subnet')}"
     [[ -z "$wg_subnet" || "$wg_subnet" == "null" ]] && return 1
@@ -7191,12 +8319,7 @@ wg_setup_mihomo_bypass() {
         fi
         pi=$((pi + 1))
     done
-    if grep -q "^exit 0" /etc/rc.local 2>/dev/null; then
-        sed -i "/^exit 0/i\\
-${rc_block}" /etc/rc.local 2>/dev/null || true
-    else
-        echo -e "$rc_block" >> /etc/rc.local
-    fi
+    _wg_rc_local_insert_block "$rc_block" || print_warn "写入 /etc/rc.local 持久化规则失败"
 
     print_success "Mihomo bypass 规则已配置 (${#unique_subnets[@]} 个子网)"
 }
@@ -7281,13 +8404,8 @@ wg_mihomo_bypass_rebuild() {
         nft insert rule inet fw4 input_wan udp dport "$wg_port" counter accept comment \"wg_allow_port\" 2>/dev/null || true
         # 持久化到 /etc/rc.local
         sed -i '/wg_allow_port/d' /etc/rc.local 2>/dev/null || true
-        if grep -q "^exit 0" /etc/rc.local 2>/dev/null; then
-            sed -i "/^exit 0/i\\
-nft insert rule inet fw4 input_wan udp dport ${wg_port} counter accept comment \\\"wg_allow_port\\\" 2>/dev/null || true" \
-                /etc/rc.local 2>/dev/null || true
-        else
-            echo "nft insert rule inet fw4 input_wan udp dport ${wg_port} counter accept comment \"wg_allow_port\" 2>/dev/null || true" >> /etc/rc.local
-        fi
+        local rc_block="nft insert rule inet fw4 input_wan udp dport ${wg_port} counter accept comment \\\"wg_allow_port\\\" 2>/dev/null || true"
+        _wg_rc_local_insert_block "$rc_block" || print_warn "写入 /etc/rc.local 端口放行规则失败"
         # uci 持久化防火墙规则
         if ! uci -q get firewall.wg_allow_port &>/dev/null; then
             uci set firewall.wg_allow_port=rule
@@ -7373,8 +8491,7 @@ wg_uninstall() {
 
     print_info "[3/6] 清理 Mihomo bypass 和 nft 规则..."
     wg_mihomo_bypass_clean
-    # 清理策略路由
-    ip rule del lookup main prio 100 2>/dev/null || true
+    # 旧版 prio 100 策略路由没有可验证标记，不能粗暴删除第三方规则。
 
     print_info "[4/6] 清理看门狗和定时任务..."
     if crontab -l 2>/dev/null | grep -q "wg-watchdog.sh"; then
@@ -7388,7 +8505,6 @@ wg_uninstall() {
     rm -f "$WG_DB_FILE" 2>/dev/null || true
     rm -rf "$WG_DB_DIR" 2>/dev/null || true
     rm -f "$WG_ROLE_FILE" 2>/dev/null || true
-    rm -f /etc/wireguard/*.key 2>/dev/null || true
     rmdir /etc/wireguard 2>/dev/null || true
     rm -rf /tmp/.wg-wd-fail /tmp/.wg-watchdog-ping-fail \
            /tmp/.wg-db-tmp.json /tmp/clash-wg-*.yaml \
@@ -7481,7 +8597,7 @@ while uci get firewall.@forwarding[$i] >/dev/null 2>&1; do
 done
 
 # === 清理 Mihomo bypass 和 nft 规则 ===
-ip rule del lookup main prio 100 2>/dev/null; true
+# 旧版 prio 100 策略路由没有可验证标记，不能粗暴删除第三方规则。
 for h in $(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print $NF}'); do
     nft delete rule inet fw4 mangle_prerouting handle "$h" 2>/dev/null; true
 done
@@ -7555,7 +8671,7 @@ wg_add_peer() {
                 read -e -r -p "LAN 网段: " lan_subnets
                 if [[ -z "$lan_subnets" ]]; then
                     print_warn "网关设备必须指定 LAN 网段"
-                elif ! echo "$lan_subnets" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+'; then
+                elif ! validate_cidr_list "$lan_subnets"; then
                     print_warn "格式无效，示例: 192.168.123.0/24"
                     lan_subnets=""
                 fi
@@ -7572,13 +8688,14 @@ wg_add_peer() {
     esac
 
     # ── 路由模式 ──
-    local client_allowed_ips server_subnet server_lan
+    local client_allowed_ips server_subnet server_lan route_mode="managed"
     server_subnet=$(wg_db_get '.server.subnet')
     server_lan=$(wg_db_get '.server.server_lan_subnet // empty')
 
     # 收集所有网关 LAN 网段 (含当前新设备)
     local all_lan_subnets=""
     local pc=$(wg_db_get '.peers | length') pi=0
+    local target_idx="$pc"
     while [[ $pi -lt $pc ]]; do
         local pls=$(wg_db_get ".peers[$pi].lan_subnets // empty")
         if [[ -n "$pls" && "$pls" != "null" ]]; then
@@ -7632,9 +8749,10 @@ wg_add_peer() {
         read -e -r -p "选择 [1]: " route_mode
         route_mode=${route_mode:-1}
         case $route_mode in
-            1) client_allowed_ips="0.0.0.0/0, ::/0" ;;
-            2) client_allowed_ips="$server_subnet" ;;
+            1) client_allowed_ips="0.0.0.0/0, ::/0"; route_mode="full" ;;
+            2) client_allowed_ips="$server_subnet"; route_mode="vpn" ;;
             3)
+                route_mode="managed"
                 client_allowed_ips="$server_subnet"
                 [[ -n "$server_lan" && "$server_lan" != "null" ]] && client_allowed_ips="${client_allowed_ips}, ${server_lan}"
                 [[ -n "$all_lan_subnets" ]] && client_allowed_ips="${client_allowed_ips}, ${all_lan_subnets}"
@@ -7642,8 +8760,15 @@ wg_add_peer() {
             4)
                 read -e -r -p "输入允许的 IP 范围 (逗号分隔): " client_allowed_ips
                 [[ -z "$client_allowed_ips" ]] && client_allowed_ips="0.0.0.0/0, ::/0"
+                if validate_wg_allowed_ips "$client_allowed_ips"; then
+                    route_mode="custom"
+                else
+                    print_warn "自定义路由格式无效，回退为仅 VPN 内网"
+                    client_allowed_ips="$server_subnet"
+                    route_mode="vpn"
+                fi
                 ;;
-            *) client_allowed_ips="0.0.0.0/0, ::/0" ;;
+            *) client_allowed_ips="0.0.0.0/0, ::/0"; route_mode="full" ;;
         esac
     fi
 
@@ -7684,6 +8809,7 @@ PersistentKeepalive = 25"
               --arg gw "$is_gateway" \
               --arg lans "$lan_subnets" \
               --arg ptype "$peer_type" \
+              --arg route_mode "$route_mode" \
     '.peers += [{
         name: $name,
         ip: $ip,
@@ -7695,7 +8821,8 @@ PersistentKeepalive = 25"
         created: $created,
         is_gateway: ($gw == "true"),
         lan_subnets: $lans,
-        peer_type: $ptype
+        peer_type: $ptype,
+        route_mode: $route_mode
     }]'
 
     # ── 网关设备: 联动更新其他 peer 的 allowed_ips ──
@@ -7704,8 +8831,8 @@ PersistentKeepalive = 25"
     fi
 
     # ── 重建配置并应用 ──
-    wg_rebuild_uci_conf
-    wg_rebuild_conf
+    wg_rebuild_uci_conf "no_reload"
+    wg_apply_runtime_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
     wg_regenerate_client_confs
 
     # 网关 peer 添加/删除会改变 LAN 子网列表，需重建 Mihomo bypass
@@ -7772,6 +8899,8 @@ _wg_update_peer_routes() {
         local _is_gw=$(wg_db_get ".peers[$_pi].is_gateway // false")
         local _own=$(wg_db_get ".peers[$_pi].lan_subnets // empty")
         local _ptype=$(wg_db_get ".peers[$_pi].peer_type // \"standard\"")
+        local _route_mode=$(wg_db_get ".peers[$_pi].route_mode // empty")
+        [[ "$_route_mode" == "custom" ]] && { _pi=$((_pi + 1)); continue; }
 
         if [[ "$_is_gw" == "true" ]]; then
             # 网关: VPN 子网 + 服务端 LAN + 其他网关 LAN (排除自己)
@@ -7804,87 +8933,6 @@ _wg_update_peer_routes() {
     done
 }
 
-wg_list_peers() {
-    wg_check_server || return 1
-    print_title "WireGuard 设备列表"
-    local peer_count
-    peer_count=$(wg_db_get '.peers | length')
-    if [[ "$peer_count" -eq 0 || "$peer_count" == "null" ]]; then
-        print_warn "暂无设备"
-        pause; return
-    fi
-    local wg_dump=""
-    wg_is_running && wg_dump=$(wg show "$WG_INTERFACE" dump 2>/dev/null | tail -n +2)
-    printf "${C_CYAN}%-4s %-14s %-14s %-8s %-8s %-10s %-10s %s${C_RESET}\n" \
-        "#" "名称" "IP" "类型" "状态" "↓接收" "↑发送" "最近握手"
-    draw_line
-    local i=0
-    while [[ $i -lt $peer_count ]]; do
-        local name ip pubkey enabled peer_type
-        name=$(wg_db_get ".peers[$i].name")
-        ip=$(wg_db_get ".peers[$i].ip")
-        pubkey=$(wg_db_get ".peers[$i].public_key")
-        enabled=$(wg_db_get ".peers[$i].enabled")
-        peer_type=$(wg_db_get ".peers[$i].peer_type // \"standard\"")
-        local type_str
-        case "$peer_type" in
-            clash)   type_str="${C_CYAN}Clash${C_RESET}" ;;
-            gateway) type_str="${C_YELLOW}网关${C_RESET}" ;;
-            *)       type_str="标准" ;;
-        esac
-        local status_str
-        if [[ "$enabled" != "true" ]]; then
-            status_str="${C_GRAY}禁用${C_RESET}"
-        else
-            status_str="${C_GREEN}启用${C_RESET}"
-        fi
-        local rx_bytes="0" tx_bytes="0" last_handshake="从未"
-        if [[ -n "$wg_dump" ]]; then
-            local peer_line
-            peer_line=$(echo "$wg_dump" | grep "^${pubkey}" 2>/dev/null)
-            if [[ -n "$peer_line" ]]; then
-                rx_bytes=$(echo "$peer_line" | awk '{print $6}')
-                tx_bytes=$(echo "$peer_line" | awk '{print $7}')
-                local hs_epoch
-                hs_epoch=$(echo "$peer_line" | awk '{print $5}')
-                if [[ -n "$hs_epoch" && "$hs_epoch" != "0" ]]; then
-                    local now_epoch diff
-                    now_epoch=$(date +%s)
-                    diff=$((now_epoch - hs_epoch))
-                    if [[ $diff -lt 60 ]]; then
-                        last_handshake="${diff}秒前"
-                        status_str="${C_GREEN}在线${C_RESET}"
-                    elif [[ $diff -lt 3600 ]]; then
-                        last_handshake="$((diff / 60))分前"
-                    elif [[ $diff -lt 86400 ]]; then
-                        last_handshake="$((diff / 3600))时前"
-                    else
-                        last_handshake="$((diff / 86400))天前"
-                    fi
-                fi
-            fi
-        fi
-        printf "%-4s %-14s %-14s %-8b %-8b %-10s %-10s %s\n" \
-            "$((i + 1))" "$name" "$ip" "$type_str" "$status_str" \
-            "$(wg_format_bytes "$rx_bytes")" "$(wg_format_bytes "$tx_bytes")" "$last_handshake"
-        i=$((i + 1))
-    done
-    echo -e "${C_CYAN}共 ${peer_count} 个设备${C_RESET}"
-    # 显示网关 LAN 信息
-    local gw_found=0 gi=0
-    while [[ $gi -lt $peer_count ]]; do
-        local gw_check=$(wg_db_get ".peers[$gi].is_gateway // false")
-        if [[ "$gw_check" == "true" ]]; then
-            [[ $gw_found -eq 0 ]] && { echo -e "${C_CYAN}网关设备 LAN 网段:${C_RESET}"; gw_found=1; }
-            local gw_name=$(wg_db_get ".peers[$gi].name")
-            local gw_lans=$(wg_db_get ".peers[$gi].lan_subnets // empty")
-            echo -e "  ${gw_name}: ${C_GREEN}${gw_lans:-未设置}${C_RESET}"
-        fi
-        gi=$((gi + 1))
-    done
-    pause
-}
-
 wg_toggle_peer() {
     wg_check_server || return 1
     print_title "启用/禁用 WireGuard 设备"
@@ -7900,16 +8948,16 @@ wg_toggle_peer() {
             if wg_is_running; then
                 wg set "$WG_INTERFACE" peer "$target_pubkey" remove 2>/dev/null || true
             fi
-            wg_rebuild_uci_conf
-            wg_rebuild_conf
+            wg_rebuild_uci_conf "no_reload"
+            wg_apply_runtime_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
             print_success "设备 '${target_name}' 已禁用"
             log_action "WireGuard peer disabled: ${target_name}"
         fi
     else
         if confirm "确认启用设备 '${target_name}'？"; then
             wg_db_set --argjson idx "$target_idx" '.peers[$idx].enabled = true'
-            wg_rebuild_uci_conf
-            wg_rebuild_conf
+            wg_rebuild_uci_conf "no_reload"
+            wg_apply_runtime_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
             print_success "设备 '${target_name}' 已启用"
             log_action "WireGuard peer enabled: ${target_name}"
         fi
@@ -7941,8 +8989,8 @@ wg_delete_peer() {
     fi
 
     rm -f "/etc/wireguard/clients/${target_name}.conf"
-    wg_rebuild_uci_conf
-    wg_rebuild_conf
+    wg_rebuild_uci_conf "no_reload"
+    wg_apply_runtime_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
     wg_regenerate_client_confs
 
     # 网关 peer 删除后 LAN 子网列表变化，需重建 Mihomo bypass
@@ -8071,8 +9119,7 @@ i=0; while uci get firewall.@zone[\$i] >/dev/null 2>&1; do
     case "\$zname" in wg|wireguard) uci delete "firewall.@zone[\$i]" 2>/dev/null; true; continue ;; esac
     i=\$((i + 1))
 done
-# clean ALL ip rules with prio 100 (old fake-ip bypass rules)
-while ip rule del prio 100 2>/dev/null; do true; done
+# 旧版 prio 100 规则没有可验证标记，不能粗暴删除全部 prio 100（可能属于第三方）。
 for h in \$(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print \$NF}'); do
     nft delete rule inet fw4 mangle_prerouting handle "\$h" 2>/dev/null; true
 done
@@ -8156,22 +9203,24 @@ fi
 
 # 持久化: rc.local 中使用外部 DNS 动态解析 (每次开机重新解析)
 sed -i '/wg_bypass/d; /WireGuard bypass/d; /wg_ep_resolve/d; /ip rule.*prio 100/d' /etc/rc.local 2>/dev/null; true
-if grep -q "^exit 0" /etc/rc.local 2>/dev/null; then
-    sed -i "/^exit 0/i # WireGuard bypass Mihomo (dynamic resolve, bypass fake-ip) # wg_bypass\\
-WG_EP=\\\$(nslookup '${ep_host}' 223.5.5.5 2>/dev/null | awk '/^Address:/{a=\\\$2} END{if(a) print a}') # wg_ep_resolve\\
-[ -n \\\"\\\$WG_EP\\\" ] \&\& { ip rule add to \\\"\\\$WG_EP\\\" lookup main prio 100 2>/dev/null; true; } # wg_bypass\\
-[ -n \\\"\\\$WG_EP\\\" ] \&\& nft insert rule inet fw4 mangle_prerouting ip daddr \\\"\\\$WG_EP\\\" udp dport ${sport} counter return comment \\\"wg_bypass\\\" 2>/dev/null; true # wg_bypass\\
-nft insert rule inet fw4 mangle_prerouting iifname \\\"wg0\\\" counter return comment \\\"wg_bypass_iface\\\" 2>/dev/null; true # wg_bypass" \\
-        /etc/rc.local 2>/dev/null; true
-else
-    cat >> /etc/rc.local << 'RCEOF'
-# WireGuard bypass Mihomo (dynamic resolve) # wg_bypass
+WG_RC_BLOCK="/tmp/wg-rc-block.\$\$"
+WG_RC_TMP="\$(mktemp /tmp/rc.local.XXXXXX 2>/dev/null || echo /tmp/rc.local.\$\$)"
+cat > "\$WG_RC_BLOCK" << 'WG_RC_EOF'
+# WireGuard bypass Mihomo (dynamic resolve, bypass fake-ip) # wg_bypass
 WG_EP=\$(nslookup '${ep_host}' 223.5.5.5 2>/dev/null | awk '/^Address:/{a=\$2} END{if(a) print a}') # wg_ep_resolve
 [ -n "\$WG_EP" ] && { ip rule add to "\$WG_EP" lookup main prio 100 2>/dev/null; true; } # wg_bypass
 [ -n "\$WG_EP" ] && nft insert rule inet fw4 mangle_prerouting ip daddr "\$WG_EP" udp dport ${sport} counter return comment "wg_bypass" 2>/dev/null; true # wg_bypass
 nft insert rule inet fw4 mangle_prerouting iifname "wg0" counter return comment "wg_bypass_iface" 2>/dev/null; true # wg_bypass
-RCEOF
-fi
+WG_RC_EOF
+[ -f /etc/rc.local ] || { printf '#!/bin/sh\nexit 0\n' > /etc/rc.local; chmod +x /etc/rc.local 2>/dev/null; }
+awk '
+    FNR == NR { block = block \$0 ORS; next }
+    /^[[:space:]]*exit[[:space:]]+0([[:space:]]*(#.*)?)?\$/ && !inserted { printf "%s", block; inserted=1 }
+    { print }
+    END { if (!inserted) printf "%s", block }
+' "\$WG_RC_BLOCK" /etc/rc.local > "\$WG_RC_TMP" && cat "\$WG_RC_TMP" > /etc/rc.local
+chmod +x /etc/rc.local 2>/dev/null; true
+rm -f "\$WG_RC_BLOCK" "\$WG_RC_TMP"
 
 # === 开机自恢复服务 ===
 cat > /etc/init.d/wg-client << 'INITEOF'
@@ -8296,7 +9345,7 @@ if [ -n "$EP_HOST" ] && ! echo "$EP_HOST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[
             nft delete rule inet fw4 mangle_prerouting handle "$h" 2>/dev/null; true
         done
         nft insert rule inet fw4 mangle_prerouting ip daddr "$RESOLVED" udp dport "$PORT" counter return comment "wg_bypass" 2>/dev/null; true
-        while ip rule del prio 100 2>/dev/null; do true; done
+        ip rule del to "$RESOLVED" lookup main prio 100 2>/dev/null; true
         ip rule add to "$RESOLVED" lookup main prio 100 2>/dev/null; true
         wdlog "bypass updated -> $RESOLVED"
     fi
@@ -8350,10 +9399,43 @@ WDEOF
     echo "  • 看门狗: 每分钟检测 fake-ip 并自动修正"
     draw_line
 }
+_wg_clash_db_get() {
+    local mode="$1"; shift
+    case "$mode" in
+        debian) wg_deb_db_get "$@" ;;
+        *)      wg_db_get "$@" ;;
+    esac
+}
+
+_wg_clash_check_server() {
+    local mode="$1"
+    case "$mode" in
+        debian) wg_deb_check_server ;;
+        *)      wg_check_server ;;
+    esac
+}
+
+_wg_clash_server_name() {
+    local mode="$1"
+    case "$mode" in
+        debian) wg_deb_get_server_name ;;
+        *)      wg_get_server_name ;;
+    esac
+}
+
 wg_generate_clash_config() {
-    wg_check_server || return 1
+    _wg_generate_clash_config_impl "openwrt"
+}
+
+wg_deb_generate_clash_config() {
+    _wg_generate_clash_config_impl "debian"
+}
+
+_wg_generate_clash_config_impl() {
+    local mode="${1:-openwrt}"
+    _wg_clash_check_server "$mode" || return 1
     print_title "生成 Clash (OpenClash) WireGuard 配置"
-    local peer_count=$(wg_db_get '.peers | length')
+    local peer_count=$(_wg_clash_db_get "$mode" '.peers | length')
     if [[ "$peer_count" -eq 0 ]]; then
         print_warn "暂无设备，请先添加 Peer"
         pause; return
@@ -8363,9 +9445,9 @@ wg_generate_clash_config() {
     echo "选择要生成 Clash 配置的设备:"
     local i=0
     while [[ $i -lt $peer_count ]]; do
-        local name=$(wg_db_get ".peers[$i].name")
-        local ip=$(wg_db_get ".peers[$i].ip")
-        local is_gw=$(wg_db_get ".peers[$i].is_gateway // false")
+        local name=$(_wg_clash_db_get "$mode" ".peers[$i].name")
+        local ip=$(_wg_clash_db_get "$mode" ".peers[$i].ip")
+        local is_gw=$(_wg_clash_db_get "$mode" ".peers[$i].is_gateway // false")
         local mark=""
         [[ "$is_gw" == "true" ]] && mark=" ${C_YELLOW}(网关)${C_RESET}"
         echo -e "  $((i+1)). ${name} (${ip})${mark}"
@@ -8378,24 +9460,24 @@ wg_generate_clash_config() {
         print_error "无效序号"; pause; return
     fi
     local ti=$((idx-1))
-    local peer_name=$(wg_db_get ".peers[$ti].name")
-    local peer_ip=$(wg_db_get ".peers[$ti].ip")
-    local peer_privkey=$(wg_db_get ".peers[$ti].private_key")
-    local peer_psk=$(wg_db_get ".peers[$ti].preshared_key")
-    local server_pubkey=$(wg_db_get '.server.public_key')
-    local server_endpoint=$(wg_db_get '.server.endpoint')
-    local server_port=$(wg_db_get '.server.port')
-    local server_subnet=$(wg_db_get '.server.subnet')
-    local server_dns=$(wg_db_get '.server.dns' | cut -d',' -f1 | xargs)
+    local peer_name=$(_wg_clash_db_get "$mode" ".peers[$ti].name")
+    local peer_ip=$(_wg_clash_db_get "$mode" ".peers[$ti].ip")
+    local peer_privkey=$(_wg_clash_db_get "$mode" ".peers[$ti].private_key")
+    local peer_psk=$(_wg_clash_db_get "$mode" ".peers[$ti].preshared_key")
+    local server_pubkey=$(_wg_clash_db_get "$mode" '.server.public_key')
+    local server_endpoint=$(_wg_clash_db_get "$mode" '.server.endpoint')
+    local server_port=$(_wg_clash_db_get "$mode" '.server.port')
+    local server_subnet=$(_wg_clash_db_get "$mode" '.server.subnet')
+    local server_dns=$(_wg_clash_db_get "$mode" '.server.dns' | cut -d',' -f1 | xargs)
     local mask=$(echo "$server_subnet" | cut -d'/' -f2)
 
     # 收集所有 VPN 路由网段 (含服务端 LAN)
     local vpn_cidrs=("$server_subnet")
-    local server_lan=$(wg_db_get '.server.server_lan_subnet // empty')
+    local server_lan=$(_wg_clash_db_get "$mode" '.server.server_lan_subnet // empty')
     [[ -n "$server_lan" && "$server_lan" != "null" ]] && vpn_cidrs+=("$server_lan")
     local pi=0
     while [[ $pi -lt $peer_count ]]; do
-        local pls=$(wg_db_get ".peers[$pi].lan_subnets // empty")
+        local pls=$(_wg_clash_db_get "$mode" ".peers[$pi].lan_subnets // empty")
         if [[ -n "$pls" && "$pls" != "null" ]]; then
             local IFS_BAK="$IFS"; IFS=','
             for cidr in $pls; do
@@ -8414,10 +9496,10 @@ wg_generate_clash_config() {
     local all_proxy_yaml=""
 
     # 主机节点
-    local primary_name="WG-$(wg_get_server_name)"
+    local primary_name="WG-$(_wg_clash_server_name "$mode")"
     all_proxy_names+=("$primary_name")
 
-    local mtu=$(wg_db_get '.server.mtu // 1420')
+    local mtu=$(_wg_clash_db_get "$mode" '.server.mtu // 1420')
     all_proxy_yaml+="  - name: \"${primary_name}\"
     type: wireguard
     server: ${server_endpoint}
@@ -8508,13 +9590,19 @@ wg_generate_clash_config() {
                 pause; return
             fi
             local output_file="/tmp/clash-wg-${peer_name}-$(date +%s).yaml"
+            local has_proxy_groups=false
+            echo "$original_yaml" | grep -qE '^[[:space:]]*proxy-groups:' && has_proxy_groups=true
 
             # 用 Python/jq 辅助或简单 awk 注入
             # 改进: 追踪缩进层级判断段结束
+            local old_umask inject_rc
+            old_umask=$(umask)
+            umask 077
             awk \
                 -v proxy_nodes="$all_proxy_yaml" \
                 -v proxy_group="$wg_group_yaml" \
                 -v rules="$wg_rules_yaml" \
+                -v has_proxy_groups="$has_proxy_groups" \
             '
             BEGIN { state="init"; proxy_done=0; group_done=0; rule_done=0 }
 
@@ -8531,8 +9619,16 @@ wg_generate_clash_config() {
                 state="groups"; print; next
             }
             /^rules:/ {
+                if(state=="proxies" && !proxy_done) {
+                    print ""; print proxy_nodes
+                    proxy_done=1
+                }
                 if(state=="groups" && !group_done) {
-                    print ""; print proxy_group; print "";
+                    print ""; print proxy_group; print ""
+                    group_done=1
+                }
+                if(has_proxy_groups != "true" && !group_done) {
+                    print ""; print "proxy-groups:"; print proxy_group; print ""
                     group_done=1
                 }
                 print $0
@@ -8553,16 +9649,32 @@ wg_generate_clash_config() {
             { print }
             END {
                 if(!proxy_done) { print ""; print proxy_nodes }
-                if(!group_done) { print ""; print proxy_group }
+                if(!group_done) {
+                    print ""
+                    if(has_proxy_groups != "true") { print "proxy-groups:" }
+                    print proxy_group
+                }
                 if(!rule_done) { print ""; print "rules:"; print "  # === WireGuard VPN 路由规则 ==="; printf "%s", rules }
             }
             ' <<< "$original_yaml" > "$output_file"
+            inject_rc=$?
+            umask "$old_umask"
+            chmod 600 "$output_file" 2>/dev/null || true
+            if [[ $inject_rc -ne 0 ]]; then
+                print_error "YAML 注入失败"
+                rm -f "$output_file"
+                pause; return
+            fi
 
             # ── 自动注入 nameserver-policy: 订阅域名走国内 DNS 直连解析 ──
             # 避免 DNS 鸡蛋问题: fallback DNS (Google/Cloudflare DoH) 需要代理才能访问
             # 但此时代理尚未建立，订阅 URL 无法解析 → 节点拉取失败
             local _prov_block=""
-            _prov_block=$(awk '/^proxy-providers:/,/^[a-zA-Z_-]+:/' "$output_file" 2>/dev/null || true)
+            _prov_block=$(awk '
+                /^proxy-providers:/ { in_providers=1; print; next }
+                in_providers && /^[A-Za-z_-]+:/ { exit }
+                in_providers { print }
+            ' "$output_file" 2>/dev/null || true)
             if [[ -n "$_prov_block" ]]; then
                 local _inject_ns=""
                 while IFS= read -r _purl; do
@@ -8622,7 +9734,7 @@ wg_generate_clash_config() {
                     ;;
             esac
             echo -e "${C_CYAN}下载命令:${C_RESET}"
-            echo "  scp root@$(wg_db_get '.server.endpoint'):${output_file} ./clash-config.yaml"
+            echo "  scp root@$(_wg_clash_db_get "$mode" '.server.endpoint'):${output_file} ./clash-config.yaml"
             draw_line
             ;;
         0|"") return ;;
@@ -8642,9 +9754,10 @@ wg_setup_watchdog() {
     wg_check_installed || return 1
     local watchdog_script="/usr/local/bin/wg-watchdog.sh"
     local watchdog_log="/var/log/wg-watchdog.log"
+    local auto_mode="${1:-}"
 
     # 已启用时的管理界面
-    if crontab -l 2>/dev/null | grep -q "wg-watchdog.sh"; then
+    if [[ -z "$auto_mode" ]] && crontab -l 2>/dev/null | grep -q "wg-watchdog.sh"; then
         print_title "WireGuard 看门狗"
         echo -e "  状态: ${C_GREEN}已启用${C_RESET}"
         echo -e "  脚本: ${C_CYAN}${watchdog_script}${C_RESET}"
@@ -8675,12 +9788,14 @@ wg_setup_watchdog() {
         pause; return
     fi
 
-    print_title "WireGuard 服务端看门狗"
-    echo "看门狗功能:
+    if [[ -z "$auto_mode" ]]; then
+        print_title "WireGuard 服务端看门狗"
+        echo "看门狗功能:
   • 每分钟检测 wg0 接口状态
   • 接口消失 → 立即拉起
   • wg show 失败 → 重启接口"
-    if ! confirm "启用看门狗?"; then pause; return; fi
+        if ! confirm "启用看门狗?"; then pause; return; fi
+    fi
 
     # ── OpenWrt 看门狗 (#!/bin/sh + ifup/ifdown + Mihomo bypass + 路由检查) ──
     cat > "$watchdog_script" << 'WDEOF_OPENWRT'
@@ -8704,10 +9819,20 @@ fi
 
 # 检测 Mihomo bypass 规则是否存在
 if nft list chain inet fw4 mangle_prerouting &>/dev/null; then
-    if ! nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep -q "wg_bypass"; then
-        $LOG "Mihomo bypass rules missing, rebuilding"
-        grep "wg_bypass" /etc/rc.local 2>/dev/null | while IFS= read -r line; do
-            eval "$line" 2>/dev/null || true
+    NFT_RULES=$(nft list chain inet fw4 mangle_prerouting 2>/dev/null)
+    if ! echo "$NFT_RULES" | grep -q "wg_bypass_iface"; then
+        nft insert rule inet fw4 mangle_prerouting iifname "wg0" counter return comment "wg_bypass_iface" 2>/dev/null || true
+        $LOG "restored wg_bypass_iface rule"
+    fi
+    if [ -f "$DB" ] && command -v jq >/dev/null 2>&1; then
+        jq -r '[.server.subnet, (.server.server_lan_subnet // empty), (.peers[]? | select(.enabled == true and .is_gateway == true) | .lan_subnets // empty)] | .[] | select(. != null and . != "")' "$DB" 2>/dev/null | \
+        tr ',' '\n' | while IFS= read -r sub; do
+            sub=$(echo "$sub" | xargs)
+            [ -z "$sub" ] && continue
+            if ! echo "$NFT_RULES" | grep -q "daddr $sub"; then
+                nft insert rule inet fw4 mangle_prerouting ip daddr "$sub" counter return comment "wg_bypass_subnet" 2>/dev/null || true
+                $LOG "restored wg_bypass_subnet rule: $sub"
+            fi
         done
     fi
 fi
@@ -8732,7 +9857,7 @@ WDEOF_OPENWRT
     echo -e "  脚本: ${C_CYAN}${watchdog_script}${C_RESET}"
     echo "  检测: 接口存活 → wg show → Mihomo bypass 规则"
     log_action "WireGuard watchdog enabled (platform=openwrt)"
-    pause
+    [[ -z "$auto_mode" ]] && pause
 }
 
 wg_export_peers() {
@@ -8745,7 +9870,7 @@ wg_export_peers() {
         pause; return
     fi
     local export_file
-    export_file=$(mktemp "/tmp/${SCRIPT_NAME}-wg-peers-XXXXXX.json")
+    export_file=$(mktemp "/tmp/${SCRIPT_NAME}-wg-peers.XXXXXX") || { print_error "无法创建导出文件"; pause; return 1; }
     chmod 600 "$export_file"
     if jq '{
         export_version: 2,
@@ -8833,7 +9958,7 @@ wg_import_peers() {
     local imported=0 skipped=0
     local i=0
     while [[ $i -lt $import_count ]]; do
-        local name ip privkey pubkey psk allowed enabled is_gw lans created peer_type
+        local name ip privkey pubkey psk allowed enabled is_gw lans created peer_type route_mode
         name=$(jq -r ".peers[$i].name" "$import_file")
         ip=$(jq -r ".peers[$i].ip" "$import_file")
         privkey=$(jq -r ".peers[$i].private_key" "$import_file")
@@ -8845,10 +9970,39 @@ wg_import_peers() {
         lans=$(jq -r ".peers[$i].lan_subnets // empty" "$import_file")
         created=$(jq -r ".peers[$i].created // empty" "$import_file")
         peer_type=$(jq -r ".peers[$i].peer_type // empty" "$import_file")
+        route_mode=$(jq -r ".peers[$i].route_mode // empty" "$import_file")
         # 兼容旧版 JSON: 无 peer_type 时根据 is_gateway 推断
         if [[ -z "$peer_type" || "$peer_type" == "null" ]]; then
             [[ "$is_gw" == "true" ]] && peer_type="gateway" || peer_type="standard"
         fi
+        [[ -z "$route_mode" || "$route_mode" == "null" ]] && route_mode="managed"
+        [[ "$enabled" == "true" || "$enabled" == "false" ]] || enabled=true
+        [[ "$is_gw" == "true" || "$is_gw" == "false" ]] || is_gw=false
+
+        if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            print_warn "跳过: $name (名称格式无效)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
+        if ! validate_ip "$ip"; then
+            print_warn "跳过: $name (IP 格式无效: $ip)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
+        if [[ -z "$allowed" || "$allowed" == "null" ]] || ! validate_cidr_list "$allowed"; then
+            print_warn "跳过: $name (AllowedIPs 格式无效: $allowed)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
+        if ! validate_cidr_list "$lans"; then
+            print_warn "跳过: $name (LAN 网段格式无效: $lans)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
+        case "$peer_type" in
+            standard|gateway) ;;
+            *) print_warn "跳过: $name (设备类型无效: $peer_type)"; skipped=$((skipped + 1)); i=$((i + 1)); continue ;;
+        esac
+        case "$route_mode" in
+            managed|custom|full|vpn) ;;
+            *) print_warn "跳过: $name (路由模式无效: $route_mode)"; skipped=$((skipped + 1)); i=$((i + 1)); continue ;;
+        esac
 
         # 检查重名
         local exists
@@ -8870,6 +10024,18 @@ wg_import_peers() {
             pubkey=$(echo "$privkey" | wg pubkey)
             psk=$(wg genpsk)
         fi
+        if ! validate_wg_key "$privkey"; then
+            print_warn "跳过: $name (私钥格式无效)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
+        if ! validate_wg_key "$pubkey"; then
+            print_warn "跳过: $name (公钥格式无效)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
+        if ! validate_wg_key "$psk"; then
+            print_warn "跳过: $name (预共享密钥格式无效)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
 
         [[ -z "$created" || "$created" == "null" ]] && created=$(date '+%Y-%m-%d %H:%M:%S')
 
@@ -8884,6 +10050,7 @@ wg_import_peers() {
                   --arg gw "$is_gw" \
                   --arg lans "$lans" \
                   --arg ptype "$peer_type" \
+                  --arg route_mode "$route_mode" \
             '.peers += [{
                 name: $name,
                 ip: $ip,
@@ -8895,15 +10062,16 @@ wg_import_peers() {
                 created: $created,
                 is_gateway: ($gw == "true"),
                 lan_subnets: $lans,
-                peer_type: $ptype
+                peer_type: $ptype,
+                route_mode: $route_mode
             }]'
         imported=$((imported + 1))
         i=$((i + 1))
     done
 
     if [[ $imported -gt 0 ]]; then
-        wg_rebuild_uci_conf
-        wg_rebuild_conf
+        wg_rebuild_uci_conf "no_reload"
+        wg_apply_runtime_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
         wg_regenerate_client_confs
     fi
     echo ""
@@ -8981,7 +10149,9 @@ wg_main_menu() {
         if wg_is_installed; then
             local role
             role=$(wg_get_role)
-            if [[ "$role" == "server" || -f "$WG_CONF" ]]; then
+            local server_private_key=""
+            server_private_key=$(wg_db_get '.server.private_key // empty')
+            if [[ "$role" == "server" ]] || { [[ "$role" == "none" || -z "$role" ]] && [[ -f "$WG_CONF" ]] && [[ -n "$server_private_key" && "$server_private_key" != "null" ]]; }; then
                 [[ "$role" == "server" ]] || wg_set_role "server"
                 print_title "WireGuard VPN"
                 local srv_name
@@ -9154,87 +10324,20 @@ wg_deb_check_compat() {
     fi
     return 0
 }
-# 使用 wg_deb_ 前缀，与 OpenWrt 版 (wg_) 完全隔离
+# 使用 wg_deb_ 前缀隔离平台入口；DB/role 路径通过 WG_SHARED_* 显式共享，便于跨平台导入/管理。
 
 readonly WG_DEB_INTERFACE="wg0"
-readonly WG_DEB_DB_DIR="/etc/wireguard/db"
-readonly WG_DEB_DB_FILE="${WG_DEB_DB_DIR}/wg-data.json"
+readonly WG_DEB_DB_DIR="${WG_SHARED_DB_DIR}"
+readonly WG_DEB_DB_FILE="${WG_SHARED_DB_FILE}"
 readonly WG_DEB_CONF="/etc/wireguard/${WG_DEB_INTERFACE}.conf"
-readonly WG_DEB_ROLE_FILE="/etc/wireguard/.role"
+readonly WG_DEB_ROLE_FILE="${WG_SHARED_ROLE_FILE}"
 readonly WG_DEB_CLIENT_DIR="/etc/wireguard/clients"
 
-wg_deb_db_init() {
-    mkdir -p "$WG_DEB_DB_DIR"
-    [[ -f "$WG_DEB_DB_FILE" ]] && return 0
-    cat > "$WG_DEB_DB_FILE" << 'WGEOF'
-{
-  "role": "",
-  "server": {},
-  "peers": [],
-  "client": {}
-}
-WGEOF
-    chmod 600 "$WG_DEB_DB_FILE"
-}
-
-wg_deb_db_migrate() {
-    [[ ! -f "$WG_DEB_DB_FILE" ]] && return 0
-    local ver
-    ver=$(wg_deb_db_get '.schema_version // 0')
-    [[ "$ver" -ge 2 ]] && return 0
-    print_info "数据库迁移: v${ver} → v2 ..."
-    local pc i=0
-    pc=$(wg_deb_db_get '.peers | length')
-    while [[ $i -lt ${pc:-0} ]]; do
-        local existing_type
-        existing_type=$(wg_deb_db_get ".peers[$i].peer_type // empty")
-        if [[ -z "$existing_type" || "$existing_type" == "null" ]]; then
-            local is_gw
-            is_gw=$(wg_deb_db_get ".peers[$i].is_gateway // false")
-            if [[ "$is_gw" == "true" ]]; then
-                wg_deb_db_set --argjson idx "$i" '.peers[$idx].peer_type = "gateway"'
-            else
-                wg_deb_db_set --argjson idx "$i" '.peers[$idx].peer_type = "standard"'
-            fi
-        fi
-        i=$((i + 1))
-    done
-    wg_deb_db_set '.schema_version = 2'
-    print_success "数据库迁移完成"
-}
-
-wg_deb_db_get() { jq -r "$@" "$WG_DEB_DB_FILE" 2>/dev/null; }
-
-wg_deb_db_set() {
-    local tmp
-    tmp=$(mktemp "${WG_DEB_DB_DIR}/.tmp.XXXXXX") || { print_error "无法创建临时文件"; return 1; }
-    (
-        flock -w 5 200 || { rm -f "$tmp"; print_error "无法获取数据库锁"; return 1; }
-        if jq "$@" "$WG_DEB_DB_FILE" > "$tmp" 2>/dev/null; then
-            mv "$tmp" "$WG_DEB_DB_FILE"; chmod 600 "$WG_DEB_DB_FILE"
-        else
-            rm -f "$tmp"; print_error "数据库写入失败"; return 1
-        fi
-    ) 200>"${WG_DEB_DB_FILE}.lock"
-}
-
-wg_deb_get_role() {
-    local role=""
-    [[ -f "$WG_DEB_ROLE_FILE" ]] && role=$(cat "$WG_DEB_ROLE_FILE" 2>/dev/null)
-    [[ -z "$role" && -f "$WG_DEB_DB_FILE" ]] && role=$(wg_deb_db_get '.role // empty')
-    if [[ -z "$role" && -f "$WG_DEB_DB_FILE" ]]; then
-        local spk=$(wg_deb_db_get '.server.private_key // empty')
-        [[ -n "$spk" ]] && role="server"
-    fi
-    echo "${role:-none}"
-}
-
-wg_deb_set_role() {
-    mkdir -p /etc/wireguard
-    echo "$1" > "$WG_DEB_ROLE_FILE"
-    chmod 600 "$WG_DEB_ROLE_FILE"
-    wg_deb_db_set --arg r "$1" '.role = $r' 2>/dev/null || true
-}
+wg_deb_db_init() { wg_shared_db_init; }
+wg_deb_db_get() { wg_shared_db_get "$@"; }
+wg_deb_db_set() { wg_shared_db_set "$@"; }
+wg_deb_get_role() { wg_shared_get_role; }
+wg_deb_set_role() { wg_shared_set_role "$@"; }
 
 wg_deb_is_installed() { command_exists wg && [[ -f "$WG_DEB_DB_FILE" ]]; }
 wg_deb_is_running()   { ip link show "$WG_DEB_INTERFACE" &>/dev/null; }
@@ -9346,7 +10449,7 @@ wg_deb_next_ip() {
     local next
     for next in $(seq 2 254); do
         local candidate="${prefix}.${next}"
-        echo "$used_ips" | grep -qw "$candidate" || { echo "$candidate"; return 0; }
+        printf '%s\n' $used_ips | grep -Fxq -- "$candidate" || { echo "$candidate"; return 0; }
     done
     print_error "子网 IP 已耗尽"; return 1
 }
@@ -9365,6 +10468,13 @@ wg_deb_format_bytes() {
 # 检测默认出口网卡
 wg_deb_detect_default_iface() {
     ip route show default 2>/dev/null | grep -oP 'dev \K\S+' | head -1
+}
+
+_wg_deb_cleanup_nat_iface() {
+    local subnet="${1:-}" iface="${2:-}"
+    [[ -n "$subnet" && -n "$iface" && "$iface" != "null" ]] || return 0
+    command_exists iptables || return 0
+    iptables -t nat -D POSTROUTING -s "$subnet" -o "$iface" -j MASQUERADE >/dev/null 2>&1 || true
 }
 
 # 生成 /etc/wireguard/wg0.conf (Debian 的运行配置)
@@ -9390,6 +10500,9 @@ wg_deb_rebuild_conf() {
     [[ -z "$def_iface" || "$def_iface" == "null" ]] && def_iface=$(wg_deb_detect_default_iface)
     [[ -z "$def_iface" ]] && def_iface="eth0"
 
+    local old_umask _rc
+    old_umask=$(umask)
+    umask 077
     {
         echo "[Interface]"
         echo "PrivateKey = ${priv_key}"
@@ -9427,6 +10540,9 @@ wg_deb_rebuild_conf() {
             i=$((i + 1))
         done
     } > "$WG_DEB_CONF"
+    _rc=$?
+    umask "$old_umask"
+    [[ $_rc -eq 0 ]] || return 1
     chmod 600 "$WG_DEB_CONF"
 }
 
@@ -9462,6 +10578,26 @@ PersistentKeepalive = 25"
         chmod 600 "${WG_DEB_CLIENT_DIR}/${name}.conf"
         i=$((i + 1))
     done
+}
+
+wg_deb_apply_conf() {
+    wg_deb_rebuild_conf || return 1
+    wg_deb_regenerate_client_confs
+    wg_deb_is_running || return 0
+    local tmp
+    tmp=$(mktemp "/tmp/${SCRIPT_NAME}-wg-deb-sync.XXXXXX") || return 1
+    awk '
+        /^\[Interface\]$/ { section="interface"; print; next }
+        /^\[Peer\]$/ { section="peer"; print; next }
+        section=="interface" && /^(PrivateKey|ListenPort|FwMark)[[:space:]]*=/ { print; next }
+        section=="peer" && /^(PublicKey|PresharedKey|AllowedIPs|Endpoint|PersistentKeepalive)[[:space:]]*=/ { print; next }
+    ' "$WG_DEB_CONF" > "$tmp"
+    if wg syncconf "$WG_DEB_INTERFACE" "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
 }
 wg_deb_server_install() {
     print_title "安装 WireGuard 服务端 (Debian/Ubuntu)"
@@ -9605,8 +10741,7 @@ wg_deb_server_install() {
     # ── [6/7] 写入数据库 + 生成配置 ──
     print_info "[6/7] 写入配置..."
     wg_deb_db_init
-    wg_deb_set_role "server"
-    wg_deb_db_set --arg sname "$server_name" \
+    if ! wg_deb_db_set --arg sname "$server_name" \
               --arg pk "$server_privkey" \
               --arg pub "$server_pubkey" \
               --arg ip "$server_ip" \
@@ -9633,7 +10768,11 @@ wg_deb_server_install() {
         ddns_domain: $ddns,
         server_lan_subnet: $lan,
         default_iface: $iface
-    } | .schema_version = 2'
+    } | .schema_version = 2'; then
+        print_error "数据库写入失败，已中止安装"
+        pause; return 1
+    fi
+    wg_deb_set_role "server"
 
     # 生成 wg0.conf
     wg_deb_rebuild_conf
@@ -9646,12 +10785,12 @@ wg_deb_server_install() {
 
     # ── [7/7] 启动服务 ──
     print_info "[7/7] 启动 WireGuard..."
-    systemctl enable wg-quick@wg0 >/dev/null 2>&1
-    systemctl start wg-quick@wg0 >/dev/null 2>&1
+    systemctl enable wg-quick@${WG_DEB_INTERFACE} >/dev/null 2>&1
+    systemctl start wg-quick@${WG_DEB_INTERFACE} >/dev/null 2>&1
     sleep 2
 
     # 放行 WG UDP 端口 (ufw 如果启用)
-    if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
+    if ufw_is_active; then
         ufw allow "$wg_port"/udp >/dev/null 2>&1
         print_info "已在 UFW 放行 ${wg_port}/udp"
     fi
@@ -9661,7 +10800,7 @@ wg_deb_server_install() {
     if wg_deb_is_running; then
         print_success "WireGuard 服务端安装并启动成功！"
     else
-        print_warn "WireGuard 已安装，但启动可能失败，请检查: journalctl -u wg-quick@wg0"
+        print_warn "WireGuard 已安装，但启动可能失败，请检查: journalctl -u wg-quick@${WG_DEB_INTERFACE}"
     fi
     echo -e "  角色:       ${C_GREEN}服务端 (Server)${C_RESET}"
     echo -e "  监听地址:   ${C_GREEN}${listen_addr}:${wg_port}/udp${C_RESET}"
@@ -9689,25 +10828,29 @@ wg_deb_server_install() {
 wg_deb_modify_server() {
     wg_deb_check_server || return 1
     print_title "修改 WireGuard 服务端配置"
-    local cur_port cur_dns cur_ep cur_lan cur_iface
+    local cur_port cur_dns cur_ep cur_lan cur_iface cur_subnet
     cur_port=$(wg_deb_db_get '.server.port')
     cur_dns=$(wg_deb_db_get '.server.dns')
     cur_ep=$(wg_deb_db_get '.server.endpoint')
     cur_lan=$(wg_deb_db_get '.server.server_lan_subnet // empty')
     cur_iface=$(wg_deb_db_get '.server.default_iface // empty')
+    cur_subnet=$(wg_deb_db_get '.server.subnet')
     [[ -z "$cur_iface" || "$cur_iface" == "null" ]] && cur_iface=$(wg_deb_detect_default_iface)
     echo -e "  当前端口:   ${C_GREEN}${cur_port}${C_RESET}"
     echo -e "  当前 DNS:   ${C_GREEN}${cur_dns}${C_RESET}"
     echo -e "  当前端点:   ${C_GREEN}${cur_ep}${C_RESET}"
     echo -e "  出口网卡:   ${C_GREEN}${cur_iface}${C_RESET}"
     [[ -n "$cur_lan" && "$cur_lan" != "null" ]] && echo -e "  当前 LAN:   ${C_GREEN}${cur_lan}${C_RESET}"
-    local changed=false
+    local changed=false lan_changed=false iface_changed=false
 
     read -e -r -p "新监听端口 [${cur_port}]: " new_port
     new_port=${new_port:-$cur_port}
     if [[ "$new_port" != "$cur_port" ]]; then
         if validate_port "$new_port"; then
-            wg_deb_db_set --argjson p "$new_port" '.server.port = $p'
+            if ! wg_deb_db_set --argjson p "$new_port" '.server.port = $p'; then
+                print_error "数据库写入失败，端口未修改"
+                pause; return 1
+            fi
             changed=true
             print_info "端口将更改为 ${new_port}"
         else
@@ -9719,7 +10862,10 @@ wg_deb_modify_server() {
     read -e -r -p "新客户端 DNS [${cur_dns}]: " new_dns
     new_dns=${new_dns:-$cur_dns}
     if [[ "$new_dns" != "$cur_dns" ]]; then
-        wg_deb_db_set --arg d "$new_dns" '.server.dns = $d'
+        if ! wg_deb_db_set --arg d "$new_dns" '.server.dns = $d'; then
+            print_error "数据库写入失败，DNS 未修改"
+            pause; return 1
+        fi
         changed=true
         print_info "DNS 将更改为 ${new_dns}"
     fi
@@ -9727,7 +10873,10 @@ wg_deb_modify_server() {
     read -e -r -p "新公网端点 [${cur_ep}]: " new_ep
     new_ep=${new_ep:-$cur_ep}
     if [[ "$new_ep" != "$cur_ep" ]]; then
-        wg_deb_db_set --arg e "$new_ep" '.server.endpoint = $e'
+        if ! wg_deb_db_set --arg e "$new_ep" '.server.endpoint = $e'; then
+            print_error "数据库写入失败，端点未修改"
+            pause; return 1
+        fi
         changed=true
         print_info "端点将更改为 ${new_ep}"
     fi
@@ -9735,16 +10884,29 @@ wg_deb_modify_server() {
     read -e -r -p "新服务端 LAN 子网 [${cur_lan:-无}]: " new_lan
     new_lan=${new_lan:-$cur_lan}
     if [[ "$new_lan" != "$cur_lan" ]]; then
-        wg_deb_db_set --arg l "$new_lan" '.server.server_lan_subnet = $l'
-        changed=true
-        print_info "LAN 子网将更改为 ${new_lan}"
+        if ! validate_cidr_list "$new_lan"; then
+            print_warn "LAN 子网格式无效，保持原值"
+            new_lan="$cur_lan"
+        else
+            if ! wg_deb_db_set --arg l "$new_lan" '.server.server_lan_subnet = $l'; then
+                print_error "数据库写入失败，LAN 子网未修改"
+                pause; return 1
+            fi
+            changed=true
+            lan_changed=true
+            print_info "LAN 子网将更改为 ${new_lan}"
+        fi
     fi
 
     read -e -r -p "出口网卡 [${cur_iface}]: " new_iface
     new_iface=${new_iface:-$cur_iface}
     if [[ "$new_iface" != "$cur_iface" ]]; then
-        wg_deb_db_set --arg i "$new_iface" '.server.default_iface = $i'
+        if ! wg_deb_db_set --arg i "$new_iface" '.server.default_iface = $i'; then
+            print_error "数据库写入失败，出口网卡未修改"
+            pause; return 1
+        fi
         changed=true
+        iface_changed=true
         print_info "出口网卡将更改为 ${new_iface}"
     fi
 
@@ -9753,18 +10915,24 @@ wg_deb_modify_server() {
         pause; return
     fi
 
+    if [[ "$lan_changed" == "true" ]] && ! _wg_deb_update_peer_routes; then
+        print_error "联动更新客户端路由失败"
+        pause; return 1
+    fi
+
     wg_deb_rebuild_conf
     wg_deb_regenerate_client_confs
 
     # UFW 端口变更
-    if [[ "$new_port" != "$cur_port" ]] && command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
+    if [[ "$new_port" != "$cur_port" ]] && ufw_is_active; then
         ufw delete allow "$cur_port"/udp >/dev/null 2>&1
         ufw allow "$new_port"/udp >/dev/null 2>&1
     fi
 
     # 重启服务使配置生效
-    systemctl restart wg-quick@wg0 >/dev/null 2>&1
+    systemctl restart wg-quick@${WG_DEB_INTERFACE} >/dev/null 2>&1
     sleep 2
+    [[ "$iface_changed" == "true" ]] && _wg_deb_cleanup_nat_iface "$cur_subnet" "$cur_iface"
 
     print_success "服务端配置已更新"
     log_action "WireGuard(deb) server config modified: port=${new_port} dns=${new_dns} endpoint=${new_ep} lan=${new_lan:-none} iface=${new_iface}"
@@ -9801,9 +10969,9 @@ wg_deb_server_status() {
     # systemd 服务状态
     echo ""
     local svc_status
-    svc_status=$(systemctl is-active wg-quick@wg0 2>/dev/null || echo "unknown")
+    svc_status=$(systemctl is-active wg-quick@${WG_DEB_INTERFACE} 2>/dev/null || echo "unknown")
     local svc_enabled
-    svc_enabled=$(systemctl is-enabled wg-quick@wg0 2>/dev/null || echo "unknown")
+    svc_enabled=$(systemctl is-enabled wg-quick@${WG_DEB_INTERFACE} 2>/dev/null || echo "unknown")
     echo -e "  systemd:  active=${C_CYAN}${svc_status}${C_RESET}  enabled=${C_CYAN}${svc_enabled}${C_RESET}"
 
     echo ""
@@ -9894,13 +11062,13 @@ wg_deb_start() {
         return 0
     fi
     print_info "正在启动 WireGuard..."
-    systemctl start wg-quick@wg0 >/dev/null 2>&1
+    systemctl start wg-quick@${WG_DEB_INTERFACE} >/dev/null 2>&1
     sleep 2
     if wg_deb_is_running; then
         print_success "WireGuard 已启动"
         log_action "WireGuard(deb) started"
     else
-        print_error "启动失败，请检查: journalctl -u wg-quick@wg0 -n 20"
+        print_error "启动失败，请检查: journalctl -u wg-quick@${WG_DEB_INTERFACE} -n 20"
         log_action "WireGuard(deb) start failed"
     fi
 }
@@ -9911,7 +11079,7 @@ wg_deb_stop() {
         return 0
     fi
     print_info "正在停止 WireGuard..."
-    systemctl stop wg-quick@wg0 >/dev/null 2>&1
+    systemctl stop wg-quick@${WG_DEB_INTERFACE} >/dev/null 2>&1
     sleep 1
     if ! wg_deb_is_running; then
         print_success "WireGuard 已停止"
@@ -9923,13 +11091,13 @@ wg_deb_stop() {
 
 wg_deb_restart() {
     print_info "正在重启 WireGuard..."
-    systemctl restart wg-quick@wg0 >/dev/null 2>&1
+    systemctl restart wg-quick@${WG_DEB_INTERFACE} >/dev/null 2>&1
     sleep 2
     if wg_deb_is_running; then
         print_success "WireGuard 已重启"
         log_action "WireGuard(deb) restarted"
     else
-        print_error "重启失败，请检查: journalctl -u wg-quick@wg0 -n 20"
+        print_error "重启失败，请检查: journalctl -u wg-quick@${WG_DEB_INTERFACE} -n 20"
         log_action "WireGuard(deb) restart failed"
     fi
 }
@@ -9954,14 +11122,14 @@ wg_deb_uninstall() {
     fi
 
     print_info "[1/5] 停止 WireGuard 服务..."
-    systemctl stop wg-quick@wg0 2>/dev/null || true
-    systemctl disable wg-quick@wg0 2>/dev/null || true
+    systemctl stop wg-quick@${WG_DEB_INTERFACE} 2>/dev/null || true
+    systemctl disable wg-quick@${WG_DEB_INTERFACE} 2>/dev/null || true
     # 确保接口已删除
     ip link set "$WG_DEB_INTERFACE" down 2>/dev/null || true
     ip link delete "$WG_DEB_INTERFACE" 2>/dev/null || true
 
     print_info "[2/5] 清理防火墙规则..."
-    if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
+    if ufw_is_active; then
         local wg_port
         wg_port=$(wg_deb_db_get '.server.port' 2>/dev/null)
         [[ -n "$wg_port" && "$wg_port" != "null" ]] && ufw delete allow "$wg_port"/udp >/dev/null 2>&1
@@ -9979,7 +11147,6 @@ wg_deb_uninstall() {
     rm -f "$WG_DEB_DB_FILE" 2>/dev/null || true
     rm -rf "$WG_DEB_DB_DIR" 2>/dev/null || true
     rm -f "$WG_DEB_ROLE_FILE" 2>/dev/null || true
-    rm -f /etc/wireguard/*.key 2>/dev/null || true
     rm -f /etc/sysctl.d/99-wireguard.conf 2>/dev/null || true
     rmdir /etc/wireguard 2>/dev/null || true
 
@@ -10051,7 +11218,7 @@ wg_deb_add_peer() {
                 read -e -r -p "LAN 网段: " lan_subnets
                 if [[ -z "$lan_subnets" ]]; then
                     print_warn "网关设备必须指定 LAN 网段"
-                elif ! echo "$lan_subnets" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+'; then
+                elif ! validate_cidr_list "$lan_subnets"; then
                     print_warn "格式无效，示例: 192.168.123.0/24"
                     lan_subnets=""
                 fi
@@ -10068,7 +11235,7 @@ wg_deb_add_peer() {
     esac
 
     # ── 路由模式 ──
-    local client_allowed_ips server_subnet server_lan
+    local client_allowed_ips server_subnet server_lan route_mode="managed"
     server_subnet=$(wg_deb_db_get '.server.subnet')
     server_lan=$(wg_deb_db_get '.server.server_lan_subnet // empty')
 
@@ -10125,9 +11292,10 @@ wg_deb_add_peer() {
         read -e -r -p "选择 [1]: " route_mode
         route_mode=${route_mode:-1}
         case $route_mode in
-            1) client_allowed_ips="0.0.0.0/0, ::/0" ;;
-            2) client_allowed_ips="$server_subnet" ;;
+            1) client_allowed_ips="0.0.0.0/0, ::/0"; route_mode="full" ;;
+            2) client_allowed_ips="$server_subnet"; route_mode="vpn" ;;
             3)
+                route_mode="managed"
                 client_allowed_ips="$server_subnet"
                 [[ -n "$server_lan" && "$server_lan" != "null" ]] && client_allowed_ips="${client_allowed_ips}, ${server_lan}"
                 [[ -n "$all_lan_subnets" ]] && client_allowed_ips="${client_allowed_ips}, ${all_lan_subnets}"
@@ -10135,8 +11303,15 @@ wg_deb_add_peer() {
             4)
                 read -e -r -p "输入允许的 IP 范围 (逗号分隔): " client_allowed_ips
                 [[ -z "$client_allowed_ips" ]] && client_allowed_ips="0.0.0.0/0, ::/0"
+                if validate_wg_allowed_ips "$client_allowed_ips"; then
+                    route_mode="custom"
+                else
+                    print_warn "自定义路由格式无效，回退为仅 VPN 内网"
+                    client_allowed_ips="$server_subnet"
+                    route_mode="vpn"
+                fi
                 ;;
-            *) client_allowed_ips="0.0.0.0/0, ::/0" ;;
+            *) client_allowed_ips="0.0.0.0/0, ::/0"; route_mode="full" ;;
         esac
     fi
 
@@ -10147,27 +11322,11 @@ wg_deb_add_peer() {
     sport=$(wg_deb_db_get '.server.port')
     sdns=$(wg_deb_db_get '.server.dns')
     mask=$(echo "$server_subnet" | cut -d'/' -f2)
-    local dns_line=""
-    [[ "$is_gateway" != "true" ]] && dns_line="DNS = ${sdns}"
-    local client_conf="[Interface]
-PrivateKey = ${peer_privkey}
-Address = ${peer_ip}/${mask}
-${dns_line}
-[Peer]
-PublicKey = ${spub}
-PresharedKey = ${psk}
-Endpoint = ${sep}:${sport}
-AllowedIPs = ${client_allowed_ips}
-PersistentKeepalive = 25"
-    client_conf=$(echo "$client_conf" | sed '/^$/N;/^\n$/d')
-    mkdir -p "$WG_DEB_CLIENT_DIR"
     local conf_file="${WG_DEB_CLIENT_DIR}/${peer_name}.conf"
-    write_file_atomic "$conf_file" "$client_conf"
-    chmod 600 "$conf_file"
 
     # ── 写入数据库 ──
     local now; now=$(date '+%Y-%m-%d %H:%M:%S')
-    wg_deb_db_set --arg name "$peer_name" \
+    if ! wg_deb_db_set --arg name "$peer_name" \
               --arg ip "$peer_ip" \
               --arg privkey "$peer_privkey" \
               --arg pubkey "$peer_pubkey" \
@@ -10177,6 +11336,7 @@ PersistentKeepalive = 25"
               --arg gw "$is_gateway" \
               --arg lans "$lan_subnets" \
               --arg ptype "$peer_type" \
+              --arg route_mode "$route_mode" \
     '.peers += [{
         name: $name,
         ip: $ip,
@@ -10188,23 +11348,24 @@ PersistentKeepalive = 25"
         created: $created,
         is_gateway: ($gw == "true"),
         lan_subnets: $lans,
-        peer_type: $ptype
-    }]'
+        peer_type: $ptype,
+        route_mode: $route_mode
+    }]'; then
+        rm -f "$conf_file"
+        print_error "数据库写入失败，已清理生成的客户端配置"
+        pause; return 1
+    fi
 
     # ── 网关设备: 联动更新其他 peer 的 allowed_ips ──
     if [[ "$is_gateway" == "true" && -n "$lan_subnets" ]]; then
-        _wg_deb_update_peer_routes
+        if ! _wg_deb_update_peer_routes; then
+            print_error "联动更新客户端路由失败"
+            pause; return 1
+        fi
     fi
 
-    # ── 重建配置并应用 ──
-    wg_deb_rebuild_conf
-    wg_deb_regenerate_client_confs
-
-    # 重启使新 peer 生效
-    if wg_deb_is_running; then
-        systemctl restart wg-quick@wg0 >/dev/null 2>&1
-        sleep 1
-    fi
+    # ── 重建配置并热应用 ──
+    wg_deb_apply_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
 
     # ── 结果展示 ──
     draw_line
@@ -10226,7 +11387,7 @@ PersistentKeepalive = 25"
         echo ""
         read -e -r -p "是否立即生成 Clash/Mihomo 客户端配置? [Y/n]: " _gen_clash
         _gen_clash=${_gen_clash:-Y}
-        [[ "$_gen_clash" =~ ^[Yy]$ ]] && wg_generate_clash_config
+        [[ "$_gen_clash" =~ ^[Yy]$ ]] && wg_deb_generate_clash_config
     elif [[ "$peer_type" == "gateway" ]]; then
         echo -e "\n${C_YELLOW}[网关设备部署提示]${C_RESET}"
         echo "  • LAN 内设备无需安装任何 VPN 客户端，网关自动代理"
@@ -10260,6 +11421,8 @@ _wg_deb_update_peer_routes() {
         local _is_gw=$(wg_deb_db_get ".peers[$_pi].is_gateway // false")
         local _own=$(wg_deb_db_get ".peers[$_pi].lan_subnets // empty")
         local _ptype=$(wg_deb_db_get ".peers[$_pi].peer_type // \"standard\"")
+        local _route_mode=$(wg_deb_db_get ".peers[$_pi].route_mode // empty")
+        [[ "$_route_mode" == "custom" ]] && { _pi=$((_pi + 1)); continue; }
 
         if [[ "$_is_gw" == "true" ]]; then
             local _other="" _IFS_BAK="$IFS"; IFS=','
@@ -10273,96 +11436,21 @@ _wg_deb_update_peer_routes() {
             local _new="$server_subnet"
             [[ -n "$server_lan" && "$server_lan" != "null" ]] && _new="${_new}, ${server_lan}"
             [[ -n "$_other" ]] && _new="${_new}, ${_other}"
-            wg_deb_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a'
+            if ! wg_deb_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a'; then
+                print_error "数据库写入失败，客户端路由未完整更新"
+                return 1
+            fi
         else
             local _new="$server_subnet"
             [[ -n "$server_lan" && "$server_lan" != "null" ]] && _new="${_new}, ${server_lan}"
             [[ -n "$_all_lans" ]] && _new="${_new}, ${_all_lans}"
-            wg_deb_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a'
+            if ! wg_deb_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a'; then
+                print_error "数据库写入失败，客户端路由未完整更新"
+                return 1
+            fi
         fi
         _pi=$((_pi + 1))
     done
-}
-
-wg_deb_list_peers() {
-    wg_deb_check_server || return 1
-    print_title "WireGuard 设备列表"
-    local peer_count
-    peer_count=$(wg_deb_db_get '.peers | length')
-    if [[ "$peer_count" -eq 0 || "$peer_count" == "null" ]]; then
-        print_warn "暂无设备"
-        pause; return
-    fi
-    local wg_dump=""
-    wg_deb_is_running && wg_dump=$(wg show "$WG_DEB_INTERFACE" dump 2>/dev/null | tail -n +2)
-    printf "${C_CYAN}%-4s %-14s %-14s %-8s %-8s %-10s %-10s %s${C_RESET}\n" \
-        "#" "名称" "IP" "类型" "状态" "↓接收" "↑发送" "最近握手"
-    draw_line
-    local i=0
-    while [[ $i -lt $peer_count ]]; do
-        local name ip pubkey enabled peer_type
-        name=$(wg_deb_db_get ".peers[$i].name")
-        ip=$(wg_deb_db_get ".peers[$i].ip")
-        pubkey=$(wg_deb_db_get ".peers[$i].public_key")
-        enabled=$(wg_deb_db_get ".peers[$i].enabled")
-        peer_type=$(wg_deb_db_get ".peers[$i].peer_type // \"standard\"")
-        local type_str
-        case "$peer_type" in
-            clash)   type_str="${C_CYAN}Clash${C_RESET}" ;;
-            gateway) type_str="${C_YELLOW}网关${C_RESET}" ;;
-            *)       type_str="标准" ;;
-        esac
-        local status_str
-        if [[ "$enabled" != "true" ]]; then
-            status_str="${C_GRAY}禁用${C_RESET}"
-        else
-            status_str="${C_GREEN}启用${C_RESET}"
-        fi
-        local rx_bytes="0" tx_bytes="0" last_handshake="从未"
-        if [[ -n "$wg_dump" ]]; then
-            local peer_line
-            peer_line=$(echo "$wg_dump" | grep "^${pubkey}" 2>/dev/null)
-            if [[ -n "$peer_line" ]]; then
-                rx_bytes=$(echo "$peer_line" | awk '{print $6}')
-                tx_bytes=$(echo "$peer_line" | awk '{print $7}')
-                local hs_epoch
-                hs_epoch=$(echo "$peer_line" | awk '{print $5}')
-                if [[ -n "$hs_epoch" && "$hs_epoch" != "0" ]]; then
-                    local now_epoch diff
-                    now_epoch=$(date +%s)
-                    diff=$((now_epoch - hs_epoch))
-                    if [[ $diff -lt 60 ]]; then
-                        last_handshake="${diff}秒前"
-                        status_str="${C_GREEN}在线${C_RESET}"
-                    elif [[ $diff -lt 3600 ]]; then
-                        last_handshake="$((diff / 60))分前"
-                    elif [[ $diff -lt 86400 ]]; then
-                        last_handshake="$((diff / 3600))时前"
-                    else
-                        last_handshake="$((diff / 86400))天前"
-                    fi
-                fi
-            fi
-        fi
-        printf "%-4s %-14s %-14s %-8b %-8b %-10s %-10s %s\n" \
-            "$((i + 1))" "$name" "$ip" "$type_str" "$status_str" \
-            "$(wg_deb_format_bytes "$rx_bytes")" "$(wg_deb_format_bytes "$tx_bytes")" "$last_handshake"
-        i=$((i + 1))
-    done
-    echo -e "${C_CYAN}共 ${peer_count} 个设备${C_RESET}"
-    # 显示网关 LAN 信息
-    local gw_found=0 gi=0
-    while [[ $gi -lt $peer_count ]]; do
-        local gw_check=$(wg_deb_db_get ".peers[$gi].is_gateway // false")
-        if [[ "$gw_check" == "true" ]]; then
-            [[ $gw_found -eq 0 ]] && { echo -e "${C_CYAN}网关设备 LAN 网段:${C_RESET}"; gw_found=1; }
-            local gw_name=$(wg_deb_db_get ".peers[$gi].name")
-            local gw_lans=$(wg_deb_db_get ".peers[$gi].lan_subnets // empty")
-            echo -e "  ${gw_name}: ${C_GREEN}${gw_lans:-未设置}${C_RESET}"
-        fi
-        gi=$((gi + 1))
-    done
-    pause
 }
 
 wg_deb_toggle_peer() {
@@ -10376,21 +11464,21 @@ wg_deb_toggle_peer() {
     current_state=$(wg_deb_db_get ".peers[$target_idx].enabled")
     if [[ "$current_state" == "true" ]]; then
         if confirm "确认禁用设备 '${target_name}'？"; then
-            wg_deb_db_set --argjson idx "$target_idx" '.peers[$idx].enabled = false'
-            wg_deb_rebuild_conf
-            if wg_deb_is_running; then
-                systemctl restart wg-quick@wg0 >/dev/null 2>&1
+            if ! wg_deb_db_set --argjson idx "$target_idx" '.peers[$idx].enabled = false'; then
+                print_error "数据库写入失败，设备状态未修改"
+                pause; return 1
             fi
+            wg_deb_apply_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
             print_success "设备 '${target_name}' 已禁用"
             log_action "WireGuard(deb) peer disabled: ${target_name}"
         fi
     else
         if confirm "确认启用设备 '${target_name}'？"; then
-            wg_deb_db_set --argjson idx "$target_idx" '.peers[$idx].enabled = true'
-            wg_deb_rebuild_conf
-            if wg_deb_is_running; then
-                systemctl restart wg-quick@wg0 >/dev/null 2>&1
+            if ! wg_deb_db_set --argjson idx "$target_idx" '.peers[$idx].enabled = true'; then
+                print_error "数据库写入失败，设备状态未修改"
+                pause; return 1
             fi
+            wg_deb_apply_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
             print_success "设备 '${target_name}' 已启用"
             log_action "WireGuard(deb) peer enabled: ${target_name}"
         fi
@@ -10410,21 +11498,21 @@ wg_deb_delete_peer() {
     fi
     local _del_gw=$(wg_deb_db_get ".peers[$target_idx].is_gateway // false")
     local _del_lans=$(wg_deb_db_get ".peers[$target_idx].lan_subnets // empty")
-    wg_deb_db_set --argjson idx "$target_idx" 'del(.peers[$idx])'
+    if ! wg_deb_db_set --argjson idx "$target_idx" 'del(.peers[$idx])'; then
+        print_error "数据库写入失败，设备未删除"
+        pause; return 1
+    fi
 
     # 网关删除后联动更新其他 peer
     if [[ "$_del_gw" == "true" && -n "$_del_lans" && "$_del_lans" != "null" ]]; then
-        _wg_deb_update_peer_routes
+        if ! _wg_deb_update_peer_routes; then
+            print_error "联动更新客户端路由失败"
+            pause; return 1
+        fi
     fi
 
     rm -f "${WG_DEB_CLIENT_DIR}/${target_name}.conf"
-    wg_deb_rebuild_conf
-    wg_deb_regenerate_client_confs
-
-    # 重启使配置生效
-    if wg_deb_is_running; then
-        systemctl restart wg-quick@wg0 >/dev/null 2>&1
-    fi
+    wg_deb_apply_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
 
     print_success "设备 '${target_name}' 已删除"
     log_action "WireGuard(deb) peer deleted: ${target_name}"
@@ -10454,7 +11542,7 @@ wg_deb_show_peer_conf() {
         echo -e "  (Clash 客户端不使用 .conf 文件，请生成 Clash YAML 配置)"
         echo ""
         if confirm "是否生成 Clash/Mihomo 配置?"; then
-            wg_generate_clash_config
+            wg_deb_generate_clash_config
         fi
     else
         draw_line
@@ -10516,15 +11604,19 @@ wg_deb_setup_watchdog() {
     if [[ -z "$auto_mode" ]]; then
         print_title "WireGuard 服务端看门狗 (Debian)"
         echo "看门狗功能:
-  • 每分钟检测 wg0 接口状态
+  • 每分钟检测 ${WG_DEB_INTERFACE} 接口状态
   • 接口消失 → 自动 systemctl restart
   • wg show 失败 → 自动重启"
         if ! confirm "启用看门狗?"; then pause; return; fi
     fi
 
     # ── Debian 看门狗 (systemctl 管理) ──
-    cat > "$watchdog_script" << 'WDEOF_DEB'
+    {
+        cat << 'WDEOF_DEB'
 #!/bin/bash
+WDEOF_DEB
+        printf 'WG_DEB_INTERFACE=%q\n' "$WG_DEB_INTERFACE"
+        cat << 'WDEOF_DEB'
 LOG="/var/log/wg-watchdog.log"
 MAX_LOG_SIZE=32768
 
@@ -10537,19 +11629,20 @@ wdlog() {
 }
 
 # 检测接口存活
-if ! ip link show wg0 &>/dev/null; then
-    wdlog "wg0 down, restarting via systemctl"
-    systemctl restart wg-quick@wg0
+if ! ip link show "$WG_DEB_INTERFACE" &>/dev/null; then
+    wdlog "${WG_DEB_INTERFACE} down, restarting via systemctl"
+    systemctl restart "wg-quick@${WG_DEB_INTERFACE}"
     exit 0
 fi
 
 # 检测 wg show 是否正常
-if ! wg show wg0 &>/dev/null; then
-    wdlog "wg show failed, restarting"
-    systemctl restart wg-quick@wg0
+if ! wg show "$WG_DEB_INTERFACE" &>/dev/null; then
+    wdlog "wg show ${WG_DEB_INTERFACE} failed, restarting"
+    systemctl restart "wg-quick@${WG_DEB_INTERFACE}"
     exit 0
 fi
 WDEOF_DEB
+    } > "$watchdog_script"
     chmod +x "$watchdog_script"
     cron_add_job "wg-watchdog.sh" "* * * * * $watchdog_script >/dev/null 2>&1"
     echo ""
@@ -10570,7 +11663,7 @@ wg_deb_export_peers() {
         pause; return
     fi
     local export_file
-    export_file=$(mktemp "/tmp/${SCRIPT_NAME}-wg-peers-XXXXXX.json")
+    export_file=$(mktemp "/tmp/${SCRIPT_NAME}-wg-peers.XXXXXX") || { print_error "无法创建导出文件"; pause; return 1; }
     chmod 600 "$export_file"
     if jq '{
         export_version: 2,
@@ -10649,7 +11742,7 @@ wg_deb_import_peers() {
     local imported=0 skipped=0
     local i=0
     while [[ $i -lt $import_count ]]; do
-        local name ip privkey pubkey psk allowed enabled is_gw lans created peer_type
+        local name ip privkey pubkey psk allowed enabled is_gw lans created peer_type route_mode
         name=$(jq -r ".peers[$i].name" "$import_file")
         ip=$(jq -r ".peers[$i].ip" "$import_file")
         privkey=$(jq -r ".peers[$i].private_key" "$import_file")
@@ -10661,9 +11754,38 @@ wg_deb_import_peers() {
         lans=$(jq -r ".peers[$i].lan_subnets // empty" "$import_file")
         created=$(jq -r ".peers[$i].created // empty" "$import_file")
         peer_type=$(jq -r ".peers[$i].peer_type // empty" "$import_file")
+        route_mode=$(jq -r ".peers[$i].route_mode // empty" "$import_file")
         if [[ -z "$peer_type" || "$peer_type" == "null" ]]; then
             [[ "$is_gw" == "true" ]] && peer_type="gateway" || peer_type="standard"
         fi
+        [[ -z "$route_mode" || "$route_mode" == "null" ]] && route_mode="managed"
+        [[ "$enabled" == "true" || "$enabled" == "false" ]] || enabled=true
+        [[ "$is_gw" == "true" || "$is_gw" == "false" ]] || is_gw=false
+
+        if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            print_warn "跳过: $name (名称格式无效)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
+        if ! validate_ip "$ip"; then
+            print_warn "跳过: $name (IP 格式无效: $ip)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
+        if [[ -z "$allowed" || "$allowed" == "null" ]] || ! validate_cidr_list "$allowed"; then
+            print_warn "跳过: $name (AllowedIPs 格式无效: $allowed)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
+        if ! validate_cidr_list "$lans"; then
+            print_warn "跳过: $name (LAN 网段格式无效: $lans)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
+        case "$peer_type" in
+            standard|gateway) ;;
+            *) print_warn "跳过: $name (设备类型无效: $peer_type)"; skipped=$((skipped + 1)); i=$((i + 1)); continue ;;
+        esac
+        case "$route_mode" in
+            managed|custom|full|vpn) ;;
+            *) print_warn "跳过: $name (路由模式无效: $route_mode)"; skipped=$((skipped + 1)); i=$((i + 1)); continue ;;
+        esac
 
         # 检查重名
         local exists
@@ -10685,10 +11807,22 @@ wg_deb_import_peers() {
             pubkey=$(echo "$privkey" | wg pubkey)
             psk=$(wg genpsk)
         fi
+        if ! validate_wg_key "$privkey"; then
+            print_warn "跳过: $name (私钥格式无效)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
+        if ! validate_wg_key "$pubkey"; then
+            print_warn "跳过: $name (公钥格式无效)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
+        if ! validate_wg_key "$psk"; then
+            print_warn "跳过: $name (预共享密钥格式无效)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
 
         [[ -z "$created" || "$created" == "null" ]] && created=$(date '+%Y-%m-%d %H:%M:%S')
 
-        wg_deb_db_set --arg name "$name" \
+        if ! wg_deb_db_set --arg name "$name" \
                   --arg ip "$ip" \
                   --arg privkey "$privkey" \
                   --arg pubkey "$pubkey" \
@@ -10699,6 +11833,7 @@ wg_deb_import_peers() {
                   --arg gw "$is_gw" \
                   --arg lans "$lans" \
                   --arg ptype "$peer_type" \
+                  --arg route_mode "$route_mode" \
             '.peers += [{
                 name: $name,
                 ip: $ip,
@@ -10710,18 +11845,18 @@ wg_deb_import_peers() {
                 created: $created,
                 is_gateway: ($gw == "true"),
                 lan_subnets: $lans,
-                peer_type: $ptype
-            }]'
+                peer_type: $ptype,
+                route_mode: $route_mode
+            }]'; then
+            print_error "跳过: $name (数据库写入失败)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
         imported=$((imported + 1))
         i=$((i + 1))
     done
 
     if [[ $imported -gt 0 ]]; then
-        wg_deb_rebuild_conf
-        wg_deb_regenerate_client_confs
-        if wg_deb_is_running; then
-            systemctl restart wg-quick@wg0 >/dev/null 2>&1
-        fi
+        wg_deb_apply_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
     fi
     echo ""
     print_success "导入完成: 成功 ${imported}, 跳过 ${skipped}"
@@ -10768,7 +11903,7 @@ wg_deb_server_menu() {
             3) wg_deb_delete_peer ;;
             4) wg_deb_toggle_peer ;;
             5) wg_deb_show_peer_conf ;;
-            6) wg_generate_clash_config ;;
+            6) wg_deb_generate_clash_config ;;
             7) wg_deb_start; pause ;;
             8) wg_deb_stop; pause ;;
             9) wg_deb_restart; pause ;;
@@ -10793,7 +11928,9 @@ wg_deb_main_menu() {
         if wg_deb_is_installed; then
             local role
             role=$(wg_deb_get_role)
-            if [[ "$role" == "server" || -f "$WG_DEB_CONF" ]]; then
+            local server_private_key=""
+            server_private_key=$(wg_deb_db_get '.server.private_key // empty')
+            if [[ "$role" == "server" ]] || { [[ "$role" == "none" || -z "$role" ]] && [[ -f "$WG_DEB_CONF" ]] && [[ -n "$server_private_key" && "$server_private_key" != "null" ]]; }; then
                 [[ "$role" == "server" ]] || wg_deb_set_role "server"
                 print_title "WireGuard VPN"
                 local srv_name
@@ -10996,6 +12133,12 @@ _email_export_wrangler_env() {
     export CLOUDFLARE_ACCOUNT_ID="${CF_ACCOUNT_ID:-}"
 }
 
+_email_clear_sensitive_env() {
+    unset CF_API_TOKEN CF_ACCOUNT_ID CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID
+    unset EMAIL_RESEND_TOKEN EMAIL_RESEND_DKIM EMAIL_JWT_SECRET EMAIL_ADMIN_PASSWORD
+    trap - RETURN 2>/dev/null || true
+}
+
 # 统一调用上游项目本地 Wrangler。
 # Cloudflare 官方推荐 Wrangler 作为项目依赖安装；cloudflare_temp_email 的 worker/frontend/pages
 # package.json 也都把 wrangler 放在 devDependencies，避免全局 wrangler 与项目锁定版本漂移。
@@ -11044,11 +12187,12 @@ email_run() {
     email_state_init_dirs
     email_log "===== $label ====="
     printf '%b' "${C_BLUE}[..]${C_RESET} $label..."
-    if "$@" >> "$EMAIL_LOG_FILE" 2>&1; then
+    "$@" >> "$EMAIL_LOG_FILE" 2>&1
+    local rc=$?
+    if (( rc == 0 )); then
         printf '\r%b\n' "${C_GREEN}[✓]${C_RESET} $label                                                  "
         return 0
     fi
-    local rc=$?
     printf '\r%b\n' "${C_RED}[✗]${C_RESET} $label (exit=$rc)                                            "
     echo -e "${C_GRAY}最近日志 (${EMAIL_LOG_FILE} 末 30 行，敏感字段已脱敏)：${C_RESET}"
     # tail 时过滤可能出现的 secret 明文（curl --data 的 secret_text、wrangler 输出 TOKEN 等）
@@ -11080,10 +12224,28 @@ _email_patch_pages_service_binding() {
         email_log "pages service binding 已是 ${EMAIL_WORKER_NAME}，跳过"
         return 0
     fi
-    sed -i.bak -E "s|^([[:space:]]*service[[:space:]]*=[[:space:]]*\")[^\"]+(\".*)$|\1${EMAIL_WORKER_NAME}\2|" "$pages_toml"
-    rm -f "${pages_toml}.bak"
+    local backup tmp
+    backup=$(mktemp "/tmp/server-manage-pages-wrangler.XXXXXX") || return 1
+    tmp=$(mktemp "${pages_dir}/.wrangler.toml.XXXXXX") || { rm -f "$backup"; return 1; }
+    cp -a "$pages_toml" "$backup" || { rm -f "$backup" "$tmp"; return 1; }
+    awk -v worker="$EMAIL_WORKER_NAME" '
+        /^[[:space:]]*service[[:space:]]*=/ {
+            sub(/"[^"]+"/, "\"" worker "\"")
+        }
+        { print }
+    ' "$pages_toml" > "$tmp" || { rm -f "$backup" "$tmp"; return 1; }
+    mv -f "$tmp" "$pages_toml" || { rm -f "$backup" "$tmp"; return 1; }
+    EMAIL_PAGES_TOML_BACKUP="$backup"
+    EMAIL_PAGES_TOML_BACKUP_TARGET="$pages_toml"
     email_log "Patched pages/wrangler.toml service binding → ${EMAIL_WORKER_NAME}"
     return 0
+}
+
+_email_restore_pages_service_binding() {
+    local backup="${EMAIL_PAGES_TOML_BACKUP:-}" target="${EMAIL_PAGES_TOML_BACKUP_TARGET:-}"
+    [[ -n "$backup" && -n "$target" && -f "$backup" ]] || return 0
+    mv -f "$backup" "$target" # restore wrangler.toml
+    unset EMAIL_PAGES_TOML_BACKUP EMAIL_PAGES_TOML_BACKUP_TARGET
 }
 # 调用前需要：export CF_API_TOKEN / CF_ACCOUNT_ID
 #
@@ -11122,6 +12284,37 @@ _email_cf_api() {
         return 1
     fi
     printf '%s' "$resp"
+}
+
+# DELETE 请求，将 HTTP 404（资源已不存在）视为幂等成功。
+# 卸载流程在部分失败后会保留 state 供重跑；若重跑时已删除的资源返回 404 仍被判失败，
+# 会导致 state 永远无法清除（死锁）。此 helper 让重复删除变为幂等。
+# 返回: 0 = 删除成功或资源本就不存在; 1 = token 缺失或确定性失败; 2 = 网络错误
+_email_cf_api_delete() {
+    # $1: path (不带前导 /)
+    local path="$1"
+    [[ -n "${CF_API_TOKEN:-}" ]] || { email_log "CF API token missing"; return 1; }
+    local url="https://api.cloudflare.com/client/v4/$path"
+    local out http resp ok
+    out=$(curl -sS --max-time 30 -w '\n%{http_code}' -X DELETE \
+        -H "Authorization: Bearer $CF_API_TOKEN" \
+        -H "Content-Type: application/json" \
+        "$url" 2>>"$EMAIL_LOG_FILE") || {
+        email_log "CF API network failure: DELETE $path"
+        return 2
+    }
+    http="${out##*$'\n'}"
+    resp="${out%$'\n'*}"
+    ok=$(echo "$resp" | jq -r '.success // false' 2>/dev/null)
+    [[ "$ok" == "true" ]] && return 0
+    if [[ "$http" == "404" ]]; then
+        email_log "CF API DELETE $path: 404 already gone, treated as success"
+        return 0
+    fi
+    local err
+    err=$(echo "$resp" | jq -r '.errors // [] | map("\(.code): \(.message)") | join("; ")' 2>/dev/null)
+    email_log "CF API DELETE $path failed: http=${http:-unknown} ${err:-<empty>}"
+    return 1
 }
 
 _email_cf_token_verify() {
@@ -11182,7 +12375,7 @@ _email_cf_dns_create() {
 _email_cf_dns_delete() {
     local zid="$1" rid="$2"
     [[ -z "$rid" || "$rid" == "null" ]] && return 0
-    _email_cf_api DELETE "zones/$zid/dns_records/$rid" >/dev/null
+    _email_cf_api_delete "zones/$zid/dns_records/$rid" >/dev/null
 }
 
 # 按 type+name 查找（用于清理脏数据 / 防重复添加）
@@ -11215,7 +12408,7 @@ _email_cf_pages_project_create() {
 
 _email_cf_pages_project_delete() {
     local name="$1"
-    _email_cf_api DELETE "accounts/$CF_ACCOUNT_ID/pages/projects/$name" >/dev/null
+    _email_cf_api_delete "accounts/$CF_ACCOUNT_ID/pages/projects/$name" >/dev/null
 }
 
 _email_cf_pages_get_subdomain() {
@@ -11235,7 +12428,38 @@ _email_cf_pages_attach_domain() {
 # ── Workers / D1 ──
 _email_cf_worker_exists() {
     local name="$1"
-    _email_cf_api GET "accounts/$CF_ACCOUNT_ID/workers/scripts/$name" >/dev/null 2>&1
+    [[ -n "${CF_API_TOKEN:-}" && -n "${CF_ACCOUNT_ID:-}" ]] || {
+        email_log "Worker exists check missing token/account: $name"
+        return 2
+    }
+    command_exists jq || {
+        email_log "Worker exists check requires jq: $name"
+        return 2
+    }
+
+    local enc_name url out resp http ok err
+    enc_name=$(_email_cf_urlencode "$name")
+    url="https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/$enc_name"
+    out=$(curl -sS --max-time 30 -w '\n%{http_code}' -X GET \
+        -H "Authorization: Bearer $CF_API_TOKEN" \
+        -H "Content-Type: application/json" \
+        "$url" 2>>"$EMAIL_LOG_FILE") || {
+        email_log "Worker exists check network failure: $name"
+        return 2
+    }
+    http="${out##*$'\n'}"
+    resp="${out%$'\n'*}"
+    ok=$(jq -r '.success // false' 2>/dev/null <<< "$resp")
+    if [[ "$ok" == "true" ]]; then
+        return 0
+    fi
+    if [[ "$http" == "404" ]]; then
+        email_log "Worker not found: $name"
+        return 1
+    fi
+    err=$(jq -r '.errors // [] | map("\(.code): \(.message)") | join("; ")' 2>/dev/null <<< "$resp")
+    email_log "Worker exists check indeterminate: name=$name http=${http:-unknown} errors=${err:-<empty>}"
+    return 2
 }
 
 _email_cf_pages_project_exists() {
@@ -11245,7 +12469,7 @@ _email_cf_pages_project_exists() {
 
 _email_cf_worker_delete() {
     local name="$1"
-    _email_cf_api DELETE "accounts/$CF_ACCOUNT_ID/workers/scripts/$name" >/dev/null
+    _email_cf_api_delete "accounts/$CF_ACCOUNT_ID/workers/scripts/$name" >/dev/null
 }
 
 _email_cf_worker_secret_put() {
@@ -11260,7 +12484,7 @@ _email_cf_worker_secret_put() {
 _email_cf_d1_delete() {
     local d1_id="$1"
     [[ -n "$d1_id" ]] || return 0
-    _email_cf_api DELETE "accounts/$CF_ACCOUNT_ID/d1/database/$d1_id" >/dev/null
+    _email_cf_api_delete "accounts/$CF_ACCOUNT_ID/d1/database/$d1_id" >/dev/null
 }
 
 # ── Email Routing ──
@@ -11313,6 +12537,7 @@ _email_cf_dns_create_record_into() {
 
 # ── 入口 ──
 email_deploy() {
+    trap '_email_clear_sensitive_env' RETURN
     print_title "Cloudflare Temp Email 一键部署"
     echo -e "${C_CYAN}项目: https://github.com/dreamhunter2333/cloudflare_temp_email${C_RESET}"
     echo ""
@@ -11320,10 +12545,10 @@ email_deploy() {
     # 已部署：让用户决定是否覆盖
     if email_state_load 2>/dev/null; then
         print_warn "检测到已有部署：${EMAIL_FRONTEND_DOMAIN:-?} / ${EMAIL_API_DOMAIN:-?}"
-        echo -e "${C_GRAY}如需修改密码/域名/Resend，请使用管理菜单；本流程会覆盖现有配置。${C_RESET}"
-        confirm "继续覆盖部署?" || { pause; return; }
-        local bak
-        bak=$(email_state_backup) && [[ -n "$bak" ]] && print_info "已备份旧 state → $bak"
+        print_error "已安装状态不允许直接覆盖部署，避免生成新的 D1/Pages 后丢失旧资源 ID。"
+        print_info "如需更新，请使用管理菜单【重新部署/升级】；如需重装，请先执行完整卸载。"
+        pause
+        return 1
     # 半成品（state 存在但 INSTALLED=0）：强警告，建议先卸载残留
     elif [[ -f "$EMAIL_STATE_FILE" ]] && validate_conf_file "$EMAIL_STATE_FILE" 2>/dev/null; then
         _email_state_reset_vars
@@ -11389,7 +12614,7 @@ email_deploy() {
 
 # ── 1. 环境依赖 ──
 _email_validate_dns_label() {
-    [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
+    validate_dns_label "${1:-}"
 }
 
 # 当 Token 可见多个 Account 时，强制让用户选；只有 1 个时静默选用
@@ -11440,8 +12665,12 @@ _email_deploy_check_env() {
     done
 
     if ! command_exists node; then
-        email_run "安装 Node.js LTS" bash -c '
-            curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - >/dev/null 2>&1
+        email_run "安装 Node.js LTS" bash -o pipefail -c '
+            set -e
+            tmp=$(mktemp)
+            trap "rm -f \"$tmp\"" EXIT
+            curl -fsSL https://deb.nodesource.com/setup_lts.x -o "$tmp"
+            bash "$tmp" >/dev/null 2>&1
             apt-get install -y -qq nodejs
         ' || { print_error "Node.js 安装失败，请手动安装"; return 1; }
     fi
@@ -11564,11 +12793,23 @@ _email_deploy_collect_inputs() {
 # ── 2b. Worker 名字决策（需要 Token 已验证）──
 _email_deploy_pick_worker_name() {
     local default_name="cloudflare_temp_email"
-    if ! _email_cf_worker_exists "$default_name"; then
-        EMAIL_WORKER_NAME="$default_name"
-        print_success "Worker 名: $EMAIL_WORKER_NAME"
-        return 0
-    fi
+    local exists_rc
+    _email_cf_worker_exists "$default_name"
+    exists_rc=$?
+    case "$exists_rc" in
+        1)
+            EMAIL_WORKER_NAME="$default_name"
+            print_success "Worker 名: $EMAIL_WORKER_NAME"
+            return 0
+            ;;
+        0)
+            ;;
+        *)
+            print_error "无法确认默认 Worker 是否存在，已中止以避免覆盖生产 Worker"
+            print_info "请检查 Cloudflare Token 权限、Account ID 与网络后重试。"
+            return 1
+            ;;
+    esac
     print_warn "账户已存在名为 ${default_name} 的 Worker"
     echo "  1. 取消部署"
     echo "  2. 使用自定义 Worker 名"
@@ -11587,10 +12828,20 @@ _email_deploy_pick_worker_name() {
                     print_error "名字格式无效（需以小写字母开头）"
                     continue
                 fi
-                if _email_cf_worker_exists "$new_name"; then
-                    print_error "$new_name 也已存在，请换一个"
-                    continue
-                fi
+                _email_cf_worker_exists "$new_name"
+                exists_rc=$?
+                case "$exists_rc" in
+                    0)
+                        print_error "$new_name 也已存在，请换一个"
+                        continue
+                        ;;
+                    1)
+                        ;;
+                    *)
+                        print_error "无法确认 $new_name 是否存在，已中止以避免覆盖生产 Worker"
+                        return 1
+                        ;;
+                esac
                 EMAIL_WORKER_NAME="$new_name"
                 print_success "Worker 名: $EMAIL_WORKER_NAME"
                 return 0
@@ -11684,8 +12935,9 @@ EOF
 
 # ── 5. 完整 wrangler.toml ──
 _email_deploy_render_toml() {
-    local domains_json prefix_val
+    local domains_json prefix_val admin_json
     domains_json="[\"${EMAIL_DOMAIN}\"]"
+    admin_json=$(jq -nc --arg p "$EMAIL_ADMIN_PASSWORD" '[$p]')
     # 上游 Worker 直接把 PREFIX 拼到 local-part 前面（无分隔符）。
     # 为得到用户在确认页看到的 "prefix.xxx@domain" 形态，写入 wrangler.toml 时自动补 "."
     # 末尾。用户已带 "." 时不重复。
@@ -11730,6 +12982,7 @@ BLACK_LIST = ""
 ENABLE_USER_CREATE_EMAIL = true
 ENABLE_USER_DELETE_EMAIL = true
 ENABLE_AUTO_REPLY = false
+ADMIN_PASSWORDS = ${admin_json}
 
 [[d1_databases]]
 binding = "DB"
@@ -11786,16 +13039,22 @@ _email_deploy_pages() {
         && print_success "Pages service binding 已确认: ${EMAIL_WORKER_NAME}" \
         || print_warn "pages/wrangler.toml service 未同步（文件可能缺失，请手工检查）"
 
-    email_run "安装 Pages 依赖" pnpm install --no-frozen-lockfile || return 1
+    email_run "安装 Pages 依赖" pnpm install --no-frozen-lockfile || {
+        _email_restore_pages_service_binding
+        return 1
+    }
 
     # 创建项目（已存在则忽略）
     if ! _email_cf_pages_project_create "$EMAIL_PAGES_PROJECT" 2>/dev/null; then
         email_log "Pages project create returned non-zero — 可能已存在，继续"
     fi
 
+    local deploy_rc=0
     email_run "部署 Pages (${EMAIL_PAGES_PROJECT})" \
         _email_wrangler pages deploy --project-name "$EMAIL_PAGES_PROJECT" \
-            --branch production --commit-dirty=true || return 1
+            --branch production --commit-dirty=true || deploy_rc=$?
+    _email_restore_pages_service_binding
+    [[ "$deploy_rc" -eq 0 ]] || return "$deploy_rc"
 
     EMAIL_PAGES_DOMAIN=$(_email_cf_pages_get_subdomain "$EMAIL_PAGES_PROJECT" 2>/dev/null)
     [[ -n "$EMAIL_PAGES_DOMAIN" ]] || EMAIL_PAGES_DOMAIN="${EMAIL_PAGES_PROJECT}.pages.dev"
@@ -11978,14 +13237,16 @@ _email_manage_update_admin_passwords_var() {
     [[ -f "$toml" ]] || return 1
 
     cp -a "$toml" "${toml}.adminpw.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+    local line="ADMIN_PASSWORDS = ${admin_json}"
     if grep -qE '^[[:space:]]*ADMIN_PASSWORDS[[:space:]]*=' "$toml"; then
-        awk -v line="ADMIN_PASSWORDS = ${admin_json}" '
+        ADMIN_PASSWORDS_LINE="$line" awk '
+            BEGIN { line = ENVIRON["ADMIN_PASSWORDS_LINE"] }
             /^[[:space:]]*ADMIN_PASSWORDS[[:space:]]*=/ { print line; next }
             { print }
         ' "$toml" > "${toml}.tmp" && mv "${toml}.tmp" "$toml"
     else
-        awk -v line="ADMIN_PASSWORDS = ${admin_json}" '
-            BEGIN { inserted=0 }
+        ADMIN_PASSWORDS_LINE="$line" awk '
+            BEGIN { line = ENVIRON["ADMIN_PASSWORDS_LINE"]; inserted=0 }
             /^\[vars\]/ { print; print line; inserted=1; next }
             { print }
             END {
@@ -12006,6 +13267,7 @@ _email_manage_update_admin_passwords_var() {
 
 # ── 1. 修改管理员密码 ──
 email_manage_change_admin_password() {
+    trap '_email_clear_sensitive_env' RETURN
     print_title "修改管理员密码"
     _email_manage_prepare || { pause; return; }
 
@@ -12046,6 +13308,7 @@ email_manage_change_admin_password() {
 
 # ── 2. 管理收信域名 DOMAINS ──
 email_manage_domains() {
+    trap '_email_clear_sensitive_env' RETURN
     print_title "管理收信域名 (DOMAINS)"
     _email_manage_prepare || { pause; return; }
 
@@ -12067,7 +13330,11 @@ email_manage_domains() {
 
     # 当前域名数组
     local arr
-    arr=$(echo "$current" | jq -c '.' 2>/dev/null) || arr='["'"$EMAIL_DOMAIN"'"]'
+    if ! arr=$(printf '%s' "$current" | jq -c '.' 2>/dev/null) \
+       || ! printf '%s' "$arr" | jq -e 'type == "array" and all(.[]; type == "string")' >/dev/null 2>&1; then
+        print_error "DOMAINS 当前配置不是合法 JSON 字符串数组，请先手工修复 wrangler.toml"
+        pause; return 1
+    fi
     local new_arr
     case $act in
         1)
@@ -12105,10 +13372,11 @@ email_manage_domains() {
 
 # ── 3. Resend ──
 email_manage_resend() {
+    trap '_email_clear_sensitive_env' RETURN
     print_title "配置 / 更新 Resend"
     _email_manage_prepare || { pause; return; }
 
-    echo "当前状态: $([[ ${EMAIL_RESEND_ENABLED:-0} -eq 1 ]] && echo "${C_GREEN}已启用${C_RESET}" || echo "${C_GRAY}未启用${C_RESET}")"
+    echo -e "当前状态: $([[ ${EMAIL_RESEND_ENABLED:-0} -eq 1 ]] && echo "${C_GREEN}已启用${C_RESET}" || echo "${C_GRAY}未启用${C_RESET}")"
     [[ "${EMAIL_RESEND_ENABLED:-0}" == "1" ]] && echo "  发件子域:  $EMAIL_RESEND_SEND_DOMAIN"
     echo ""
     echo "1. 启用 / 重新配置 Resend"
@@ -12197,8 +13465,10 @@ _email_manage_resend_disable() {
 
 # ── 4. 升级到最新版本 ──
 email_manage_upgrade() {
+    trap '_email_clear_sensitive_env' RETURN
     print_title "升级到最新版本"
     _email_manage_prepare || { pause; return; }
+    local old_version="${EMAIL_INSTALL_VERSION:-未知}"
 
     echo -e "${C_CYAN}当前版本:${C_RESET} ${EMAIL_INSTALL_VERSION:-未知}"
     email_run "拉取上游 tags" git -C "$EMAIL_INSTALL_DIR" fetch --tags --prune || { pause; return; }
@@ -12235,12 +13505,16 @@ email_manage_upgrade() {
             base=$(basename "$p")
             if email_run "应用 $base" _email_wrangler d1 execute "$EMAIL_D1_NAME" --file="$p" --remote; then
                 EMAIL_PATCHES_APPLIED="${EMAIL_PATCHES_APPLIED} ${base}"
+                EMAIL_PATCHES_APPLIED="${EMAIL_PATCHES_APPLIED# }"
+                if ! email_state_write; then
+                    print_error "patch $base 已应用，但写入升级进度失败；已中止升级（worker 未重新部署）"
+                    pause; return
+                fi
             else
                 print_error "patch $base 失败，已中止升级（worker 未重新部署）"
                 pause; return
             fi
         done
-        EMAIL_PATCHES_APPLIED="${EMAIL_PATCHES_APPLIED# }"
     else
         print_info "无新增 D1 migration"
     fi
@@ -12259,19 +13533,28 @@ email_manage_upgrade() {
     _email_patch_pages_service_binding "$EMAIL_INSTALL_DIR/pages" \
         && print_success "Pages service binding 已确认: ${EMAIL_WORKER_NAME}" \
         || print_warn "pages/wrangler.toml service 未同步（请手工检查）"
-    email_run "Pages 依赖" pnpm install --no-frozen-lockfile || { pause; return; }
+    email_run "Pages 依赖" pnpm install --no-frozen-lockfile || {
+        _email_restore_pages_service_binding
+        pause; return
+    }
+    local pages_rc=0
     email_run "部署 Pages" _email_wrangler pages deploy --project-name "$EMAIL_PAGES_PROJECT" \
-        --branch production --commit-dirty=true || { pause; return; }
+        --branch production --commit-dirty=true || pages_rc=$?
+    _email_restore_pages_service_binding
+    if [[ "$pages_rc" -ne 0 ]]; then
+        pause; return
+    fi
 
     EMAIL_INSTALL_VERSION="$latest"
     email_state_write
     print_success "已升级到 $latest"
-    log_action "Email upgraded ${EMAIL_INSTALL_VERSION} → $latest"
+    log_action "Email upgraded ${old_version} → $latest"
     pause
 }
 
 # ── 5. 重新部署（保留 D1 数据）──
 email_manage_redeploy() {
+    trap '_email_clear_sensitive_env' RETURN
     print_title "重新部署 Worker / Pages（保留 D1 数据）"
     _email_manage_prepare || { pause; return; }
     confirm "确认重新部署当前版本 ${EMAIL_INSTALL_VERSION}?" || return
@@ -12289,8 +13572,13 @@ email_manage_redeploy() {
     _email_patch_pages_service_binding "$EMAIL_INSTALL_DIR/pages" \
         && print_success "Pages service binding 已确认: ${EMAIL_WORKER_NAME}" \
         || print_warn "pages/wrangler.toml service 未同步（请手工检查）"
+    local pages_rc=0
     email_run "部署 Pages" _email_wrangler pages deploy --project-name "$EMAIL_PAGES_PROJECT" \
-        --branch production --commit-dirty=true || { pause; return; }
+        --branch production --commit-dirty=true || pages_rc=$?
+    _email_restore_pages_service_binding
+    if [[ "$pages_rc" -ne 0 ]]; then
+        pause; return
+    fi
 
     print_success "重新部署完成"
     log_action "Email redeployed: $EMAIL_INSTALL_VERSION"
@@ -12298,6 +13586,7 @@ email_manage_redeploy() {
 }
 
 email_uninstall() {
+    trap '_email_clear_sensitive_env' RETURN
     print_title "完全卸载 Cloudflare Temp Email"
 
     # 不再硬卡 EMAIL_INSTALLED=1 — 只要 state 文件能加载，即视为有可回收的远端资源（涵盖部署中途失败的场景）
@@ -12373,21 +13662,27 @@ email_uninstall() {
 
     echo ""
     print_info "开始回收远程资源..."
+    local uninstall_failed=0
 
     # 1. 关闭 catch-all
     if [[ "${EMAIL_CATCH_ALL_ENABLED:-0}" == "1" && -n "$EMAIL_ZONE_ID" ]]; then
         if email_run "禁用 Email Routing catch-all" _email_cf_catch_all_disable "$EMAIL_ZONE_ID"; then
             EMAIL_CATCH_ALL_ENABLED=0
+        else
+            uninstall_failed=1
         fi
     fi
 
     # 2. DNS 记录（按 state 中记录的 ID 删除）
-    [[ -n "$EMAIL_ZONE_ID" ]] && _email_uninstall_delete_dns
+    if [[ -n "$EMAIL_ZONE_ID" ]]; then
+        _email_uninstall_delete_dns || uninstall_failed=1
+    fi
 
     # 3. Worker
     if [[ -n "$EMAIL_WORKER_NAME" ]]; then
         if email_run "删除 Worker ${EMAIL_WORKER_NAME}" _email_cf_worker_delete "$EMAIL_WORKER_NAME"; then :; else
             print_warn "Worker 删除失败（可能已不存在）"
+            uninstall_failed=1
         fi
     fi
 
@@ -12395,6 +13690,7 @@ email_uninstall() {
     if [[ -n "$EMAIL_PAGES_PROJECT" ]]; then
         if email_run "删除 Pages ${EMAIL_PAGES_PROJECT}" _email_cf_pages_project_delete "$EMAIL_PAGES_PROJECT"; then :; else
             print_warn "Pages 删除失败（可能已不存在）"
+            uninstall_failed=1
         fi
     fi
 
@@ -12402,11 +13698,22 @@ email_uninstall() {
     if [[ -n "$EMAIL_D1_ID" ]]; then
         if email_run "删除 D1 ${EMAIL_D1_NAME}" _email_cf_d1_delete "$EMAIL_D1_ID"; then :; else
             print_warn "D1 删除失败 — 请登录 Dashboard 手动删除 ${EMAIL_D1_NAME}"
+            uninstall_failed=1
         fi
     fi
 
     # 6. 本地目录与状态（先保存日志要用到的字段，再清 state）
     local _log_domain="${EMAIL_DOMAIN:-unknown}"
+    if [[ "$uninstall_failed" -ne 0 ]]; then
+        email_state_write 2>/dev/null || true
+        print_error "远端资源未完全删除，已保留本地目录和 state，避免丢失资源 ID。"
+        print_warn "请根据上方失败项处理后重新执行卸载。"
+        log_action "Cloudflare Temp Email uninstall incomplete: $_log_domain"
+        unset CF_API_TOKEN CLOUDFLARE_API_TOKEN
+        pause
+        return 1
+    fi
+
     rm -rf "$EMAIL_INSTALL_DIR"
     rm -f "$EMAIL_ADMIN_FILE"
     print_success "本地目录已删除: $EMAIL_INSTALL_DIR"
@@ -12424,6 +13731,7 @@ email_uninstall() {
 
 _email_uninstall_delete_dns() {
     local zid="$EMAIL_ZONE_ID"
+    local failed=0
     local pairs=(
         "EMAIL_DNS_FRONTEND_ID:CNAME(前端)"
         "EMAIL_DNS_MX1_ID:MX(route1)"
@@ -12444,6 +13752,7 @@ _email_uninstall_delete_dns() {
             print_success "已删 DNS: $label"
         else
             print_warn "DNS 删除失败: $label (id=$rid)"
+            failed=1
         fi
     done
 
@@ -12456,6 +13765,7 @@ _email_uninstall_delete_dns() {
         _email_cf_dns_purge "$zid" "MX"  "send.${EMAIL_DOMAIN}" 2>/dev/null || true
         _email_cf_dns_purge "$zid" "TXT" "_dmarc.${EMAIL_DOMAIN}" 2>/dev/null || true
     fi
+    return "$failed"
 }
 # 项目: https://github.com/dreamhunter2333/cloudflare_temp_email
 # 模块拆分: 14a state / 14b cf-api / 14c deploy / 14d manage / 14e uninstall
@@ -13307,7 +14617,8 @@ reality_port_in_use() {
 }
 
 reality_random_port() {
-    local min="${REALITY_PORT_MIN:-20000}" max="${REALITY_PORT_MAX:-60000}" port try
+    local min="${REALITY_PORT_MIN:-20000}" max="${REALITY_PORT_MAX:-60000}" port try range rand
+    range=$((max - min + 1))
     if [[ -n "${REALITY_TEST_PORT_CANDIDATES:-}" ]]; then
         for port in $REALITY_TEST_PORT_CANDIDATES; do
             [[ "$port" =~ ^[0-9]+$ ]] || continue
@@ -13318,8 +14629,11 @@ reality_random_port() {
     for try in $(seq 1 200); do
         if command_exists shuf; then
             port=$(shuf -i "${min}-${max}" -n 1)
+        elif command_exists od && [[ -r /dev/urandom ]]; then
+            rand=$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ')
+            port=$(( rand % range + min ))
         else
-            port=$(( RANDOM % (max - min + 1) + min ))
+            port=$(( (((RANDOM << 15) ^ RANDOM) % range) + min ))
         fi
         reality_port_in_use "$port" || { echo "$port"; return 0; }
     done
@@ -13438,10 +14752,11 @@ reality_local_client_self_test() {
     reality_load_state || return 1
     command_exists sing-box || { print_warn "sing-box 不存在，跳过本机协议自测"; return 1; }
     command_exists curl || { print_warn "curl 不存在，跳过本机协议自测"; return 1; }
-    local test_port="${REALITY_SELFTEST_PORT:-19090}" cfg log pid i
+    local test_port="${REALITY_SELFTEST_PORT:-19090}" cfg log curl_log pid i
     cfg=$(mktemp /tmp/reality-client-test.XXXXXX.json) || return 1
     log=$(mktemp /tmp/reality-client-test.XXXXXX.log) || { rm -f "$cfg"; return 1; }
-    chmod 600 "$cfg" "$log" 2>/dev/null || true
+    curl_log=$(mktemp /tmp/reality-selftest-curl.XXXXXX.log) || { rm -f "$cfg" "$log"; return 1; }
+    chmod 600 "$cfg" "$log" "$curl_log" 2>/dev/null || true
     cat > "$cfg" <<EOF
 {"log":{"level":"info","timestamp":true},"inbounds":[{"type":"mixed","listen":"127.0.0.1","listen_port":${test_port}}],"outbounds":[{"type":"vless","tag":"self-test","server":"127.0.0.1","server_port":${REALITY_PORT},"uuid":"${REALITY_UUID}","flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":"${REALITY_SNI}","utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":"${REALITY_PUBLIC_KEY}","short_id":"${REALITY_SHORT_ID}"}}}],"route":{"final":"self-test"}}
 EOF
@@ -13451,17 +14766,17 @@ EOF
         ss -ltn 2>/dev/null | grep -q ":${test_port} " && break
         sleep 0.2
     done
-    if curl -x "socks5h://127.0.0.1:${test_port}" -fsS --max-time 15 https://www.cloudflare.com/cdn-cgi/trace >/tmp/reality-selftest-curl.log 2>&1; then
+    if curl -x "socks5h://127.0.0.1:${test_port}" -fsS --max-time 15 https://www.cloudflare.com/cdn-cgi/trace >"$curl_log" 2>&1; then
         print_success "本机协议自测通过: sing-box client -> 127.0.0.1:${REALITY_PORT} -> 外网"
-        rm -f "$cfg" "$log" "${cfg}.pid" /tmp/reality-selftest-curl.log
+        rm -f "$cfg" "$log" "$curl_log" "${cfg}.pid"
         [[ -n "$pid" ]] && kill "$pid" >/dev/null 2>&1 || true
         return 0
     fi
     print_warn "本机协议自测失败，最近日志:"
-    tail -n 20 /tmp/reality-selftest-curl.log 2>/dev/null || true
+    tail -n 20 "$curl_log" 2>/dev/null || true
     sed -E 's/[0-9a-fA-F-]{36}/<uuid>/g' "$log" 2>/dev/null | tail -n 20 || true
     [[ -n "$pid" ]] && kill "$pid" >/dev/null 2>&1 || true
-    rm -f "$cfg" "$log" "${cfg}.pid" /tmp/reality-selftest-curl.log
+    rm -f "$cfg" "$log" "$curl_log" "${cfg}.pid"
     return 1
 }
 
@@ -13516,7 +14831,9 @@ reality_verify_sni() {
     command_exists openssl || install_package "openssl" "silent" || return 1
     local timeout_cmd=""
     command_exists timeout && timeout_cmd="timeout 12"
-    $timeout_cmd openssl s_client -connect "${domain}:443" -servername "$domain" -verify_hostname "$domain" -brief </dev/null >/tmp/reality-sni-check.log 2>&1
+    REALITY_SNI_CHECK_LOG=$(mktemp /tmp/reality-sni-check.XXXXXX.log) || return 1
+    chmod 600 "$REALITY_SNI_CHECK_LOG" 2>/dev/null || true
+    $timeout_cmd openssl s_client -connect "${domain}:443" -servername "$domain" -verify_hostname "$domain" -verify_return_error -brief </dev/null >"$REALITY_SNI_CHECK_LOG" 2>&1
 }
 
 reality_pick_sni_candidates() {
@@ -13559,7 +14876,7 @@ reality_prompt_sni_legacy() {
             echo "$sni"; return 0
         fi
         print_warn "SNI 校验未通过或网络不可达: $sni" >&2
-        tail -n 3 /tmp/reality-sni-check.log >&2 2>/dev/null || true
+        tail -n 3 "${REALITY_SNI_CHECK_LOG:-/dev/null}" >&2 2>/dev/null || true
         confirm "仍然使用该 SNI?" && { echo "$sni"; return 0; }
     done
 }
@@ -13575,6 +14892,58 @@ reality_backup_file() {
     [[ -f "$file" ]] || return 0
     mkdir -p "$REALITY_BACKUP_DIR"
     cp -a "$file" "$REALITY_BACKUP_DIR/$(basename "$file").$(date +%Y%m%d-%H%M%S).bak"
+}
+
+reality_apply_singbox_config() {
+    local content="$1" target="${2:-$REALITY_SINGBOX_CONFIG}"
+    [[ -n "$content" ]] || { print_error "sing-box 配置内容为空"; return 1; }
+    command_exists sing-box || { print_error "sing-box 未安装"; return 1; }
+    mkdir -p "$(dirname "$target")"
+    local tmp backup="" had_old=0
+    tmp=$(mktemp "$(dirname "$target")/.tmp.server-manage.singbox.XXXXXX") || return 1
+    _tmp_register "$tmp"
+    printf '%s\n' "$content" > "$tmp" || { rm -f "$tmp"; _tmp_unregister "$tmp"; return 1; }
+    chmod 600 "$tmp" 2>/dev/null || true
+
+    if ! sing-box check -c "$tmp" >/dev/null 2>&1; then
+        print_error "sing-box 新配置校验失败，已保留原配置。"
+        rm -f "$tmp"
+        _tmp_unregister "$tmp"
+        return 1
+    fi
+
+    if [[ -f "$target" ]]; then
+        backup=$(mktemp "$(dirname "$target")/.bak.server-manage.singbox.XXXXXX") || { rm -f "$tmp"; _tmp_unregister "$tmp"; return 1; }
+        _tmp_register "$backup"
+        cp -a "$target" "$backup" || { rm -f "$tmp" "$backup"; _tmp_unregister "$tmp"; _tmp_unregister "$backup"; return 1; }
+        had_old=1
+    fi
+
+    if ! mv "$tmp" "$target"; then
+        print_error "写入 sing-box 配置失败，已保留原配置。"
+        rm -f "$tmp"
+        [[ -n "$backup" ]] && rm -f "$backup"
+        _tmp_unregister "$tmp"
+        [[ -n "$backup" ]] && _tmp_unregister "$backup"
+        return 1
+    fi
+    _tmp_unregister "$tmp"
+
+    if ! systemctl restart sing-box >/dev/null 2>&1; then
+        print_error "sing-box 重启失败，正在回滚原配置。"
+        if [[ $had_old -eq 1 && -n "$backup" ]]; then
+            mv "$backup" "$target" 2>/dev/null || true
+            _tmp_unregister "$backup"
+        else
+            rm -f "$target"
+        fi
+        systemctl restart sing-box >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    [[ -n "$backup" ]] && rm -f "$backup"
+    [[ -n "$backup" ]] && _tmp_unregister "$backup"
+    return 0
 }
 
 reality_state_quote() {
@@ -13759,6 +15128,9 @@ reality_install_landing() {
     validate_domain "$sni" || { print_error "SNI 域名无效"; return 1; }
     validate_port "$port" || { print_error "端口无效"; return 1; }
     [[ -z "$node_name" ]] || reality_validate_node_name "$node_name" || { print_error "节点名称无效"; return 1; }
+    reality_load_state || true
+    local had_relay=0
+    [[ "${REALITY_ROLE:-}" == *"relay"* ]] && had_relay=1
     reality_install_singbox_official || return 1
     REALITY_UUID=$(reality_generate_uuid) || return 1
     local keys
@@ -13766,16 +15138,17 @@ reality_install_landing() {
     REALITY_PRIVATE_KEY=$(sed -n '1p' <<< "$keys")
     REALITY_PUBLIC_KEY=$(sed -n '2p' <<< "$keys")
     REALITY_SHORT_ID=$(reality_generate_short_id)
-    REALITY_ROLE="landing"
+    if [[ "$had_relay" -eq 1 ]]; then
+        REALITY_ROLE="landing+relay"
+    else
+        REALITY_ROLE="landing"
+    fi
     REALITY_NODE_NAME="$node_name"
     REALITY_NODE_DOMAIN="$node_domain"
     REALITY_SNI="$sni"
     REALITY_PORT="$port"
-    reality_backup_file "$REALITY_SINGBOX_CONFIG"
-    mkdir -p /etc/sing-box
-    reality_render_singbox_config "$REALITY_UUID" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID" > "$REALITY_SINGBOX_CONFIG"
-    chmod 600 "$REALITY_SINGBOX_CONFIG"
-    sing-box check -c "$REALITY_SINGBOX_CONFIG" || return 1
+    local new_config
+    new_config=$(reality_render_singbox_config "$REALITY_UUID" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID") || return 1
     firewall_apply_reality_port "$REALITY_PORT"
     local _fw_rc=$?
     if [[ $_fw_rc -eq 1 ]]; then
@@ -13791,7 +15164,7 @@ reality_install_landing() {
         fi
     fi
     systemctl enable sing-box >/dev/null || return 1
-    systemctl restart sing-box || return 1
+    reality_apply_singbox_config "$new_config" || return 1
     [[ -n "$cf_token" ]] && reality_sync_cloudflare_dns "$REALITY_NODE_DOMAIN" "$cf_token"
     reality_write_state
     reality_write_client_artifacts
@@ -13817,6 +15190,30 @@ reality_select_realm_asset_url() {
     printf '%s\n' "$url"
 }
 
+reality_select_realm_checksum_url() {
+    local api="$1" asset_url="$2" asset_name checksum_url=""
+    asset_name="$(basename "$asset_url")"
+    checksum_url=$(grep -Eo "https://[^\" ]+/${asset_name}\.(sha256|sha256sum|sha256.txt)" <<< "$api" | head -n 1)
+    if [[ -z "$checksum_url" ]]; then
+        checksum_url=$(grep -Eo 'https://[^" ]+/(SHA256SUMS|sha256sums\.txt|checksums\.txt|checksum\.txt)' <<< "$api" | head -n 1)
+    fi
+    [[ -n "$checksum_url" ]] || return 1
+    printf '%s\n' "$checksum_url"
+}
+
+reality_verify_sha256_file() {
+    local file="$1" checksum_file="$2" asset_name="${3:-$(basename "$file")}" hash line
+    command_exists sha256sum || { print_error "缺少 sha256sum，无法校验下载文件"; return 1; }
+    line=$(grep -F "$asset_name" "$checksum_file" 2>/dev/null | head -n 1 || true)
+    if [[ -n "$line" ]]; then
+        hash=$(awk '{print $1}' <<< "$line")
+    else
+        hash=$(grep -Eo '^[a-fA-F0-9]{64}' "$checksum_file" | head -n 1)
+    fi
+    [[ "$hash" =~ ^[a-fA-F0-9]{64}$ ]] || { print_error "无法解析 sha256 校验文件"; return 1; }
+    printf '%s  %s\n' "$hash" "$file" | sha256sum -c - >/dev/null
+}
+
 reality_find_realm_binary() {
     local dir="$1" bin=""
     bin=$(find "$dir" -type f -name realm -print -quit 2>/dev/null)
@@ -13831,17 +15228,34 @@ reality_install_realm_binary() {
     command_exists curl || install_package "curl" "silent" || return 1
     command_exists tar || install_package "tar" "silent" || true
     if command_exists realm; then return 0; fi
-    local arch api url tmp bin
+    local arch api url checksum_url tmp bin asset_name
     arch=$(reality_realm_arch) || { print_error "Realm 不支持当前架构"; return 1; }
     api=$(curl -fsSL https://api.github.com/repos/zhboner/realm/releases/latest) || return 1
     url=$(reality_select_realm_asset_url "$api" "$arch") || true
     [[ -n "$url" ]] || { print_error "未找到 Realm ${arch} 发布包"; return 1; }
+    checksum_url=$(reality_select_realm_checksum_url "$api" "$url") || {
+        print_error "未找到 Realm 发布包 sha256 校验文件，已拒绝安装"
+        return 1
+    }
+    asset_name="$(basename "$url")"
     tmp=$(mktemp -d)
-    curl -fsSL "$url" -o "$tmp/realm.tgz" || return 1
-    tar -xzf "$tmp/realm.tgz" -C "$tmp" || return 1
+    curl -fsSL "$url" -o "$tmp/realm.tgz" || { rm -rf "$tmp"; return 1; }
+    curl -fsSL "$checksum_url" -o "$tmp/realm.sha256" || { rm -rf "$tmp"; return 1; }
+    reality_verify_sha256_file "$tmp/realm.tgz" "$tmp/realm.sha256" "$asset_name" || { rm -rf "$tmp"; return 1; }
+    tar -xzf "$tmp/realm.tgz" -C "$tmp" || { rm -rf "$tmp"; return 1; }
     bin=$(reality_find_realm_binary "$tmp") || { print_error "Realm 发布包中未找到可安装二进制"; rm -rf "$tmp"; return 1; }
     install -m 0755 "$bin" /usr/local/bin/realm || { rm -rf "$tmp"; return 1; }
     rm -rf "$tmp"
+}
+
+firewall_remove_reality_ports() {
+    command_exists ufw || return 0
+    ufw_is_active || return 0
+    local port
+    for port in "${REALITY_PORT:-}" "${REALITY_RELAY_PORT:-}"; do
+        validate_port "$port" || continue
+        ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
+    done
 }
 
 reality_install_relay() {
@@ -13851,6 +15265,8 @@ reality_install_relay() {
     validate_domain "$target_host" || validate_ip "$target_host" || { print_error "落地地址无效"; return 1; }
     validate_port "$target_port" || { print_error "落地端口无效"; return 1; }
     [[ -z "$node_name" ]] || reality_validate_node_name "$node_name" || { print_error "节点名称无效"; return 1; }
+    # 若同机已存在落地机 state，先加载再写入中转字段，避免重装中转时清空 UUID/私钥/SNI 等落地机参数。
+    reality_load_state || true
     reality_require_supported_os || return 1
     reality_install_realm_binary || return 1
     mkdir -p /etc/realm "$REALITY_CONFIG_DIR"
@@ -13889,8 +15305,12 @@ EOF
     systemctl daemon-reload
     systemctl enable realm >/dev/null || return 1
     systemctl restart realm || return 1
-    REALITY_ROLE="relay"
-    REALITY_NODE_NAME="$node_name"
+    if [[ -n "${REALITY_UUID:-}" && "${REALITY_ROLE:-}" == *"landing"* ]]; then
+        REALITY_ROLE="landing+relay"
+    else
+        REALITY_ROLE="relay"
+    fi
+    [[ -n "$node_name" ]] && REALITY_NODE_NAME="$node_name"
     REALITY_RELAY_DOMAIN="$relay_domain"
     REALITY_RELAY_PORT="$listen_port"
     REALITY_RELAY_TARGET_HOST="$target_host"
@@ -14029,9 +15449,17 @@ reality_show_info() {
 reality_status() {
     print_title "Reality 服务状态"
     command_exists systemctl || { print_warn "systemctl 不可用"; pause; return; }
-    systemctl --no-pager --full status sing-box 2>/dev/null | sed -n '1,12p' || print_warn "sing-box 未运行"
+    local status_out
+    if status_out=$(systemctl --no-pager --full status sing-box 2>&1); then
+        printf '%s\n' "$status_out" | sed -n '1,12p'
+    else
+        print_warn "sing-box 未运行"
+        printf '%s\n' "$status_out" | sed -n '1,6p'
+    fi
     echo ""
-    systemctl --no-pager --full status realm 2>/dev/null | sed -n '1,12p' || true
+    if status_out=$(systemctl --no-pager --full status realm 2>&1); then
+        printf '%s\n' "$status_out" | sed -n '1,12p'
+    fi
     pause
 }
 
@@ -14100,10 +15528,10 @@ reality_diagnose() {
         print_success "SNI TLS/SAN 校验通过: $REALITY_SNI"
     else
         print_warn "SNI TLS/SAN 校验失败或当前网络不可达: $REALITY_SNI"
-        tail -n 5 /tmp/reality-sni-check.log 2>/dev/null || true
+        tail -n 5 "${REALITY_SNI_CHECK_LOG:-/dev/null}" 2>/dev/null || true
     fi
 
-    if [[ "${REALITY_ROLE:-}" == "landing" ]]; then
+    if [[ "${REALITY_ROLE:-}" == *"landing"* ]]; then
         reality_local_client_self_test || true
     fi
 
@@ -14131,11 +15559,16 @@ reality_restart() {
 
 reality_rotate_user() {
     reality_load_state || { print_error "未安装落地机配置"; pause; return 1; }
-    [[ -n "${REALITY_PRIVATE_KEY:-}" && -n "${REALITY_PORT:-}" ]] || { print_error "状态文件缺少落地机参数"; pause; return 1; }
-    REALITY_UUID=$(reality_generate_uuid) || return 1
-    reality_backup_file "$REALITY_SINGBOX_CONFIG"
-    reality_render_singbox_config "$REALITY_UUID" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID" > "$REALITY_SINGBOX_CONFIG"
-    sing-box check -c "$REALITY_SINGBOX_CONFIG" && systemctl restart sing-box
+    [[ -n "${REALITY_PRIVATE_KEY:-}" && -n "${REALITY_PORT:-}" && -n "${REALITY_SNI:-}" && -n "${REALITY_SHORT_ID:-}" ]] || { print_error "状态文件缺少落地机参数"; pause; return 1; }
+    validate_port "$REALITY_PORT" || { print_error "状态文件端口无效: ${REALITY_PORT:-空}"; pause; return 1; }
+    local old_uuid="$REALITY_UUID" new_uuid new_config
+    new_uuid=$(reality_generate_uuid) || return 1
+    new_config=$(reality_render_singbox_config "$new_uuid" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID") || return 1
+    REALITY_UUID="$new_uuid"
+    if ! reality_apply_singbox_config "$new_config"; then
+        REALITY_UUID="$old_uuid"
+        pause; return 1
+    fi
     reality_write_state; reality_write_client_artifacts
     print_success "UUID 已轮换"
     reality_show_info
@@ -14143,14 +15576,20 @@ reality_rotate_user() {
 
 reality_rotate_key() {
     reality_load_state || { print_error "未安装落地机配置"; pause; return 1; }
-    local keys
+    [[ -n "${REALITY_UUID:-}" && -n "${REALITY_PORT:-}" && -n "${REALITY_SNI:-}" ]] || { print_error "状态文件缺少落地机参数"; pause; return 1; }
+    validate_port "$REALITY_PORT" || { print_error "状态文件端口无效: ${REALITY_PORT:-空}"; pause; return 1; }
+    local old_private_key="$REALITY_PRIVATE_KEY" old_public_key="$REALITY_PUBLIC_KEY" old_short_id="$REALITY_SHORT_ID" keys new_config
     keys=$(reality_generate_keypair) || return 1
     REALITY_PRIVATE_KEY=$(sed -n '1p' <<< "$keys")
     REALITY_PUBLIC_KEY=$(sed -n '2p' <<< "$keys")
     REALITY_SHORT_ID=$(reality_generate_short_id)
-    reality_backup_file "$REALITY_SINGBOX_CONFIG"
-    reality_render_singbox_config "$REALITY_UUID" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID" > "$REALITY_SINGBOX_CONFIG"
-    sing-box check -c "$REALITY_SINGBOX_CONFIG" && systemctl restart sing-box
+    new_config=$(reality_render_singbox_config "$REALITY_UUID" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID") || return 1
+    if ! reality_apply_singbox_config "$new_config"; then
+        REALITY_PRIVATE_KEY="$old_private_key"
+        REALITY_PUBLIC_KEY="$old_public_key"
+        REALITY_SHORT_ID="$old_short_id"
+        pause; return 1
+    fi
     reality_write_state; reality_write_client_artifacts
     print_success "Reality Key/ShortID 已轮换"
     reality_show_info
@@ -14182,12 +15621,14 @@ reality_update_node_name() {
 reality_delete_node_info() {
     print_title "删除 Reality 节点信息"
     confirm "确认删除本机 Reality/Realm 管理信息? 不会卸载 sing-box 软件包" || return 0
+    reality_load_state || true
+    firewall_remove_reality_ports
     systemctl disable --now realm 2>/dev/null || true
     rm -f /etc/systemd/system/realm.service
     systemctl daemon-reload 2>/dev/null || true
     reality_backup_file "$REALITY_SINGBOX_CONFIG"
     rm -f "$REALITY_REALM_CONFIG"
-    rm -rf "$REALITY_CONFIG_DIR"
+    rm -f "$REALITY_STATE_FILE" "$REALITY_LINK_FILE" "$REALITY_CLIENT_JSON"
     print_success "Reality/Realm 节点信息已删除"
     pause
 }
@@ -14350,6 +15791,10 @@ main() {
         shift
         check_root
         check_os
+        if [[ "$PLATFORM" == "openwrt" ]]; then
+            feature_blocked "Sing-box Reality 节点"
+            exit 1
+        fi
         init_environment
         refresh_ssh_port
         reality_cli "$@"

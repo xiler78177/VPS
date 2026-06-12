@@ -86,6 +86,10 @@ main() {
         shift
         check_root
         check_os
+        if [[ "$PLATFORM" == "openwrt" ]]; then
+            feature_blocked "Sing-box Reality 节点"
+            exit 1
+        fi
         init_environment
         refresh_ssh_port
         reality_cli "$@"

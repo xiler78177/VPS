@@ -19,7 +19,7 @@ web_add_domain() {
     # 2. 选择域名 (自动列出 Token 可管理的域名)
     print_info "获取 Token 可管理的域名列表..."
     local zones_json zone_list=() zone_ids=()
-    zones_json=$(_cf_api GET "/zones?per_page=50&status=active" "$CF_API_TOKEN")
+    zones_json=$(_cf_list_zones "$CF_API_TOKEN" "status=active")
     if ! _cf_api_ok "$zones_json"; then
         print_error "获取域名列表失败: $(_cf_api_err "$zones_json")"
         pause; return
@@ -58,12 +58,18 @@ web_add_domain() {
     echo -e "  ${C_GRAY}例如输入 www -> 完整域名为 www.${root_domain}${C_RESET}"
     echo -e "  ${C_GRAY}例如输入 panel -> 完整域名为 panel.${root_domain}${C_RESET}"
     echo -e "  ${C_GRAY}直接回车 -> 使用根域名 ${root_domain}${C_RESET}"
-    read -e -r -p "子域名前缀 [留空=根域名]: " sub_prefix
-    if [[ -z "$sub_prefix" ]]; then
-        DOMAIN="$root_domain"
-    else
-        DOMAIN="${sub_prefix}.${root_domain}"
-    fi
+    while true; do
+        read -e -r -p "子域名前缀 [留空=根域名]: " sub_prefix
+        if [[ -z "$sub_prefix" ]]; then
+            DOMAIN="$root_domain"
+            break
+        fi
+        if validate_dns_label "$sub_prefix"; then
+            DOMAIN="${sub_prefix}.${root_domain}"
+            break
+        fi
+        print_error "子域名前缀格式无效（仅小写字母、数字、短横；首尾不能为短横，1-63 字符）"
+    done
 
     # 检查是否已有配置
     if [[ -f "${CONFIG_DIR}/${DOMAIN}.conf" ]]; then
@@ -123,10 +129,21 @@ web_add_domain() {
     # 5. DNS 解析
     print_info "探测本机公网 IP..."
     local ipv4 ipv6
-    ipv4=$(curl -4 -s --max-time 5 https://4.ipw.cn 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv4=""
-    ipv6=$(curl -6 -s --max-time 5 https://6.ipw.cn 2>/dev/null || curl -6 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv6=""
-    _CACHED_IPV4="$ipv4"; _CACHED_IPV6="$ipv6"
-    [[ -n "$ipv6" && ! "$ipv6" =~ : ]] && { print_warn "IPv6 探测异常 ($ipv6)，已忽略"; ipv6=""; }
+    ipv4=$(get_public_ipv4 2>/dev/null || true)
+    ipv6=$(get_public_ipv6 2>/dev/null || true)
+    if [[ -n "$ipv4" ]]; then
+        if ! validate_ip "$ipv4" || [[ "$ipv4" == *:* ]]; then
+            print_warn "IPv4 探测异常 ($ipv4)，已忽略"
+            ipv4=""
+        fi
+    fi
+    if [[ -n "$ipv6" ]]; then
+        if ! validate_ip "$ipv6" || [[ "$ipv6" != *:* ]]; then
+            print_warn "IPv6 探测异常 ($ipv6)，已忽略"
+            ipv6=""
+        fi
+    fi
+    CACHED_IPV4="$ipv4"; CACHED_IPV6="$ipv6"
     echo "  IPv4: ${ipv4:-[✗] 未检测到}"
     echo "  IPv6: ${ipv6:-[✗] 未检测到}"
     local dns_mode=""
@@ -261,7 +278,7 @@ $(_nginx_tls_http2_block "$NGINX_HTTPS_PORT")
 
             # ── 防火墙 ──
             echo -e "\n${C_CYAN}=== [${step}] 防火墙 ===${C_RESET}"
-            if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+            if ufw_is_active; then
                 ufw allow "$NGINX_HTTP_PORT/tcp" comment "Nginx-HTTP" >/dev/null 2>&1 || true
                 ufw allow "$NGINX_HTTPS_PORT/tcp" comment "Nginx-HTTPS" >/dev/null 2>&1 || true
                 print_success "防火墙规则已更新"
@@ -340,7 +357,7 @@ LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
         ((step++))
 
         # ── DDNS 动态解析 ──
-        if [[ "$dns_mode" != "0" ]] && [[ ! -f "$DDNS_CONFIG_DIR/${DOMAIN}.conf" ]]; then
+        if [[ "$dns_mode" != "0" ]]; then
             echo -e "\n${C_CYAN}=== [${step}] DDNS 动态解析 ===${C_RESET}"
             local ddns_ipv4="false" ddns_ipv6="false"
             [[ "$dns_mode" == "1" || "$dns_mode" == "3" ]] && ddns_ipv4="true"
@@ -407,7 +424,7 @@ web_view_config() {
     echo "0. 返回"
     read -e -r -p "请输入序号: " idx
     if [[ "$idx" == "0" || -z "$idx" ]]; then return; fi
-    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -gt ${#domains[@]} ]]; then
+    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -lt 1 || "$idx" -gt ${#domains[@]} ]]; then
         print_error "无效序号。"
         pause; return
     fi
@@ -509,7 +526,7 @@ web_delete_domain() {
     echo "0. 返回"
     read -e -r -p "请输入序号删除: " idx
     if [[ "$idx" == "0" || -z "$idx" ]]; then return; fi
-    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -gt ${#domains[@]} ]]; then
+    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -lt 1 || "$idx" -gt ${#domains[@]} ]]; then
         print_error "无效序号。"
         pause; return
     fi

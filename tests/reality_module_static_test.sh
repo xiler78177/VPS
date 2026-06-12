@@ -18,6 +18,58 @@ source modules/00-constants.sh
 source modules/01-utils.sh
 source modules/15-singbox-reality.sh
 
+# review #14 / audit H10-H11: Reality 轮换必须先写临时文件并 check，失败不覆盖 config/state；中转重装必须先读取既有 state。
+declare -F reality_apply_singbox_config >/dev/null || fail "Reality should define checked sing-box config apply helper"
+rotate_user_body="$(declare -f reality_rotate_user)"
+rotate_key_body="$(declare -f reality_rotate_key)"
+relay_body="$(declare -f reality_install_relay)"
+assert_contains 'reality_apply_singbox_config' "$rotate_user_body" "UUID rotation should use checked apply helper"
+assert_contains 'reality_apply_singbox_config' "$rotate_key_body" "key rotation should use checked apply helper"
+if grep -Fq '> "$REALITY_SINGBOX_CONFIG"' <<< "$rotate_user_body$rotate_key_body"; then
+    fail "Reality rotation should not write directly to final sing-box config"
+fi
+assert_contains 'old_uuid' "$rotate_user_body" "UUID rotation should keep old UUID for rollback"
+assert_contains 'old_private_key' "$rotate_key_body" "key rotation should keep old key for rollback"
+assert_contains 'validate_port "$REALITY_PORT"' "$rotate_key_body" "key rotation should validate REALITY_PORT before rendering JSON numeric port"
+if ! awk '/reality_install_relay\(\)/{infn=1} infn && /reality_load_state \|\| true/{load=NR} infn && /REALITY_ROLE=/{role=NR} infn && /^}/{exit !(load && role && load < role)}' modules/15-singbox-reality.sh; then
+    fail "relay install should load existing state before writing relay fields"
+fi
+
+reality_test_tmp="$(mktemp -d)"
+reality_old_path="$PATH"
+realm_tmp=""
+trap 'PATH="$reality_old_path"; rm -rf "$reality_test_tmp" "$realm_tmp"' EXIT
+REALITY_SINGBOX_CONFIG="$reality_test_tmp/config.json"
+printf '%s\n' 'old-config' > "$REALITY_SINGBOX_CONFIG"
+mkdir -p "$reality_test_tmp/bin"
+cat > "$reality_test_tmp/bin/sing-box" <<'EOF_MOCK_SINGBOX_FAIL'
+#!/usr/bin/env bash
+exit 1
+EOF_MOCK_SINGBOX_FAIL
+cat > "$reality_test_tmp/bin/systemctl" <<'EOF_MOCK_SYSTEMCTL_OK'
+#!/usr/bin/env bash
+exit 0
+EOF_MOCK_SYSTEMCTL_OK
+chmod +x "$reality_test_tmp/bin/sing-box" "$reality_test_tmp/bin/systemctl"
+PATH="$reality_test_tmp/bin:$PATH"
+if reality_apply_singbox_config '{"new":"bad"}' >/dev/null 2>&1; then
+    fail "checked apply helper should fail when sing-box check fails"
+fi
+[[ "$(cat "$REALITY_SINGBOX_CONFIG")" == 'old-config' ]] || fail "failed sing-box check should leave existing config untouched"
+cat > "$reality_test_tmp/bin/sing-box" <<'EOF_MOCK_SINGBOX_OK'
+#!/usr/bin/env bash
+exit 0
+EOF_MOCK_SINGBOX_OK
+cat > "$reality_test_tmp/bin/systemctl" <<'EOF_MOCK_SYSTEMCTL_FAIL'
+#!/usr/bin/env bash
+exit 1
+EOF_MOCK_SYSTEMCTL_FAIL
+chmod +x "$reality_test_tmp/bin/sing-box" "$reality_test_tmp/bin/systemctl"
+if reality_apply_singbox_config '{"new":"restart-fail"}' >/dev/null 2>&1; then
+    fail "checked apply helper should fail when sing-box restart fails"
+fi
+[[ "$(cat "$REALITY_SINGBOX_CONFIG")" == 'old-config' ]] || fail "failed restart should restore previous config"
+
 prompt_sni_body="$(declare -f reality_prompt_sni)"
 assert_contains 'reality_smart_sni_selection' "$prompt_sni_body" "sourcing Reality module should keep enhanced SNI prompt active"
 if grep -Fq 'REALITY SNI/handshake 目标' <<< "$prompt_sni_body"; then
@@ -81,7 +133,6 @@ realm_api_slim_only='{"assets":[{"browser_download_url":"https://github.com/zhbo
 realm_slim_url="$(reality_select_realm_asset_url "$realm_api_slim_only" 'x86_64-unknown-linux-gnu')"
 [[ "$realm_slim_url" == 'https://github.com/zhboner/realm/releases/download/v2.9.4/realm-slim-x86_64-unknown-linux-gnu.tar.gz' ]] || fail "Realm asset selector should fall back to slim asset"
 realm_tmp="$(mktemp -d)"
-trap 'rm -rf "$realm_tmp"' EXIT
 touch "$realm_tmp/realm-slim"
 realm_bin="$(reality_find_realm_binary "$realm_tmp")"
 [[ "$realm_bin" == "$realm_tmp/realm-slim" ]] || fail "Realm binary finder should accept realm-slim extracted binary, got: $realm_bin"

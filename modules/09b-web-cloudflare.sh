@@ -21,8 +21,45 @@ _cf_api() {
     return 1
 }
 
-_cf_api_ok() { [[ "$(jq -r '.success' <<< "$1")" == "true" ]]; }
-_cf_api_err() { jq -r '.errors[0].message // "未知错误"' <<< "$1"; }
+_cf_api_ok() { [[ "$(jq -r '.success // false' 2>/dev/null <<< "$1")" == "true" ]]; }
+_cf_api_err() { jq -r '.errors[0].message // "未知错误"' 2>/dev/null <<< "$1" || echo "未知错误"; }
+
+# 分页读取 Token 可见的 Cloudflare Zones。
+# 参数:
+#   $1 token
+#   $2 附加 query（可选，如 status=active）
+#   $3 per_page（可选，默认 50）
+_cf_list_zones() {
+    local token="$1" query="${2:-}" per_page="${3:-50}"
+    local page=1 resp all='[]' total_pages count endpoint
+
+    while true; do
+        endpoint="/zones?per_page=${per_page}&page=${page}"
+        [[ -n "$query" ]] && endpoint="${endpoint}&${query}"
+        resp=$(_cf_api GET "$endpoint" "$token")
+        if ! _cf_api_ok "$resp"; then
+            echo "$resp"
+            return 1
+        fi
+
+        all=$(jq -c --argjson acc "$all" '$acc + (.result // [])' <<< "$resp" 2>/dev/null) || {
+            echo '{"success":false,"errors":[{"message":"解析 Zone 分页响应失败"}]}'
+            return 1
+        }
+        total_pages=$(jq -r '.result_info.total_pages // empty' <<< "$resp" 2>/dev/null)
+        count=$(jq -r '.result | length' <<< "$resp" 2>/dev/null)
+
+        if [[ "$total_pages" =~ ^[0-9]+$ ]]; then
+            (( page >= total_pages )) && break
+        else
+            [[ "$count" =~ ^[0-9]+$ ]] || count=0
+            (( count < per_page )) && break
+        fi
+        page=$((page + 1))
+    done
+
+    jq -n --argjson result "$all" '{success:true, errors:[], messages:[], result:$result}'
+}
 
 # CF API Token 验证
 _cf_verify_token() {
@@ -66,7 +103,7 @@ _cf_get_zone_id() {
         current="${current#*.}"
     done
     # Fallback: 列出所有 zone，本地匹配 (解决二级域名 zone 查找问题)
-    local resp=$(_cf_api GET "/zones?per_page=50" "$token")
+    local resp=$(_cf_list_zones "$token")
     if _cf_api_ok "$resp"; then
         local try="$domain"
         while [[ "$try" == *"."* ]]; do
@@ -78,22 +115,13 @@ _cf_get_zone_id() {
     return 1
 }
 
-_cf_dns_upsert() {
-    local zone_id=$1 token=$2 type=$3 name=$4 content=$5 proxied=${6:-false}
-    local resp=$(_cf_api GET "/zones/$zone_id/dns_records?type=$type&name=$name" "$token")
-    local rid=$(echo "$resp" | jq -r '.result[0].id // empty')
-    local data=$(jq -n --arg type "$type" --arg name "$name" --arg content "$content" --argjson proxied "$proxied" \
-        '{type:$type, name:$name, content:$content, ttl:1, proxied:$proxied}')
-    if [[ -n "$rid" ]]; then
-        _cf_api PUT "/zones/$zone_id/dns_records/$rid" "$token" --data "$data"
-    else
-        _cf_api POST "/zones/$zone_id/dns_records" "$token" --data "$data"
-    fi
-}
-
 _cf_dns_delete() {
     local zone_id=$1 token=$2 type=$3 name=$4
     local resp=$(_cf_api GET "/zones/$zone_id/dns_records?type=$type&name=$name" "$token")
+    if ! _cf_api_ok "$resp"; then
+        print_error "读取 DNS 记录失败: $(_cf_api_err "$resp")"
+        return 1
+    fi
     local rid=$(echo "$resp" | jq -r '.result[0].id // empty')
     [[ -n "$rid" ]] && _cf_api DELETE "/zones/$zone_id/dns_records/$rid" "$token"
 }
@@ -104,6 +132,10 @@ _cf_update_dns_record() {
     [[ -z "$ip" ]] && return 0
     print_info "处理 $type 记录 -> $ip (代理: $proxied)"
     local records=$(_cf_api GET "/zones/$zone_id/dns_records?type=$type&name=$domain" "$token")
+    if ! _cf_api_ok "$records"; then
+        print_error "读取 $type 记录失败: $(_cf_api_err "$records")"
+        return 1
+    fi
     local record_id=$(jq -r '.result[0].id // empty' <<< "$records")
     local count=$(jq -r '.result | length' <<< "$records")
     [[ "$count" -gt 1 ]] && print_warn "警告: 存在 ${count} 条 $type 记录，仅更新第一条。建议手动清理多余记录。"
@@ -162,15 +194,25 @@ web_cf_dns_update() {
     command_exists jq || install_package "jq" "silent"
     print_info "正在探测本机公网 IP..."
     local ipv4 ipv6
-    if [[ -n "${_CACHED_IPV4:-}" || -n "${_CACHED_IPV6:-}" ]]; then
-        ipv4="$_CACHED_IPV4"; ipv6="$_CACHED_IPV6"
+    if [[ ( -n "${CACHED_IPV4:-}" && "${CACHED_IPV4:-}" != "N/A" ) || ( -n "${CACHED_IPV6:-}" && "${CACHED_IPV6:-}" != "N/A" ) ]]; then
+        ipv4="${CACHED_IPV4:-}"; ipv6="${CACHED_IPV6:-}"
     else
-        ipv4=$(curl -4 -s --max-time 5 https://4.ipw.cn 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv4=""
-        ipv6=$(curl -6 -s --max-time 5 https://6.ipw.cn 2>/dev/null || curl -6 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv6=""
-        _CACHED_IPV4="$ipv4"; _CACHED_IPV6="$ipv6"
+        ipv4=$(get_public_ipv4 2>/dev/null || true)
+        ipv6=$(get_public_ipv6 2>/dev/null || true)
     fi
-    # IPv6 格式校验：必须包含冒号
-    [[ -n "$ipv6" && ! "$ipv6" =~ : ]] && { print_warn "IPv6 探测结果异常 ($ipv6)，已忽略"; ipv6=""; }
+    if [[ -n "$ipv4" ]]; then
+        if ! validate_ip "$ipv4" || [[ "$ipv4" == *:* ]]; then
+            print_warn "IPv4 探测结果异常 ($ipv4)，已忽略"
+            ipv4=""
+        fi
+    fi
+    if [[ -n "$ipv6" ]]; then
+        if ! validate_ip "$ipv6" || [[ "$ipv6" != *:* ]]; then
+            print_warn "IPv6 探测结果异常 ($ipv6)，已忽略"
+            ipv6=""
+        fi
+    fi
+    CACHED_IPV4="$ipv4"; CACHED_IPV6="$ipv6"
     echo "----------------------------------------"
     echo "IPv4: ${ipv4:-[✗] 未检测到}"
     echo "IPv6: ${ipv6:-[✗] 未检测到}"
@@ -239,13 +281,29 @@ web_cf_dns_update() {
 _cf_get_origin_ruleset() {
     local token="$1" zone_id="$2"
     local url="https://api.cloudflare.com/client/v4/zones/${zone_id}/rulesets/phases/http_request_origin/entrypoint"
-    local resp=$(curl -s -w "\n%{http_code}" -X GET "$url" \
-        -H "Authorization: Bearer $token" -H "Content-Type: application/json")
-    local code=$(echo "$resp" | tail -1)
-    local body=$(echo "$resp" | sed '$d')
+    local attempt resp code body curl_rc
+    for attempt in 1 2 3; do
+        resp=$(curl -sS --connect-timeout 10 --max-time 30 -w "
+%{http_code}" -X GET "$url"             -H "Authorization: Bearer $token" -H "Content-Type: application/json" 2>/dev/null)
+        curl_rc=$?
+        if [[ $curl_rc -eq 0 && -n "$resp" ]]; then
+            code=$(echo "$resp" | tail -1)
+            body=$(echo "$resp" | sed '$d')
+            [[ "$code" =~ ^[0-9]{3}$ ]] && break
+        fi
+        [[ $attempt -lt 3 ]] && sleep $((attempt * 2))
+    done
+    if [[ ${curl_rc:-1} -ne 0 || ! "${code:-}" =~ ^[0-9]{3}$ ]]; then
+        echo '{"success":false,"errors":[{"message":"Origin Rules 读取失败或超时"}]}'
+        return 1
+    fi
     if [[ "$code" == "200" ]]; then
+        if _cf_api_ok "$body"; then
+            echo "$body"
+            return 0
+        fi
         echo "$body"
-        return 0
+        return 1
     elif [[ "$code" == "404" ]]; then
         return 0
     else
@@ -379,7 +437,11 @@ web_cf_origin_rule_list() {
     if [[ -z "$zone_id" ]]; then
         print_error "未找到 Zone ID"; pause; return
     fi
-    local resp=$(_cf_get_origin_ruleset "$token" "$zone_id")
+    local resp
+    if ! resp=$(_cf_get_origin_ruleset "$token" "$zone_id"); then
+        print_error "读取回源规则失败: $(echo "$resp" | jq -r '.errors[0].message // "未知错误"')"
+        pause; return
+    fi
     if [[ -z "$resp" ]]; then
         print_warn "该域名下没有任何回源规则"
         pause; return
@@ -414,7 +476,11 @@ web_cf_origin_rule_delete() {
     if [[ -z "$zone_id" ]]; then
         print_error "未找到 Zone ID"; pause; return
     fi
-    local resp=$(_cf_get_origin_ruleset "$token" "$zone_id")
+    local resp
+    if ! resp=$(_cf_get_origin_ruleset "$token" "$zone_id"); then
+        print_error "读取回源规则失败: $(echo "$resp" | jq -r '.errors[0].message // "未知错误"')"
+        pause; return
+    fi
     if [[ -z "$resp" ]]; then
         print_warn "没有任何回源规则"; pause; return
     fi

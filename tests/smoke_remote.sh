@@ -22,12 +22,18 @@ install_package() { return 0; }
 auto_deps() { return 0; }
 STUB
 sed -i \
-    -e "s|^readonly LOG_FILE=.*|readonly LOG_FILE=\"$WORK/server-manage.log\"|" \
+    -e "s|^[[:space:]]*readonly LOG_FILE=.*|readonly LOG_FILE=\"$WORK/log/server-manage.log\"|" \
     -e "s|^readonly CONFIG_FILE=.*|readonly CONFIG_FILE=\"$WORK/none.conf\"|" \
     "$LIB"
 
 # shellcheck disable=SC1090
 source "$LIB" >/dev/null 2>&1 || { echo "source 失败"; exit 1; }
+log_err=$(log_action "smoke log mkdir" 2>&1 >/dev/null || true)
+if [[ -z "$log_err" && -f "$WORK/log/server-manage.log" ]]; then
+    pass "log_action 自动创建日志目录且无 stderr"
+else
+    fail "log_action 未处理缺失日志目录: ${log_err:-<no stderr>}"
+fi
 NON_ROOT=0
 if [[ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]]; then
     NON_ROOT=1

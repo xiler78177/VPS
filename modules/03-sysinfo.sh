@@ -16,6 +16,61 @@ load_cache() {
     return 1
 }
 
+_sysinfo_conf_escape() {
+    local value="${1:-}"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//\$/\\$}"
+    value="${value//\`/\\\`}"
+    printf '%s' "$value"
+}
+
+_network_cache_defaults() {
+    CACHED_IPV4="${CACHED_IPV4:-N/A}"
+    CACHED_IPV6="${CACHED_IPV6:-未配置}"
+    CACHED_ISP="${CACHED_ISP:-N/A}"
+    CACHED_LOCATION="${CACHED_LOCATION:-N/A}"
+}
+
+load_cache_stale() {
+    [[ -f "$CACHE_FILE" ]] || return 1
+    validate_conf_file "$CACHE_FILE" 2>/dev/null || return 1
+    source "$CACHE_FILE" 2>/dev/null || return 1
+    _network_cache_defaults
+    return 0
+}
+
+_network_cache_refresh_background() {
+    mkdir -p "$CACHE_DIR" 2>/dev/null || return 0
+    local lock_file="${CACHE_DIR}/sysinfo.refresh.lock"
+    if command_exists flock; then
+        (
+            exec 201>"$lock_file" || exit 0
+            flock -n 201 || exit 0
+            refresh_network_cache
+        ) >/dev/null 2>&1 &
+    else
+        (
+            mkdir "${lock_file}.d" 2>/dev/null || exit 0
+            trap 'rmdir "${lock_file}.d" 2>/dev/null || true' EXIT
+            refresh_network_cache
+        ) >/dev/null 2>&1 &
+    fi
+}
+
+ensure_network_cache_async() {
+    if load_cache; then
+        return 0
+    fi
+    if load_cache_stale; then
+        _network_cache_refresh_background
+        return 0
+    fi
+    _network_cache_defaults
+    _network_cache_refresh_background
+    return 0
+}
+
 refresh_network_cache() {
     CACHED_IPV4=$(get_public_ipv4 || echo "N/A")
     CACHED_IPV6=$(get_public_ipv6 || echo "")
@@ -27,13 +82,16 @@ refresh_network_cache() {
     local city=$(echo "$ipinfo" | grep -o '"city"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
     CACHED_LOCATION="${country:-N/A} ${city:-}"
     mkdir -p "$CACHE_DIR"
-    cat > "$CACHE_FILE" << EOF
-CACHED_IPV4="$CACHED_IPV4"
-CACHED_IPV6="$CACHED_IPV6"
-CACHED_ISP="$CACHED_ISP"
-CACHED_LOCATION="$CACHED_LOCATION"
+    local cache_content
+    cache_content=$(cat << EOF
+CACHED_IPV4="$(_sysinfo_conf_escape "$CACHED_IPV4")"
+CACHED_IPV6="$(_sysinfo_conf_escape "$CACHED_IPV6")"
+CACHED_ISP="$(_sysinfo_conf_escape "$CACHED_ISP")"
+CACHED_LOCATION="$(_sysinfo_conf_escape "$CACHED_LOCATION")"
 EOF
-    chmod 600 "$CACHE_FILE"
+)
+    write_file_atomic "$CACHE_FILE" "$cache_content" || return 1
+    chmod 600 "$CACHE_FILE" 2>/dev/null || true
 }
 get_ip_location() {
     local ip="$1"
@@ -63,8 +121,57 @@ get_ip_location() {
     echo "查询失败"
 }
 
+_ip_location_cache_path() {
+    local ip="$1" safe_ip
+    safe_ip=$(printf '%s' "$ip" | tr -c 'A-Za-z0-9_.-' '_')
+    printf '%s/ip-location-%s.cache' "$CACHE_DIR" "$safe_ip"
+}
+
+_ip_location_refresh_background() {
+    local ip="$1" cache_file="$2" lock_file="${cache_file}.lock"
+    mkdir -p "$CACHE_DIR" 2>/dev/null || return 0
+    if command_exists flock; then
+        (
+            exec 202>"$lock_file" || exit 0
+            flock -n 202 || exit 0
+            local location
+            location=$(get_ip_location "$ip")
+            [[ -n "$location" ]] || location="查询失败"
+            write_file_atomic "$cache_file" "$location"
+        ) >/dev/null 2>&1 &
+    else
+        (
+            mkdir "${lock_file}.d" 2>/dev/null || exit 0
+            trap 'rmdir "${lock_file}.d" 2>/dev/null || true' EXIT
+            local location
+            location=$(get_ip_location "$ip")
+            [[ -n "$location" ]] || location="查询失败"
+            write_file_atomic "$cache_file" "$location"
+        ) >/dev/null 2>&1 &
+    fi
+}
+
+get_ip_location_cached() {
+    local ip="$1" cache_file file_mtime cache_age
+    if [[ "$ip" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|fe80:|::1|fc00:|fd00:) ]]; then
+        echo "本地网络"
+        return 0
+    fi
+    cache_file=$(_ip_location_cache_path "$ip")
+    if [[ -s "$cache_file" ]]; then
+        file_mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null || echo 0)
+        cache_age=$(($(date +%s) - file_mtime))
+        if [[ "$cache_age" -lt 86400 ]]; then
+            head -n 1 "$cache_file"
+            return 0
+        fi
+    fi
+    _ip_location_refresh_background "$ip" "$cache_file"
+    echo "待查询"
+}
+
 show_dual_column_sysinfo() {
-    load_cache || refresh_network_cache
+    ensure_network_cache_async
     local hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "unknown")
     local os_info=$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2 | head -c 35)
     local kernel=$(uname -r | head -c 20)
@@ -126,9 +233,9 @@ show_dual_column_sysinfo() {
         if(d>0)printf "%d天%d时%d分",d,h,m;else if(h>0)printf "%d时%d分",h,m;else printf "%d分",m}' /proc/uptime)
     local sys_time=$(date "+%m-%d %H:%M")
     local timezone=$(timedatectl 2>/dev/null | awk '/Time zone/{print $3}' || echo "UTC")
-    local ssh_port=$(grep -E "^Port\s" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
-    [[ -z "$ssh_port" ]] && ssh_port="22"
-    local ufw_st="○"; command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active" && ufw_st="●"
+    refresh_ssh_port
+    local ssh_port="${CURRENT_SSH_PORTS:-${CURRENT_SSH_PORT:-22}}"
+    local ufw_st="○"; command -v ufw &>/dev/null && ufw_is_active && ufw_st="●"
     local f2b_st="○"; systemctl is-active fail2ban &>/dev/null && f2b_st="●"
     local nginx_st="○"; systemctl is-active nginx &>/dev/null && nginx_st="●"
     local docker_st="○"; systemctl is-active docker &>/dev/null && docker_st="●"
@@ -175,7 +282,7 @@ show_dual_column_sysinfo() {
                 local login_time=$(echo "$login_line" | awk '{print $4, $5, $6}')
                 local login_display=""
                 if [[ -n "$login_ip" && "$login_ip" =~ ^[0-9a-f.:]+$ ]]; then
-                    local ip_loc=$(get_ip_location "$login_ip")
+                    local ip_loc=$(get_ip_location_cached "$login_ip")
                     login_display="${login_user}@${login_ip} (${ip_loc}) ${login_time}"
                 else
                     login_display="${login_user} ${login_time}"

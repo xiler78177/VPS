@@ -1,4 +1,36 @@
 # modules/06-ssh.sh - SSH 端口修改与密钥管理
+# 仅更新 Fail2ban [sshd] jail 的 port，避免误改 nginx/http 等其他 jail。
+_fail2ban_set_sshd_port() {
+    local jail_file="$1" port="$2"
+    [[ -f "$jail_file" ]] || return 1
+    validate_port "$port" || return 1
+    local tmpfile
+    tmpfile=$(mktemp "$(dirname "$jail_file")/.tmp.fail2ban-sshd.XXXXXX") || return 1
+    awk -v port="$port" '
+        BEGIN { seen_sshd=0 }
+        /^\[[^]]+\]/ {
+            if (in_sshd && !done) { print "port = " port; done=1 }
+            in_sshd=($0 == "[sshd]")
+            if (in_sshd) seen_sshd=1
+            print
+            next
+        }
+        in_sshd && /^[[:space:]]*port[[:space:]]*=/ {
+            print "port = " port
+            done=1
+            next
+        }
+        { print }
+        END {
+            if (in_sshd && !done) print "port = " port
+            if (!seen_sshd) exit 2
+        }
+    ' "$jail_file" > "$tmpfile" || { rm -f "$tmpfile"; return 1; }
+    chmod --reference="$jail_file" "$tmpfile" 2>/dev/null || true
+    chown --reference="$jail_file" "$tmpfile" 2>/dev/null || true
+    mv "$tmpfile" "$jail_file"
+}
+
 ssh_change_port() {
     print_title "修改 SSH 端口"
     refresh_ssh_port
@@ -35,6 +67,16 @@ ssh_change_port() {
         esac
     fi
 
+    local socket_unit="" socket_dropin="" socket_backup="" socket_created=0
+    if _ssh_socket_activation_active; then
+        socket_unit=$(_ssh_socket_unit)
+        print_warn "检测到 systemd ${socket_unit} socket activation。"
+        print_warn "仅修改 sshd_config 不会改变真实监听端口，必须同步修改 ${socket_unit}。"
+        if ! confirm "是否同步修改 ${socket_unit} 监听端口为 ${port}？"; then
+            pause; return
+        fi
+    fi
+
     # 检查端口是否已被其他服务占用
     if command_exists ss && ss -tlpn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}$"; then
         local occupier=$(ss -tlpn 2>/dev/null | awk -v p=":${port}$" '$4 ~ p {print $NF}' | head -1)
@@ -46,9 +88,28 @@ ssh_change_port() {
 
     local backup_file="${target_conf}.bak.$(date +%s)"
     cp "$target_conf" "$backup_file"
+
+    if [[ -n "$socket_unit" ]]; then
+        local socket_dropin_dir="/etc/systemd/system/${socket_unit}.d"
+        socket_dropin="${socket_dropin_dir}/server-manage-port.conf"
+        mkdir -p "$socket_dropin_dir"
+        if [[ -f "$socket_dropin" ]]; then
+            socket_backup="${socket_dropin}.bak.$(date +%s)"
+            cp "$socket_dropin" "$socket_backup"
+        else
+            socket_created=1
+        fi
+        cat > "$socket_dropin" <<EOF
+[Socket]
+ListenStream=
+ListenStream=${port}
+EOF
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+
     # 先放行新端口（防止改完连不上）
     local ufw_opened=0
-    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+    if ufw_is_active; then
         ufw allow "$port/tcp" comment "SSH-New" >/dev/null
         ufw_opened=1
         print_success "UFW 已放行新端口 $port。"
@@ -65,6 +126,10 @@ ssh_change_port() {
     if ! sshd -t 2>/dev/null; then
         print_error "sshd 配置校验失败！已回滚。"
         mv "$backup_file" "$target_conf"
+        if [[ -n "$socket_unit" ]]; then
+            if [[ -n "$socket_backup" ]]; then mv "$socket_backup" "$socket_dropin" 2>/dev/null || true; elif [[ $socket_created -eq 1 ]]; then rm -f "$socket_dropin"; fi
+            systemctl daemon-reload 2>/dev/null || true
+        fi
         [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
         pause; return
     fi
@@ -72,36 +137,65 @@ ssh_change_port() {
     if ! _restart_sshd; then
         print_error "重启失败！已回滚配置。"
         mv "$backup_file" "$target_conf" 2>/dev/null || true
+        if [[ -n "$socket_unit" ]]; then
+            if [[ -n "$socket_backup" ]]; then mv "$socket_backup" "$socket_dropin" 2>/dev/null || true; elif [[ $socket_created -eq 1 ]]; then rm -f "$socket_dropin"; fi
+            systemctl daemon-reload 2>/dev/null || true
+        fi
         [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
         _restart_sshd || true
         pause; return
     fi
 
-    # 重启后用 sshd -T 重新校验端口是否真的生效（drop-in 覆盖等）
-    local effective_port
-    effective_port=$(sshd -T 2>/dev/null | awk 'tolower($1)=="port"{print $2; exit}')
-    if [[ "$effective_port" != "$port" ]]; then
-        print_error "重启后 sshd -T 解析端口仍为 ${effective_port:-未知}，与目标 $port 不一致。"
-        print_error "可能仍被其他 drop-in 文件覆盖。已回滚配置，UFW 规则保持原状。"
+    local listen_ok=0 _try
+    for _try in 1 2 3 4 5; do
+        if _ssh_port_is_listening "$port"; then
+            listen_ok=1
+            break
+        fi
+        sleep 1
+    done
+    if [[ $listen_ok -ne 1 ]]; then
+        print_error "重启后未检测到 SSH 在新端口 ${port}/tcp 监听，已回滚配置。"
         mv "$backup_file" "$target_conf" 2>/dev/null || true
-        _restart_sshd || true
+        if [[ -n "$socket_unit" ]]; then
+            if [[ -n "$socket_backup" ]]; then mv "$socket_backup" "$socket_dropin" 2>/dev/null || true; elif [[ $socket_created -eq 1 ]]; then rm -f "$socket_dropin"; fi
+            systemctl daemon-reload 2>/dev/null || true
+        fi
         [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
+        _restart_sshd || true
         pause; return
     fi
 
-    print_success "SSH 重启成功，sshd -T 已确认生效端口: $port"
+    # 非 socket activation 模式下，再用 sshd -T 校验配置解析端口；socket 模式以真实监听为准。
+    if [[ -z "$socket_unit" ]]; then
+        local effective_port
+        effective_port=$(sshd -T 2>/dev/null | awk 'tolower($1)=="port"{print $2; exit}')
+        if [[ "$effective_port" != "$port" ]]; then
+            print_error "重启后 sshd -T 解析端口仍为 ${effective_port:-未知}，与目标 $port 不一致。"
+            print_error "可能仍被其他 drop-in 文件覆盖。已回滚配置，UFW 规则保持原状。"
+            mv "$backup_file" "$target_conf" 2>/dev/null || true
+            [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
+            _restart_sshd || true
+            pause; return
+        fi
+    fi
+
+    print_success "SSH 重启成功，已确认新端口真实监听: $port"
     if [[ $ufw_opened -eq 1 ]]; then
         ufw delete allow "$CURRENT_SSH_PORT/tcp" 2>/dev/null || true
     fi
     # 同步更新 Fail2ban jail 端口
     if [[ -f "$FAIL2BAN_JAIL_LOCAL" ]]; then
-        sed -i "s/^port = .*/port = $port/" "$FAIL2BAN_JAIL_LOCAL"
-        systemctl restart fail2ban 2>/dev/null || true
-        print_info "Fail2ban 已同步新端口 $port"
+        if _fail2ban_set_sshd_port "$FAIL2BAN_JAIL_LOCAL" "$port"; then
+            systemctl restart fail2ban 2>/dev/null || true
+            print_info "Fail2ban [sshd] 已同步新端口 $port"
+        else
+            print_warn "Fail2ban [sshd] 端口同步失败，请手动检查 $FAIL2BAN_JAIL_LOCAL"
+        fi
     fi
     CURRENT_SSH_PORT=$port
-    log_action "SSH port changed to $port (file=$target_conf)"
-    rm -f "$backup_file"
+    log_action "SSH port changed to $port (file=$target_conf socket=${socket_unit:-none})"
+    rm -f "$backup_file" "$socket_backup"
     pause
 }
 
@@ -193,8 +287,22 @@ ssh_keys() {
         if [[ "$didx" =~ ^[0-9]+$ ]] && [[ "$didx" -ge 1 && "$didx" -le ${#keys[@]} ]]; then
             local target_key="${keys[$((didx-1))]}"
             if confirm "确认删除第 ${didx} 个公钥?"; then
-                local escaped_key=$(printf '%s\n' "$target_key" | sed 's/[.[\*^$/]/\\&/g')
-                sed -i "\|${escaped_key}|d" "$ak"
+                local tmp_ak grep_rc
+                tmp_ak=$(mktemp "$(dirname "$ak")/.tmp.server-manage.authorized-keys.XXXXXX") || { print_error "创建临时文件失败"; pause; return; }
+                _tmp_register "$tmp_ak"
+                grep -Fvx -- "$target_key" "$ak" > "$tmp_ak"
+                grep_rc=$?
+                if [[ $grep_rc -gt 1 ]]; then
+                    rm -f "$tmp_ak"
+                    _tmp_unregister "$tmp_ak"
+                    print_error "删除失败"
+                    pause; return
+                fi
+                cat "$tmp_ak" > "$ak" || { rm -f "$tmp_ak"; _tmp_unregister "$tmp_ak"; print_error "写入失败"; pause; return; }
+                rm -f "$tmp_ak"
+                _tmp_unregister "$tmp_ak"
+                chmod 600 "$ak"
+                chown "$user:$user" "$ak" 2>/dev/null || true
                 print_success "已删除。"
                 log_action "SSH key deleted for user $user (index=$didx)"
             fi
@@ -245,6 +353,11 @@ ssh_keys() {
         fi
         ;;
     5)
+        if ! _ssh_authorized_keys_available; then
+            print_error "未检测到任何可登录用户的 authorized_keys，禁止关闭密码登录以避免锁外。"
+            print_info "请先通过 [导入公钥] 部署并测试密钥登录。"
+            pause; return
+        fi
         if confirm "确认已测试密钥登录成功？"; then
             local backup_file="${SSHD_CONFIG}.bak.$(date +%s)"
             cp "$SSHD_CONFIG" "$backup_file"
@@ -254,9 +367,22 @@ ssh_keys() {
                 mv "$backup_file" "$SSHD_CONFIG"
                 pause; return
             fi
-            _restart_sshd || true
+            local effective_password_auth
+            effective_password_auth=$(_sshd_effective_value "passwordauthentication")
+            if [[ "$effective_password_auth" != "no" ]]; then
+                print_error "sshd -T 复验失败：PasswordAuthentication 实际为 ${effective_password_auth:-未知}，未生效。"
+                print_error "可能被 /etc/ssh/sshd_config.d/*.conf 覆盖，已回滚。"
+                mv "$backup_file" "$SSHD_CONFIG"
+                pause; return
+            fi
+            if ! _restart_sshd; then
+                print_error "SSH 重启失败，已回滚。"
+                mv "$backup_file" "$SSHD_CONFIG"
+                _restart_sshd || true
+                pause; return
+            fi
             rm -f "$backup_file"
-            print_success "密码登录已禁用。"
+            print_success "密码登录已禁用，并已通过 sshd -T 复验。"
             log_action "SSH password authentication disabled"
         fi
         ;;
@@ -288,18 +414,36 @@ menu_ssh() {
                 fi
                 pause ;;
             3)
+                if ! _ssh_non_root_sudo_available; then
+                    print_error "未检测到非 root sudo 用户，禁止禁用 Root 登录以避免锁外。"
+                    print_info "请先通过 [创建 Sudo 用户] 创建并测试可登录用户。"
+                    pause; continue
+                fi
                 if confirm "禁用 Root 登录？"; then
                     local backup_file="${SSHD_CONFIG}.bak.$(date +%s)"
                     cp "$SSHD_CONFIG" "$backup_file"
-                    _sshd_set_directive "PermitRootLogin" "no" "$SSHD_CONFIG" || { mv "$backup_file" "$SSHD_CONFIG"; pause; break; }
+                    _sshd_set_directive "PermitRootLogin" "no" "$SSHD_CONFIG" || { mv "$backup_file" "$SSHD_CONFIG"; pause; continue; }
                     if ! sshd -t 2>/dev/null; then
                         print_error "sshd 配置校验失败！已回滚。"
                         mv "$backup_file" "$SSHD_CONFIG"
-                        pause; break
+                        pause; continue
                     fi
-                    _restart_sshd || true
+                    local effective_root_login
+                    effective_root_login=$(_sshd_effective_value "permitrootlogin")
+                    if [[ "$effective_root_login" != "no" ]]; then
+                        print_error "sshd -T 复验失败：PermitRootLogin 实际为 ${effective_root_login:-未知}，未生效。"
+                        print_error "可能被 /etc/ssh/sshd_config.d/*.conf 覆盖，已回滚。"
+                        mv "$backup_file" "$SSHD_CONFIG"
+                        pause; continue
+                    fi
+                    if ! _restart_sshd; then
+                        print_error "SSH 重启失败，已回滚。"
+                        mv "$backup_file" "$SSHD_CONFIG"
+                        _restart_sshd || true
+                        pause; continue
+                    fi
                     rm -f "$backup_file"
-                    print_success "Root 登录已禁用。"
+                    print_success "Root 登录已禁用，并已通过 sshd -T 复验。"
                     log_action "SSH root login disabled"
                 fi
                 pause ;;

@@ -25,18 +25,18 @@ docker_install() {
     mkdir -p "$keyring_dir"
     local docker_gpg="$keyring_dir/docker.gpg"
     local os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+    local docker_repo_os="${os_id}"
+    [[ "$docker_repo_os" != "ubuntu" && "$docker_repo_os" != "debian" ]] && docker_repo_os="debian"
     if [[ ! -f "$docker_gpg" ]]; then
         print_info "添加 Docker GPG 密钥..."
-        # 根据实际系统选择正确的 GPG URL
-        local gpg_os="${os_id}"
-        [[ "$gpg_os" != "ubuntu" && "$gpg_os" != "debian" ]] && gpg_os="debian"
-        if ! curl -fsSL "https://download.docker.com/linux/${gpg_os}/gpg" | gpg --dearmor -o "$docker_gpg" 2>/dev/null; then
+        # 根据实际系统选择正确的官方仓库 OS；非 Debian/Ubuntu 系回退到 debian 时，
+        # GPG URL 与 apt source 必须保持一致。
+        if ! curl -fsSL "https://download.docker.com/linux/${docker_repo_os}/gpg" | gpg --dearmor -o "$docker_gpg" 2>/dev/null; then
             print_error "GPG 密钥下载失败。"
             pause; return
         fi
         chmod a+r "$docker_gpg"
     fi
-    local os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
     local version_codename=$(grep 'VERSION_CODENAME' /etc/os-release | cut -d= -f2)
     if [[ -z "$version_codename" ]]; then
         version_codename=$(grep 'UBUNTU_CODENAME' /etc/os-release | cut -d= -f2)
@@ -49,7 +49,7 @@ docker_install() {
     local docker_list="/etc/apt/sources.list.d/docker.list"
     if [[ ! -f "$docker_list" ]]; then
         print_info "添加 Docker 软件源..."
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=$docker_gpg] https://download.docker.com/linux/$os_id $version_codename stable" > "$docker_list"
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=$docker_gpg] https://download.docker.com/linux/${docker_repo_os} $version_codename stable" > "$docker_list"
     fi
     apt-get update -qq 2>/dev/null || true
     if apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null 2>&1; then
@@ -82,9 +82,13 @@ docker_uninstall() {
     print_info "正在卸载软件包..."
     apt-get purge -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null 2>&1 || true
     apt-get autoremove -y >/dev/null 2>&1 || true
+    rm -f "$DOCKER_PROXY_CONF"
+    rm -rf "$DOCKER_PROXY_DIR"
     if confirm "是否删除所有 Docker 数据 (/var/lib/docker)?"; then
-        rm -rf /var/lib/docker /var/lib/containerd
+        rm -rf /var/lib/docker /var/lib/containerd /etc/docker
         print_success "数据已删除。"
+    else
+        rm -rf /etc/docker
     fi
     rm -f /etc/apt/sources.list.d/docker.list
     rm -f /etc/apt/keyrings/docker.gpg
@@ -141,14 +145,22 @@ docker_compose_install() {
     local compose_arch
     compose_arch=$(_docker_compose_standalone_arch)
     local compose_url="https://github.com/docker/compose/releases/download/${compose_version}/docker-compose-linux-${compose_arch}"
-    if curl -fL --retry 3 "$compose_url" -o /usr/local/bin/docker-compose 2>/dev/null; then
-        chmod +x /usr/local/bin/docker-compose
+    local tmp_bin tmp_sha hash
+    tmp_bin=$(mktemp /tmp/docker-compose.XXXXXX) || { print_error "创建临时文件失败"; pause; return; }
+    tmp_sha=$(mktemp /tmp/docker-compose.sha256.XXXXXX) || { rm -f "$tmp_bin"; print_error "创建临时文件失败"; pause; return; }
+    if curl -fL --retry 3 "$compose_url" -o "$tmp_bin" 2>/dev/null \
+        && curl -fL --retry 3 "${compose_url}.sha256" -o "$tmp_sha" 2>/dev/null \
+        && hash=$(awk '{print $1; exit}' "$tmp_sha") \
+        && [[ "$hash" =~ ^[a-fA-F0-9]{64}$ ]] \
+        && printf '%s  %s\n' "$hash" "$tmp_bin" | sha256sum -c - >/dev/null; then
+        install -m 0755 "$tmp_bin" /usr/local/bin/docker-compose
         print_success "Docker Compose Standalone 安装成功。"
         docker-compose --version
         log_action "Docker Compose standalone installed"
     else
         print_error "下载失败。"
     fi
+    rm -f "$tmp_bin" "$tmp_sha"
     pause
 }
 
@@ -301,7 +313,13 @@ docker_containers_manage() {
         if [[ "$action" == "6" ]]; then
             if confirm "停止所有容器?"; then
                 local rq=$(docker ps -q)
-                [[ -n "$rq" ]] && docker stop $rq && print_success "已停止" || print_warn "无运行中容器"
+                if [[ -z "$rq" ]]; then
+                    print_warn "无运行中容器"
+                elif docker stop $rq >/dev/null; then
+                    print_success "已停止"
+                else
+                    print_error "停止失败"
+                fi
                 log_action "Docker all containers stopped"
             fi
             pause; continue
@@ -309,7 +327,13 @@ docker_containers_manage() {
         if [[ "$action" == "7" ]]; then
             if confirm "删除所有容器? (危险)"; then
                 local aq=$(docker ps -aq)
-                [[ -n "$aq" ]] && docker rm -f $aq && print_success "已删除" || print_warn "无容器"
+                if [[ -z "$aq" ]]; then
+                    print_warn "无容器"
+                elif docker rm -f $aq >/dev/null; then
+                    print_success "已删除"
+                else
+                    print_error "删除失败"
+                fi
                 log_action "Docker all containers removed"
             fi
             pause; continue
@@ -327,7 +351,12 @@ docker_containers_manage() {
             1) docker start "$target_id" && print_success "已启动: $target_name" || print_error "启动失败" ;;
             2) docker stop "$target_id" && print_success "已停止: $target_name" || print_error "停止失败" ;;
             3) docker restart "$target_id" && print_success "已重启: $target_name" || print_error "重启失败" ;;
-            4) print_info "按 Ctrl+C 退出日志..."; docker logs --tail 50 -f "$target_id" ;;
+            4)
+                print_info "按 Ctrl+C 退出日志并返回菜单..."
+                trap - INT
+                docker logs --tail 50 -f "$target_id" || true
+                trap 'handle_interrupt' INT
+                ;;
             5)
                 if confirm "确认删除容器 $target_name?"; then
                     docker rm -f "$target_id" && print_success "已删除: $target_name" || print_error "删除失败"

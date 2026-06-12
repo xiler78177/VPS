@@ -1,85 +1,18 @@
 # modules/12b-wireguard-deb.sh - Debian/Ubuntu WireGuard 核心模块 (常量/DB/工具)
-# 使用 wg_deb_ 前缀，与 OpenWrt 版 (wg_) 完全隔离
+# 使用 wg_deb_ 前缀隔离平台入口；DB/role 路径通过 WG_SHARED_* 显式共享，便于跨平台导入/管理。
 
 readonly WG_DEB_INTERFACE="wg0"
-readonly WG_DEB_DB_DIR="/etc/wireguard/db"
-readonly WG_DEB_DB_FILE="${WG_DEB_DB_DIR}/wg-data.json"
+readonly WG_DEB_DB_DIR="${WG_SHARED_DB_DIR}"
+readonly WG_DEB_DB_FILE="${WG_SHARED_DB_FILE}"
 readonly WG_DEB_CONF="/etc/wireguard/${WG_DEB_INTERFACE}.conf"
-readonly WG_DEB_ROLE_FILE="/etc/wireguard/.role"
+readonly WG_DEB_ROLE_FILE="${WG_SHARED_ROLE_FILE}"
 readonly WG_DEB_CLIENT_DIR="/etc/wireguard/clients"
 
-wg_deb_db_init() {
-    mkdir -p "$WG_DEB_DB_DIR"
-    [[ -f "$WG_DEB_DB_FILE" ]] && return 0
-    cat > "$WG_DEB_DB_FILE" << 'WGEOF'
-{
-  "role": "",
-  "server": {},
-  "peers": [],
-  "client": {}
-}
-WGEOF
-    chmod 600 "$WG_DEB_DB_FILE"
-}
-
-wg_deb_db_migrate() {
-    [[ ! -f "$WG_DEB_DB_FILE" ]] && return 0
-    local ver
-    ver=$(wg_deb_db_get '.schema_version // 0')
-    [[ "$ver" -ge 2 ]] && return 0
-    print_info "数据库迁移: v${ver} → v2 ..."
-    local pc i=0
-    pc=$(wg_deb_db_get '.peers | length')
-    while [[ $i -lt ${pc:-0} ]]; do
-        local existing_type
-        existing_type=$(wg_deb_db_get ".peers[$i].peer_type // empty")
-        if [[ -z "$existing_type" || "$existing_type" == "null" ]]; then
-            local is_gw
-            is_gw=$(wg_deb_db_get ".peers[$i].is_gateway // false")
-            if [[ "$is_gw" == "true" ]]; then
-                wg_deb_db_set --argjson idx "$i" '.peers[$idx].peer_type = "gateway"'
-            else
-                wg_deb_db_set --argjson idx "$i" '.peers[$idx].peer_type = "standard"'
-            fi
-        fi
-        i=$((i + 1))
-    done
-    wg_deb_db_set '.schema_version = 2'
-    print_success "数据库迁移完成"
-}
-
-wg_deb_db_get() { jq -r "$@" "$WG_DEB_DB_FILE" 2>/dev/null; }
-
-wg_deb_db_set() {
-    local tmp
-    tmp=$(mktemp "${WG_DEB_DB_DIR}/.tmp.XXXXXX") || { print_error "无法创建临时文件"; return 1; }
-    (
-        flock -w 5 200 || { rm -f "$tmp"; print_error "无法获取数据库锁"; return 1; }
-        if jq "$@" "$WG_DEB_DB_FILE" > "$tmp" 2>/dev/null; then
-            mv "$tmp" "$WG_DEB_DB_FILE"; chmod 600 "$WG_DEB_DB_FILE"
-        else
-            rm -f "$tmp"; print_error "数据库写入失败"; return 1
-        fi
-    ) 200>"${WG_DEB_DB_FILE}.lock"
-}
-
-wg_deb_get_role() {
-    local role=""
-    [[ -f "$WG_DEB_ROLE_FILE" ]] && role=$(cat "$WG_DEB_ROLE_FILE" 2>/dev/null)
-    [[ -z "$role" && -f "$WG_DEB_DB_FILE" ]] && role=$(wg_deb_db_get '.role // empty')
-    if [[ -z "$role" && -f "$WG_DEB_DB_FILE" ]]; then
-        local spk=$(wg_deb_db_get '.server.private_key // empty')
-        [[ -n "$spk" ]] && role="server"
-    fi
-    echo "${role:-none}"
-}
-
-wg_deb_set_role() {
-    mkdir -p /etc/wireguard
-    echo "$1" > "$WG_DEB_ROLE_FILE"
-    chmod 600 "$WG_DEB_ROLE_FILE"
-    wg_deb_db_set --arg r "$1" '.role = $r' 2>/dev/null || true
-}
+wg_deb_db_init() { wg_shared_db_init; }
+wg_deb_db_get() { wg_shared_db_get "$@"; }
+wg_deb_db_set() { wg_shared_db_set "$@"; }
+wg_deb_get_role() { wg_shared_get_role; }
+wg_deb_set_role() { wg_shared_set_role "$@"; }
 
 wg_deb_is_installed() { command_exists wg && [[ -f "$WG_DEB_DB_FILE" ]]; }
 wg_deb_is_running()   { ip link show "$WG_DEB_INTERFACE" &>/dev/null; }
@@ -191,7 +124,7 @@ wg_deb_next_ip() {
     local next
     for next in $(seq 2 254); do
         local candidate="${prefix}.${next}"
-        echo "$used_ips" | grep -qw "$candidate" || { echo "$candidate"; return 0; }
+        printf '%s\n' $used_ips | grep -Fxq -- "$candidate" || { echo "$candidate"; return 0; }
     done
     print_error "子网 IP 已耗尽"; return 1
 }
@@ -210,6 +143,13 @@ wg_deb_format_bytes() {
 # 检测默认出口网卡
 wg_deb_detect_default_iface() {
     ip route show default 2>/dev/null | grep -oP 'dev \K\S+' | head -1
+}
+
+_wg_deb_cleanup_nat_iface() {
+    local subnet="${1:-}" iface="${2:-}"
+    [[ -n "$subnet" && -n "$iface" && "$iface" != "null" ]] || return 0
+    command_exists iptables || return 0
+    iptables -t nat -D POSTROUTING -s "$subnet" -o "$iface" -j MASQUERADE >/dev/null 2>&1 || true
 }
 
 # 生成 /etc/wireguard/wg0.conf (Debian 的运行配置)
@@ -235,6 +175,9 @@ wg_deb_rebuild_conf() {
     [[ -z "$def_iface" || "$def_iface" == "null" ]] && def_iface=$(wg_deb_detect_default_iface)
     [[ -z "$def_iface" ]] && def_iface="eth0"
 
+    local old_umask _rc
+    old_umask=$(umask)
+    umask 077
     {
         echo "[Interface]"
         echo "PrivateKey = ${priv_key}"
@@ -272,6 +215,9 @@ wg_deb_rebuild_conf() {
             i=$((i + 1))
         done
     } > "$WG_DEB_CONF"
+    _rc=$?
+    umask "$old_umask"
+    [[ $_rc -eq 0 ]] || return 1
     chmod 600 "$WG_DEB_CONF"
 }
 
@@ -307,4 +253,24 @@ PersistentKeepalive = 25"
         chmod 600 "${WG_DEB_CLIENT_DIR}/${name}.conf"
         i=$((i + 1))
     done
+}
+
+wg_deb_apply_conf() {
+    wg_deb_rebuild_conf || return 1
+    wg_deb_regenerate_client_confs
+    wg_deb_is_running || return 0
+    local tmp
+    tmp=$(mktemp "/tmp/${SCRIPT_NAME}-wg-deb-sync.XXXXXX") || return 1
+    awk '
+        /^\[Interface\]$/ { section="interface"; print; next }
+        /^\[Peer\]$/ { section="peer"; print; next }
+        section=="interface" && /^(PrivateKey|ListenPort|FwMark)[[:space:]]*=/ { print; next }
+        section=="peer" && /^(PublicKey|PresharedKey|AllowedIPs|Endpoint|PersistentKeepalive)[[:space:]]*=/ { print; next }
+    ' "$WG_DEB_CONF" > "$tmp"
+    if wg syncconf "$WG_DEB_INTERFACE" "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
 }

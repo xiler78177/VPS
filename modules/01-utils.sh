@@ -26,9 +26,12 @@ print_title() {
 print_info() { echo -e "${C_BLUE}[i]${C_RESET} $1"; }
 print_guide() { echo -e "${C_GREEN}>>${C_RESET} $1"; }
 print_success() { echo -e "${C_GREEN}[✓]${C_RESET} $1"; }
-print_warn() { echo -e "${C_YELLOW}[!]${C_RESET} $1"; }
-print_error() { echo -e "${C_RED}[✗]${C_RESET} $1"; }
+print_warn() { echo -e "${C_YELLOW}[!]${C_RESET} $1" >&2; }
+print_error() { echo -e "${C_RED}[✗]${C_RESET} $1" >&2; }
 log_action() {
+    local log_dir
+    log_dir=$(dirname "$LOG_FILE")
+    [[ -d "$log_dir" ]] || mkdir -p "$log_dir" 2>/dev/null || return 0
     # 日志轮转: 超过 5MB 自动归档
     if [[ -f "$LOG_FILE" ]]; then
         local log_size
@@ -60,24 +63,65 @@ pause() {
     echo ""
 }
 
+SERVER_MANAGE_TMPFILES=()
+
+_tmp_register() {
+    local tmpfile="${1:-}"
+    [[ -n "$tmpfile" ]] || return 0
+    SERVER_MANAGE_TMPFILES+=("$tmpfile")
+}
+
+_tmp_unregister() {
+    local remove="${1:-}" tmpfile
+    local kept=()
+    [[ -n "$remove" ]] || return 0
+    for tmpfile in "${SERVER_MANAGE_TMPFILES[@]}"; do
+        [[ "$tmpfile" == "$remove" ]] || kept+=("$tmpfile")
+    done
+    SERVER_MANAGE_TMPFILES=("${kept[@]}")
+}
+
+_cleanup_tmpfiles() {
+    local tmpfile
+    for tmpfile in "${SERVER_MANAGE_TMPFILES[@]}"; do
+        # 仅清理本脚本登记过、且文件名符合本脚本临时文件模式的路径。
+        case "$tmpfile" in
+            */.tmp.server-manage.*|*/.bak.server-manage.*|/etc/resolv.conf.tmp.*)
+                rm -f -- "$tmpfile" 2>/dev/null || true
+                ;;
+        esac
+    done
+    SERVER_MANAGE_TMPFILES=()
+    # 兼容旧版本可能残留在 /etc 下的同名前缀临时文件。
+    rm -f /etc/.tmp.server-manage.* 2>/dev/null || true
+}
+
 write_file_atomic() {
-    local filepath="$1" content="$2" tmpfile
-    mkdir -p "$(dirname "$filepath")"
-    tmpfile=$(mktemp "$(dirname "$filepath")/.tmp.server-manage.XXXXXX")
-    printf "%s\n" "$content" > "$tmpfile"
+    local filepath="$1" content="$2" tmpfile dir
+    dir="$(dirname "$filepath")"
+    mkdir -p "$dir" || return 1
+    tmpfile=$(mktemp "${dir}/.tmp.server-manage.XXXXXX") || return 1
+    _tmp_register "$tmpfile"
+    if ! printf "%s\n" "$content" > "$tmpfile"; then
+        rm -f -- "$tmpfile" 2>/dev/null || true
+        _tmp_unregister "$tmpfile"
+        return 1
+    fi
     if [[ -f "$filepath" ]]; then
         chmod --reference="$filepath" "$tmpfile" 2>/dev/null || true
         chown --reference="$filepath" "$tmpfile" 2>/dev/null || true
     fi
     if ! mv "$tmpfile" "$filepath"; then
-        rm -f "$tmpfile"
+        rm -f -- "$tmpfile" 2>/dev/null || true
+        _tmp_unregister "$tmpfile"
         return 1
     fi
+    _tmp_unregister "$tmpfile"
+    return 0
 }
 
 handle_interrupt() {
-    # 仅清理本脚本创建的临时文件，避免误删其他服务的文件
-    rm -f /etc/.tmp.server-manage.* 2>/dev/null
+    _cleanup_tmpfiles
     echo ""
     print_warn "操作已取消 (用户中断)。"
     exit 130
@@ -129,7 +173,17 @@ _require_cmd() {
 
 # 统一重启 sshd 的工具函数（兼容 sshd/ssh 两种服务名）
 _restart_sshd() {
-    is_systemd && { systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; return $?; }
+    if is_systemd; then
+        # Ubuntu 22.10+ 可能由 ssh.socket/sshd.socket 做 socket activation，重启服务本身不会改监听端口。
+        local socket_unit
+        if socket_unit=$(_ssh_socket_unit); then
+            systemctl restart "$socket_unit" 2>/dev/null || return 1
+            systemctl try-restart sshd 2>/dev/null || systemctl try-restart ssh 2>/dev/null || true
+            return 0
+        fi
+        systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
+        return $?
+    fi
     return 1
 }
 
@@ -138,6 +192,98 @@ is_systemd() {
     [[ -d /run/systemd/system ]] || return 1
     [[ "$(ps -p 1 -o comm= 2>/dev/null)" == "systemd" ]] || return 1
     return 0
+}
+
+_ssh_socket_unit() {
+    is_systemd || return 1
+    local unit
+    for unit in ssh.socket sshd.socket; do
+        systemctl is-active --quiet "$unit" 2>/dev/null && { echo "$unit"; return 0; }
+        systemctl is-enabled --quiet "$unit" 2>/dev/null && { echo "$unit"; return 0; }
+    done
+    return 1
+}
+
+_ssh_socket_activation_active() {
+    _ssh_socket_unit >/dev/null
+}
+
+_ssh_port_is_listening() {
+    local port="$1"
+    validate_port "$port" || return 1
+    if command_exists ss; then
+        ss -H -tlpn 2>/dev/null | awk -v p="$port" '
+            { addr=$4; if (addr ~ (":" p "$")) found=1 }
+            END { exit found ? 0 : 1 }
+        '
+        return $?
+    fi
+    if command_exists netstat; then
+        netstat -tlpn 2>/dev/null | awk -v p="$port" '
+            NR > 2 { addr=$4; if (addr ~ (":" p "$")) found=1 }
+            END { exit found ? 0 : 1 }
+        '
+        return $?
+    fi
+    return 1
+}
+
+_sshd_effective_value() {
+    local key="${1,,}"
+    command_exists sshd || return 1
+    sshd -T 2>/dev/null | awk -v k="$key" 'tolower($1)==k {print tolower($2); exit}'
+}
+
+_ssh_authorized_keys_file_has_key() {
+    local file="$1"
+    [[ -f "$file" && -s "$file" ]] || return 1
+    grep -Eq '^[[:space:]]*(ssh-(rsa|ed25519|dss)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256))[[:space:]]+[A-Za-z0-9+/=]+' "$file" 2>/dev/null
+}
+
+_ssh_authorized_keys_available() {
+    local root_home="${SSH_ROOT_HOME:-/root}"
+    local passwd_file="${SSH_PASSWD_FILE:-/etc/passwd}"
+    _ssh_authorized_keys_file_has_key "${root_home}/.ssh/authorized_keys" && return 0
+    [[ -f "$passwd_file" ]] || return 1
+    local user _x uid gid gecos home shell
+    while IFS=: read -r user _x uid gid gecos home shell; do
+        [[ -z "$user" || "$user" == "root" ]] && continue
+        [[ -z "$home" || "$shell" =~ (nologin|false)$ ]] && continue
+        _ssh_authorized_keys_file_has_key "${home}/.ssh/authorized_keys" && return 0
+    done < "$passwd_file"
+    return 1
+}
+
+_ssh_non_root_sudo_available() {
+    local passwd_file="${SSH_PASSWD_FILE:-/etc/passwd}"
+    local group_file="${SSH_GROUP_FILE:-/etc/group}"
+    [[ -f "$passwd_file" && -f "$group_file" ]] || return 1
+    local sudo_users=" " sudo_gids=" " group _x gid members member
+    while IFS=: read -r group _x gid members; do
+        case "$group" in
+            sudo|wheel)
+                sudo_gids+="${gid} "
+                IFS=',' read -ra _sudo_member_arr <<< "$members"
+                for member in "${_sudo_member_arr[@]}"; do
+                    [[ -n "$member" ]] && sudo_users+="${member} "
+                done
+                ;;
+        esac
+    done < "$group_file"
+    local user uid gecos home shell
+    while IFS=: read -r user _x uid gid gecos home shell; do
+        [[ -z "$user" || "$user" == "root" ]] && continue
+        [[ -z "$shell" || "$shell" =~ (nologin|false)$ ]] && continue
+        if [[ "$sudo_users" == *" ${user} "* || "$sudo_gids" == *" ${gid} "* ]]; then
+            return 0
+        fi
+    done < "$passwd_file"
+    return 1
+}
+
+ufw_is_active() {
+    command_exists ufw || return 1
+    LANG=C ufw status 2>/dev/null | grep -qi 'Status: active'
 }
 
 # 统一设置 sshd_config 的某个 directive：命中则替换，未命中则追加
@@ -155,21 +301,61 @@ _sshd_set_directive() {
             confirm "继续修改 ${file}（drop-in 可能覆盖此设置）?" || return 1
         fi
     fi
-    if grep -qE "^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+" "$file"; then
-        sed -i -E "s|^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+.*|${key} ${value}|" "$file"
-    else
-        printf '\n# server-manage: appended %s\n%s %s\n' "$key" "$key" "$value" >> "$file"
+
+    local tmpfile
+    tmpfile=$(mktemp "$(dirname "$file")/.tmp.server-manage.sshd-directive.XXXXXX") || return 1
+    _tmp_register "$tmpfile"
+    awk -v key="$key" -v value="$value" '
+        BEGIN { done=0; inserted=0; key_l=tolower(key) }
+        /^[[:space:]]*Match([[:space:]]|$)/ {
+            if (!done && !inserted) {
+                print key " " value
+                done=1
+                inserted=1
+            }
+            print
+            in_match=1
+            next
+        }
+        !in_match && tolower($0) ~ "^[[:space:]]*#?[[:space:]]*" key_l "[[:space:]]+" {
+            if (!done) {
+                print key " " value
+                done=1
+            }
+            next
+        }
+        { print }
+        END {
+            if (!done) {
+                print ""
+                print "# server-manage: appended " key
+                print key " " value
+            }
+        }
+    ' "$file" > "$tmpfile" || { rm -f "$tmpfile"; _tmp_unregister "$tmpfile"; return 1; }
+    chmod --reference="$file" "$tmpfile" 2>/dev/null || true
+    chown --reference="$file" "$tmpfile" 2>/dev/null || true
+    if ! mv "$tmpfile" "$file"; then
+        rm -f "$tmpfile" 2>/dev/null || true
+        _tmp_unregister "$tmpfile"
+        return 1
     fi
+    _tmp_unregister "$tmpfile"
 }
 
 refresh_ssh_port() {
-    local p=""
+    local p="" ports=() seen=" "
     # 优先用 sshd -T 解析有效配置（覆盖 /etc/ssh/sshd_config + sshd_config.d/*.conf 全部 drop-in）
     if command_exists sshd; then
-        p=$(sshd -T 2>/dev/null | awk 'tolower($1)=="port"{print $2; exit}')
+        while IFS= read -r p; do
+            if validate_port "$p" && [[ "$seen" != *" $p "* ]]; then
+                ports+=("$p")
+                seen+="$p "
+            fi
+        done < <(sshd -T 2>/dev/null | awk 'tolower($1)=="port"{print $2}')
     fi
     # 回退：grep 主配 + drop-in（按字母序，后者优先）
-    if [[ ! "$p" =~ ^[0-9]+$ ]]; then
+    if [[ ${#ports[@]} -eq 0 ]]; then
         local files=("$SSHD_CONFIG") f
         if [[ -d /etc/ssh/sshd_config.d ]]; then
             while IFS= read -r f; do
@@ -179,20 +365,30 @@ refresh_ssh_port() {
         for f in "${files[@]}"; do
             [[ -f "$f" ]] || continue
             local cand
-            cand=$(grep -iE "^\s*Port\s+" "$f" 2>/dev/null | tail -n 1 | awk '{print $2}')
-            [[ "$cand" =~ ^[0-9]+$ ]] && p="$cand"
+            while IFS= read -r cand; do
+                if validate_port "$cand" && [[ "$seen" != *" $cand "* ]]; then
+                    ports+=("$cand")
+                    seen+="$cand "
+                fi
+            done < <(grep -iE "^\s*Port\s+" "$f" 2>/dev/null | awk '{print $2}')
         done
     fi
-    if [[ "$p" =~ ^[0-9]+$ ]]; then
-        CURRENT_SSH_PORT="$p"
+    if [[ ${#ports[@]} -gt 0 ]]; then
+        CURRENT_SSH_PORT="${ports[0]}"
+        CURRENT_SSH_PORTS="${ports[*]}"
     else
         CURRENT_SSH_PORT=$DEFAULT_SSH_PORT
+        CURRENT_SSH_PORTS=$DEFAULT_SSH_PORT
     fi
 }
 
 confirm() {
     local prompt="$1"
     local reply
+    if [[ ! -t 0 ]]; then
+        print_warn "非交互终端无法确认: ${prompt}"
+        return 1
+    fi
     while true; do
         read -e -r -p "$(echo -e "${C_YELLOW}${prompt} [Y/n]:${C_RESET} ")" reply
         case "${reply,,}" in
@@ -208,6 +404,18 @@ validate_port() {
     [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
 }
 
+validate_dns_label() {
+    local label="${1:-}"
+    [[ "$label" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
+}
+
+validate_host() {
+    local host="${1:-}"
+    [[ -n "$host" && ${#host} -le 253 ]] || return 1
+    validate_ip "$host" && return 0
+    [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$ ]]
+}
+
 validate_ip() {
     local ip=$1
     # IPv4 验证
@@ -221,13 +429,79 @@ validate_ip() {
         done
         return 0
     fi
-    # IPv6 验证：必须包含冒号，仅允许十六进制和冒号，长度合理，不允许连续3个冒号
+    # IPv6 验证：必须包含冒号，仅允许十六进制和冒号，长度合理；最多允许一个 :: 压缩段
     if [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$ip" == *:* ]]; then
         [[ ${#ip} -le 39 ]] || return 1
         [[ ! "$ip" == *:::* ]] || return 1
+        local double_colon_count
+        double_colon_count=$(grep -o '::' <<< "$ip" | wc -l | tr -d ' ')
+        [[ "$double_colon_count" -le 1 ]] || return 1
+        IFS=':' read -ra _ipv6_parts <<< "$ip"
+        local part nonempty=0
+        for part in "${_ipv6_parts[@]}"; do
+            [[ -z "$part" ]] && continue
+            [[ ${#part} -le 4 ]] || return 1
+            ((nonempty++)) || true
+        done
+        if [[ "$double_colon_count" -eq 1 ]]; then
+            [[ "$nonempty" -le 7 ]] || return 1
+        else
+            [[ "$nonempty" -eq 8 ]] || return 1
+        fi
         return 0
     fi
     return 1
+}
+
+validate_cidr() {
+    local cidr="${1:-}" ip prefix
+    [[ "$cidr" == */* ]] || return 1
+    ip="${cidr%/*}"
+    prefix="${cidr##*/}"
+    [[ -n "$ip" && "$prefix" =~ ^[0-9]+$ ]] || return 1
+    validate_ip "$ip" || return 1
+    if [[ "$ip" == *:* ]]; then
+        (( prefix >= 0 && prefix <= 128 ))
+    else
+        (( prefix >= 0 && prefix <= 32 ))
+    fi
+}
+
+validate_cidr_list() {
+    local list="${1:-}" item
+    [[ -n "$list" && "$list" != "null" ]] || return 0
+    local IFS=','
+    local -a _cidr_items
+    read -ra _cidr_items <<< "$list"
+    for item in "${_cidr_items[@]}"; do
+        item=$(echo "$item" | xargs)
+        [[ -n "$item" ]] || return 1
+        validate_cidr "$item" || return 1
+    done
+    return 0
+}
+
+validate_wg_allowed_ips() {
+    local list="${1:-}" item
+    [[ -n "$list" && "$list" != "null" ]] || return 1
+    local IFS=','
+    local -a _allowed_items
+    read -ra _allowed_items <<< "$list"
+    for item in "${_allowed_items[@]}"; do
+        item=$(echo "$item" | xargs)
+        [[ -n "$item" ]] || return 1
+        if [[ "$item" == */* ]]; then
+            validate_cidr "$item" || return 1
+        else
+            validate_ip "$item" || return 1
+        fi
+    done
+    return 0
+}
+
+validate_wg_key() {
+    local key="${1:-}"
+    [[ "$key" =~ ^[A-Za-z0-9+/]{43}=$ ]]
 }
 
 validate_domain() {
@@ -323,8 +597,12 @@ cron_remove_job() {
     local pattern="$1"
     local cron_tmp
     cron_tmp=$(mktemp) || return 1
-    crontab -l 2>/dev/null | grep -v "$pattern" > "$cron_tmp" || true
-    crontab "$cron_tmp" 2>/dev/null
+    crontab -l 2>/dev/null | grep -Fv -- "$pattern" > "$cron_tmp" || true
+    if ! crontab "$cron_tmp" 2>/dev/null; then
+        print_error "更新 crontab 失败"
+        rm -f "$cron_tmp"
+        return 1
+    fi
     rm -f "$cron_tmp"
 }
 
@@ -332,9 +610,13 @@ cron_add_job() {
     local pattern="$1" line="$2"
     local cron_tmp
     cron_tmp=$(mktemp) || return 1
-    crontab -l 2>/dev/null | grep -v "$pattern" > "$cron_tmp" || true
+    crontab -l 2>/dev/null | grep -Fv -- "$pattern" > "$cron_tmp" || true
     echo "$line" >> "$cron_tmp"
-    crontab "$cron_tmp" 2>/dev/null
+    if ! crontab "$cron_tmp" 2>/dev/null; then
+        print_error "更新 crontab 失败"
+        rm -f "$cron_tmp"
+        return 1
+    fi
     rm -f "$cron_tmp"
 }
 

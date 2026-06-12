@@ -1,8 +1,41 @@
 # modules/11e-wireguard-clash.sh - WireGuard Clash/OpenClash config generator
+_wg_clash_db_get() {
+    local mode="$1"; shift
+    case "$mode" in
+        debian) wg_deb_db_get "$@" ;;
+        *)      wg_db_get "$@" ;;
+    esac
+}
+
+_wg_clash_check_server() {
+    local mode="$1"
+    case "$mode" in
+        debian) wg_deb_check_server ;;
+        *)      wg_check_server ;;
+    esac
+}
+
+_wg_clash_server_name() {
+    local mode="$1"
+    case "$mode" in
+        debian) wg_deb_get_server_name ;;
+        *)      wg_get_server_name ;;
+    esac
+}
+
 wg_generate_clash_config() {
-    wg_check_server || return 1
+    _wg_generate_clash_config_impl "openwrt"
+}
+
+wg_deb_generate_clash_config() {
+    _wg_generate_clash_config_impl "debian"
+}
+
+_wg_generate_clash_config_impl() {
+    local mode="${1:-openwrt}"
+    _wg_clash_check_server "$mode" || return 1
     print_title "生成 Clash (OpenClash) WireGuard 配置"
-    local peer_count=$(wg_db_get '.peers | length')
+    local peer_count=$(_wg_clash_db_get "$mode" '.peers | length')
     if [[ "$peer_count" -eq 0 ]]; then
         print_warn "暂无设备，请先添加 Peer"
         pause; return
@@ -12,9 +45,9 @@ wg_generate_clash_config() {
     echo "选择要生成 Clash 配置的设备:"
     local i=0
     while [[ $i -lt $peer_count ]]; do
-        local name=$(wg_db_get ".peers[$i].name")
-        local ip=$(wg_db_get ".peers[$i].ip")
-        local is_gw=$(wg_db_get ".peers[$i].is_gateway // false")
+        local name=$(_wg_clash_db_get "$mode" ".peers[$i].name")
+        local ip=$(_wg_clash_db_get "$mode" ".peers[$i].ip")
+        local is_gw=$(_wg_clash_db_get "$mode" ".peers[$i].is_gateway // false")
         local mark=""
         [[ "$is_gw" == "true" ]] && mark=" ${C_YELLOW}(网关)${C_RESET}"
         echo -e "  $((i+1)). ${name} (${ip})${mark}"
@@ -27,24 +60,24 @@ wg_generate_clash_config() {
         print_error "无效序号"; pause; return
     fi
     local ti=$((idx-1))
-    local peer_name=$(wg_db_get ".peers[$ti].name")
-    local peer_ip=$(wg_db_get ".peers[$ti].ip")
-    local peer_privkey=$(wg_db_get ".peers[$ti].private_key")
-    local peer_psk=$(wg_db_get ".peers[$ti].preshared_key")
-    local server_pubkey=$(wg_db_get '.server.public_key')
-    local server_endpoint=$(wg_db_get '.server.endpoint')
-    local server_port=$(wg_db_get '.server.port')
-    local server_subnet=$(wg_db_get '.server.subnet')
-    local server_dns=$(wg_db_get '.server.dns' | cut -d',' -f1 | xargs)
+    local peer_name=$(_wg_clash_db_get "$mode" ".peers[$ti].name")
+    local peer_ip=$(_wg_clash_db_get "$mode" ".peers[$ti].ip")
+    local peer_privkey=$(_wg_clash_db_get "$mode" ".peers[$ti].private_key")
+    local peer_psk=$(_wg_clash_db_get "$mode" ".peers[$ti].preshared_key")
+    local server_pubkey=$(_wg_clash_db_get "$mode" '.server.public_key')
+    local server_endpoint=$(_wg_clash_db_get "$mode" '.server.endpoint')
+    local server_port=$(_wg_clash_db_get "$mode" '.server.port')
+    local server_subnet=$(_wg_clash_db_get "$mode" '.server.subnet')
+    local server_dns=$(_wg_clash_db_get "$mode" '.server.dns' | cut -d',' -f1 | xargs)
     local mask=$(echo "$server_subnet" | cut -d'/' -f2)
 
     # 收集所有 VPN 路由网段 (含服务端 LAN)
     local vpn_cidrs=("$server_subnet")
-    local server_lan=$(wg_db_get '.server.server_lan_subnet // empty')
+    local server_lan=$(_wg_clash_db_get "$mode" '.server.server_lan_subnet // empty')
     [[ -n "$server_lan" && "$server_lan" != "null" ]] && vpn_cidrs+=("$server_lan")
     local pi=0
     while [[ $pi -lt $peer_count ]]; do
-        local pls=$(wg_db_get ".peers[$pi].lan_subnets // empty")
+        local pls=$(_wg_clash_db_get "$mode" ".peers[$pi].lan_subnets // empty")
         if [[ -n "$pls" && "$pls" != "null" ]]; then
             local IFS_BAK="$IFS"; IFS=','
             for cidr in $pls; do
@@ -63,10 +96,10 @@ wg_generate_clash_config() {
     local all_proxy_yaml=""
 
     # 主机节点
-    local primary_name="WG-$(wg_get_server_name)"
+    local primary_name="WG-$(_wg_clash_server_name "$mode")"
     all_proxy_names+=("$primary_name")
 
-    local mtu=$(wg_db_get '.server.mtu // 1420')
+    local mtu=$(_wg_clash_db_get "$mode" '.server.mtu // 1420')
     all_proxy_yaml+="  - name: \"${primary_name}\"
     type: wireguard
     server: ${server_endpoint}
@@ -157,13 +190,19 @@ wg_generate_clash_config() {
                 pause; return
             fi
             local output_file="/tmp/clash-wg-${peer_name}-$(date +%s).yaml"
+            local has_proxy_groups=false
+            echo "$original_yaml" | grep -qE '^[[:space:]]*proxy-groups:' && has_proxy_groups=true
 
             # 用 Python/jq 辅助或简单 awk 注入
             # 改进: 追踪缩进层级判断段结束
+            local old_umask inject_rc
+            old_umask=$(umask)
+            umask 077
             awk \
                 -v proxy_nodes="$all_proxy_yaml" \
                 -v proxy_group="$wg_group_yaml" \
                 -v rules="$wg_rules_yaml" \
+                -v has_proxy_groups="$has_proxy_groups" \
             '
             BEGIN { state="init"; proxy_done=0; group_done=0; rule_done=0 }
 
@@ -180,8 +219,16 @@ wg_generate_clash_config() {
                 state="groups"; print; next
             }
             /^rules:/ {
+                if(state=="proxies" && !proxy_done) {
+                    print ""; print proxy_nodes
+                    proxy_done=1
+                }
                 if(state=="groups" && !group_done) {
-                    print ""; print proxy_group; print "";
+                    print ""; print proxy_group; print ""
+                    group_done=1
+                }
+                if(has_proxy_groups != "true" && !group_done) {
+                    print ""; print "proxy-groups:"; print proxy_group; print ""
                     group_done=1
                 }
                 print $0
@@ -202,16 +249,32 @@ wg_generate_clash_config() {
             { print }
             END {
                 if(!proxy_done) { print ""; print proxy_nodes }
-                if(!group_done) { print ""; print proxy_group }
+                if(!group_done) {
+                    print ""
+                    if(has_proxy_groups != "true") { print "proxy-groups:" }
+                    print proxy_group
+                }
                 if(!rule_done) { print ""; print "rules:"; print "  # === WireGuard VPN 路由规则 ==="; printf "%s", rules }
             }
             ' <<< "$original_yaml" > "$output_file"
+            inject_rc=$?
+            umask "$old_umask"
+            chmod 600 "$output_file" 2>/dev/null || true
+            if [[ $inject_rc -ne 0 ]]; then
+                print_error "YAML 注入失败"
+                rm -f "$output_file"
+                pause; return
+            fi
 
             # ── 自动注入 nameserver-policy: 订阅域名走国内 DNS 直连解析 ──
             # 避免 DNS 鸡蛋问题: fallback DNS (Google/Cloudflare DoH) 需要代理才能访问
             # 但此时代理尚未建立，订阅 URL 无法解析 → 节点拉取失败
             local _prov_block=""
-            _prov_block=$(awk '/^proxy-providers:/,/^[a-zA-Z_-]+:/' "$output_file" 2>/dev/null || true)
+            _prov_block=$(awk '
+                /^proxy-providers:/ { in_providers=1; print; next }
+                in_providers && /^[A-Za-z_-]+:/ { exit }
+                in_providers { print }
+            ' "$output_file" 2>/dev/null || true)
             if [[ -n "$_prov_block" ]]; then
                 local _inject_ns=""
                 while IFS= read -r _purl; do
@@ -271,7 +334,7 @@ wg_generate_clash_config() {
                     ;;
             esac
             echo -e "${C_CYAN}下载命令:${C_RESET}"
-            echo "  scp root@$(wg_db_get '.server.endpoint'):${output_file} ./clash-config.yaml"
+            echo "  scp root@$(_wg_clash_db_get "$mode" '.server.endpoint'):${output_file} ./clash-config.yaml"
             draw_line
             ;;
         0|"") return ;;

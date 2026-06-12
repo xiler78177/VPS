@@ -49,14 +49,16 @@ _email_manage_update_admin_passwords_var() {
     [[ -f "$toml" ]] || return 1
 
     cp -a "$toml" "${toml}.adminpw.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+    local line="ADMIN_PASSWORDS = ${admin_json}"
     if grep -qE '^[[:space:]]*ADMIN_PASSWORDS[[:space:]]*=' "$toml"; then
-        awk -v line="ADMIN_PASSWORDS = ${admin_json}" '
+        ADMIN_PASSWORDS_LINE="$line" awk '
+            BEGIN { line = ENVIRON["ADMIN_PASSWORDS_LINE"] }
             /^[[:space:]]*ADMIN_PASSWORDS[[:space:]]*=/ { print line; next }
             { print }
         ' "$toml" > "${toml}.tmp" && mv "${toml}.tmp" "$toml"
     else
-        awk -v line="ADMIN_PASSWORDS = ${admin_json}" '
-            BEGIN { inserted=0 }
+        ADMIN_PASSWORDS_LINE="$line" awk '
+            BEGIN { line = ENVIRON["ADMIN_PASSWORDS_LINE"]; inserted=0 }
             /^\[vars\]/ { print; print line; inserted=1; next }
             { print }
             END {
@@ -77,6 +79,7 @@ _email_manage_update_admin_passwords_var() {
 
 # ── 1. 修改管理员密码 ──
 email_manage_change_admin_password() {
+    trap '_email_clear_sensitive_env' RETURN
     print_title "修改管理员密码"
     _email_manage_prepare || { pause; return; }
 
@@ -117,6 +120,7 @@ email_manage_change_admin_password() {
 
 # ── 2. 管理收信域名 DOMAINS ──
 email_manage_domains() {
+    trap '_email_clear_sensitive_env' RETURN
     print_title "管理收信域名 (DOMAINS)"
     _email_manage_prepare || { pause; return; }
 
@@ -138,7 +142,11 @@ email_manage_domains() {
 
     # 当前域名数组
     local arr
-    arr=$(echo "$current" | jq -c '.' 2>/dev/null) || arr='["'"$EMAIL_DOMAIN"'"]'
+    if ! arr=$(printf '%s' "$current" | jq -c '.' 2>/dev/null) \
+       || ! printf '%s' "$arr" | jq -e 'type == "array" and all(.[]; type == "string")' >/dev/null 2>&1; then
+        print_error "DOMAINS 当前配置不是合法 JSON 字符串数组，请先手工修复 wrangler.toml"
+        pause; return 1
+    fi
     local new_arr
     case $act in
         1)
@@ -176,10 +184,11 @@ email_manage_domains() {
 
 # ── 3. Resend ──
 email_manage_resend() {
+    trap '_email_clear_sensitive_env' RETURN
     print_title "配置 / 更新 Resend"
     _email_manage_prepare || { pause; return; }
 
-    echo "当前状态: $([[ ${EMAIL_RESEND_ENABLED:-0} -eq 1 ]] && echo "${C_GREEN}已启用${C_RESET}" || echo "${C_GRAY}未启用${C_RESET}")"
+    echo -e "当前状态: $([[ ${EMAIL_RESEND_ENABLED:-0} -eq 1 ]] && echo "${C_GREEN}已启用${C_RESET}" || echo "${C_GRAY}未启用${C_RESET}")"
     [[ "${EMAIL_RESEND_ENABLED:-0}" == "1" ]] && echo "  发件子域:  $EMAIL_RESEND_SEND_DOMAIN"
     echo ""
     echo "1. 启用 / 重新配置 Resend"
@@ -268,8 +277,10 @@ _email_manage_resend_disable() {
 
 # ── 4. 升级到最新版本 ──
 email_manage_upgrade() {
+    trap '_email_clear_sensitive_env' RETURN
     print_title "升级到最新版本"
     _email_manage_prepare || { pause; return; }
+    local old_version="${EMAIL_INSTALL_VERSION:-未知}"
 
     echo -e "${C_CYAN}当前版本:${C_RESET} ${EMAIL_INSTALL_VERSION:-未知}"
     email_run "拉取上游 tags" git -C "$EMAIL_INSTALL_DIR" fetch --tags --prune || { pause; return; }
@@ -306,12 +317,16 @@ email_manage_upgrade() {
             base=$(basename "$p")
             if email_run "应用 $base" _email_wrangler d1 execute "$EMAIL_D1_NAME" --file="$p" --remote; then
                 EMAIL_PATCHES_APPLIED="${EMAIL_PATCHES_APPLIED} ${base}"
+                EMAIL_PATCHES_APPLIED="${EMAIL_PATCHES_APPLIED# }"
+                if ! email_state_write; then
+                    print_error "patch $base 已应用，但写入升级进度失败；已中止升级（worker 未重新部署）"
+                    pause; return
+                fi
             else
                 print_error "patch $base 失败，已中止升级（worker 未重新部署）"
                 pause; return
             fi
         done
-        EMAIL_PATCHES_APPLIED="${EMAIL_PATCHES_APPLIED# }"
     else
         print_info "无新增 D1 migration"
     fi
@@ -330,19 +345,28 @@ email_manage_upgrade() {
     _email_patch_pages_service_binding "$EMAIL_INSTALL_DIR/pages" \
         && print_success "Pages service binding 已确认: ${EMAIL_WORKER_NAME}" \
         || print_warn "pages/wrangler.toml service 未同步（请手工检查）"
-    email_run "Pages 依赖" pnpm install --no-frozen-lockfile || { pause; return; }
+    email_run "Pages 依赖" pnpm install --no-frozen-lockfile || {
+        _email_restore_pages_service_binding
+        pause; return
+    }
+    local pages_rc=0
     email_run "部署 Pages" _email_wrangler pages deploy --project-name "$EMAIL_PAGES_PROJECT" \
-        --branch production --commit-dirty=true || { pause; return; }
+        --branch production --commit-dirty=true || pages_rc=$?
+    _email_restore_pages_service_binding
+    if [[ "$pages_rc" -ne 0 ]]; then
+        pause; return
+    fi
 
     EMAIL_INSTALL_VERSION="$latest"
     email_state_write
     print_success "已升级到 $latest"
-    log_action "Email upgraded ${EMAIL_INSTALL_VERSION} → $latest"
+    log_action "Email upgraded ${old_version} → $latest"
     pause
 }
 
 # ── 5. 重新部署（保留 D1 数据）──
 email_manage_redeploy() {
+    trap '_email_clear_sensitive_env' RETURN
     print_title "重新部署 Worker / Pages（保留 D1 数据）"
     _email_manage_prepare || { pause; return; }
     confirm "确认重新部署当前版本 ${EMAIL_INSTALL_VERSION}?" || return
@@ -360,8 +384,13 @@ email_manage_redeploy() {
     _email_patch_pages_service_binding "$EMAIL_INSTALL_DIR/pages" \
         && print_success "Pages service binding 已确认: ${EMAIL_WORKER_NAME}" \
         || print_warn "pages/wrangler.toml service 未同步（请手工检查）"
+    local pages_rc=0
     email_run "部署 Pages" _email_wrangler pages deploy --project-name "$EMAIL_PAGES_PROJECT" \
-        --branch production --commit-dirty=true || { pause; return; }
+        --branch production --commit-dirty=true || pages_rc=$?
+    _email_restore_pages_service_binding
+    if [[ "$pages_rc" -ne 0 ]]; then
+        pause; return
+    fi
 
     print_success "重新部署完成"
     log_action "Email redeployed: $EMAIL_INSTALL_VERSION"

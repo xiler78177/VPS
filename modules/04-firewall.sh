@@ -5,14 +5,21 @@ ufw_setup() {
         print_warn "检测到 firewalld 正在运行，请先禁用它。"
         return
     fi
+    refresh_ssh_port
+    local _ssh_port
+    for _ssh_port in $CURRENT_SSH_PORTS; do
+        validate_port "$_ssh_port" || { print_error "无法确认当前 SSH 端口，拒绝启用 UFW"; pause; return 1; }
+    done
     print_info "配置默认规则..."
     ufw default deny incoming >/dev/null
     ufw default allow outgoing >/dev/null
-    ufw allow "$CURRENT_SSH_PORT/tcp" comment "SSH-Access" >/dev/null
+    for _ssh_port in $CURRENT_SSH_PORTS; do
+        ufw allow "$_ssh_port/tcp" comment "SSH-Access" >/dev/null
+    done
     if confirm "启用 UFW 可能导致 SSH 断开(若端口配置错误)，确认启用?"; then
         echo "y" | ufw enable
         print_success "UFW 已启用。"
-        log_action "UFW enabled with SSH port $CURRENT_SSH_PORT"
+        log_action "UFW enabled with SSH ports $CURRENT_SSH_PORTS"
     fi
     pause
 }
@@ -21,7 +28,7 @@ ufw_del() {
     _require_cmd ufw "UFW" || return
     print_title "删除 UFW 规则"
     echo -e "${C_CYAN}当前放行的端口 (已过滤 Fail2ban 规则):${C_RESET}"
-    ufw status | grep "ALLOW" | awk '{print $1}' | sort -t'/' -k1,1n -u
+    ufw status | grep "ALLOW" | grep -viE 'fail2ban|f2b' | awk '{print $1}' | sort -t'/' -k1,1n -u
     echo -e "${C_YELLOW}格式: 端口 或 端口/协议 (如 80, 443/tcp, 53/udp)${C_RESET}"
     echo -e "${C_YELLOW}多个用空格分隔，不指定协议则同时删除 tcp 和 udp${C_RESET}"
     read -e -r -p "要删除的规则: " rules
@@ -30,6 +37,10 @@ ufw_del() {
         if [[ "$rule" =~ ^([0-9]+)(/tcp|/udp)?$ ]]; then
             local port="${BASH_REMATCH[1]}"
             local proto="${BASH_REMATCH[2]}"
+            if ! validate_port "$port"; then
+                print_error "端口无效: $port"
+                continue
+            fi
             if [[ -n "$proto" ]]; then
                 ufw delete allow "${port}${proto}" 2>/dev/null && print_success "已删除: ${port}${proto}" || print_warn "${port}${proto} 不存在"
             else
@@ -48,13 +59,20 @@ ufw_safe_reset() {
     _require_cmd ufw "UFW" || return
     if confirm "这将重置所有规则！脚本会尝试保留当前 SSH 端口，确定吗？"; then
         print_info "正在重置..."
+        refresh_ssh_port
+        local _ssh_port
+        for _ssh_port in $CURRENT_SSH_PORTS; do
+            validate_port "$_ssh_port" || { print_error "无法确认当前 SSH 端口，拒绝重置 UFW"; pause; return 1; }
+        done
         echo "y" | ufw disable >/dev/null
         echo "y" | ufw reset >/dev/null
         ufw default deny incoming >/dev/null
         ufw default allow outgoing >/dev/null
-        ufw allow "$CURRENT_SSH_PORT/tcp" comment "SSH-Access" >/dev/null
+        for _ssh_port in $CURRENT_SSH_PORTS; do
+            ufw allow "$_ssh_port/tcp" comment "SSH-Access" >/dev/null
+        done
         echo "y" | ufw enable >/dev/null
-        print_success "重置完成。SSH 端口 $CURRENT_SSH_PORT 已放行。"
+        print_success "重置完成。SSH 端口 ${CURRENT_SSH_PORTS} 已放行。"
         log_action "UFW reset completed"
     fi
     pause
@@ -118,7 +136,7 @@ firewall_allow_tcp_port() {
         return 2
     fi
 
-    if ! ufw status 2>/dev/null | grep -q "Status: active"; then
+    if ! ufw_is_active; then
         print_warn "UFW 已安装但未启用 — 本脚本不会在业务流程里自动启用 UFW。"
         print_info "如需本地防火墙保护，请进入【防火墙管理】→ 安装并启用 UFW；"
         print_info "或在云厂商安全组放行 ${port}/tcp。"
@@ -150,7 +168,9 @@ readonly GEOIP_CONF_DIR="/etc/server-manage"
 readonly GEOIP_CONF="${GEOIP_CONF_DIR}/geoip.conf"
 readonly GEOIP_DATA_DIR="${GEOIP_CONF_DIR}/geoip-data"
 readonly GEOIP_CHAIN="GEOIP_FILTER"
+readonly GEOIP6_CHAIN="GEOIP6_FILTER"
 readonly GEOIP_URL="https://www.ipdeny.com/ipblocks/data/aggregated"
+readonly GEOIP6_URL="https://www.ipdeny.com/ipv6/ipaddresses/aggregated"
 
 _geoip_country_name() {
     case "${1^^}" in
@@ -174,63 +194,161 @@ _geoip_download() {
     for cc in $countries; do
         cc="${cc,,}"
         local url="${GEOIP_URL}/${cc}-aggregated.zone"
+        local url6="${GEOIP6_URL}/${cc}-aggregated.zone"
         local dest="${GEOIP_DATA_DIR}/${cc}.zone"
-        if curl -sSL --connect-timeout 10 --max-time 30 -o "$dest" "$url" 2>/dev/null; then
-            local count=$(grep -c '^[0-9]' "$dest" 2>/dev/null || echo 0)
+        local dest6="${GEOIP_DATA_DIR}/${cc}.zone6"
+        local tmp tmp6 count count6
+        tmp=$(mktemp "${GEOIP_DATA_DIR}/.${cc}.zone.XXXXXX") || { print_error "${cc^^}: 创建临时文件失败"; ((fail++)) || true; continue; }
+        if curl -fsSL --connect-timeout 10 --max-time 30 -o "$tmp" "$url" 2>/dev/null; then
+            count=$(grep -c '^[0-9]' "$tmp" 2>/dev/null)
             if [[ "$count" -gt 0 ]]; then
-                echo -e "  ${C_GREEN}✓${C_RESET} ${cc^^} ($(_geoip_country_name "$cc")): ${count} 条 IP 段"
+                mv "$tmp" "$dest"
+                echo -e "  ${C_GREEN}✓${C_RESET} ${cc^^} ($(_geoip_country_name "$cc")) IPv4: ${count} 条 IP 段"
                 ((ok++)) || true
             else
-                print_warn "${cc^^}: 文件为空或格式异常"
-                rm -f "$dest"; ((fail++)) || true
+                print_warn "${cc^^}: 文件为空或格式异常，保留旧数据"
+                rm -f "$tmp"
+                ((fail++)) || true
             fi
         else
-            print_error "${cc^^}: 下载失败"
+            print_error "${cc^^}: 下载失败，保留旧数据"
+            rm -f "$tmp"
+            ((fail++)) || true
+        fi
+        tmp6=$(mktemp "${GEOIP_DATA_DIR}/.${cc}.zone6.XXXXXX") || { print_error "${cc^^}: 创建 IPv6 临时文件失败"; ((fail++)) || true; continue; }
+        if curl -fsSL --connect-timeout 10 --max-time 30 -o "$tmp6" "$url6" 2>/dev/null; then
+            count6=$(grep -c ':' "$tmp6" 2>/dev/null)
+            if [[ "$count6" -gt 0 ]]; then
+                mv "$tmp6" "$dest6"
+                echo -e "  ${C_GREEN}✓${C_RESET} ${cc^^} ($(_geoip_country_name "$cc")) IPv6: ${count6} 条 IP 段"
+            else
+                print_warn "${cc^^}: IPv6 文件为空或格式异常，保留旧数据"
+                rm -f "$tmp6"
+                ((fail++)) || true
+            fi
+        else
+            print_error "${cc^^}: IPv6 下载失败，保留旧数据"
+            rm -f "$tmp6"
             ((fail++)) || true
         fi
     done
-    [[ $ok -gt 0 ]] && return 0 || return 1
+    [[ $fail -eq 0 ]] && [[ $ok -gt 0 ]]
 }
 
 _geoip_apply() {
     local mode="$1" countries="$2"
     local set_name="geoip_${mode}"
     local tmp_set="${set_name}_tmp"
+    local set6_name="geoip_${mode}6"
+    local tmp6_set="${set6_name}_tmp"
+    local total_entries=0 total6_entries=0
+    for cc in $countries; do
+        local f="${GEOIP_DATA_DIR}/${cc,,}.zone"
+        if [[ -f "$f" ]]; then
+            local count
+            count=$(grep -c '^[0-9]' "$f" 2>/dev/null)
+            total_entries=$((total_entries + count))
+        fi
+        local f6="${GEOIP_DATA_DIR}/${cc,,}.zone6"
+        if [[ -f "$f6" ]]; then
+            local count6
+            count6=$(grep -c ':' "$f6" 2>/dev/null)
+            total6_entries=$((total6_entries + count6))
+        fi
+    done
+    if [[ "$total_entries" -le 0 ]]; then
+        print_error "GeoIP 有效 IP 段为空，拒绝应用规则以避免清空集合。"
+        return 1
+    fi
+    if [[ -e /proc/net/if_inet6 ]] && ! command_exists ip6tables; then
+        print_error "检测到 IPv6 栈但缺少 ip6tables，拒绝应用 GeoIP 以避免 IPv6 绕过。"
+        return 1
+    fi
     # Bulk load into temp set
-    ipset create "$tmp_set" hash:net maxelem 131072 2>/dev/null || ipset flush "$tmp_set"
+    ipset create "$tmp_set" hash:net maxelem 131072 2>/dev/null || ipset flush "$tmp_set" || return 1
     for cc in $countries; do
         local f="${GEOIP_DATA_DIR}/${cc,,}.zone"
         [[ -f "$f" ]] || continue
-        sed -e '/^#/d' -e '/^$/d' -e '/^[^0-9]/d' -e "s/^/add ${tmp_set} /" "$f" | ipset restore -exist 2>/dev/null
+        if ! sed -e '/^#/d' -e '/^$/d' -e '/^[^0-9]/d' -e "s/^/add ${tmp_set} /" "$f" | ipset restore -exist 2>/dev/null; then
+            print_error "GeoIP 写入 ipset 失败: ${cc}"
+            ipset destroy "$tmp_set" 2>/dev/null || true
+            return 1
+        fi
     done
     # Atomic swap
     ipset create "$set_name" hash:net maxelem 131072 2>/dev/null || true
-    ipset swap "$tmp_set" "$set_name"
+    if ! ipset swap "$tmp_set" "$set_name"; then
+        print_error "GeoIP ipset swap 失败，保留旧集合。"
+        ipset destroy "$tmp_set" 2>/dev/null || true
+        return 1
+    fi
     ipset destroy "$tmp_set" 2>/dev/null || true
+    if command_exists ip6tables; then
+        ipset create "$tmp6_set" hash:net family inet6 maxelem 131072 2>/dev/null || ipset flush "$tmp6_set" || return 1
+        for cc in $countries; do
+            local f6="${GEOIP_DATA_DIR}/${cc,,}.zone6"
+            [[ -f "$f6" ]] || continue
+            if ! sed -e '/^#/d' -e '/^$/d' -e '/:/!d' -e "s/^/add ${tmp6_set} /" "$f6" | ipset restore -exist 2>/dev/null; then
+                print_error "GeoIP 写入 IPv6 ipset 失败: ${cc}"
+                ipset destroy "$tmp6_set" 2>/dev/null || true
+                return 1
+            fi
+        done
+        ipset create "$set6_name" hash:net family inet6 maxelem 131072 2>/dev/null || true
+        if ! ipset swap "$tmp6_set" "$set6_name"; then
+            print_error "GeoIP IPv6 ipset swap 失败，保留旧集合。"
+            ipset destroy "$tmp6_set" 2>/dev/null || true
+            return 1
+        fi
+        ipset destroy "$tmp6_set" 2>/dev/null || true
+        if [[ "$total6_entries" -le 0 ]]; then
+            print_warn "GeoIP IPv6 数据为空；白名单模式将默认拦截公网 IPv6。"
+        fi
+    fi
     # Build iptables chain
-    iptables -N "$GEOIP_CHAIN" 2>/dev/null || iptables -F "$GEOIP_CHAIN"
-    iptables -A "$GEOIP_CHAIN" -i lo -j RETURN
-    iptables -A "$GEOIP_CHAIN" -s 127.0.0.0/8 -j RETURN
-    iptables -A "$GEOIP_CHAIN" -s 10.0.0.0/8 -j RETURN
-    iptables -A "$GEOIP_CHAIN" -s 172.16.0.0/12 -j RETURN
-    iptables -A "$GEOIP_CHAIN" -s 192.168.0.0/16 -j RETURN
-    iptables -A "$GEOIP_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+    iptables -N "$GEOIP_CHAIN" 2>/dev/null || iptables -F "$GEOIP_CHAIN" || return 1
+    iptables -A "$GEOIP_CHAIN" -i lo -j RETURN || return 1
+    iptables -A "$GEOIP_CHAIN" -s 127.0.0.0/8 -j RETURN || return 1
+    iptables -A "$GEOIP_CHAIN" -s 10.0.0.0/8 -j RETURN || return 1
+    iptables -A "$GEOIP_CHAIN" -s 172.16.0.0/12 -j RETURN || return 1
+    iptables -A "$GEOIP_CHAIN" -s 192.168.0.0/16 -j RETURN || return 1
+    iptables -A "$GEOIP_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN || return 1
     if [[ "$mode" == "whitelist" ]]; then
-        iptables -A "$GEOIP_CHAIN" -m set --match-set "$set_name" src -j RETURN
-        iptables -A "$GEOIP_CHAIN" -j DROP
+        iptables -A "$GEOIP_CHAIN" -m set --match-set "$set_name" src -j RETURN || return 1
+        iptables -A "$GEOIP_CHAIN" -j DROP || return 1
     else
-        iptables -A "$GEOIP_CHAIN" -m set --match-set "$set_name" src -j DROP
+        iptables -A "$GEOIP_CHAIN" -m set --match-set "$set_name" src -j DROP || return 1
     fi
     # Insert into INPUT chain at position 1 (before UFW)
-    iptables -C INPUT -j "$GEOIP_CHAIN" 2>/dev/null || iptables -I INPUT 1 -j "$GEOIP_CHAIN"
+    iptables -C INPUT -j "$GEOIP_CHAIN" 2>/dev/null || iptables -I INPUT 1 -j "$GEOIP_CHAIN" || return 1
+    if command_exists ip6tables; then
+        ip6tables -N "$GEOIP6_CHAIN" 2>/dev/null || ip6tables -F "$GEOIP6_CHAIN" || return 1
+        ip6tables -A "$GEOIP6_CHAIN" -i lo -j RETURN || return 1
+        ip6tables -A "$GEOIP6_CHAIN" -s ::1/128 -j RETURN || return 1
+        ip6tables -A "$GEOIP6_CHAIN" -s fc00::/7 -j RETURN || return 1
+        ip6tables -A "$GEOIP6_CHAIN" -s fe80::/10 -j RETURN || return 1
+        ip6tables -A "$GEOIP6_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN || return 1
+        if [[ "$mode" == "whitelist" ]]; then
+            ip6tables -A "$GEOIP6_CHAIN" -m set --match-set "$set6_name" src -j RETURN || return 1
+            ip6tables -A "$GEOIP6_CHAIN" -j DROP || return 1
+        else
+            ip6tables -A "$GEOIP6_CHAIN" -m set --match-set "$set6_name" src -j DROP || return 1
+        fi
+        ip6tables -C INPUT -j "$GEOIP6_CHAIN" 2>/dev/null || ip6tables -I INPUT 1 -j "$GEOIP6_CHAIN" || return 1
+    fi
 }
 
 _geoip_clear() {
     iptables -D INPUT -j "$GEOIP_CHAIN" 2>/dev/null || true
     iptables -F "$GEOIP_CHAIN" 2>/dev/null || true
     iptables -X "$GEOIP_CHAIN" 2>/dev/null || true
+    ip6tables -D INPUT -j "$GEOIP6_CHAIN" 2>/dev/null || true
+    ip6tables -F "$GEOIP6_CHAIN" 2>/dev/null || true
+    ip6tables -X "$GEOIP6_CHAIN" 2>/dev/null || true
     ipset destroy geoip_whitelist 2>/dev/null || true
     ipset destroy geoip_blacklist 2>/dev/null || true
+    ipset destroy geoip_whitelist6 2>/dev/null || true
+    ipset destroy geoip_blacklist6 2>/dev/null || true
 }
 
 _geoip_install_persistence() {
@@ -240,6 +358,7 @@ _geoip_install_persistence() {
 CONF="/etc/server-manage/geoip.conf"
 DATA="/etc/server-manage/geoip-data"
 CHAIN="GEOIP_FILTER"
+CHAIN6="GEOIP6_FILTER"
 [ -f "$CONF" ] || exit 0
 
 # 安全解析：拒绝 source，避免被替换为恶意 conf 触发 root 命令执行
@@ -266,30 +385,74 @@ done < "$CONF"
 [[ "$GEOIP_MODE" =~ ^(whitelist|blacklist)$ ]] || exit 0
 set_name="geoip_${GEOIP_MODE}"
 tmp_set="${set_name}_tmp"
-ipset create "$tmp_set" hash:net maxelem 131072 2>/dev/null || ipset flush "$tmp_set"
+set6_name="geoip_${GEOIP_MODE}6"
+tmp6_set="${set6_name}_tmp"
+total_entries=0
+total6_entries=0
 for cc in $GEOIP_COUNTRIES; do
     [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || continue
     f="${DATA}/${cc,,}.zone"
     [ -f "$f" ] || continue
-    sed -e '/^#/d' -e '/^$/d' -e '/^[^0-9]/d' -e "s/^/add ${tmp_set} /" "$f" | ipset restore -exist 2>/dev/null
+    count=$(grep -c '^[0-9]' "$f" 2>/dev/null)
+    total_entries=$((total_entries + count))
+    f6="${DATA}/${cc,,}.zone6"
+    [ -f "$f6" ] || continue
+    count6=$(grep -c ':' "$f6" 2>/dev/null)
+    total6_entries=$((total6_entries + count6))
+done
+[ "$total_entries" -gt 0 ] || exit 1
+[ -e /proc/net/if_inet6 ] && ! command -v ip6tables >/dev/null 2>&1 && exit 1
+ipset create "$tmp_set" hash:net maxelem 131072 2>/dev/null || ipset flush "$tmp_set" || exit 1
+for cc in $GEOIP_COUNTRIES; do
+    [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || continue
+    f="${DATA}/${cc,,}.zone"
+    [ -f "$f" ] || continue
+    sed -e '/^#/d' -e '/^$/d' -e '/^[^0-9]/d' -e "s/^/add ${tmp_set} /" "$f" | ipset restore -exist 2>/dev/null || { ipset destroy "$tmp_set" 2>/dev/null || true; exit 1; }
 done
 ipset create "$set_name" hash:net maxelem 131072 2>/dev/null || true
-ipset swap "$tmp_set" "$set_name"
+ipset swap "$tmp_set" "$set_name" || { ipset destroy "$tmp_set" 2>/dev/null || true; exit 1; }
 ipset destroy "$tmp_set" 2>/dev/null || true
-iptables -N "$CHAIN" 2>/dev/null || iptables -F "$CHAIN"
-iptables -A "$CHAIN" -i lo -j RETURN
-iptables -A "$CHAIN" -s 127.0.0.0/8 -j RETURN
-iptables -A "$CHAIN" -s 10.0.0.0/8 -j RETURN
-iptables -A "$CHAIN" -s 172.16.0.0/12 -j RETURN
-iptables -A "$CHAIN" -s 192.168.0.0/16 -j RETURN
-iptables -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
-if [ "$GEOIP_MODE" = "whitelist" ]; then
-    iptables -A "$CHAIN" -m set --match-set "$set_name" src -j RETURN
-    iptables -A "$CHAIN" -j DROP
-else
-    iptables -A "$CHAIN" -m set --match-set "$set_name" src -j DROP
+if command -v ip6tables >/dev/null 2>&1; then
+    ipset create "$tmp6_set" hash:net family inet6 maxelem 131072 2>/dev/null || ipset flush "$tmp6_set" || exit 1
+    for cc in $GEOIP_COUNTRIES; do
+        [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || continue
+        f6="${DATA}/${cc,,}.zone6"
+        [ -f "$f6" ] || continue
+        sed -e '/^#/d' -e '/^$/d' -e '/:/!d' -e "s/^/add ${tmp6_set} /" "$f6" | ipset restore -exist 2>/dev/null || { ipset destroy "$tmp6_set" 2>/dev/null || true; exit 1; }
+    done
+    ipset create "$set6_name" hash:net family inet6 maxelem 131072 2>/dev/null || true
+    ipset swap "$tmp6_set" "$set6_name" || { ipset destroy "$tmp6_set" 2>/dev/null || true; exit 1; }
+    ipset destroy "$tmp6_set" 2>/dev/null || true
 fi
-iptables -C INPUT -j "$CHAIN" 2>/dev/null || iptables -I INPUT 1 -j "$CHAIN"
+iptables -N "$CHAIN" 2>/dev/null || iptables -F "$CHAIN" || exit 1
+iptables -A "$CHAIN" -i lo -j RETURN || exit 1
+iptables -A "$CHAIN" -s 127.0.0.0/8 -j RETURN || exit 1
+iptables -A "$CHAIN" -s 10.0.0.0/8 -j RETURN || exit 1
+iptables -A "$CHAIN" -s 172.16.0.0/12 -j RETURN || exit 1
+iptables -A "$CHAIN" -s 192.168.0.0/16 -j RETURN || exit 1
+iptables -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN || exit 1
+if [ "$GEOIP_MODE" = "whitelist" ]; then
+    iptables -A "$CHAIN" -m set --match-set "$set_name" src -j RETURN || exit 1
+    iptables -A "$CHAIN" -j DROP || exit 1
+else
+    iptables -A "$CHAIN" -m set --match-set "$set_name" src -j DROP || exit 1
+fi
+iptables -C INPUT -j "$CHAIN" 2>/dev/null || iptables -I INPUT 1 -j "$CHAIN" || exit 1
+if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -N "$CHAIN6" 2>/dev/null || ip6tables -F "$CHAIN6" || exit 1
+    ip6tables -A "$CHAIN6" -i lo -j RETURN || exit 1
+    ip6tables -A "$CHAIN6" -s ::1/128 -j RETURN || exit 1
+    ip6tables -A "$CHAIN6" -s fc00::/7 -j RETURN || exit 1
+    ip6tables -A "$CHAIN6" -s fe80::/10 -j RETURN || exit 1
+    ip6tables -A "$CHAIN6" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN || exit 1
+    if [ "$GEOIP_MODE" = "whitelist" ]; then
+        ip6tables -A "$CHAIN6" -m set --match-set "$set6_name" src -j RETURN || exit 1
+        ip6tables -A "$CHAIN6" -j DROP || exit 1
+    else
+        ip6tables -A "$CHAIN6" -m set --match-set "$set6_name" src -j DROP || exit 1
+    fi
+    ip6tables -C INPUT -j "$CHAIN6" 2>/dev/null || ip6tables -I INPUT 1 -j "$CHAIN6" || exit 1
+fi
 APPLY_EOF
     chmod 700 /usr/local/bin/geoip-apply.sh
     # Update script (cron weekly)
@@ -298,6 +461,7 @@ APPLY_EOF
 CONF="/etc/server-manage/geoip.conf"
 DATA="/etc/server-manage/geoip-data"
 URL="https://www.ipdeny.com/ipblocks/data/aggregated"
+URL6="https://www.ipdeny.com/ipv6/ipaddresses/aggregated"
 [ -f "$CONF" ] || exit 0
 
 # 安全解析（同 apply 脚本）
@@ -315,13 +479,38 @@ while IFS= read -r line || [ -n "$line" ]; do
 done < "$CONF"
 [ -z "$GEOIP_COUNTRIES" ] && exit 0
 
+mkdir -p "$DATA"
 for cc in $GEOIP_COUNTRIES; do
     [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || continue
     cc="${cc,,}"
-    curl -sSL --connect-timeout 10 --max-time 30 \
-        -o "${DATA}/${cc}.zone" "${URL}/${cc}-aggregated.zone" 2>/dev/null
+    tmp=$(mktemp "${DATA}/.${cc}.zone.XXXXXX") || exit 1
+    tmp6=$(mktemp "${DATA}/.${cc}.zone6.XXXXXX") || { rm -f "$tmp"; exit 1; }
+    if curl -fsSL --connect-timeout 10 --max-time 30 -o "$tmp" "${URL}/${cc}-aggregated.zone" 2>/dev/null; then
+        count=$(grep -c '^[0-9]' "$tmp" 2>/dev/null)
+        if [ "$count" -gt 0 ]; then
+            mv "$tmp" "${DATA}/${cc}.zone" || { rm -f "$tmp"; exit 1; }
+        else
+            rm -f "$tmp" "$tmp6"
+            exit 1
+        fi
+    else
+        rm -f "$tmp" "$tmp6"
+        exit 1
+    fi
+    if curl -fsSL --connect-timeout 10 --max-time 30 -o "$tmp6" "${URL6}/${cc}-aggregated.zone" 2>/dev/null; then
+        count6=$(grep -c ':' "$tmp6" 2>/dev/null)
+        if [ "$count6" -gt 0 ]; then
+            mv "$tmp6" "${DATA}/${cc}.zone6" || { rm -f "$tmp6"; exit 1; }
+        else
+            rm -f "$tmp6"
+            exit 1
+        fi
+    else
+        rm -f "$tmp6"
+        exit 1
+    fi
 done
-/usr/local/bin/geoip-apply.sh
+/usr/local/bin/geoip-apply.sh || exit 1
 sed -i "s/^GEOIP_LAST_UPDATE=.*/GEOIP_LAST_UPDATE=\"$(date +%Y-%m-%d)\"/" "$CONF"
 UPDATE_EOF
     chmod 700 /usr/local/bin/geoip-update.sh
@@ -418,11 +607,14 @@ geoip_setup() {
         print_error "所有国家数据下载失败"; pause; return
     fi
     print_info "正在应用防火墙规则..."
-    _geoip_apply "$mode" "$countries"
+    if ! _geoip_apply "$mode" "$countries"; then
+        print_error "GeoIP 规则应用失败，未写入持久化配置。"
+        pause; return
+    fi
     local total=0
     for cc in $countries; do
         local f="${GEOIP_DATA_DIR}/${cc,,}.zone"
-        [[ -f "$f" ]] && total=$((total + $(grep -c '^[0-9]' "$f" 2>/dev/null || echo 0)))
+        [[ -f "$f" ]] && total=$((total + $(grep -c '^[0-9]' "$f" 2>/dev/null)))
     done
     mkdir -p "$GEOIP_CONF_DIR"
     cat > "$GEOIP_CONF" << EOF
@@ -457,7 +649,7 @@ geoip_status() {
     for cc in $GEOIP_COUNTRIES; do
         local f="${GEOIP_DATA_DIR}/${cc,,}.zone"
         if [[ -f "$f" ]]; then
-            local count=$(grep -c '^[0-9]' "$f" 2>/dev/null || echo 0)
+            local count=$(grep -c '^[0-9]' "$f" 2>/dev/null)
             printf "  %-4s %-10s %s 条\n" "${cc}" "$(_geoip_country_name "$cc")" "$count"
             total=$((total + count))
         fi
@@ -470,7 +662,7 @@ geoip_status() {
     echo ""
     echo -e "${C_CYAN}[ipset 集合]${C_RESET}"
     if ipset list "$set_name" 2>/dev/null | head -5; then
-        local entries=$(ipset list "$set_name" 2>/dev/null | grep -c '^[0-9]' || echo 0)
+        local entries=$(ipset list "$set_name" 2>/dev/null | grep -c '^[0-9]')
         echo "  已加载条目: ${entries}"
     else
         print_warn "ipset 集合不存在"
@@ -487,7 +679,10 @@ geoip_update() {
     print_info "正在更新 IP 数据 (${GEOIP_COUNTRIES})..."
     if _geoip_download "$GEOIP_COUNTRIES"; then
         print_info "正在重新加载规则..."
-        _geoip_apply "$GEOIP_MODE" "$GEOIP_COUNTRIES"
+        if ! _geoip_apply "$GEOIP_MODE" "$GEOIP_COUNTRIES"; then
+            print_error "GeoIP 规则重新加载失败，已保留旧规则"
+            pause; return 1
+        fi
         sed -i "s/^GEOIP_LAST_UPDATE=.*/GEOIP_LAST_UPDATE=\"$(date +%Y-%m-%d)\"/" "$GEOIP_CONF"
         print_success "更新完成"
         log_action "GeoIP data updated: $GEOIP_COUNTRIES"

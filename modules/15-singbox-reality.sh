@@ -1,5 +1,6 @@
 # modules/15-singbox-reality.sh - Sing-box VLESS REALITY / Realm 中转
 
+# BEGIN BUILD-OMIT reality-sni-runtime-source
 # Source SNI 测速增强模块（纯交互式）
 REALITY_MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REALITY_ENHANCEMENT_MODULE="${REALITY_MODULE_DIR}/enhancements/reality-sni-speedtest-interactive.sh"
@@ -7,6 +8,7 @@ if [[ -f "$REALITY_ENHANCEMENT_MODULE" ]]; then
     source "$REALITY_ENHANCEMENT_MODULE"
     # reality_prompt_sni() 会被增强模块自动替换
 fi
+# END BUILD-OMIT reality-sni-runtime-source
 
 REALITY_CANDIDATE_SNI=(
     "c.6sc.co"
@@ -118,7 +120,8 @@ reality_port_in_use() {
 }
 
 reality_random_port() {
-    local min="${REALITY_PORT_MIN:-20000}" max="${REALITY_PORT_MAX:-60000}" port try
+    local min="${REALITY_PORT_MIN:-20000}" max="${REALITY_PORT_MAX:-60000}" port try range rand
+    range=$((max - min + 1))
     if [[ -n "${REALITY_TEST_PORT_CANDIDATES:-}" ]]; then
         for port in $REALITY_TEST_PORT_CANDIDATES; do
             [[ "$port" =~ ^[0-9]+$ ]] || continue
@@ -129,8 +132,11 @@ reality_random_port() {
     for try in $(seq 1 200); do
         if command_exists shuf; then
             port=$(shuf -i "${min}-${max}" -n 1)
+        elif command_exists od && [[ -r /dev/urandom ]]; then
+            rand=$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ')
+            port=$(( rand % range + min ))
         else
-            port=$(( RANDOM % (max - min + 1) + min ))
+            port=$(( (((RANDOM << 15) ^ RANDOM) % range) + min ))
         fi
         reality_port_in_use "$port" || { echo "$port"; return 0; }
     done
@@ -249,10 +255,11 @@ reality_local_client_self_test() {
     reality_load_state || return 1
     command_exists sing-box || { print_warn "sing-box 不存在，跳过本机协议自测"; return 1; }
     command_exists curl || { print_warn "curl 不存在，跳过本机协议自测"; return 1; }
-    local test_port="${REALITY_SELFTEST_PORT:-19090}" cfg log pid i
+    local test_port="${REALITY_SELFTEST_PORT:-19090}" cfg log curl_log pid i
     cfg=$(mktemp /tmp/reality-client-test.XXXXXX.json) || return 1
     log=$(mktemp /tmp/reality-client-test.XXXXXX.log) || { rm -f "$cfg"; return 1; }
-    chmod 600 "$cfg" "$log" 2>/dev/null || true
+    curl_log=$(mktemp /tmp/reality-selftest-curl.XXXXXX.log) || { rm -f "$cfg" "$log"; return 1; }
+    chmod 600 "$cfg" "$log" "$curl_log" 2>/dev/null || true
     cat > "$cfg" <<EOF
 {"log":{"level":"info","timestamp":true},"inbounds":[{"type":"mixed","listen":"127.0.0.1","listen_port":${test_port}}],"outbounds":[{"type":"vless","tag":"self-test","server":"127.0.0.1","server_port":${REALITY_PORT},"uuid":"${REALITY_UUID}","flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":"${REALITY_SNI}","utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":"${REALITY_PUBLIC_KEY}","short_id":"${REALITY_SHORT_ID}"}}}],"route":{"final":"self-test"}}
 EOF
@@ -262,17 +269,17 @@ EOF
         ss -ltn 2>/dev/null | grep -q ":${test_port} " && break
         sleep 0.2
     done
-    if curl -x "socks5h://127.0.0.1:${test_port}" -fsS --max-time 15 https://www.cloudflare.com/cdn-cgi/trace >/tmp/reality-selftest-curl.log 2>&1; then
+    if curl -x "socks5h://127.0.0.1:${test_port}" -fsS --max-time 15 https://www.cloudflare.com/cdn-cgi/trace >"$curl_log" 2>&1; then
         print_success "本机协议自测通过: sing-box client -> 127.0.0.1:${REALITY_PORT} -> 外网"
-        rm -f "$cfg" "$log" "${cfg}.pid" /tmp/reality-selftest-curl.log
+        rm -f "$cfg" "$log" "$curl_log" "${cfg}.pid"
         [[ -n "$pid" ]] && kill "$pid" >/dev/null 2>&1 || true
         return 0
     fi
     print_warn "本机协议自测失败，最近日志:"
-    tail -n 20 /tmp/reality-selftest-curl.log 2>/dev/null || true
+    tail -n 20 "$curl_log" 2>/dev/null || true
     sed -E 's/[0-9a-fA-F-]{36}/<uuid>/g' "$log" 2>/dev/null | tail -n 20 || true
     [[ -n "$pid" ]] && kill "$pid" >/dev/null 2>&1 || true
-    rm -f "$cfg" "$log" "${cfg}.pid" /tmp/reality-selftest-curl.log
+    rm -f "$cfg" "$log" "$curl_log" "${cfg}.pid"
     return 1
 }
 
@@ -327,7 +334,9 @@ reality_verify_sni() {
     command_exists openssl || install_package "openssl" "silent" || return 1
     local timeout_cmd=""
     command_exists timeout && timeout_cmd="timeout 12"
-    $timeout_cmd openssl s_client -connect "${domain}:443" -servername "$domain" -verify_hostname "$domain" -brief </dev/null >/tmp/reality-sni-check.log 2>&1
+    REALITY_SNI_CHECK_LOG=$(mktemp /tmp/reality-sni-check.XXXXXX.log) || return 1
+    chmod 600 "$REALITY_SNI_CHECK_LOG" 2>/dev/null || true
+    $timeout_cmd openssl s_client -connect "${domain}:443" -servername "$domain" -verify_hostname "$domain" -verify_return_error -brief </dev/null >"$REALITY_SNI_CHECK_LOG" 2>&1
 }
 
 reality_pick_sni_candidates() {
@@ -370,7 +379,7 @@ reality_prompt_sni_legacy() {
             echo "$sni"; return 0
         fi
         print_warn "SNI 校验未通过或网络不可达: $sni" >&2
-        tail -n 3 /tmp/reality-sni-check.log >&2 2>/dev/null || true
+        tail -n 3 "${REALITY_SNI_CHECK_LOG:-/dev/null}" >&2 2>/dev/null || true
         confirm "仍然使用该 SNI?" && { echo "$sni"; return 0; }
     done
 }
@@ -386,6 +395,58 @@ reality_backup_file() {
     [[ -f "$file" ]] || return 0
     mkdir -p "$REALITY_BACKUP_DIR"
     cp -a "$file" "$REALITY_BACKUP_DIR/$(basename "$file").$(date +%Y%m%d-%H%M%S).bak"
+}
+
+reality_apply_singbox_config() {
+    local content="$1" target="${2:-$REALITY_SINGBOX_CONFIG}"
+    [[ -n "$content" ]] || { print_error "sing-box 配置内容为空"; return 1; }
+    command_exists sing-box || { print_error "sing-box 未安装"; return 1; }
+    mkdir -p "$(dirname "$target")"
+    local tmp backup="" had_old=0
+    tmp=$(mktemp "$(dirname "$target")/.tmp.server-manage.singbox.XXXXXX") || return 1
+    _tmp_register "$tmp"
+    printf '%s\n' "$content" > "$tmp" || { rm -f "$tmp"; _tmp_unregister "$tmp"; return 1; }
+    chmod 600 "$tmp" 2>/dev/null || true
+
+    if ! sing-box check -c "$tmp" >/dev/null 2>&1; then
+        print_error "sing-box 新配置校验失败，已保留原配置。"
+        rm -f "$tmp"
+        _tmp_unregister "$tmp"
+        return 1
+    fi
+
+    if [[ -f "$target" ]]; then
+        backup=$(mktemp "$(dirname "$target")/.bak.server-manage.singbox.XXXXXX") || { rm -f "$tmp"; _tmp_unregister "$tmp"; return 1; }
+        _tmp_register "$backup"
+        cp -a "$target" "$backup" || { rm -f "$tmp" "$backup"; _tmp_unregister "$tmp"; _tmp_unregister "$backup"; return 1; }
+        had_old=1
+    fi
+
+    if ! mv "$tmp" "$target"; then
+        print_error "写入 sing-box 配置失败，已保留原配置。"
+        rm -f "$tmp"
+        [[ -n "$backup" ]] && rm -f "$backup"
+        _tmp_unregister "$tmp"
+        [[ -n "$backup" ]] && _tmp_unregister "$backup"
+        return 1
+    fi
+    _tmp_unregister "$tmp"
+
+    if ! systemctl restart sing-box >/dev/null 2>&1; then
+        print_error "sing-box 重启失败，正在回滚原配置。"
+        if [[ $had_old -eq 1 && -n "$backup" ]]; then
+            mv "$backup" "$target" 2>/dev/null || true
+            _tmp_unregister "$backup"
+        else
+            rm -f "$target"
+        fi
+        systemctl restart sing-box >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    [[ -n "$backup" ]] && rm -f "$backup"
+    [[ -n "$backup" ]] && _tmp_unregister "$backup"
+    return 0
 }
 
 reality_state_quote() {
@@ -570,6 +631,9 @@ reality_install_landing() {
     validate_domain "$sni" || { print_error "SNI 域名无效"; return 1; }
     validate_port "$port" || { print_error "端口无效"; return 1; }
     [[ -z "$node_name" ]] || reality_validate_node_name "$node_name" || { print_error "节点名称无效"; return 1; }
+    reality_load_state || true
+    local had_relay=0
+    [[ "${REALITY_ROLE:-}" == *"relay"* ]] && had_relay=1
     reality_install_singbox_official || return 1
     REALITY_UUID=$(reality_generate_uuid) || return 1
     local keys
@@ -577,16 +641,17 @@ reality_install_landing() {
     REALITY_PRIVATE_KEY=$(sed -n '1p' <<< "$keys")
     REALITY_PUBLIC_KEY=$(sed -n '2p' <<< "$keys")
     REALITY_SHORT_ID=$(reality_generate_short_id)
-    REALITY_ROLE="landing"
+    if [[ "$had_relay" -eq 1 ]]; then
+        REALITY_ROLE="landing+relay"
+    else
+        REALITY_ROLE="landing"
+    fi
     REALITY_NODE_NAME="$node_name"
     REALITY_NODE_DOMAIN="$node_domain"
     REALITY_SNI="$sni"
     REALITY_PORT="$port"
-    reality_backup_file "$REALITY_SINGBOX_CONFIG"
-    mkdir -p /etc/sing-box
-    reality_render_singbox_config "$REALITY_UUID" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID" > "$REALITY_SINGBOX_CONFIG"
-    chmod 600 "$REALITY_SINGBOX_CONFIG"
-    sing-box check -c "$REALITY_SINGBOX_CONFIG" || return 1
+    local new_config
+    new_config=$(reality_render_singbox_config "$REALITY_UUID" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID") || return 1
     firewall_apply_reality_port "$REALITY_PORT"
     local _fw_rc=$?
     if [[ $_fw_rc -eq 1 ]]; then
@@ -602,7 +667,7 @@ reality_install_landing() {
         fi
     fi
     systemctl enable sing-box >/dev/null || return 1
-    systemctl restart sing-box || return 1
+    reality_apply_singbox_config "$new_config" || return 1
     [[ -n "$cf_token" ]] && reality_sync_cloudflare_dns "$REALITY_NODE_DOMAIN" "$cf_token"
     reality_write_state
     reality_write_client_artifacts
@@ -628,6 +693,30 @@ reality_select_realm_asset_url() {
     printf '%s\n' "$url"
 }
 
+reality_select_realm_checksum_url() {
+    local api="$1" asset_url="$2" asset_name checksum_url=""
+    asset_name="$(basename "$asset_url")"
+    checksum_url=$(grep -Eo "https://[^\" ]+/${asset_name}\.(sha256|sha256sum|sha256.txt)" <<< "$api" | head -n 1)
+    if [[ -z "$checksum_url" ]]; then
+        checksum_url=$(grep -Eo 'https://[^" ]+/(SHA256SUMS|sha256sums\.txt|checksums\.txt|checksum\.txt)' <<< "$api" | head -n 1)
+    fi
+    [[ -n "$checksum_url" ]] || return 1
+    printf '%s\n' "$checksum_url"
+}
+
+reality_verify_sha256_file() {
+    local file="$1" checksum_file="$2" asset_name="${3:-$(basename "$file")}" hash line
+    command_exists sha256sum || { print_error "缺少 sha256sum，无法校验下载文件"; return 1; }
+    line=$(grep -F "$asset_name" "$checksum_file" 2>/dev/null | head -n 1 || true)
+    if [[ -n "$line" ]]; then
+        hash=$(awk '{print $1}' <<< "$line")
+    else
+        hash=$(grep -Eo '^[a-fA-F0-9]{64}' "$checksum_file" | head -n 1)
+    fi
+    [[ "$hash" =~ ^[a-fA-F0-9]{64}$ ]] || { print_error "无法解析 sha256 校验文件"; return 1; }
+    printf '%s  %s\n' "$hash" "$file" | sha256sum -c - >/dev/null
+}
+
 reality_find_realm_binary() {
     local dir="$1" bin=""
     bin=$(find "$dir" -type f -name realm -print -quit 2>/dev/null)
@@ -642,17 +731,34 @@ reality_install_realm_binary() {
     command_exists curl || install_package "curl" "silent" || return 1
     command_exists tar || install_package "tar" "silent" || true
     if command_exists realm; then return 0; fi
-    local arch api url tmp bin
+    local arch api url checksum_url tmp bin asset_name
     arch=$(reality_realm_arch) || { print_error "Realm 不支持当前架构"; return 1; }
     api=$(curl -fsSL https://api.github.com/repos/zhboner/realm/releases/latest) || return 1
     url=$(reality_select_realm_asset_url "$api" "$arch") || true
     [[ -n "$url" ]] || { print_error "未找到 Realm ${arch} 发布包"; return 1; }
+    checksum_url=$(reality_select_realm_checksum_url "$api" "$url") || {
+        print_error "未找到 Realm 发布包 sha256 校验文件，已拒绝安装"
+        return 1
+    }
+    asset_name="$(basename "$url")"
     tmp=$(mktemp -d)
-    curl -fsSL "$url" -o "$tmp/realm.tgz" || return 1
-    tar -xzf "$tmp/realm.tgz" -C "$tmp" || return 1
+    curl -fsSL "$url" -o "$tmp/realm.tgz" || { rm -rf "$tmp"; return 1; }
+    curl -fsSL "$checksum_url" -o "$tmp/realm.sha256" || { rm -rf "$tmp"; return 1; }
+    reality_verify_sha256_file "$tmp/realm.tgz" "$tmp/realm.sha256" "$asset_name" || { rm -rf "$tmp"; return 1; }
+    tar -xzf "$tmp/realm.tgz" -C "$tmp" || { rm -rf "$tmp"; return 1; }
     bin=$(reality_find_realm_binary "$tmp") || { print_error "Realm 发布包中未找到可安装二进制"; rm -rf "$tmp"; return 1; }
     install -m 0755 "$bin" /usr/local/bin/realm || { rm -rf "$tmp"; return 1; }
     rm -rf "$tmp"
+}
+
+firewall_remove_reality_ports() {
+    command_exists ufw || return 0
+    ufw_is_active || return 0
+    local port
+    for port in "${REALITY_PORT:-}" "${REALITY_RELAY_PORT:-}"; do
+        validate_port "$port" || continue
+        ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
+    done
 }
 
 reality_install_relay() {
@@ -662,6 +768,8 @@ reality_install_relay() {
     validate_domain "$target_host" || validate_ip "$target_host" || { print_error "落地地址无效"; return 1; }
     validate_port "$target_port" || { print_error "落地端口无效"; return 1; }
     [[ -z "$node_name" ]] || reality_validate_node_name "$node_name" || { print_error "节点名称无效"; return 1; }
+    # 若同机已存在落地机 state，先加载再写入中转字段，避免重装中转时清空 UUID/私钥/SNI 等落地机参数。
+    reality_load_state || true
     reality_require_supported_os || return 1
     reality_install_realm_binary || return 1
     mkdir -p /etc/realm "$REALITY_CONFIG_DIR"
@@ -700,8 +808,12 @@ EOF
     systemctl daemon-reload
     systemctl enable realm >/dev/null || return 1
     systemctl restart realm || return 1
-    REALITY_ROLE="relay"
-    REALITY_NODE_NAME="$node_name"
+    if [[ -n "${REALITY_UUID:-}" && "${REALITY_ROLE:-}" == *"landing"* ]]; then
+        REALITY_ROLE="landing+relay"
+    else
+        REALITY_ROLE="relay"
+    fi
+    [[ -n "$node_name" ]] && REALITY_NODE_NAME="$node_name"
     REALITY_RELAY_DOMAIN="$relay_domain"
     REALITY_RELAY_PORT="$listen_port"
     REALITY_RELAY_TARGET_HOST="$target_host"
@@ -840,9 +952,17 @@ reality_show_info() {
 reality_status() {
     print_title "Reality 服务状态"
     command_exists systemctl || { print_warn "systemctl 不可用"; pause; return; }
-    systemctl --no-pager --full status sing-box 2>/dev/null | sed -n '1,12p' || print_warn "sing-box 未运行"
+    local status_out
+    if status_out=$(systemctl --no-pager --full status sing-box 2>&1); then
+        printf '%s\n' "$status_out" | sed -n '1,12p'
+    else
+        print_warn "sing-box 未运行"
+        printf '%s\n' "$status_out" | sed -n '1,6p'
+    fi
     echo ""
-    systemctl --no-pager --full status realm 2>/dev/null | sed -n '1,12p' || true
+    if status_out=$(systemctl --no-pager --full status realm 2>&1); then
+        printf '%s\n' "$status_out" | sed -n '1,12p'
+    fi
     pause
 }
 
@@ -911,10 +1031,10 @@ reality_diagnose() {
         print_success "SNI TLS/SAN 校验通过: $REALITY_SNI"
     else
         print_warn "SNI TLS/SAN 校验失败或当前网络不可达: $REALITY_SNI"
-        tail -n 5 /tmp/reality-sni-check.log 2>/dev/null || true
+        tail -n 5 "${REALITY_SNI_CHECK_LOG:-/dev/null}" 2>/dev/null || true
     fi
 
-    if [[ "${REALITY_ROLE:-}" == "landing" ]]; then
+    if [[ "${REALITY_ROLE:-}" == *"landing"* ]]; then
         reality_local_client_self_test || true
     fi
 
@@ -942,11 +1062,16 @@ reality_restart() {
 
 reality_rotate_user() {
     reality_load_state || { print_error "未安装落地机配置"; pause; return 1; }
-    [[ -n "${REALITY_PRIVATE_KEY:-}" && -n "${REALITY_PORT:-}" ]] || { print_error "状态文件缺少落地机参数"; pause; return 1; }
-    REALITY_UUID=$(reality_generate_uuid) || return 1
-    reality_backup_file "$REALITY_SINGBOX_CONFIG"
-    reality_render_singbox_config "$REALITY_UUID" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID" > "$REALITY_SINGBOX_CONFIG"
-    sing-box check -c "$REALITY_SINGBOX_CONFIG" && systemctl restart sing-box
+    [[ -n "${REALITY_PRIVATE_KEY:-}" && -n "${REALITY_PORT:-}" && -n "${REALITY_SNI:-}" && -n "${REALITY_SHORT_ID:-}" ]] || { print_error "状态文件缺少落地机参数"; pause; return 1; }
+    validate_port "$REALITY_PORT" || { print_error "状态文件端口无效: ${REALITY_PORT:-空}"; pause; return 1; }
+    local old_uuid="$REALITY_UUID" new_uuid new_config
+    new_uuid=$(reality_generate_uuid) || return 1
+    new_config=$(reality_render_singbox_config "$new_uuid" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID") || return 1
+    REALITY_UUID="$new_uuid"
+    if ! reality_apply_singbox_config "$new_config"; then
+        REALITY_UUID="$old_uuid"
+        pause; return 1
+    fi
     reality_write_state; reality_write_client_artifacts
     print_success "UUID 已轮换"
     reality_show_info
@@ -954,14 +1079,20 @@ reality_rotate_user() {
 
 reality_rotate_key() {
     reality_load_state || { print_error "未安装落地机配置"; pause; return 1; }
-    local keys
+    [[ -n "${REALITY_UUID:-}" && -n "${REALITY_PORT:-}" && -n "${REALITY_SNI:-}" ]] || { print_error "状态文件缺少落地机参数"; pause; return 1; }
+    validate_port "$REALITY_PORT" || { print_error "状态文件端口无效: ${REALITY_PORT:-空}"; pause; return 1; }
+    local old_private_key="$REALITY_PRIVATE_KEY" old_public_key="$REALITY_PUBLIC_KEY" old_short_id="$REALITY_SHORT_ID" keys new_config
     keys=$(reality_generate_keypair) || return 1
     REALITY_PRIVATE_KEY=$(sed -n '1p' <<< "$keys")
     REALITY_PUBLIC_KEY=$(sed -n '2p' <<< "$keys")
     REALITY_SHORT_ID=$(reality_generate_short_id)
-    reality_backup_file "$REALITY_SINGBOX_CONFIG"
-    reality_render_singbox_config "$REALITY_UUID" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID" > "$REALITY_SINGBOX_CONFIG"
-    sing-box check -c "$REALITY_SINGBOX_CONFIG" && systemctl restart sing-box
+    new_config=$(reality_render_singbox_config "$REALITY_UUID" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID") || return 1
+    if ! reality_apply_singbox_config "$new_config"; then
+        REALITY_PRIVATE_KEY="$old_private_key"
+        REALITY_PUBLIC_KEY="$old_public_key"
+        REALITY_SHORT_ID="$old_short_id"
+        pause; return 1
+    fi
     reality_write_state; reality_write_client_artifacts
     print_success "Reality Key/ShortID 已轮换"
     reality_show_info
@@ -993,12 +1124,14 @@ reality_update_node_name() {
 reality_delete_node_info() {
     print_title "删除 Reality 节点信息"
     confirm "确认删除本机 Reality/Realm 管理信息? 不会卸载 sing-box 软件包" || return 0
+    reality_load_state || true
+    firewall_remove_reality_ports
     systemctl disable --now realm 2>/dev/null || true
     rm -f /etc/systemd/system/realm.service
     systemctl daemon-reload 2>/dev/null || true
     reality_backup_file "$REALITY_SINGBOX_CONFIG"
     rm -f "$REALITY_REALM_CONFIG"
-    rm -rf "$REALITY_CONFIG_DIR"
+    rm -f "$REALITY_STATE_FILE" "$REALITY_LINK_FILE" "$REALITY_CLIENT_JSON"
     print_success "Reality/Realm 节点信息已删除"
     pause
 }

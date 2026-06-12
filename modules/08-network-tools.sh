@@ -9,7 +9,7 @@ net_iperf3() {
         pause; return
     fi
     local ufw_opened=0
-        if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+        if ufw_is_active; then
         if ! ufw status 2>/dev/null | grep -q "$port/tcp"; then
             ufw allow "$port/tcp" comment "iPerf3-Temp" >/dev/null
             ufw_opened=1
@@ -38,7 +38,6 @@ net_iperf3() {
             kill "$iperf_pid" 2>/dev/null || true
             wait "$iperf_pid" 2>/dev/null || true
         fi
-        pkill -f "iperf3 -s -p $port" 2>/dev/null || true
         if [[ $ufw_opened -eq 1 ]]; then
             ufw delete allow "$port/tcp" >/dev/null 2>&1 || true
             print_info "防火墙规则已移除。"
@@ -118,14 +117,18 @@ net_dns() {
         fi
     done
     if [[ "$PLATFORM" == "openwrt" ]]; then
-        uci delete network.wan.dns 2>/dev/null || true
+        local network_wan="wan" network_lan="lan" dns_iface
+        dns_iface="$network_wan"
+        uci -q get "network.${dns_iface}" >/dev/null 2>&1 || dns_iface="$network_lan"
+        uci -q get "network.${dns_iface}" >/dev/null 2>&1 || { print_error "未找到 OpenWrt wan/lan 网络接口"; pause; return 1; }
+        uci delete "network.${dns_iface}.dns" 2>/dev/null || true
         for ip in $dns; do
-            uci add_list network.wan.dns="$ip"
+            uci add_list "network.${dns_iface}.dns=$ip" || { print_error "写入 OpenWrt DNS 失败: $ip"; pause; return 1; }
         done
-        uci set network.wan.peerdns='0'
-        uci commit network
+        uci set "network.${dns_iface}.peerdns=0" || { print_error "设置 OpenWrt peerdns 失败"; pause; return 1; }
+        uci commit network || { print_error "提交 OpenWrt network 配置失败"; pause; return 1; }
         /etc/init.d/network reload 2>/dev/null || true
-        print_success "DNS 已通过 uci 修改 (持久化)。"
+        print_success "DNS 已通过 uci 修改 (接口: ${dns_iface}, 持久化)。"
     elif is_systemd && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         local res_conf="/etc/systemd/resolved.conf"
         grep -q '^\[Resolve\]' "$res_conf" || echo -e "\n[Resolve]" >> "$res_conf"
@@ -134,12 +137,11 @@ net_dns() {
         systemctl restart systemd-resolved
         print_success "DNS 已修改。"
     else
-        local tmp_resolv
-        tmp_resolv=$(mktemp /etc/resolv.conf.tmp.XXXXXX)
+        local resolv_content=""
         for ip in $dns; do
-            echo "nameserver $ip" >> "$tmp_resolv"
+            resolv_content+="nameserver $ip"$'\n'
         done
-        mv "$tmp_resolv" /etc/resolv.conf
+        write_file_atomic /etc/resolv.conf "${resolv_content%$'\n'}" || { print_error "写入 /etc/resolv.conf 失败"; pause; return 1; }
         print_success "DNS 已修改。"
     fi
     log_action "DNS changed to: $dns"
@@ -181,6 +183,9 @@ net_diag() {
     3)
         read -e -r -p "目标 IP/域名: " host
         [[ -z "$host" ]] && return
+        if ! validate_host "$host"; then
+            print_error "目标主机格式无效（仅支持 IP 或普通域名）"; pause; return
+        fi
         read -e -r -p "端口: " port
         if ! validate_port "$port"; then
             print_error "端口无效"; pause; return
@@ -193,7 +198,7 @@ net_diag() {
                 print_error "端口不可达或超时"
             fi
         else
-            if timeout 5 bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null; then
+            if timeout 5 bash -c 'echo >/dev/tcp/"$1"/"$2"' _ "$host" "$port" 2>/dev/null; then
                 print_success "端口可达"
             else
                 print_error "端口不可达或超时"

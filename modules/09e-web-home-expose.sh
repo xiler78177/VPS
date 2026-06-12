@@ -30,7 +30,7 @@ web_home_expose() {
     # 2. 选择域名 (自动列出 Token 可管理的域名)
     print_info "获取 Token 可管理的域名列表..."
     local zones_json zone_list=() zone_ids=()
-    zones_json=$(_cf_api GET "/zones?per_page=50&status=active" "$token")
+    zones_json=$(_cf_list_zones "$token" "status=active")
     if ! _cf_api_ok "$zones_json"; then
         print_error "获取域名列表失败: $(_cf_api_err "$zones_json")"
         pause; return
@@ -70,9 +70,15 @@ web_home_expose() {
     print_guide "输入子域名前缀"
     echo -e "  ${C_GRAY}例如输入 alist -> 访问地址为 alist.${root_domain}${C_RESET}"
     echo -e "  ${C_GRAY}例如输入 nas -> 访问地址为 nas.${root_domain}${C_RESET}"
-    while [[ -z "$sub_prefix" ]]; do
+    while true; do
         read -e -r -p "子域名前缀: " sub_prefix
-        [[ -z "$sub_prefix" ]] && print_warn "不能为空"
+        if [[ -z "$sub_prefix" ]]; then
+            print_warn "不能为空"
+            continue
+        fi
+        validate_dns_label "$sub_prefix" && break
+        print_error "子域名前缀格式无效（仅小写字母、数字、短横；首尾不能为短横，1-63 字符）"
+        sub_prefix=""
     done
     local full_domain="${sub_prefix}.${root_domain}"
 
@@ -272,15 +278,14 @@ $(_nginx_tls_http2_block "$https_port")
     local ddns_domain="$full_domain"
     local ddns_proxied="true"
     mkdir -p "$DDNS_CONFIG_DIR"
-    cat > "$DDNS_CONFIG_DIR/${ddns_domain}.conf" << EOF
-DDNS_DOMAIN="${ddns_domain}"
+    local ddns_conf_content="DDNS_DOMAIN="${ddns_domain}"
 DDNS_TOKEN="${token}"
 DDNS_ZONE_ID="${zone_id}"
 DDNS_IPV4="true"
 DDNS_IPV6="false"
 DDNS_PROXIED="${ddns_proxied}"
-DDNS_INTERVAL="${ddns_interval}"
-EOF
+DDNS_INTERVAL="${ddns_interval}""
+    write_file_atomic "$DDNS_CONFIG_DIR/${ddns_domain}.conf" "$ddns_conf_content" || { print_error "DDNS 配置写入失败"; pause; return; }
     chmod 600 "$DDNS_CONFIG_DIR/${ddns_domain}.conf"
     ddns_create_script
     ddns_rebuild_cron
@@ -289,7 +294,7 @@ EOF
 
     # Step: 防火墙
     echo -e "\n${C_CYAN}=== [${step}/${total_steps}] 防火墙 ===${C_RESET}"
-    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+    if ufw_is_active; then
         ufw allow "${https_port}/tcp" comment "HomeExpose-${full_domain}" >/dev/null 2>&1 || true
         print_success "已放行端口 ${https_port}/tcp"
     else
@@ -302,12 +307,16 @@ EOF
         echo -e "\n${C_CYAN}=== [${step}/${total_steps}] CF Origin Rule (端口回源) ===${C_RESET}"
         print_info "创建回源规则: 用户访问 :443 -> CF 回源 :${https_port}"
         local existing
-        existing=$(_cf_get_origin_ruleset "$token" "$zone_id")
-        local existing_rules="[]"
-        if [[ -n "$existing" ]]; then
-            existing_rules=$(echo "$existing" | jq '.result.rules // []')
-        fi
-        # 移除同域名旧规则
+        if ! existing=$(_cf_get_origin_ruleset "$token" "$zone_id"); then
+            print_warn "Origin Rules 读取失败，已跳过自动创建，避免覆盖该 Zone 的既有回源规则。"
+            print_warn "可稍后通过菜单 [10.创建回源规则] 手动添加"
+            ((step++))
+        else
+            local existing_rules="[]"
+            if [[ -n "$existing" ]]; then
+                existing_rules=$(echo "$existing" | jq '.result.rules // []')
+            fi
+            # 移除同域名旧规则
         local filtered_rules=$(echo "$existing_rules" | jq --arg d "$full_domain" \
             '[.[] | select(.expression != ("http.host eq \"" + $d + "\""))]')
         # 构建新规则
@@ -324,13 +333,14 @@ EOF
             }')
         local final_rules=$(echo "$filtered_rules" | jq --argjson new "$new_rule" '. + [$new]')
         local err
-        if ! err=$(_cf_put_origin_ruleset "$token" "$zone_id" "$final_rules"); then
-            print_warn "Origin Rule 创建失败: $err"
-            print_warn "可稍后通过菜单 [10.创建回源规则] 手动添加"
-        else
-            print_success "Origin Rule 已创建 (用户 :443 -> 回源 :${https_port})"
+            if ! err=$(_cf_put_origin_ruleset "$token" "$zone_id" "$final_rules"); then
+                print_warn "Origin Rule 创建失败: $err"
+                print_warn "可稍后通过菜单 [10.创建回源规则] 手动添加"
+            else
+                print_success "Origin Rule 已创建 (用户 :443 -> 回源 :${https_port})"
+            fi
+            ((step++))
         fi
-        ((step++))
     fi
 
     # Step: SSL/TLS Full 模式
@@ -453,6 +463,12 @@ CONFEOF
             read -e -r -p "内网 IP: " nginx_ip
             [[ -z "$nginx_ip" ]] && { print_warn "跳过 DNS 劫持配置"; pause; return; }
         fi
+        if ! validate_ip "$nginx_ip"; then
+            print_error "内网 IP 无效: ${nginx_ip}"
+            print_warn "跳过 DNS 劫持配置"
+            pause
+            return 0
+        fi
 
         echo -e "${C_CYAN}配置预览:${C_RESET}"
         echo -e "  路由器: ${C_GREEN}${router_ssh}${C_RESET}"
@@ -478,9 +494,9 @@ uci set dhcp.@domain[-1].name='${full_domain}'
 uci set dhcp.@domain[-1].ip='${nginx_ip}'
 uci commit dhcp
 /etc/init.d/dnsmasq restart
-"
+	"
         if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
-            ${router_ssh} "${uci_cmds}" 2>&1; then
+            "$router_ssh" "${uci_cmds}" 2>&1; then
             print_success "内网 DNS 劫持配置成功！"
             echo -e "  ${C_GREEN}${full_domain} -> ${nginx_ip}${C_RESET} (内网直连)"
         else

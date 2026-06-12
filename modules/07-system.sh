@@ -5,7 +5,7 @@ menu_update() {
     local FULL_DEPS="curl wget jq unzip openssl ca-certificates ufw fail2ban ipset iproute2 net-tools procps"
     local ufw_was_active=0
     local f2b_was_active=0
-    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+    if ufw_is_active; then
         ufw_was_active=1
     fi
     if systemctl is-active fail2ban &>/dev/null; then
@@ -21,6 +21,7 @@ menu_update() {
     local installed=0
     local failed=0
     local ok_count=0
+    local f2b_newly_installed=0
     for pkg in $FULL_DEPS; do
         if dpkg -s "$pkg" &>/dev/null; then
             echo -e "  ${C_GREEN}✓${C_RESET} $pkg (正常)"
@@ -30,6 +31,7 @@ menu_update() {
             if (DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" >/dev/null 2>&1); then
                 echo -e "${C_GREEN}成功${C_RESET}"
                 ((installed++)) || true
+                [[ "$pkg" == "fail2ban" ]] && f2b_newly_installed=1
             else
                 echo -e "${C_RED}失败${C_RESET}"
                 ((failed++)) || true
@@ -48,6 +50,10 @@ menu_update() {
     fi
     if [[ $f2b_was_active -eq 1 ]]; then
         systemctl start fail2ban >/dev/null 2>&1 || true
+    elif [[ $f2b_newly_installed -eq 1 ]]; then
+        # Debian/Ubuntu 安装 fail2ban 后可能立即启动默认 sshd jail。
+        # 自动依赖检查只负责安装，不应静默启用封禁策略。
+        systemctl disable --now fail2ban >/dev/null 2>&1 || systemctl stop fail2ban >/dev/null 2>&1 || true
     fi
     echo "================================================================================"
     log_action "Dependencies checked/repaired manually"
@@ -87,7 +93,7 @@ auto_deps() {
     print_info "正在检查并安装基础依赖..."
     local ufw_was_active=0
     local f2b_was_active=0
-    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+    if ufw_is_active; then
         ufw_was_active=1
     fi
     if systemctl is-active fail2ban &>/dev/null; then
@@ -136,6 +142,9 @@ auto_deps() {
     fi
     if [[ $f2b_was_active -eq 1 ]]; then
         systemctl start fail2ban >/dev/null 2>&1 || true
+    elif [[ $f2b_newly_installed -eq 1 ]]; then
+        # apt 安装 fail2ban 后可能立即启动默认 sshd jail；自动依赖检查不启用策略。
+        systemctl disable --now fail2ban >/dev/null 2>&1 || systemctl stop fail2ban >/dev/null 2>&1 || true
     fi
     # 保存状态
     _deps_save_state "$FULL_DEPS"
@@ -154,7 +163,7 @@ install_package() {
     local pkg="$1"
     local silent="${2:-}"
     if [[ "$PLATFORM" == "openwrt" ]]; then
-        if command -v "${pkg%%-*}" &>/dev/null 2>&1 || opkg list-installed 2>/dev/null | grep -q "^${pkg} "; then
+        if opkg list-installed 2>/dev/null | grep -q "^${pkg} "; then
             [[ "$silent" != "silent" ]] && print_warn "$pkg 已安装，跳过。"
             return 0
         fi
@@ -247,11 +256,22 @@ opt_hostname() {
     fi
     # 先保存旧主机名，再执行修改
     local old_name=$(hostname 2>/dev/null)
-    if command_exists hostnamectl; then
-        hostnamectl set-hostname "$new_name"
+    if [[ "$PLATFORM" == "openwrt" ]]; then
+        if ! command_exists uci; then
+            print_error "OpenWrt 缺少 uci，无法持久化主机名。"
+            pause; return 1
+        fi
+        if ! uci set system.@system[0].hostname="$new_name" || ! uci commit system; then
+            print_error "OpenWrt 主机名写入 uci 失败。"
+            pause; return 1
+        fi
+        hostname "$new_name" 2>/dev/null || true
+        /etc/init.d/system reload >/dev/null 2>&1 || true
+    elif command_exists hostnamectl; then
+        hostnamectl set-hostname "$new_name" || { print_error "hostnamectl 设置失败。"; pause; return 1; }
     else
-        hostname "$new_name"
-        echo "$new_name" > /etc/hostname
+        hostname "$new_name" || { print_error "临时主机名设置失败。"; pause; return 1; }
+        echo "$new_name" > /etc/hostname || { print_error "/etc/hostname 写入失败。"; pause; return 1; }
     fi
 
     # 安全替换 /etc/hosts 中的旧主机名
@@ -339,9 +359,20 @@ opt_bbr() {
         sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
         echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
         echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-        sysctl -p >/dev/null
-        print_success "BBR 已开启。"
-        log_action "BBR enabled"
+        if sysctl -p >/dev/null 2>&1; then
+            local verify_cc
+            verify_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+            if [[ "$verify_cc" == "bbr" ]]; then
+                print_success "BBR 已开启。"
+                log_action "BBR enabled"
+            else
+                print_error "BBR 未实际生效 (当前: $verify_cc)，请检查内核是否支持。"
+                log_action "BBR enable failed: verify_cc=$verify_cc" "ERROR"
+            fi
+        else
+            print_error "sysctl -p 执行失败，BBR 未应用。"
+            log_action "BBR enable failed: sysctl -p" "ERROR"
+        fi
     fi
     pause
 }
@@ -349,17 +380,33 @@ opt_bbr() {
 select_timezone() {
     echo "1.上海 2.香港 3.东京 4.纽约 5.伦敦 6.UTC"
     read -e -r -p "选择: " t
-    local z
+    local z tz
     case $t in
-        1) z="Asia/Shanghai" ;; 2) z="Asia/Hong_Kong" ;; 3) z="Asia/Tokyo" ;;
-        4) z="America/New_York" ;; 5) z="Europe/London" ;; 6) z="UTC" ;;
+        1) z="Asia/Shanghai"; tz="CST-8" ;;
+        2) z="Asia/Hong_Kong"; tz="HKT-8" ;;
+        3) z="Asia/Tokyo"; tz="JST-9" ;;
+        4) z="America/New_York"; tz="EST5EDT,M3.2.0,M11.1.0" ;;
+        5) z="Europe/London"; tz="GMT0BST,M3.5.0/1,M10.5.0" ;;
+        6) z="UTC"; tz="UTC0" ;;
         *) print_error "无效选择"; return 1 ;;
     esac
-    # 优先使用 timedatectl（systemd 系统），回退到软链接
-    if command_exists timedatectl; then
-        timedatectl set-timezone "$z"
+    if [[ "$PLATFORM" == "openwrt" ]]; then
+        if ! command_exists uci; then
+            print_error "OpenWrt 缺少 uci，无法持久化时区。"
+            return 1
+        fi
+        if ! uci set system.@system[0].zonename="$z" || \
+           ! uci set system.@system[0].timezone="$tz" || \
+           ! uci commit system; then
+            print_error "OpenWrt 时区写入 uci 失败。"
+            return 1
+        fi
+        /etc/init.d/system reload >/dev/null 2>&1 || true
+    elif command_exists timedatectl; then
+        timedatectl set-timezone "$z" || { print_error "timedatectl 设置时区失败。"; return 1; }
     else
-        ln -sf /usr/share/zoneinfo/$z /etc/localtime
+        [[ -f "/usr/share/zoneinfo/$z" ]] || { print_error "zoneinfo 不存在: /usr/share/zoneinfo/$z"; return 1; }
+        ln -sf "/usr/share/zoneinfo/$z" /etc/localtime || { print_error "写入 /etc/localtime 失败。"; return 1; }
     fi
     print_success "时区已设为 $z"
     log_action "Timezone changed to $z"
@@ -395,10 +442,11 @@ opt_sysctl() {
     # Backup before modifying
     [[ ! -f /etc/sysctl.conf.pre-tuning ]] && cp /etc/sysctl.conf /etc/sysctl.conf.pre-tuning
     local params=""
+    local block_start="# BEGIN server-manage sysctl tuning"
+    local block_end="# END server-manage sysctl tuning"
     case $sc in
     1)
-        params="
-# server-manage sysctl tuning: proxy/tunnel
+        params="${block_start}: proxy/tunnel
 fs.file-max = 1048576
 net.core.somaxconn = 4096
 net.core.netdev_max_backlog = 4096
@@ -414,11 +462,11 @@ net.ipv4.tcp_max_tw_buckets = 32768
 net.ipv4.tcp_syncookies = 1
 net.ipv4.ip_forward = 1
 net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216"
+net.ipv4.tcp_wmem = 4096 65536 16777216
+${block_end}"
         ;;
     2)
-        params="
-# server-manage sysctl tuning: web server
+        params="${block_start}: web server
 fs.file-max = 524288
 net.core.somaxconn = 8192
 net.core.netdev_max_backlog = 8192
@@ -429,23 +477,24 @@ net.ipv4.tcp_keepalive_time = 300
 net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_keepalive_probes = 3
 net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_max_tw_buckets = 65536"
+net.ipv4.tcp_max_tw_buckets = 65536
+${block_end}"
         ;;
     3)
-        params="
-# server-manage sysctl tuning: conservative
+        params="${block_start}: conservative
 fs.file-max = 262144
 net.core.somaxconn = 2048
 net.ipv4.tcp_max_syn_backlog = 2048
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_fin_timeout = 30"
+net.ipv4.tcp_fin_timeout = 30
+${block_end}"
         ;;
     *) print_error "无效选择"; pause; return ;;
     esac
-    # Remove old tuning block and append new
-    sed -i '/^# server-manage sysctl tuning/,/^$/d' /etc/sysctl.conf
-    echo "$params" >> /etc/sysctl.conf
+    # Remove old tuning block and append new. 旧版本没有 END 标记，保留兼容删除。
+    sed -i '/^# BEGIN server-manage sysctl tuning/,/^# END server-manage sysctl tuning/d; /^# server-manage sysctl tuning/,/^$/d' /etc/sysctl.conf
+    printf '\n%s\n' "$params" >> /etc/sysctl.conf
     if sysctl -p >/dev/null 2>&1; then
         print_success "内核参数已应用 (无需重启)。"
         log_action "Sysctl tuning applied: preset=$sc"
@@ -480,4 +529,3 @@ menu_opt() {
         esac
     done
 }
-

@@ -3,9 +3,10 @@ wg_setup_watchdog() {
     wg_check_installed || return 1
     local watchdog_script="/usr/local/bin/wg-watchdog.sh"
     local watchdog_log="/var/log/wg-watchdog.log"
+    local auto_mode="${1:-}"
 
     # 已启用时的管理界面
-    if crontab -l 2>/dev/null | grep -q "wg-watchdog.sh"; then
+    if [[ -z "$auto_mode" ]] && crontab -l 2>/dev/null | grep -q "wg-watchdog.sh"; then
         print_title "WireGuard 看门狗"
         echo -e "  状态: ${C_GREEN}已启用${C_RESET}"
         echo -e "  脚本: ${C_CYAN}${watchdog_script}${C_RESET}"
@@ -36,12 +37,14 @@ wg_setup_watchdog() {
         pause; return
     fi
 
-    print_title "WireGuard 服务端看门狗"
-    echo "看门狗功能:
+    if [[ -z "$auto_mode" ]]; then
+        print_title "WireGuard 服务端看门狗"
+        echo "看门狗功能:
   • 每分钟检测 wg0 接口状态
   • 接口消失 → 立即拉起
   • wg show 失败 → 重启接口"
-    if ! confirm "启用看门狗?"; then pause; return; fi
+        if ! confirm "启用看门狗?"; then pause; return; fi
+    fi
 
     # ── OpenWrt 看门狗 (#!/bin/sh + ifup/ifdown + Mihomo bypass + 路由检查) ──
     cat > "$watchdog_script" << 'WDEOF_OPENWRT'
@@ -65,10 +68,20 @@ fi
 
 # 检测 Mihomo bypass 规则是否存在
 if nft list chain inet fw4 mangle_prerouting &>/dev/null; then
-    if ! nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep -q "wg_bypass"; then
-        $LOG "Mihomo bypass rules missing, rebuilding"
-        grep "wg_bypass" /etc/rc.local 2>/dev/null | while IFS= read -r line; do
-            eval "$line" 2>/dev/null || true
+    NFT_RULES=$(nft list chain inet fw4 mangle_prerouting 2>/dev/null)
+    if ! echo "$NFT_RULES" | grep -q "wg_bypass_iface"; then
+        nft insert rule inet fw4 mangle_prerouting iifname "wg0" counter return comment "wg_bypass_iface" 2>/dev/null || true
+        $LOG "restored wg_bypass_iface rule"
+    fi
+    if [ -f "$DB" ] && command -v jq >/dev/null 2>&1; then
+        jq -r '[.server.subnet, (.server.server_lan_subnet // empty), (.peers[]? | select(.enabled == true and .is_gateway == true) | .lan_subnets // empty)] | .[] | select(. != null and . != "")' "$DB" 2>/dev/null | \
+        tr ',' '\n' | while IFS= read -r sub; do
+            sub=$(echo "$sub" | xargs)
+            [ -z "$sub" ] && continue
+            if ! echo "$NFT_RULES" | grep -q "daddr $sub"; then
+                nft insert rule inet fw4 mangle_prerouting ip daddr "$sub" counter return comment "wg_bypass_subnet" 2>/dev/null || true
+                $LOG "restored wg_bypass_subnet rule: $sub"
+            fi
         done
     fi
 fi
@@ -93,7 +106,7 @@ WDEOF_OPENWRT
     echo -e "  脚本: ${C_CYAN}${watchdog_script}${C_RESET}"
     echo "  检测: 接口存活 → wg show → Mihomo bypass 规则"
     log_action "WireGuard watchdog enabled (platform=openwrt)"
-    pause
+    [[ -z "$auto_mode" ]] && pause
 }
 
 wg_export_peers() {
@@ -106,7 +119,7 @@ wg_export_peers() {
         pause; return
     fi
     local export_file
-    export_file=$(mktemp "/tmp/${SCRIPT_NAME}-wg-peers-XXXXXX.json")
+    export_file=$(mktemp "/tmp/${SCRIPT_NAME}-wg-peers.XXXXXX") || { print_error "无法创建导出文件"; pause; return 1; }
     chmod 600 "$export_file"
     if jq '{
         export_version: 2,
@@ -194,7 +207,7 @@ wg_import_peers() {
     local imported=0 skipped=0
     local i=0
     while [[ $i -lt $import_count ]]; do
-        local name ip privkey pubkey psk allowed enabled is_gw lans created peer_type
+        local name ip privkey pubkey psk allowed enabled is_gw lans created peer_type route_mode
         name=$(jq -r ".peers[$i].name" "$import_file")
         ip=$(jq -r ".peers[$i].ip" "$import_file")
         privkey=$(jq -r ".peers[$i].private_key" "$import_file")
@@ -206,10 +219,39 @@ wg_import_peers() {
         lans=$(jq -r ".peers[$i].lan_subnets // empty" "$import_file")
         created=$(jq -r ".peers[$i].created // empty" "$import_file")
         peer_type=$(jq -r ".peers[$i].peer_type // empty" "$import_file")
+        route_mode=$(jq -r ".peers[$i].route_mode // empty" "$import_file")
         # 兼容旧版 JSON: 无 peer_type 时根据 is_gateway 推断
         if [[ -z "$peer_type" || "$peer_type" == "null" ]]; then
             [[ "$is_gw" == "true" ]] && peer_type="gateway" || peer_type="standard"
         fi
+        [[ -z "$route_mode" || "$route_mode" == "null" ]] && route_mode="managed"
+        [[ "$enabled" == "true" || "$enabled" == "false" ]] || enabled=true
+        [[ "$is_gw" == "true" || "$is_gw" == "false" ]] || is_gw=false
+
+        if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            print_warn "跳过: $name (名称格式无效)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
+        if ! validate_ip "$ip"; then
+            print_warn "跳过: $name (IP 格式无效: $ip)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
+        if [[ -z "$allowed" || "$allowed" == "null" ]] || ! validate_cidr_list "$allowed"; then
+            print_warn "跳过: $name (AllowedIPs 格式无效: $allowed)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
+        if ! validate_cidr_list "$lans"; then
+            print_warn "跳过: $name (LAN 网段格式无效: $lans)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
+        case "$peer_type" in
+            standard|gateway) ;;
+            *) print_warn "跳过: $name (设备类型无效: $peer_type)"; skipped=$((skipped + 1)); i=$((i + 1)); continue ;;
+        esac
+        case "$route_mode" in
+            managed|custom|full|vpn) ;;
+            *) print_warn "跳过: $name (路由模式无效: $route_mode)"; skipped=$((skipped + 1)); i=$((i + 1)); continue ;;
+        esac
 
         # 检查重名
         local exists
@@ -231,6 +273,18 @@ wg_import_peers() {
             pubkey=$(echo "$privkey" | wg pubkey)
             psk=$(wg genpsk)
         fi
+        if ! validate_wg_key "$privkey"; then
+            print_warn "跳过: $name (私钥格式无效)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
+        if ! validate_wg_key "$pubkey"; then
+            print_warn "跳过: $name (公钥格式无效)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
+        if ! validate_wg_key "$psk"; then
+            print_warn "跳过: $name (预共享密钥格式无效)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
 
         [[ -z "$created" || "$created" == "null" ]] && created=$(date '+%Y-%m-%d %H:%M:%S')
 
@@ -245,6 +299,7 @@ wg_import_peers() {
                   --arg gw "$is_gw" \
                   --arg lans "$lans" \
                   --arg ptype "$peer_type" \
+                  --arg route_mode "$route_mode" \
             '.peers += [{
                 name: $name,
                 ip: $ip,
@@ -256,15 +311,16 @@ wg_import_peers() {
                 created: $created,
                 is_gateway: ($gw == "true"),
                 lan_subnets: $lans,
-                peer_type: $ptype
+                peer_type: $ptype,
+                route_mode: $route_mode
             }]'
         imported=$((imported + 1))
         i=$((i + 1))
     done
 
     if [[ $imported -gt 0 ]]; then
-        wg_rebuild_uci_conf
-        wg_rebuild_conf
+        wg_rebuild_uci_conf "no_reload"
+        wg_apply_runtime_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
         wg_regenerate_client_confs
     fi
     echo ""
@@ -342,7 +398,9 @@ wg_main_menu() {
         if wg_is_installed; then
             local role
             role=$(wg_get_role)
-            if [[ "$role" == "server" || -f "$WG_CONF" ]]; then
+            local server_private_key=""
+            server_private_key=$(wg_db_get '.server.private_key // empty')
+            if [[ "$role" == "server" ]] || { [[ "$role" == "none" || -z "$role" ]] && [[ -f "$WG_CONF" ]] && [[ -n "$server_private_key" && "$server_private_key" != "null" ]]; }; then
                 [[ "$role" == "server" ]] || wg_set_role "server"
                 print_title "WireGuard VPN"
                 local srv_name

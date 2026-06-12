@@ -40,15 +40,19 @@ wg_deb_setup_watchdog() {
     if [[ -z "$auto_mode" ]]; then
         print_title "WireGuard 服务端看门狗 (Debian)"
         echo "看门狗功能:
-  • 每分钟检测 wg0 接口状态
+  • 每分钟检测 ${WG_DEB_INTERFACE} 接口状态
   • 接口消失 → 自动 systemctl restart
   • wg show 失败 → 自动重启"
         if ! confirm "启用看门狗?"; then pause; return; fi
     fi
 
     # ── Debian 看门狗 (systemctl 管理) ──
-    cat > "$watchdog_script" << 'WDEOF_DEB'
+    {
+        cat << 'WDEOF_DEB'
 #!/bin/bash
+WDEOF_DEB
+        printf 'WG_DEB_INTERFACE=%q\n' "$WG_DEB_INTERFACE"
+        cat << 'WDEOF_DEB'
 LOG="/var/log/wg-watchdog.log"
 MAX_LOG_SIZE=32768
 
@@ -61,19 +65,20 @@ wdlog() {
 }
 
 # 检测接口存活
-if ! ip link show wg0 &>/dev/null; then
-    wdlog "wg0 down, restarting via systemctl"
-    systemctl restart wg-quick@wg0
+if ! ip link show "$WG_DEB_INTERFACE" &>/dev/null; then
+    wdlog "${WG_DEB_INTERFACE} down, restarting via systemctl"
+    systemctl restart "wg-quick@${WG_DEB_INTERFACE}"
     exit 0
 fi
 
 # 检测 wg show 是否正常
-if ! wg show wg0 &>/dev/null; then
-    wdlog "wg show failed, restarting"
-    systemctl restart wg-quick@wg0
+if ! wg show "$WG_DEB_INTERFACE" &>/dev/null; then
+    wdlog "wg show ${WG_DEB_INTERFACE} failed, restarting"
+    systemctl restart "wg-quick@${WG_DEB_INTERFACE}"
     exit 0
 fi
 WDEOF_DEB
+    } > "$watchdog_script"
     chmod +x "$watchdog_script"
     cron_add_job "wg-watchdog.sh" "* * * * * $watchdog_script >/dev/null 2>&1"
     echo ""
@@ -94,7 +99,7 @@ wg_deb_export_peers() {
         pause; return
     fi
     local export_file
-    export_file=$(mktemp "/tmp/${SCRIPT_NAME}-wg-peers-XXXXXX.json")
+    export_file=$(mktemp "/tmp/${SCRIPT_NAME}-wg-peers.XXXXXX") || { print_error "无法创建导出文件"; pause; return 1; }
     chmod 600 "$export_file"
     if jq '{
         export_version: 2,
@@ -173,7 +178,7 @@ wg_deb_import_peers() {
     local imported=0 skipped=0
     local i=0
     while [[ $i -lt $import_count ]]; do
-        local name ip privkey pubkey psk allowed enabled is_gw lans created peer_type
+        local name ip privkey pubkey psk allowed enabled is_gw lans created peer_type route_mode
         name=$(jq -r ".peers[$i].name" "$import_file")
         ip=$(jq -r ".peers[$i].ip" "$import_file")
         privkey=$(jq -r ".peers[$i].private_key" "$import_file")
@@ -185,9 +190,38 @@ wg_deb_import_peers() {
         lans=$(jq -r ".peers[$i].lan_subnets // empty" "$import_file")
         created=$(jq -r ".peers[$i].created // empty" "$import_file")
         peer_type=$(jq -r ".peers[$i].peer_type // empty" "$import_file")
+        route_mode=$(jq -r ".peers[$i].route_mode // empty" "$import_file")
         if [[ -z "$peer_type" || "$peer_type" == "null" ]]; then
             [[ "$is_gw" == "true" ]] && peer_type="gateway" || peer_type="standard"
         fi
+        [[ -z "$route_mode" || "$route_mode" == "null" ]] && route_mode="managed"
+        [[ "$enabled" == "true" || "$enabled" == "false" ]] || enabled=true
+        [[ "$is_gw" == "true" || "$is_gw" == "false" ]] || is_gw=false
+
+        if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            print_warn "跳过: $name (名称格式无效)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
+        if ! validate_ip "$ip"; then
+            print_warn "跳过: $name (IP 格式无效: $ip)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
+        if [[ -z "$allowed" || "$allowed" == "null" ]] || ! validate_cidr_list "$allowed"; then
+            print_warn "跳过: $name (AllowedIPs 格式无效: $allowed)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
+        if ! validate_cidr_list "$lans"; then
+            print_warn "跳过: $name (LAN 网段格式无效: $lans)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
+        case "$peer_type" in
+            standard|gateway) ;;
+            *) print_warn "跳过: $name (设备类型无效: $peer_type)"; skipped=$((skipped + 1)); i=$((i + 1)); continue ;;
+        esac
+        case "$route_mode" in
+            managed|custom|full|vpn) ;;
+            *) print_warn "跳过: $name (路由模式无效: $route_mode)"; skipped=$((skipped + 1)); i=$((i + 1)); continue ;;
+        esac
 
         # 检查重名
         local exists
@@ -209,10 +243,22 @@ wg_deb_import_peers() {
             pubkey=$(echo "$privkey" | wg pubkey)
             psk=$(wg genpsk)
         fi
+        if ! validate_wg_key "$privkey"; then
+            print_warn "跳过: $name (私钥格式无效)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
+        if ! validate_wg_key "$pubkey"; then
+            print_warn "跳过: $name (公钥格式无效)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
+        if ! validate_wg_key "$psk"; then
+            print_warn "跳过: $name (预共享密钥格式无效)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
 
         [[ -z "$created" || "$created" == "null" ]] && created=$(date '+%Y-%m-%d %H:%M:%S')
 
-        wg_deb_db_set --arg name "$name" \
+        if ! wg_deb_db_set --arg name "$name" \
                   --arg ip "$ip" \
                   --arg privkey "$privkey" \
                   --arg pubkey "$pubkey" \
@@ -223,6 +269,7 @@ wg_deb_import_peers() {
                   --arg gw "$is_gw" \
                   --arg lans "$lans" \
                   --arg ptype "$peer_type" \
+                  --arg route_mode "$route_mode" \
             '.peers += [{
                 name: $name,
                 ip: $ip,
@@ -234,18 +281,18 @@ wg_deb_import_peers() {
                 created: $created,
                 is_gateway: ($gw == "true"),
                 lan_subnets: $lans,
-                peer_type: $ptype
-            }]'
+                peer_type: $ptype,
+                route_mode: $route_mode
+            }]'; then
+            print_error "跳过: $name (数据库写入失败)"
+            skipped=$((skipped + 1)); i=$((i + 1)); continue
+        fi
         imported=$((imported + 1))
         i=$((i + 1))
     done
 
     if [[ $imported -gt 0 ]]; then
-        wg_deb_rebuild_conf
-        wg_deb_regenerate_client_confs
-        if wg_deb_is_running; then
-            systemctl restart wg-quick@wg0 >/dev/null 2>&1
-        fi
+        wg_deb_apply_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
     fi
     echo ""
     print_success "导入完成: 成功 ${imported}, 跳过 ${skipped}"
@@ -292,7 +339,7 @@ wg_deb_server_menu() {
             3) wg_deb_delete_peer ;;
             4) wg_deb_toggle_peer ;;
             5) wg_deb_show_peer_conf ;;
-            6) wg_generate_clash_config ;;
+            6) wg_deb_generate_clash_config ;;
             7) wg_deb_start; pause ;;
             8) wg_deb_stop; pause ;;
             9) wg_deb_restart; pause ;;
@@ -317,7 +364,9 @@ wg_deb_main_menu() {
         if wg_deb_is_installed; then
             local role
             role=$(wg_deb_get_role)
-            if [[ "$role" == "server" || -f "$WG_DEB_CONF" ]]; then
+            local server_private_key=""
+            server_private_key=$(wg_deb_db_get '.server.private_key // empty')
+            if [[ "$role" == "server" ]] || { [[ "$role" == "none" || -z "$role" ]] && [[ -f "$WG_DEB_CONF" ]] && [[ -n "$server_private_key" && "$server_private_key" != "null" ]]; }; then
                 [[ "$role" == "server" ]] || wg_deb_set_role "server"
                 print_title "WireGuard VPN"
                 local srv_name

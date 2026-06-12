@@ -7,15 +7,15 @@
 #   11e -> Clash/OpenClash config
 #   11g -> watchdog + import/export + menus
 readonly WG_INTERFACE="wg0"
-readonly WG_DB_DIR="/etc/wireguard/db"
-readonly WG_DB_FILE="${WG_DB_DIR}/wg-data.json"
+readonly WG_DB_DIR="${WG_SHARED_DB_DIR}"
+readonly WG_DB_FILE="${WG_SHARED_DB_FILE}"
 readonly WG_CONF="/etc/wireguard/${WG_INTERFACE}.conf"
-readonly WG_ROLE_FILE="/etc/wireguard/.role"
+readonly WG_ROLE_FILE="${WG_SHARED_ROLE_FILE}"
 
-wg_db_init() {
-    mkdir -p "$WG_DB_DIR"
-    [[ -f "$WG_DB_FILE" ]] && return 0
-    cat > "$WG_DB_FILE" << 'WGEOF'
+wg_shared_db_init() {
+    mkdir -p "$WG_SHARED_DB_DIR"
+    [[ -f "$WG_SHARED_DB_FILE" ]] && return 0
+    cat > "$WG_SHARED_DB_FILE" << 'WGEOF'
 {
   "role": "",
   "server": {},
@@ -23,48 +23,14 @@ wg_db_init() {
   "client": {}
 }
 WGEOF
-    chmod 600 "$WG_DB_FILE"
+    chmod 600 "$WG_SHARED_DB_FILE"
 }
 
-wg_db_migrate() {
-    [[ ! -f "$WG_DB_FILE" ]] && return 0
-    local ver
-    ver=$(wg_db_get '.schema_version // 0')
-    [[ "$ver" -ge 2 ]] && return 0
-    print_info "数据库迁移: v${ver} → v2 ..."
-    # 删除 overseas 相关字段
-    wg_db_set 'del(.server.deploy_mode, .server.tunnel_type,
-        .server.vless_port, .server.vless_uuid, .server.vless_network,
-        .server.vless_flow, .server.reality_public_key,
-        .server.reality_private_key, .server.reality_short_id,
-        .server.reality_sni, .server.reality_dest)' 2>/dev/null || true
-    # 为每个 peer 补充 peer_type
-    local pc i=0
-    pc=$(wg_db_get '.peers | length')
-    while [[ $i -lt ${pc:-0} ]]; do
-        local existing_type
-        existing_type=$(wg_db_get ".peers[$i].peer_type // empty")
-        if [[ -z "$existing_type" || "$existing_type" == "null" ]]; then
-            local is_gw
-            is_gw=$(wg_db_get ".peers[$i].is_gateway // false")
-            if [[ "$is_gw" == "true" ]]; then
-                wg_db_set --argjson idx "$i" '.peers[$idx].peer_type = "gateway"'
-            else
-                wg_db_set --argjson idx "$i" '.peers[$idx].peer_type = "standard"'
-            fi
-        fi
-        i=$((i + 1))
-    done
-    # 设置版本号
-    wg_db_set '.schema_version = 2'
-    print_success "数据库迁移完成"
-}
+wg_shared_db_get() { jq -r "$@" "$WG_SHARED_DB_FILE" 2>/dev/null; }
 
-wg_db_get() { jq -r "$@" "$WG_DB_FILE" 2>/dev/null; }
-
-wg_db_set() {
+wg_shared_db_set() {
     local tmp
-    tmp=$(mktemp "${WG_DB_DIR}/.tmp.XXXXXX") || { print_error "无法创建临时文件"; return 1; }
+    tmp=$(mktemp "${WG_SHARED_DB_DIR}/.tmp.XXXXXX") || { print_error "无法创建临时文件"; return 1; }
     (
         if [[ "$PLATFORM" == "openwrt" ]]; then
             local _retry=0
@@ -76,31 +42,38 @@ wg_db_set() {
         else
             flock -w 5 200 || { rm -f "$tmp"; print_error "无法获取数据库锁"; return 1; }
         fi
-        if jq "$@" "$WG_DB_FILE" > "$tmp" 2>/dev/null; then
-            mv "$tmp" "$WG_DB_FILE"; chmod 600 "$WG_DB_FILE"
+        if jq "$@" "$WG_SHARED_DB_FILE" > "$tmp" 2>/dev/null; then
+            mv "$tmp" "$WG_SHARED_DB_FILE"; chmod 600 "$WG_SHARED_DB_FILE"
         else
             rm -f "$tmp"; print_error "数据库写入失败"; return 1
         fi
-    ) 200>"${WG_DB_FILE}.lock"
+    ) 200>"${WG_SHARED_DB_FILE}.lock"
 }
 
-wg_get_role() {
+wg_shared_get_role() {
     local role=""
-    [[ -f "$WG_ROLE_FILE" ]] && role=$(cat "$WG_ROLE_FILE" 2>/dev/null)
-    [[ -z "$role" && -f "$WG_DB_FILE" ]] && role=$(wg_db_get '.role // empty')
-    if [[ -z "$role" && -f "$WG_DB_FILE" ]]; then
-        local spk=$(wg_db_get '.server.private_key // empty')
+    [[ -f "$WG_SHARED_ROLE_FILE" ]] && role=$(cat "$WG_SHARED_ROLE_FILE" 2>/dev/null)
+    [[ -z "$role" && -f "$WG_SHARED_DB_FILE" ]] && role=$(wg_shared_db_get '.role // empty')
+    if [[ -z "$role" && -f "$WG_SHARED_DB_FILE" ]]; then
+        local spk
+        spk=$(wg_shared_db_get '.server.private_key // empty')
         [[ -n "$spk" ]] && role="server"
     fi
     echo "${role:-none}"
 }
 
-wg_set_role() {
+wg_shared_set_role() {
     mkdir -p /etc/wireguard
-    echo "$1" > "$WG_ROLE_FILE"
-    chmod 600 "$WG_ROLE_FILE"
-    wg_db_set --arg r "$1" '.role = $r' 2>/dev/null || true
+    echo "$1" > "$WG_SHARED_ROLE_FILE"
+    chmod 600 "$WG_SHARED_ROLE_FILE"
+    wg_shared_db_set --arg r "$1" '.role = $r' 2>/dev/null || true
 }
+
+wg_db_init() { wg_shared_db_init; }
+wg_db_get() { wg_shared_db_get "$@"; }
+wg_db_set() { wg_shared_db_set "$@"; }
+wg_get_role() { wg_shared_get_role; }
+wg_set_role() { wg_shared_set_role "$@"; }
 
 wg_is_installed() { command_exists wg && [[ -f "$WG_DB_FILE" ]]; }
 wg_is_running()   { ip link show "$WG_INTERFACE" &>/dev/null; }
@@ -212,7 +185,7 @@ wg_next_ip() {
     local next
     for next in $(seq 2 254); do
         local candidate="${prefix}.${next}"
-        echo "$used_ips" | grep -qw "$candidate" || { echo "$candidate"; return 0; }
+        printf '%s\n' $used_ips | grep -Fxq -- "$candidate" || { echo "$candidate"; return 0; }
     done
     print_error "子网 IP 已耗尽"; return 1
 }
@@ -231,6 +204,7 @@ wg_format_bytes() {
 
 wg_rebuild_uci_conf() {
     [[ "$(wg_get_role)" != "server" ]] && return 1
+    local apply_mode="${1:-reload}"
     local priv_key port subnet server_ip mask mtu
     priv_key=$(wg_db_get '.server.private_key')
     port=$(wg_db_get '.server.port')
@@ -298,14 +272,34 @@ wg_rebuild_uci_conf() {
 
     uci commit network
 
-    # --- 如果 wg0 正在运行，热重载配置 ---
-    if wg_is_running; then
+    # --- 非 peer 热应用路径仍允许重启接口；peer 操作传 no_reload 后用 wg syncconf 热同步 ---
+    if wg_is_running && [[ "$apply_mode" != "no_reload" ]]; then
         ifdown wg0 2>/dev/null
         sleep 1
         ifup wg0 2>/dev/null
         sleep 1
         wg_sync_peer_routes
     fi
+}
+
+wg_apply_runtime_conf() {
+    wg_rebuild_conf || return 1
+    wg_is_running || return 0
+    local tmp
+    tmp=$(mktemp "/tmp/${SCRIPT_NAME}-wg-sync.XXXXXX") || return 1
+    awk '
+        /^\[Interface\]$/ { section="interface"; print; next }
+        /^\[Peer\]$/ { section="peer"; print; next }
+        section=="interface" && /^(PrivateKey|ListenPort|FwMark)[[:space:]]*=/ { print; next }
+        section=="peer" && /^(PublicKey|PresharedKey|AllowedIPs|Endpoint|PersistentKeepalive)[[:space:]]*=/ { print; next }
+    ' "$WG_CONF" > "$tmp"
+    if wg syncconf "$WG_INTERFACE" "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        wg_sync_peer_routes
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
 }
 
 # 同步网关 peer 的 LAN 路由到内核路由表
@@ -346,6 +340,9 @@ wg_rebuild_conf() {
     mask=$(echo "$subnet" | cut -d'/' -f2)
     mtu=$(wg_db_get '.server.mtu // empty')
     [[ -z "$mtu" || "$mtu" == "null" ]] && mtu=$WG_MTU_DIRECT
+    local old_umask _rc
+    old_umask=$(umask)
+    umask 077
     {
         echo "[Interface]"
         echo "PrivateKey = ${priv_key}"
@@ -371,6 +368,9 @@ wg_rebuild_conf() {
             i=$((i + 1))
         done
     } > "$WG_CONF"
+    _rc=$?
+    umask "$old_umask"
+    [[ $_rc -eq 0 ]] || return 1
     chmod 600 "$WG_CONF"
 }
 

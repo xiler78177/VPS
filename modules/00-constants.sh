@@ -1,12 +1,14 @@
 # modules/00-constants.sh - 全局常量、变量、平台检测
 readonly VERSION="v14.1"
 readonly SCRIPT_NAME="server-manage"
-readonly LOG_FILE="/var/log/${SCRIPT_NAME}.log"
 readonly CONFIG_FILE="/etc/${SCRIPT_NAME}.conf"
 readonly CACHE_DIR="/var/cache/${SCRIPT_NAME}"
 readonly CACHE_FILE="${CACHE_DIR}/sysinfo.cache"
 readonly CACHE_TTL=300 
 readonly CERT_HOOKS_DIR="/root/cert-hooks"
+readonly WG_SHARED_DB_DIR="/etc/wireguard/db"
+readonly WG_SHARED_DB_FILE="${WG_SHARED_DB_DIR}/wg-data.json"
+readonly WG_SHARED_ROLE_FILE="/etc/wireguard/.role"
 readonly WG_DEFAULT_PORT=50000
 readonly WG_MTU_DIRECT=1420
 PLATFORM="debian"
@@ -22,9 +24,15 @@ detect_platform() {
         esac
     elif command -v opkg &>/dev/null; then
         PLATFORM="openwrt"
-    fi
+fi
 }
 detect_platform
+
+if [[ "$PLATFORM" == "openwrt" ]]; then
+    readonly LOG_FILE="/root/.server-manage/log/${SCRIPT_NAME}.log"
+else
+    readonly LOG_FILE="/var/log/${SCRIPT_NAME}.log"
+fi
 
 feature_blocked() {
     echo -e "${C_YELLOW}[!] 功能不可用: $1${C_RESET}"
@@ -56,6 +64,7 @@ DOCKER_PROXY_CONF="${DOCKER_PROXY_DIR}/http-proxy.conf"
 # 注意：$CONFIG_FILE 的安全加载在 01-utils.sh 末尾完成（需依赖 validate_conf_file）
 
 CURRENT_SSH_PORT=""
+CURRENT_SSH_PORTS=""
 APT_UPDATED=0
 
 CACHED_IPV4=""

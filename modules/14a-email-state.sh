@@ -154,6 +154,12 @@ _email_export_wrangler_env() {
     export CLOUDFLARE_ACCOUNT_ID="${CF_ACCOUNT_ID:-}"
 }
 
+_email_clear_sensitive_env() {
+    unset CF_API_TOKEN CF_ACCOUNT_ID CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID
+    unset EMAIL_RESEND_TOKEN EMAIL_RESEND_DKIM EMAIL_JWT_SECRET EMAIL_ADMIN_PASSWORD
+    trap - RETURN 2>/dev/null || true
+}
+
 # 统一调用上游项目本地 Wrangler。
 # Cloudflare 官方推荐 Wrangler 作为项目依赖安装；cloudflare_temp_email 的 worker/frontend/pages
 # package.json 也都把 wrangler 放在 devDependencies，避免全局 wrangler 与项目锁定版本漂移。
@@ -202,11 +208,12 @@ email_run() {
     email_state_init_dirs
     email_log "===== $label ====="
     printf '%b' "${C_BLUE}[..]${C_RESET} $label..."
-    if "$@" >> "$EMAIL_LOG_FILE" 2>&1; then
+    "$@" >> "$EMAIL_LOG_FILE" 2>&1
+    local rc=$?
+    if (( rc == 0 )); then
         printf '\r%b\n' "${C_GREEN}[✓]${C_RESET} $label                                                  "
         return 0
     fi
-    local rc=$?
     printf '\r%b\n' "${C_RED}[✗]${C_RESET} $label (exit=$rc)                                            "
     echo -e "${C_GRAY}最近日志 (${EMAIL_LOG_FILE} 末 30 行，敏感字段已脱敏)：${C_RESET}"
     # tail 时过滤可能出现的 secret 明文（curl --data 的 secret_text、wrangler 输出 TOKEN 等）
@@ -238,8 +245,26 @@ _email_patch_pages_service_binding() {
         email_log "pages service binding 已是 ${EMAIL_WORKER_NAME}，跳过"
         return 0
     fi
-    sed -i.bak -E "s|^([[:space:]]*service[[:space:]]*=[[:space:]]*\")[^\"]+(\".*)$|\1${EMAIL_WORKER_NAME}\2|" "$pages_toml"
-    rm -f "${pages_toml}.bak"
+    local backup tmp
+    backup=$(mktemp "/tmp/server-manage-pages-wrangler.XXXXXX") || return 1
+    tmp=$(mktemp "${pages_dir}/.wrangler.toml.XXXXXX") || { rm -f "$backup"; return 1; }
+    cp -a "$pages_toml" "$backup" || { rm -f "$backup" "$tmp"; return 1; }
+    awk -v worker="$EMAIL_WORKER_NAME" '
+        /^[[:space:]]*service[[:space:]]*=/ {
+            sub(/"[^"]+"/, "\"" worker "\"")
+        }
+        { print }
+    ' "$pages_toml" > "$tmp" || { rm -f "$backup" "$tmp"; return 1; }
+    mv -f "$tmp" "$pages_toml" || { rm -f "$backup" "$tmp"; return 1; }
+    EMAIL_PAGES_TOML_BACKUP="$backup"
+    EMAIL_PAGES_TOML_BACKUP_TARGET="$pages_toml"
     email_log "Patched pages/wrangler.toml service binding → ${EMAIL_WORKER_NAME}"
     return 0
+}
+
+_email_restore_pages_service_binding() {
+    local backup="${EMAIL_PAGES_TOML_BACKUP:-}" target="${EMAIL_PAGES_TOML_BACKUP_TARGET:-}"
+    [[ -n "$backup" && -n "$target" && -f "$backup" ]] || return 0
+    mv -f "$backup" "$target" # restore wrangler.toml
+    unset EMAIL_PAGES_TOML_BACKUP EMAIL_PAGES_TOML_BACKUP_TARGET
 }

@@ -1,5 +1,57 @@
 # modules/09d-web-proxy.sh - 反向代理管理 + 主菜单
 
+_replace_proxy_pass_backend() {
+    local new_backend="${1:-}" conf_file="${2:-}"
+    [[ -n "$new_backend" && -f "$conf_file" ]] || return 1
+    NEW_BACKEND="$new_backend" awk '
+        BEGIN { new_backend = ENVIRON["NEW_BACKEND"] }
+        /^[[:space:]]*proxy_pass[[:space:]]+/ {
+            if (match($0, /proxy_pass[[:space:]]+[^;]+;/)) {
+                $0 = substr($0, 1, RSTART - 1) "proxy_pass " new_backend ";" substr($0, RSTART + RLENGTH)
+            }
+        }
+        { print }
+    ' "$conf_file"
+}
+
+_cert_name_matches_domain() {
+    local pattern="${1:-}" domain="${2:-}" suffix left
+    pattern="${pattern%.}"
+    domain="${domain%.}"
+    pattern="${pattern,,}"
+    domain="${domain,,}"
+    [[ -z "$pattern" || -z "$domain" ]] && return 1
+
+    [[ "$pattern" == "$domain" ]] && return 0
+
+    # RFC 6125 常见语义：*.example.com 只覆盖 api.example.com，
+    # 不覆盖 example.com 或 deep.api.example.com。
+    if [[ "$pattern" == \*.* ]]; then
+        suffix="${pattern#\*.}"
+        [[ -z "$suffix" || "$suffix" == *"*"* ]] && return 1
+        [[ "$domain" == *".${suffix}" ]] || return 1
+        left="${domain%.${suffix}}"
+        [[ -n "$left" && "$left" != *.* ]] && return 0
+    fi
+    return 1
+}
+
+_cert_covers_domain() {
+    local cert_file="${1:-}" domain="${2:-}" entry name
+    [[ -f "$cert_file" && -n "$domain" ]] || return 1
+    command -v openssl >/dev/null 2>&1 || return 1
+
+    while IFS= read -r entry; do
+        [[ "$entry" == *DNS:* ]] || continue
+        name="${entry#*DNS:}"
+        name="${name%%[[:space:]]*}"
+        name="${name%,}"
+        [[ -z "$name" ]] && continue
+        _cert_name_matches_domain "$name" "$domain" && return 0
+    done < <(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null | tr ',' '\n')
+    return 1
+}
+
 web_reverse_proxy_site() {
     local prefill_backend="${1:-}"
     print_title "添加反向代理网站"
@@ -57,10 +109,16 @@ web_reverse_proxy_site() {
     else
         # 尝试查找通配符证书或主域证书
         local parent_domain=$(echo "$DOMAIN" | sed 's/^[^.]*\.//')
-        if [[ -f "${CERT_PATH_PREFIX}/${parent_domain}/fullchain.pem" ]]; then
-            cert_dir="${CERT_PATH_PREFIX}/${parent_domain}"
-            print_success "使用主域证书: ${cert_dir}"
-            has_cert=1
+        local parent_cert="${CERT_PATH_PREFIX}/${parent_domain}/fullchain.pem"
+        local parent_key="${CERT_PATH_PREFIX}/${parent_domain}/privkey.pem"
+        if [[ -f "$parent_cert" && -f "$parent_key" ]]; then
+            if _cert_covers_domain "$parent_cert" "$DOMAIN"; then
+                cert_dir="${CERT_PATH_PREFIX}/${parent_domain}"
+                print_success "使用覆盖 ${DOMAIN} 的父域/通配符证书: ${cert_dir}"
+                has_cert=1
+            else
+                print_warn "检测到父域证书 ${CERT_PATH_PREFIX}/${parent_domain}，但证书 SAN 不覆盖 ${DOMAIN}，不能复用。"
+            fi
         fi
     fi
     if [[ $has_cert -eq 0 ]]; then
@@ -354,7 +412,7 @@ $(_nginx_tls_http2_block "$HTTPS_PORT")
     print_success "Nginx 反代配置已生效。"
     
     # 防火墙规则
-    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+    if ufw_is_active; then
         ufw allow "$HTTP_PORT/tcp" comment "ReverseProxy-HTTP" >/dev/null 2>&1 || true
         ufw allow "$HTTPS_PORT/tcp" comment "ReverseProxy-HTTPS" >/dev/null 2>&1 || true
         print_success "防火墙规则已更新。"
@@ -429,7 +487,14 @@ web_edit_reverse_proxy() {
         pause; return
     fi
     cp "$target_conf" "${target_conf}.bak"
-    sed -i "s|proxy_pass ${current_backend};|proxy_pass ${new_backend};|g" "$target_conf"
+    local tmp_conf
+    tmp_conf=$(mktemp "${target_conf}.tmp.XXXXXX") || { print_error "创建临时配置失败"; pause; return; }
+    if ! _replace_proxy_pass_backend "$new_backend" "$target_conf" > "$tmp_conf"; then
+        rm -f "$tmp_conf"
+        print_error "更新配置失败"
+        pause; return
+    fi
+    mv "$tmp_conf" "$target_conf"
     if nginx -t >/dev/null 2>&1; then
         _nginx_reload
         rm -f "${target_conf}.bak"
@@ -502,16 +567,17 @@ menu_web() {
                 read -e -r -p "选择 [1]: " renew_mode
                 renew_mode=${renew_mode:-1}
                 print_info "正在续签..."
+                local renew_log="/var/log/certbot-renew.log"
                 if [[ "$renew_mode" == "2" ]]; then
                     print_warn "强制续签: Let's Encrypt 限制每周 5 次相同证书"
                     if confirm "确认强制续签?"; then
-                        certbot renew --force-renewal 2>&1 | tee /tmp/certbot-renew.log
+                        certbot renew --force-renewal 2>&1 | tee "$renew_log"
                         local renew_rc=${PIPESTATUS[0]}
                     else
                         pause; continue
                     fi
                 else
-                    certbot renew 2>&1 | tee /tmp/certbot-renew.log
+                    certbot renew 2>&1 | tee "$renew_log"
                     local renew_rc=${PIPESTATUS[0]}
                 fi
                 if [[ ${renew_rc:-1} -ne 0 ]]; then

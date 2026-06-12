@@ -259,7 +259,7 @@ wg_modify_server() {
     echo -e "  当前 DNS:   ${C_GREEN}${cur_dns}${C_RESET}"
     echo -e "  当前端点:   ${C_GREEN}${cur_ep}${C_RESET}"
     [[ -n "$cur_lan" && "$cur_lan" != "null" ]] && echo -e "  当前 LAN:   ${C_GREEN}${cur_lan}${C_RESET}"
-    local changed=false
+    local changed=false lan_changed=false
 
     read -e -r -p "新监听端口 [${cur_port}]: " new_port
     new_port=${new_port:-$cur_port}
@@ -293,14 +293,25 @@ wg_modify_server() {
     read -e -r -p "新服务端 LAN 子网 [${cur_lan:-无}]: " new_lan
     new_lan=${new_lan:-$cur_lan}
     if [[ "$new_lan" != "$cur_lan" ]]; then
-        wg_db_set --arg l "$new_lan" '.server.server_lan_subnet = $l'
-        changed=true
-        print_info "LAN 子网将更改为 ${new_lan}"
+        if ! validate_cidr_list "$new_lan"; then
+            print_warn "LAN 子网格式无效，保持原值"
+            new_lan="$cur_lan"
+        else
+            wg_db_set --arg l "$new_lan" '.server.server_lan_subnet = $l'
+            changed=true
+            lan_changed=true
+            print_info "LAN 子网将更改为 ${new_lan}"
+        fi
     fi
 
     if [[ "$changed" != "true" ]]; then
         print_info "未做任何更改"
         pause; return
+    fi
+
+    if [[ "$lan_changed" == "true" ]]; then
+        _wg_update_peer_routes
+        wg_mihomo_bypass_rebuild 2>/dev/null || true
     fi
 
     wg_rebuild_uci_conf
@@ -511,6 +522,32 @@ wg_restart() {
 
 # ── Mihomo bypass 函数 ──
 
+_wg_rc_local_insert_block() {
+    local rc_block="${1:-}" rc_file="${2:-/etc/rc.local}"
+    [[ -n "$rc_block" ]] || return 1
+    local tmp_block tmp_out
+    tmp_block=$(mktemp "/tmp/${SCRIPT_NAME}-wg-rc-block.XXXXXX") || return 1
+    tmp_out=$(mktemp "/tmp/${SCRIPT_NAME}-wg-rc-local.XXXXXX") || { rm -f "$tmp_block"; return 1; }
+    if [[ ! -f "$rc_file" ]]; then
+        printf '#!/bin/sh\nexit 0\n' > "$rc_file" 2>/dev/null || { rm -f "$tmp_block" "$tmp_out"; return 1; }
+        chmod +x "$rc_file" 2>/dev/null || true
+    fi
+    printf '%b\n' "$rc_block" > "$tmp_block"
+    if awk '
+        FNR == NR { block = block $0 ORS; next }
+        /^[[:space:]]*exit[[:space:]]+0([[:space:]]*(#.*)?)?$/ && !inserted { printf "%s", block; inserted=1 }
+        { print }
+        END { if (!inserted) printf "%s", block }
+    ' "$tmp_block" "$rc_file" > "$tmp_out"; then
+        cat "$tmp_out" > "$rc_file"
+        chmod +x "$rc_file" 2>/dev/null || true
+        rm -f "$tmp_block" "$tmp_out"
+        return 0
+    fi
+    rm -f "$tmp_block" "$tmp_out"
+    return 1
+}
+
 wg_setup_mihomo_bypass() {
     local wg_subnet="${1:-$(wg_db_get '.server.subnet')}"
     [[ -z "$wg_subnet" || "$wg_subnet" == "null" ]] && return 1
@@ -577,12 +614,7 @@ wg_setup_mihomo_bypass() {
         fi
         pi=$((pi + 1))
     done
-    if grep -q "^exit 0" /etc/rc.local 2>/dev/null; then
-        sed -i "/^exit 0/i\\
-${rc_block}" /etc/rc.local 2>/dev/null || true
-    else
-        echo -e "$rc_block" >> /etc/rc.local
-    fi
+    _wg_rc_local_insert_block "$rc_block" || print_warn "写入 /etc/rc.local 持久化规则失败"
 
     print_success "Mihomo bypass 规则已配置 (${#unique_subnets[@]} 个子网)"
 }
@@ -667,13 +699,8 @@ wg_mihomo_bypass_rebuild() {
         nft insert rule inet fw4 input_wan udp dport "$wg_port" counter accept comment \"wg_allow_port\" 2>/dev/null || true
         # 持久化到 /etc/rc.local
         sed -i '/wg_allow_port/d' /etc/rc.local 2>/dev/null || true
-        if grep -q "^exit 0" /etc/rc.local 2>/dev/null; then
-            sed -i "/^exit 0/i\\
-nft insert rule inet fw4 input_wan udp dport ${wg_port} counter accept comment \\\"wg_allow_port\\\" 2>/dev/null || true" \
-                /etc/rc.local 2>/dev/null || true
-        else
-            echo "nft insert rule inet fw4 input_wan udp dport ${wg_port} counter accept comment \"wg_allow_port\" 2>/dev/null || true" >> /etc/rc.local
-        fi
+        local rc_block="nft insert rule inet fw4 input_wan udp dport ${wg_port} counter accept comment \\\"wg_allow_port\\\" 2>/dev/null || true"
+        _wg_rc_local_insert_block "$rc_block" || print_warn "写入 /etc/rc.local 端口放行规则失败"
         # uci 持久化防火墙规则
         if ! uci -q get firewall.wg_allow_port &>/dev/null; then
             uci set firewall.wg_allow_port=rule
@@ -759,8 +786,7 @@ wg_uninstall() {
 
     print_info "[3/6] 清理 Mihomo bypass 和 nft 规则..."
     wg_mihomo_bypass_clean
-    # 清理策略路由
-    ip rule del lookup main prio 100 2>/dev/null || true
+    # 旧版 prio 100 策略路由没有可验证标记，不能粗暴删除第三方规则。
 
     print_info "[4/6] 清理看门狗和定时任务..."
     if crontab -l 2>/dev/null | grep -q "wg-watchdog.sh"; then
@@ -774,7 +800,6 @@ wg_uninstall() {
     rm -f "$WG_DB_FILE" 2>/dev/null || true
     rm -rf "$WG_DB_DIR" 2>/dev/null || true
     rm -f "$WG_ROLE_FILE" 2>/dev/null || true
-    rm -f /etc/wireguard/*.key 2>/dev/null || true
     rmdir /etc/wireguard 2>/dev/null || true
     rm -rf /tmp/.wg-wd-fail /tmp/.wg-watchdog-ping-fail \
            /tmp/.wg-db-tmp.json /tmp/clash-wg-*.yaml \
@@ -867,7 +892,7 @@ while uci get firewall.@forwarding[$i] >/dev/null 2>&1; do
 done
 
 # === 清理 Mihomo bypass 和 nft 规则 ===
-ip rule del lookup main prio 100 2>/dev/null; true
+# 旧版 prio 100 策略路由没有可验证标记，不能粗暴删除第三方规则。
 for h in $(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print $NF}'); do
     nft delete rule inet fw4 mangle_prerouting handle "$h" 2>/dev/null; true
 done

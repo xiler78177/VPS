@@ -2,6 +2,7 @@
 
 # ── 入口 ──
 email_deploy() {
+    trap '_email_clear_sensitive_env' RETURN
     print_title "Cloudflare Temp Email 一键部署"
     echo -e "${C_CYAN}项目: https://github.com/dreamhunter2333/cloudflare_temp_email${C_RESET}"
     echo ""
@@ -9,10 +10,10 @@ email_deploy() {
     # 已部署：让用户决定是否覆盖
     if email_state_load 2>/dev/null; then
         print_warn "检测到已有部署：${EMAIL_FRONTEND_DOMAIN:-?} / ${EMAIL_API_DOMAIN:-?}"
-        echo -e "${C_GRAY}如需修改密码/域名/Resend，请使用管理菜单；本流程会覆盖现有配置。${C_RESET}"
-        confirm "继续覆盖部署?" || { pause; return; }
-        local bak
-        bak=$(email_state_backup) && [[ -n "$bak" ]] && print_info "已备份旧 state → $bak"
+        print_error "已安装状态不允许直接覆盖部署，避免生成新的 D1/Pages 后丢失旧资源 ID。"
+        print_info "如需更新，请使用管理菜单【重新部署/升级】；如需重装，请先执行完整卸载。"
+        pause
+        return 1
     # 半成品（state 存在但 INSTALLED=0）：强警告，建议先卸载残留
     elif [[ -f "$EMAIL_STATE_FILE" ]] && validate_conf_file "$EMAIL_STATE_FILE" 2>/dev/null; then
         _email_state_reset_vars
@@ -78,7 +79,7 @@ email_deploy() {
 
 # ── 1. 环境依赖 ──
 _email_validate_dns_label() {
-    [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
+    validate_dns_label "${1:-}"
 }
 
 # 当 Token 可见多个 Account 时，强制让用户选；只有 1 个时静默选用
@@ -129,8 +130,12 @@ _email_deploy_check_env() {
     done
 
     if ! command_exists node; then
-        email_run "安装 Node.js LTS" bash -c '
-            curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - >/dev/null 2>&1
+        email_run "安装 Node.js LTS" bash -o pipefail -c '
+            set -e
+            tmp=$(mktemp)
+            trap "rm -f \"$tmp\"" EXIT
+            curl -fsSL https://deb.nodesource.com/setup_lts.x -o "$tmp"
+            bash "$tmp" >/dev/null 2>&1
             apt-get install -y -qq nodejs
         ' || { print_error "Node.js 安装失败，请手动安装"; return 1; }
     fi
@@ -253,11 +258,23 @@ _email_deploy_collect_inputs() {
 # ── 2b. Worker 名字决策（需要 Token 已验证）──
 _email_deploy_pick_worker_name() {
     local default_name="cloudflare_temp_email"
-    if ! _email_cf_worker_exists "$default_name"; then
-        EMAIL_WORKER_NAME="$default_name"
-        print_success "Worker 名: $EMAIL_WORKER_NAME"
-        return 0
-    fi
+    local exists_rc
+    _email_cf_worker_exists "$default_name"
+    exists_rc=$?
+    case "$exists_rc" in
+        1)
+            EMAIL_WORKER_NAME="$default_name"
+            print_success "Worker 名: $EMAIL_WORKER_NAME"
+            return 0
+            ;;
+        0)
+            ;;
+        *)
+            print_error "无法确认默认 Worker 是否存在，已中止以避免覆盖生产 Worker"
+            print_info "请检查 Cloudflare Token 权限、Account ID 与网络后重试。"
+            return 1
+            ;;
+    esac
     print_warn "账户已存在名为 ${default_name} 的 Worker"
     echo "  1. 取消部署"
     echo "  2. 使用自定义 Worker 名"
@@ -276,10 +293,20 @@ _email_deploy_pick_worker_name() {
                     print_error "名字格式无效（需以小写字母开头）"
                     continue
                 fi
-                if _email_cf_worker_exists "$new_name"; then
-                    print_error "$new_name 也已存在，请换一个"
-                    continue
-                fi
+                _email_cf_worker_exists "$new_name"
+                exists_rc=$?
+                case "$exists_rc" in
+                    0)
+                        print_error "$new_name 也已存在，请换一个"
+                        continue
+                        ;;
+                    1)
+                        ;;
+                    *)
+                        print_error "无法确认 $new_name 是否存在，已中止以避免覆盖生产 Worker"
+                        return 1
+                        ;;
+                esac
                 EMAIL_WORKER_NAME="$new_name"
                 print_success "Worker 名: $EMAIL_WORKER_NAME"
                 return 0
@@ -373,8 +400,9 @@ EOF
 
 # ── 5. 完整 wrangler.toml ──
 _email_deploy_render_toml() {
-    local domains_json prefix_val
+    local domains_json prefix_val admin_json
     domains_json="[\"${EMAIL_DOMAIN}\"]"
+    admin_json=$(jq -nc --arg p "$EMAIL_ADMIN_PASSWORD" '[$p]')
     # 上游 Worker 直接把 PREFIX 拼到 local-part 前面（无分隔符）。
     # 为得到用户在确认页看到的 "prefix.xxx@domain" 形态，写入 wrangler.toml 时自动补 "."
     # 末尾。用户已带 "." 时不重复。
@@ -419,6 +447,7 @@ BLACK_LIST = ""
 ENABLE_USER_CREATE_EMAIL = true
 ENABLE_USER_DELETE_EMAIL = true
 ENABLE_AUTO_REPLY = false
+ADMIN_PASSWORDS = ${admin_json}
 
 [[d1_databases]]
 binding = "DB"
@@ -475,16 +504,22 @@ _email_deploy_pages() {
         && print_success "Pages service binding 已确认: ${EMAIL_WORKER_NAME}" \
         || print_warn "pages/wrangler.toml service 未同步（文件可能缺失，请手工检查）"
 
-    email_run "安装 Pages 依赖" pnpm install --no-frozen-lockfile || return 1
+    email_run "安装 Pages 依赖" pnpm install --no-frozen-lockfile || {
+        _email_restore_pages_service_binding
+        return 1
+    }
 
     # 创建项目（已存在则忽略）
     if ! _email_cf_pages_project_create "$EMAIL_PAGES_PROJECT" 2>/dev/null; then
         email_log "Pages project create returned non-zero — 可能已存在，继续"
     fi
 
+    local deploy_rc=0
     email_run "部署 Pages (${EMAIL_PAGES_PROJECT})" \
         _email_wrangler pages deploy --project-name "$EMAIL_PAGES_PROJECT" \
-            --branch production --commit-dirty=true || return 1
+            --branch production --commit-dirty=true || deploy_rc=$?
+    _email_restore_pages_service_binding
+    [[ "$deploy_rc" -eq 0 ]] || return "$deploy_rc"
 
     EMAIL_PAGES_DOMAIN=$(_email_cf_pages_get_subdomain "$EMAIL_PAGES_PROJECT" 2>/dev/null)
     [[ -n "$EMAIL_PAGES_DOMAIN" ]] || EMAIL_PAGES_DOMAIN="${EMAIL_PAGES_PROJECT}.pages.dev"

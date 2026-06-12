@@ -48,7 +48,7 @@ wg_add_peer() {
                 read -e -r -p "LAN 网段: " lan_subnets
                 if [[ -z "$lan_subnets" ]]; then
                     print_warn "网关设备必须指定 LAN 网段"
-                elif ! echo "$lan_subnets" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+'; then
+                elif ! validate_cidr_list "$lan_subnets"; then
                     print_warn "格式无效，示例: 192.168.123.0/24"
                     lan_subnets=""
                 fi
@@ -65,13 +65,14 @@ wg_add_peer() {
     esac
 
     # ── 路由模式 ──
-    local client_allowed_ips server_subnet server_lan
+    local client_allowed_ips server_subnet server_lan route_mode="managed"
     server_subnet=$(wg_db_get '.server.subnet')
     server_lan=$(wg_db_get '.server.server_lan_subnet // empty')
 
     # 收集所有网关 LAN 网段 (含当前新设备)
     local all_lan_subnets=""
     local pc=$(wg_db_get '.peers | length') pi=0
+    local target_idx="$pc"
     while [[ $pi -lt $pc ]]; do
         local pls=$(wg_db_get ".peers[$pi].lan_subnets // empty")
         if [[ -n "$pls" && "$pls" != "null" ]]; then
@@ -125,9 +126,10 @@ wg_add_peer() {
         read -e -r -p "选择 [1]: " route_mode
         route_mode=${route_mode:-1}
         case $route_mode in
-            1) client_allowed_ips="0.0.0.0/0, ::/0" ;;
-            2) client_allowed_ips="$server_subnet" ;;
+            1) client_allowed_ips="0.0.0.0/0, ::/0"; route_mode="full" ;;
+            2) client_allowed_ips="$server_subnet"; route_mode="vpn" ;;
             3)
+                route_mode="managed"
                 client_allowed_ips="$server_subnet"
                 [[ -n "$server_lan" && "$server_lan" != "null" ]] && client_allowed_ips="${client_allowed_ips}, ${server_lan}"
                 [[ -n "$all_lan_subnets" ]] && client_allowed_ips="${client_allowed_ips}, ${all_lan_subnets}"
@@ -135,8 +137,15 @@ wg_add_peer() {
             4)
                 read -e -r -p "输入允许的 IP 范围 (逗号分隔): " client_allowed_ips
                 [[ -z "$client_allowed_ips" ]] && client_allowed_ips="0.0.0.0/0, ::/0"
+                if validate_wg_allowed_ips "$client_allowed_ips"; then
+                    route_mode="custom"
+                else
+                    print_warn "自定义路由格式无效，回退为仅 VPN 内网"
+                    client_allowed_ips="$server_subnet"
+                    route_mode="vpn"
+                fi
                 ;;
-            *) client_allowed_ips="0.0.0.0/0, ::/0" ;;
+            *) client_allowed_ips="0.0.0.0/0, ::/0"; route_mode="full" ;;
         esac
     fi
 
@@ -177,6 +186,7 @@ PersistentKeepalive = 25"
               --arg gw "$is_gateway" \
               --arg lans "$lan_subnets" \
               --arg ptype "$peer_type" \
+              --arg route_mode "$route_mode" \
     '.peers += [{
         name: $name,
         ip: $ip,
@@ -188,7 +198,8 @@ PersistentKeepalive = 25"
         created: $created,
         is_gateway: ($gw == "true"),
         lan_subnets: $lans,
-        peer_type: $ptype
+        peer_type: $ptype,
+        route_mode: $route_mode
     }]'
 
     # ── 网关设备: 联动更新其他 peer 的 allowed_ips ──
@@ -197,8 +208,8 @@ PersistentKeepalive = 25"
     fi
 
     # ── 重建配置并应用 ──
-    wg_rebuild_uci_conf
-    wg_rebuild_conf
+    wg_rebuild_uci_conf "no_reload"
+    wg_apply_runtime_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
     wg_regenerate_client_confs
 
     # 网关 peer 添加/删除会改变 LAN 子网列表，需重建 Mihomo bypass
@@ -265,6 +276,8 @@ _wg_update_peer_routes() {
         local _is_gw=$(wg_db_get ".peers[$_pi].is_gateway // false")
         local _own=$(wg_db_get ".peers[$_pi].lan_subnets // empty")
         local _ptype=$(wg_db_get ".peers[$_pi].peer_type // \"standard\"")
+        local _route_mode=$(wg_db_get ".peers[$_pi].route_mode // empty")
+        [[ "$_route_mode" == "custom" ]] && { _pi=$((_pi + 1)); continue; }
 
         if [[ "$_is_gw" == "true" ]]; then
             # 网关: VPN 子网 + 服务端 LAN + 其他网关 LAN (排除自己)
@@ -297,87 +310,6 @@ _wg_update_peer_routes() {
     done
 }
 
-wg_list_peers() {
-    wg_check_server || return 1
-    print_title "WireGuard 设备列表"
-    local peer_count
-    peer_count=$(wg_db_get '.peers | length')
-    if [[ "$peer_count" -eq 0 || "$peer_count" == "null" ]]; then
-        print_warn "暂无设备"
-        pause; return
-    fi
-    local wg_dump=""
-    wg_is_running && wg_dump=$(wg show "$WG_INTERFACE" dump 2>/dev/null | tail -n +2)
-    printf "${C_CYAN}%-4s %-14s %-14s %-8s %-8s %-10s %-10s %s${C_RESET}\n" \
-        "#" "名称" "IP" "类型" "状态" "↓接收" "↑发送" "最近握手"
-    draw_line
-    local i=0
-    while [[ $i -lt $peer_count ]]; do
-        local name ip pubkey enabled peer_type
-        name=$(wg_db_get ".peers[$i].name")
-        ip=$(wg_db_get ".peers[$i].ip")
-        pubkey=$(wg_db_get ".peers[$i].public_key")
-        enabled=$(wg_db_get ".peers[$i].enabled")
-        peer_type=$(wg_db_get ".peers[$i].peer_type // \"standard\"")
-        local type_str
-        case "$peer_type" in
-            clash)   type_str="${C_CYAN}Clash${C_RESET}" ;;
-            gateway) type_str="${C_YELLOW}网关${C_RESET}" ;;
-            *)       type_str="标准" ;;
-        esac
-        local status_str
-        if [[ "$enabled" != "true" ]]; then
-            status_str="${C_GRAY}禁用${C_RESET}"
-        else
-            status_str="${C_GREEN}启用${C_RESET}"
-        fi
-        local rx_bytes="0" tx_bytes="0" last_handshake="从未"
-        if [[ -n "$wg_dump" ]]; then
-            local peer_line
-            peer_line=$(echo "$wg_dump" | grep "^${pubkey}" 2>/dev/null)
-            if [[ -n "$peer_line" ]]; then
-                rx_bytes=$(echo "$peer_line" | awk '{print $6}')
-                tx_bytes=$(echo "$peer_line" | awk '{print $7}')
-                local hs_epoch
-                hs_epoch=$(echo "$peer_line" | awk '{print $5}')
-                if [[ -n "$hs_epoch" && "$hs_epoch" != "0" ]]; then
-                    local now_epoch diff
-                    now_epoch=$(date +%s)
-                    diff=$((now_epoch - hs_epoch))
-                    if [[ $diff -lt 60 ]]; then
-                        last_handshake="${diff}秒前"
-                        status_str="${C_GREEN}在线${C_RESET}"
-                    elif [[ $diff -lt 3600 ]]; then
-                        last_handshake="$((diff / 60))分前"
-                    elif [[ $diff -lt 86400 ]]; then
-                        last_handshake="$((diff / 3600))时前"
-                    else
-                        last_handshake="$((diff / 86400))天前"
-                    fi
-                fi
-            fi
-        fi
-        printf "%-4s %-14s %-14s %-8b %-8b %-10s %-10s %s\n" \
-            "$((i + 1))" "$name" "$ip" "$type_str" "$status_str" \
-            "$(wg_format_bytes "$rx_bytes")" "$(wg_format_bytes "$tx_bytes")" "$last_handshake"
-        i=$((i + 1))
-    done
-    echo -e "${C_CYAN}共 ${peer_count} 个设备${C_RESET}"
-    # 显示网关 LAN 信息
-    local gw_found=0 gi=0
-    while [[ $gi -lt $peer_count ]]; do
-        local gw_check=$(wg_db_get ".peers[$gi].is_gateway // false")
-        if [[ "$gw_check" == "true" ]]; then
-            [[ $gw_found -eq 0 ]] && { echo -e "${C_CYAN}网关设备 LAN 网段:${C_RESET}"; gw_found=1; }
-            local gw_name=$(wg_db_get ".peers[$gi].name")
-            local gw_lans=$(wg_db_get ".peers[$gi].lan_subnets // empty")
-            echo -e "  ${gw_name}: ${C_GREEN}${gw_lans:-未设置}${C_RESET}"
-        fi
-        gi=$((gi + 1))
-    done
-    pause
-}
-
 wg_toggle_peer() {
     wg_check_server || return 1
     print_title "启用/禁用 WireGuard 设备"
@@ -393,16 +325,16 @@ wg_toggle_peer() {
             if wg_is_running; then
                 wg set "$WG_INTERFACE" peer "$target_pubkey" remove 2>/dev/null || true
             fi
-            wg_rebuild_uci_conf
-            wg_rebuild_conf
+            wg_rebuild_uci_conf "no_reload"
+            wg_apply_runtime_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
             print_success "设备 '${target_name}' 已禁用"
             log_action "WireGuard peer disabled: ${target_name}"
         fi
     else
         if confirm "确认启用设备 '${target_name}'？"; then
             wg_db_set --argjson idx "$target_idx" '.peers[$idx].enabled = true'
-            wg_rebuild_uci_conf
-            wg_rebuild_conf
+            wg_rebuild_uci_conf "no_reload"
+            wg_apply_runtime_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
             print_success "设备 '${target_name}' 已启用"
             log_action "WireGuard peer enabled: ${target_name}"
         fi
@@ -434,8 +366,8 @@ wg_delete_peer() {
     fi
 
     rm -f "/etc/wireguard/clients/${target_name}.conf"
-    wg_rebuild_uci_conf
-    wg_rebuild_conf
+    wg_rebuild_uci_conf "no_reload"
+    wg_apply_runtime_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
     wg_regenerate_client_confs
 
     # 网关 peer 删除后 LAN 子网列表变化，需重建 Mihomo bypass
@@ -564,8 +496,7 @@ i=0; while uci get firewall.@zone[\$i] >/dev/null 2>&1; do
     case "\$zname" in wg|wireguard) uci delete "firewall.@zone[\$i]" 2>/dev/null; true; continue ;; esac
     i=\$((i + 1))
 done
-# clean ALL ip rules with prio 100 (old fake-ip bypass rules)
-while ip rule del prio 100 2>/dev/null; do true; done
+# 旧版 prio 100 规则没有可验证标记，不能粗暴删除全部 prio 100（可能属于第三方）。
 for h in \$(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print \$NF}'); do
     nft delete rule inet fw4 mangle_prerouting handle "\$h" 2>/dev/null; true
 done
@@ -649,22 +580,24 @@ fi
 
 # 持久化: rc.local 中使用外部 DNS 动态解析 (每次开机重新解析)
 sed -i '/wg_bypass/d; /WireGuard bypass/d; /wg_ep_resolve/d; /ip rule.*prio 100/d' /etc/rc.local 2>/dev/null; true
-if grep -q "^exit 0" /etc/rc.local 2>/dev/null; then
-    sed -i "/^exit 0/i # WireGuard bypass Mihomo (dynamic resolve, bypass fake-ip) # wg_bypass\\
-WG_EP=\\\$(nslookup '${ep_host}' 223.5.5.5 2>/dev/null | awk '/^Address:/{a=\\\$2} END{if(a) print a}') # wg_ep_resolve\\
-[ -n \\\"\\\$WG_EP\\\" ] \&\& { ip rule add to \\\"\\\$WG_EP\\\" lookup main prio 100 2>/dev/null; true; } # wg_bypass\\
-[ -n \\\"\\\$WG_EP\\\" ] \&\& nft insert rule inet fw4 mangle_prerouting ip daddr \\\"\\\$WG_EP\\\" udp dport ${sport} counter return comment \\\"wg_bypass\\\" 2>/dev/null; true # wg_bypass\\
-nft insert rule inet fw4 mangle_prerouting iifname \\\"wg0\\\" counter return comment \\\"wg_bypass_iface\\\" 2>/dev/null; true # wg_bypass" \\
-        /etc/rc.local 2>/dev/null; true
-else
-    cat >> /etc/rc.local << 'RCEOF'
-# WireGuard bypass Mihomo (dynamic resolve) # wg_bypass
+WG_RC_BLOCK="/tmp/wg-rc-block.\$\$"
+WG_RC_TMP="\$(mktemp /tmp/rc.local.XXXXXX 2>/dev/null || echo /tmp/rc.local.\$\$)"
+cat > "\$WG_RC_BLOCK" << 'WG_RC_EOF'
+# WireGuard bypass Mihomo (dynamic resolve, bypass fake-ip) # wg_bypass
 WG_EP=\$(nslookup '${ep_host}' 223.5.5.5 2>/dev/null | awk '/^Address:/{a=\$2} END{if(a) print a}') # wg_ep_resolve
 [ -n "\$WG_EP" ] && { ip rule add to "\$WG_EP" lookup main prio 100 2>/dev/null; true; } # wg_bypass
 [ -n "\$WG_EP" ] && nft insert rule inet fw4 mangle_prerouting ip daddr "\$WG_EP" udp dport ${sport} counter return comment "wg_bypass" 2>/dev/null; true # wg_bypass
 nft insert rule inet fw4 mangle_prerouting iifname "wg0" counter return comment "wg_bypass_iface" 2>/dev/null; true # wg_bypass
-RCEOF
-fi
+WG_RC_EOF
+[ -f /etc/rc.local ] || { printf '#!/bin/sh\nexit 0\n' > /etc/rc.local; chmod +x /etc/rc.local 2>/dev/null; }
+awk '
+    FNR == NR { block = block \$0 ORS; next }
+    /^[[:space:]]*exit[[:space:]]+0([[:space:]]*(#.*)?)?\$/ && !inserted { printf "%s", block; inserted=1 }
+    { print }
+    END { if (!inserted) printf "%s", block }
+' "\$WG_RC_BLOCK" /etc/rc.local > "\$WG_RC_TMP" && cat "\$WG_RC_TMP" > /etc/rc.local
+chmod +x /etc/rc.local 2>/dev/null; true
+rm -f "\$WG_RC_BLOCK" "\$WG_RC_TMP"
 
 # === 开机自恢复服务 ===
 cat > /etc/init.d/wg-client << 'INITEOF'
@@ -789,7 +722,7 @@ if [ -n "$EP_HOST" ] && ! echo "$EP_HOST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[
             nft delete rule inet fw4 mangle_prerouting handle "$h" 2>/dev/null; true
         done
         nft insert rule inet fw4 mangle_prerouting ip daddr "$RESOLVED" udp dport "$PORT" counter return comment "wg_bypass" 2>/dev/null; true
-        while ip rule del prio 100 2>/dev/null; do true; done
+        ip rule del to "$RESOLVED" lookup main prio 100 2>/dev/null; true
         ip rule add to "$RESOLVED" lookup main prio 100 2>/dev/null; true
         wdlog "bypass updated -> $RESOLVED"
     fi

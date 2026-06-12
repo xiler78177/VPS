@@ -38,6 +38,37 @@ _email_cf_api() {
     printf '%s' "$resp"
 }
 
+# DELETE 请求，将 HTTP 404（资源已不存在）视为幂等成功。
+# 卸载流程在部分失败后会保留 state 供重跑；若重跑时已删除的资源返回 404 仍被判失败，
+# 会导致 state 永远无法清除（死锁）。此 helper 让重复删除变为幂等。
+# 返回: 0 = 删除成功或资源本就不存在; 1 = token 缺失或确定性失败; 2 = 网络错误
+_email_cf_api_delete() {
+    # $1: path (不带前导 /)
+    local path="$1"
+    [[ -n "${CF_API_TOKEN:-}" ]] || { email_log "CF API token missing"; return 1; }
+    local url="https://api.cloudflare.com/client/v4/$path"
+    local out http resp ok
+    out=$(curl -sS --max-time 30 -w '\n%{http_code}' -X DELETE \
+        -H "Authorization: Bearer $CF_API_TOKEN" \
+        -H "Content-Type: application/json" \
+        "$url" 2>>"$EMAIL_LOG_FILE") || {
+        email_log "CF API network failure: DELETE $path"
+        return 2
+    }
+    http="${out##*$'\n'}"
+    resp="${out%$'\n'*}"
+    ok=$(echo "$resp" | jq -r '.success // false' 2>/dev/null)
+    [[ "$ok" == "true" ]] && return 0
+    if [[ "$http" == "404" ]]; then
+        email_log "CF API DELETE $path: 404 already gone, treated as success"
+        return 0
+    fi
+    local err
+    err=$(echo "$resp" | jq -r '.errors // [] | map("\(.code): \(.message)") | join("; ")' 2>/dev/null)
+    email_log "CF API DELETE $path failed: http=${http:-unknown} ${err:-<empty>}"
+    return 1
+}
+
 _email_cf_token_verify() {
     _email_cf_api GET "user/tokens/verify" >/dev/null
 }
@@ -96,7 +127,7 @@ _email_cf_dns_create() {
 _email_cf_dns_delete() {
     local zid="$1" rid="$2"
     [[ -z "$rid" || "$rid" == "null" ]] && return 0
-    _email_cf_api DELETE "zones/$zid/dns_records/$rid" >/dev/null
+    _email_cf_api_delete "zones/$zid/dns_records/$rid" >/dev/null
 }
 
 # 按 type+name 查找（用于清理脏数据 / 防重复添加）
@@ -129,7 +160,7 @@ _email_cf_pages_project_create() {
 
 _email_cf_pages_project_delete() {
     local name="$1"
-    _email_cf_api DELETE "accounts/$CF_ACCOUNT_ID/pages/projects/$name" >/dev/null
+    _email_cf_api_delete "accounts/$CF_ACCOUNT_ID/pages/projects/$name" >/dev/null
 }
 
 _email_cf_pages_get_subdomain() {
@@ -149,7 +180,38 @@ _email_cf_pages_attach_domain() {
 # ── Workers / D1 ──
 _email_cf_worker_exists() {
     local name="$1"
-    _email_cf_api GET "accounts/$CF_ACCOUNT_ID/workers/scripts/$name" >/dev/null 2>&1
+    [[ -n "${CF_API_TOKEN:-}" && -n "${CF_ACCOUNT_ID:-}" ]] || {
+        email_log "Worker exists check missing token/account: $name"
+        return 2
+    }
+    command_exists jq || {
+        email_log "Worker exists check requires jq: $name"
+        return 2
+    }
+
+    local enc_name url out resp http ok err
+    enc_name=$(_email_cf_urlencode "$name")
+    url="https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/$enc_name"
+    out=$(curl -sS --max-time 30 -w '\n%{http_code}' -X GET \
+        -H "Authorization: Bearer $CF_API_TOKEN" \
+        -H "Content-Type: application/json" \
+        "$url" 2>>"$EMAIL_LOG_FILE") || {
+        email_log "Worker exists check network failure: $name"
+        return 2
+    }
+    http="${out##*$'\n'}"
+    resp="${out%$'\n'*}"
+    ok=$(jq -r '.success // false' 2>/dev/null <<< "$resp")
+    if [[ "$ok" == "true" ]]; then
+        return 0
+    fi
+    if [[ "$http" == "404" ]]; then
+        email_log "Worker not found: $name"
+        return 1
+    fi
+    err=$(jq -r '.errors // [] | map("\(.code): \(.message)") | join("; ")' 2>/dev/null <<< "$resp")
+    email_log "Worker exists check indeterminate: name=$name http=${http:-unknown} errors=${err:-<empty>}"
+    return 2
 }
 
 _email_cf_pages_project_exists() {
@@ -159,7 +221,7 @@ _email_cf_pages_project_exists() {
 
 _email_cf_worker_delete() {
     local name="$1"
-    _email_cf_api DELETE "accounts/$CF_ACCOUNT_ID/workers/scripts/$name" >/dev/null
+    _email_cf_api_delete "accounts/$CF_ACCOUNT_ID/workers/scripts/$name" >/dev/null
 }
 
 _email_cf_worker_secret_put() {
@@ -174,7 +236,7 @@ _email_cf_worker_secret_put() {
 _email_cf_d1_delete() {
     local d1_id="$1"
     [[ -n "$d1_id" ]] || return 0
-    _email_cf_api DELETE "accounts/$CF_ACCOUNT_ID/d1/database/$d1_id" >/dev/null
+    _email_cf_api_delete "accounts/$CF_ACCOUNT_ID/d1/database/$d1_id" >/dev/null
 }
 
 # ── Email Routing ──
