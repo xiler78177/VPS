@@ -727,24 +727,36 @@ reality_find_realm_binary() {
     printf '%s\n' "$bin"
 }
 
+# 上游 zhboner/realm 发布包不附带任何 sha256/SHA256SUMS 校验文件，
+# 因此固定 Realm 版本并内置各架构校验值，既保留"下载后强制 sha256 校验"，
+# 又避免"校验文件缺失即拒绝安装"导致中转链路永远装不上。
+# 升级版本时需同步更新此处版本号与对应 sha256（来自官方发布包）。
+REALITY_REALM_VERSION="${REALITY_REALM_VERSION:-v2.9.4}"
+
+reality_realm_pinned_sha256() {
+    case "$1" in
+        x86_64-unknown-linux-gnu)  echo "9dec109386b8abc828b452d0d1cecde35b7a2f8cfa93eae757fe9c248ad07ddd" ;;
+        aarch64-unknown-linux-gnu) echo "1f7f06e82fe0ea798b5c8e8e32906ee212a7085629a1c5cef9957ca270fcad99" ;;
+        *) return 1 ;;
+    esac
+}
+
 reality_install_realm_binary() {
     command_exists curl || install_package "curl" "silent" || return 1
     command_exists tar || install_package "tar" "silent" || true
     if command_exists realm; then return 0; fi
-    local arch api url checksum_url tmp bin asset_name
+    local arch expected url tmp bin asset_name
     arch=$(reality_realm_arch) || { print_error "Realm 不支持当前架构"; return 1; }
-    api=$(curl -fsSL https://api.github.com/repos/zhboner/realm/releases/latest) || return 1
-    url=$(reality_select_realm_asset_url "$api" "$arch") || true
-    [[ -n "$url" ]] || { print_error "未找到 Realm ${arch} 发布包"; return 1; }
-    checksum_url=$(reality_select_realm_checksum_url "$api" "$url") || {
-        print_error "未找到 Realm 发布包 sha256 校验文件，已拒绝安装"
-        return 1
-    }
-    asset_name="$(basename "$url")"
+    expected=$(reality_realm_pinned_sha256 "$arch") || { print_error "无内置 Realm ${arch} 校验值，已拒绝安装"; return 1; }
+    asset_name="realm-${arch}.tar.gz"
+    url="https://github.com/zhboner/realm/releases/download/${REALITY_REALM_VERSION}/${asset_name}"
     tmp=$(mktemp -d)
-    curl -fsSL "$url" -o "$tmp/realm.tgz" || { rm -rf "$tmp"; return 1; }
-    curl -fsSL "$checksum_url" -o "$tmp/realm.sha256" || { rm -rf "$tmp"; return 1; }
-    reality_verify_sha256_file "$tmp/realm.tgz" "$tmp/realm.sha256" "$asset_name" || { rm -rf "$tmp"; return 1; }
+    curl -fsSL "$url" -o "$tmp/realm.tgz" || { print_error "Realm 发布包下载失败"; rm -rf "$tmp"; return 1; }
+    # 用内置校验值生成本地 checksum 文件，复用统一校验 helper（含 sha256sum -c）。
+    printf '%s  %s\n' "$expected" "$asset_name" > "$tmp/realm.sha256"
+    reality_verify_sha256_file "$tmp/realm.tgz" "$tmp/realm.sha256" "$asset_name" || {
+        print_error "Realm 发布包 sha256 校验失败，已拒绝安装"; rm -rf "$tmp"; return 1
+    }
     tar -xzf "$tmp/realm.tgz" -C "$tmp" || { rm -rf "$tmp"; return 1; }
     bin=$(reality_find_realm_binary "$tmp") || { print_error "Realm 发布包中未找到可安装二进制"; rm -rf "$tmp"; return 1; }
     install -m 0755 "$bin" /usr/local/bin/realm || { rm -rf "$tmp"; return 1; }
