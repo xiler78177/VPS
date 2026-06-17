@@ -174,14 +174,35 @@ reality_generate_keypair() {
     printf '%s\n%s\n' "$private" "$public"
 }
 
+reality_detect_listen_host() {
+    # 决定 sing-box / realm 应绑定的本机地址：
+    #   本机存在全局 IPv6 地址 → "::"（双栈监听；bindv6only=0 默认下经 IPv4-mapped 同时覆盖 IPv4），
+    #   否则 → "0.0.0.0"（纯 IPv4）。
+    # 用本地接口判断而非公网探测，避免网络抖动导致 IPv6-only 机器误绑 0.0.0.0 而对外不可达。
+    # 可用 REALITY_LISTEN_HOST 覆盖（测试/特殊网络）。
+    if [[ -n "${REALITY_LISTEN_HOST:-}" ]]; then printf '%s' "$REALITY_LISTEN_HOST"; return 0; fi
+    if command_exists ip && ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'; then
+        printf '%s' "::"
+    else
+        printf '%s' "0.0.0.0"
+    fi
+}
+
+# 把 host+port 组装为监听串：IPv6 字面量加方括号
+reality_listen_endpoint() {
+    local host="$1" port="$2"
+    if [[ "$host" == *:* ]]; then printf '[%s]:%s' "$host" "$port"; else printf '%s:%s' "$host" "$port"; fi
+}
+
 reality_render_singbox_config() {
     local uuid="$1" private_key="$2" port="$3" sni="$4" short_id="$5"
+    local listen_host; listen_host="${REALITY_LISTEN_HOST:-$(reality_detect_listen_host)}"
     uuid=$(reality_json_escape "$uuid")
     private_key=$(reality_json_escape "$private_key")
     sni=$(reality_json_escape "$sni")
     short_id=$(reality_json_escape "$short_id")
     cat <<EOF
-{"log":{"disabled":true},"inbounds":[{"type":"vless","tag":"vless-reality-in","listen":"0.0.0.0","listen_port":${port},"users":[{"name":"main","uuid":"${uuid}","flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":"${sni}","reality":{"enabled":true,"handshake":{"server":"${sni}","server_port":443},"private_key":"${private_key}","short_id":["${short_id}"],"max_time_difference":"1m"}}}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}
+{"log":{"disabled":true},"inbounds":[{"type":"vless","tag":"vless-reality-in","listen":"${listen_host}","listen_port":${port},"users":[{"name":"main","uuid":"${uuid}","flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":"${sni}","reality":{"enabled":true,"handshake":{"server":"${sni}","server_port":443},"private_key":"${private_key}","short_id":["${short_id}"],"max_time_difference":"1m"}}}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}
 EOF
 }
 
@@ -228,12 +249,13 @@ reality_cf_dns_payload() {
 
 reality_render_realm_config() {
     local listen_port="$1" target_host="$2" target_port="$3"
+    local listen_host; listen_host="${REALITY_LISTEN_HOST:-$(reality_detect_listen_host)}"
     cat <<EOF
 log.level = "warn"
 
 [[endpoints]]
-listen = "0.0.0.0:${listen_port}"
-remote = "${target_host}:${target_port}"
+listen = "$(reality_listen_endpoint "$listen_host" "$listen_port")"
+remote = "$(reality_listen_endpoint "$target_host" "$target_port")"
 EOF
 }
 
@@ -248,6 +270,16 @@ reality_resolve_public_a() {
         ip=$(printf '%s' "$resp" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1)
         [[ -n "$ip" ]] || return 1
     fi
+    printf '%s\n' "$ip"
+}
+
+reality_resolve_public_aaaa() {
+    local domain="$1" resp ip
+    command_exists curl || return 1
+    resp=$(curl -fsS --max-time 8 -H 'accept: application/dns-json' \
+        "https://cloudflare-dns.com/dns-query?name=${domain}&type=AAAA" 2>/dev/null) || return 1
+    ip=$(printf '%s' "$resp" | grep -Eo '"data":"[0-9a-fA-F:]+"' | head -n 1 | sed -E 's/"data":"([0-9a-fA-F:]+)"/\1/')
+    [[ -n "$ip" && "$ip" == *:* ]] || return 1
     printf '%s\n' "$ip"
 }
 
@@ -472,6 +504,7 @@ REALITY_UUID=$(reality_state_quote "${REALITY_UUID:-}")
 REALITY_PRIVATE_KEY=$(reality_state_quote "${REALITY_PRIVATE_KEY:-}")
 REALITY_PUBLIC_KEY=$(reality_state_quote "${REALITY_PUBLIC_KEY:-}")
 REALITY_SHORT_ID=$(reality_state_quote "${REALITY_SHORT_ID:-}")
+REALITY_LISTEN_HOST=$(reality_state_quote "${REALITY_LISTEN_HOST:-}")
 REALITY_RELAY_DOMAIN=$(reality_state_quote "${REALITY_RELAY_DOMAIN:-}")
 REALITY_RELAY_PORT=$(reality_state_quote "${REALITY_RELAY_PORT:-}")
 REALITY_RELAY_TARGET_HOST=$(reality_state_quote "${REALITY_RELAY_TARGET_HOST:-}")
@@ -650,6 +683,9 @@ reality_install_landing() {
     REALITY_NODE_DOMAIN="$node_domain"
     REALITY_SNI="$sni"
     REALITY_PORT="$port"
+    # 重新探测监听地址：IPv6-only / 双栈机器绑定 ::，纯 IPv4 机器绑定 0.0.0.0。
+    # 每次安装都重新探测，使旧节点重装即自愈为正确的绑定地址。
+    REALITY_LISTEN_HOST="$(reality_detect_listen_host)"
     local new_config
     new_config=$(reality_render_singbox_config "$REALITY_UUID" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID") || return 1
     firewall_apply_reality_port "$REALITY_PORT"
@@ -821,7 +857,8 @@ EOF
 
 # 由全部线路渲染 realm 多端点配置（保持单端点格式：log.level + [[endpoints]]）
 reality_render_realm_config_multi() {
-    local f
+    local f listen_host
+    listen_host="${REALITY_LISTEN_HOST:-$(reality_detect_listen_host)}"
     echo 'log.level = "warn"'
     while IFS= read -r f; do
         [[ -n "$f" ]] || continue
@@ -831,8 +868,8 @@ reality_render_realm_config_multi() {
         cat <<EOF
 
 [[endpoints]]
-listen = "0.0.0.0:${RLY_LISTEN_PORT}"
-remote = "${RLY_TARGET_HOST}:${RLY_TARGET_PORT}"
+listen = "$(reality_listen_endpoint "$listen_host" "$RLY_LISTEN_PORT")"
+remote = "$(reality_listen_endpoint "$RLY_TARGET_HOST" "$RLY_TARGET_PORT")"
 EOF
     done < <(reality_relay_route_files)
 }
@@ -1325,18 +1362,41 @@ reality_diagnose() {
         fi
     fi
 
+    echo "监听地址: ${REALITY_LISTEN_HOST:-0.0.0.0}$([[ "${REALITY_LISTEN_HOST:-}" == "::" ]] && echo '（双栈 IPv4+IPv6）')"
+
+    local public_ip6 dns_ip6 has_v4_path=0 has_v6_path=0
     public_ip=$(get_public_ipv4 2>/dev/null || true)
-    [[ -n "$public_ip" ]] && echo "本机公网 IPv4: $public_ip" || print_warn "未能获取本机公网 IPv4"
+    public_ip6=$(get_public_ipv6 2>/dev/null || true)
+    [[ -n "$public_ip" ]] && { echo "本机公网 IPv4: $public_ip"; has_v4_path=1; }
+    [[ -n "$public_ip6" ]] && { echo "本机公网 IPv6: $public_ip6"; has_v6_path=1; }
+    [[ -z "$public_ip" && -z "$public_ip6" ]] && print_warn "未能获取本机公网 IPv4/IPv6"
 
     system_dns=$(getent ahostsv4 "$connect_domain" 2>/dev/null | awk '{print $1; exit}' || true)
-    [[ -n "$system_dns" ]] && echo "系统 DNS 解析: ${connect_domain} -> ${system_dns}" || print_warn "系统 DNS 未解析到 IPv4"
+    local system_dns6; system_dns6=$(getent ahostsv6 "$connect_domain" 2>/dev/null | awk '{print $1; exit}' || true)
+    [[ -n "$system_dns" ]] && echo "系统 DNS(A): ${connect_domain} -> ${system_dns}"
+    [[ -n "$system_dns6" ]] && echo "系统 DNS(AAAA): ${connect_domain} -> ${system_dns6}"
 
     dns_ip=$(reality_resolve_public_a "$connect_domain" 2>/dev/null || true)
-    [[ -n "$dns_ip" ]] && echo "Cloudflare DoH: ${connect_domain} -> ${dns_ip}" || print_warn "Cloudflare DoH 未解析到 IPv4"
+    dns_ip6=$(reality_resolve_public_aaaa "$connect_domain" 2>/dev/null || true)
+    [[ -n "$dns_ip" ]] && echo "Cloudflare DoH(A): ${connect_domain} -> ${dns_ip}"
+    [[ -n "$dns_ip6" ]] && echo "Cloudflare DoH(AAAA): ${connect_domain} -> ${dns_ip6}"
+    if [[ -z "$dns_ip" && -z "$dns_ip6" ]]; then
+        print_warn "公网 DNS 未解析到 ${connect_domain} 的 A/AAAA 记录（DNS 未同步或未创建）"
+    fi
+    # 一致性：优先按本机可用的协议栈核对
     if [[ -n "$public_ip" && -n "$dns_ip" ]]; then
         [[ "$public_ip" == "$dns_ip" ]] \
-            && print_success "DNS 公网解析与本机公网 IP 一致" \
-            || print_warn "DNS 公网解析与本机公网 IP 不一致，可能是 DDNS 未同步或当前机器在 NAT/转发环境"
+            && print_success "IPv4 DNS 解析与本机公网一致" \
+            || print_warn "IPv4 DNS 解析与本机公网不一致（DDNS 未同步或处于 NAT/转发环境）"
+    fi
+    if [[ -n "$public_ip6" && -n "$dns_ip6" ]]; then
+        [[ "$public_ip6" == "$dns_ip6" ]] \
+            && print_success "IPv6 DNS 解析与本机公网一致" \
+            || print_warn "IPv6 DNS 解析与本机公网不一致（DDNS 未同步）"
+    fi
+    if [[ "$has_v6_path" -eq 1 && "$has_v4_path" -eq 0 ]]; then
+        print_info "本机为 IPv6-only：请确认节点域名已有 AAAA 记录、监听地址为 ::、且客户端网络支持 IPv6。"
+        [[ "${REALITY_LISTEN_HOST:-}" != "::" ]] && print_warn "当前监听地址非 :: —— IPv6-only 机器需重装落地机(菜单 11→1)使其绑定 ::，否则 IPv6 客户端无法连接。"
     fi
 
     if reality_verify_sni "$REALITY_SNI"; then

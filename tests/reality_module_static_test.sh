@@ -88,13 +88,17 @@ port="$(REALITY_TEST_PORT_CANDIDATES="19999 20000 60000 60001" reality_random_po
 short_id="$(reality_generate_short_id)"
 assert_match '^[0-9a-f]{16}$' "$short_id" "short_id should be non-empty 8-byte hex"
 
-config="$(reality_render_singbox_config '11111111-1111-4111-8111-111111111111' 'priv-key' '23456' 'www.example.com' 'a1b2c3d4e5f60708')"
+config="$(REALITY_LISTEN_HOST=0.0.0.0 reality_render_singbox_config '11111111-1111-4111-8111-111111111111' 'priv-key' '23456' 'www.example.com' 'a1b2c3d4e5f60708')"
 assert_contains '"log":{"disabled":true}' "$config" "config should disable sing-box logs"
 assert_contains '"type":"vless"' "$config" "config should use VLESS inbound"
 assert_contains '"listen_port":23456' "$config" "config should include selected high port"
+assert_contains '"listen":"0.0.0.0"' "$config" "config should bind 0.0.0.0 when listen host is IPv4"
 assert_contains '"flow":"xtls-rprx-vision"' "$config" "config should enable Vision flow"
 assert_contains '"reality":{"enabled":true' "$config" "config should enable REALITY"
 assert_contains '"short_id":["a1b2c3d4e5f60708"]' "$config" "config should include non-empty short_id"
+
+config6="$(REALITY_LISTEN_HOST=:: reality_render_singbox_config '11111111-1111-4111-8111-111111111111' 'priv-key' '23456' 'www.example.com' 'a1b2c3d4e5f60708')"
+assert_contains '"listen":"::"' "$config6" "config should bind :: for dual-stack/IPv6-only"
 
 link="$(reality_build_vless_link '11111111-1111-4111-8111-111111111111' 'node.example.com' '23456' 'www.example.com' 'pub-key' 'a1b2c3d4e5f60708' 'node-01')"
 assert_contains 'vless://11111111-1111-4111-8111-111111111111@node.example.com:23456?' "$link" "link should use node host and port"
@@ -121,10 +125,13 @@ payload="$(reality_cf_dns_payload 'A' 'node.example.com' '203.0.113.10')"
 assert_contains '"proxied":false' "$payload" "Cloudflare node DNS payload must force grey-cloud"
 assert_contains '"ttl":1' "$payload" "Cloudflare DNS payload should use auto TTL"
 
-realm_cfg="$(reality_render_realm_config '25000' 'landing.example.com' '23456')"
+realm_cfg="$(REALITY_LISTEN_HOST=0.0.0.0 reality_render_realm_config '25000' 'landing.example.com' '23456')"
 assert_contains 'listen = "0.0.0.0:25000"' "$realm_cfg" "Realm config should listen on relay port"
 assert_contains 'remote = "landing.example.com:23456"' "$realm_cfg" "Realm config should forward to landing host and port"
 assert_contains 'log.level = "warn"' "$realm_cfg" "Realm config should use warn logs"
+
+realm_cfg6="$(REALITY_LISTEN_HOST=:: reality_render_realm_config '25000' 'landing.example.com' '23456')"
+assert_contains 'listen = "[::]:25000"' "$realm_cfg6" "Realm config should bracket-bind [::] for dual-stack/IPv6-only"
 
 realm_api_json='{"assets":[{"browser_download_url":"https://github.com/zhboner/realm/releases/download/v2.9.4/realm-slim-x86_64-unknown-linux-gnu.tar.gz"},{"browser_download_url":"https://github.com/zhboner/realm/releases/download/v2.9.4/realm-x86_64-unknown-linux-gnu.tar.gz"}]}'
 realm_url="$(reality_select_realm_asset_url "$realm_api_json" 'x86_64-unknown-linux-gnu')"

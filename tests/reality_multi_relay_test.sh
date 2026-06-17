@@ -38,6 +38,7 @@ export REALITY_CLIENT_JSON="$REALITY_CONFIG_DIR/client.json"
 export REALITY_BACKUP_DIR="$REALITY_CONFIG_DIR/backups"
 export REALITY_RELAY_DIR="$REALITY_CONFIG_DIR/relays"
 export REALITY_REALM_CONFIG="$TMP/realm.toml"
+export REALITY_LISTEN_HOST="0.0.0.0"   # 固定监听地址，使渲染断言不受测试机 IPv6 影响
 mkdir -p "$REALITY_CONFIG_DIR" "$REALITY_RELAY_DIR"
 
 # 避免 source 时拉起 SNI 增强模块
@@ -68,6 +69,9 @@ ck "渲染恰好 2 个 [[endpoints]]" '[[ $(grep -c "\[\[endpoints\]\]" <<< "$cf
 ck "渲染恰好 1 行 log.level" '[[ $(grep -c "log.level" <<< "$cfg") -eq 1 ]]'
 ck "含 B 端点 listen/remote" 'grep -q "listen = \"0.0.0.0:51882\"" <<< "$cfg" && grep -q "remote = \"b.land.com:33964\"" <<< "$cfg"'
 ck "含 C 端点 listen/remote" 'grep -q "listen = \"0.0.0.0:51883\"" <<< "$cfg" && grep -q "remote = \"c.land.com:443\"" <<< "$cfg"'
+
+cfg6="$(REALITY_LISTEN_HOST=:: reality_render_realm_config_multi)"
+ck "IPv6 监听渲染为 [::]:port" 'grep -q "listen = \"\[::\]:51882\"" <<< "$cfg6"'
 
 lb="$(cat "$REALITY_RELAY_DIR/relay-51882.link.txt")"
 lc="$(cat "$REALITY_RELAY_DIR/relay-51883.link.txt")"

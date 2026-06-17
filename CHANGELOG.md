@@ -14,6 +14,7 @@
   - 旧版单中转字段（`REALITY_RELAY_*`）首次操作时自动迁移为一条线路并清空旧字段，既有安装平滑过渡。
 
 ### Fixed
+- **[P0] IPv6-only / 双栈机器无法对外建立节点**：sing-box Reality 入站与 realm 中转此前固定绑定 `0.0.0.0`（仅 IPv4），IPv6-only 机器虽本地监听、IPv4 环回自测通过，但 IPv6 客户端无法连接。新增 `reality_detect_listen_host`（按本机是否存在全局 IPv6 地址决定绑 `::` 双栈或 `0.0.0.0`），sing-box/realm 渲染据此绑定（IPv6 监听串自动加方括号 `[::]:port`），并持久化 `REALITY_LISTEN_HOST`；重装落地机即自愈为正确绑定。诊断新增 IPv6 公网/AAAA 解析与一致性检查，IPv6-only 不再误报全失败，并在监听地址非 `::` 时提示重装。
 - **[P0] 中转机安装 Realm 必失败**：上游 `zhboner/realm` 发布包不附带任何 sha256/SHA256SUMS 校验文件，原「校验文件缺失即拒绝安装」逻辑导致中转链路永远装不上。改为固定 `REALITY_REALM_VERSION` + 内置各架构 sha256，下载后仍强制 `sha256sum -c` 校验，既可安装又保留供应链校验，且不再依赖 `releases/latest` API。
 - **[P0] 中转导入落地链接时客户端链接错用本机旧落地身份**：同机已有自身落地 state 时，`reality_install_relay` 在 `reality_load_state` 处用本机旧身份覆盖了刚解析出的导入身份，致使客户端 Reality 握手参数与真实落地机不匹配、节点不通。新多路模型按线路隔离身份，从架构上根除该类问题。
 
