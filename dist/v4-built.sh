@@ -82,6 +82,7 @@ REALITY_STATE_FILE="${REALITY_CONFIG_DIR}/state.conf"
 REALITY_LINK_FILE="${REALITY_CONFIG_DIR}/client-link.txt"
 REALITY_CLIENT_JSON="${REALITY_CONFIG_DIR}/client.json"
 REALITY_BACKUP_DIR="${REALITY_CONFIG_DIR}/backups"
+REALITY_RELAY_DIR="${REALITY_CONFIG_DIR}/relays"
 REALITY_SINGBOX_CONFIG="/etc/sing-box/config.json"
 REALITY_REALM_CONFIG="/etc/realm/config.toml"
 REALITY_PORT_MIN=20000
@@ -15260,49 +15261,82 @@ reality_install_realm_binary() {
     rm -rf "$tmp"
 }
 
-firewall_remove_reality_ports() {
-    command_exists ufw || return 0
-    ufw_is_active || return 0
-    local port
-    for port in "${REALITY_PORT:-}" "${REALITY_RELAY_PORT:-}"; do
-        validate_port "$port" || continue
-        ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
-    done
+# ============================================================================
+# 多路中转（A 既做落地、又同时给多台落地机 B/C/D… 做 Realm TCP 中转）
+# 每条线路独立存储自己的落地 Reality 身份，互不串扰；relays 目录是 realm 配置的
+# 唯一真相源。客户端复用本机域名、用不同监听端口区分各条线路。
+# ============================================================================
+
+# 列出全部中转线路文件（稳定排序）
+reality_relay_route_files() {
+    [[ -d "$REALITY_RELAY_DIR" ]] || return 0
+    find "$REALITY_RELAY_DIR" -maxdepth 1 -type f -name 'relay-*.conf' 2>/dev/null | sort
 }
 
-reality_install_relay() {
-    local relay_domain="$1" listen_port="$2" target_host="$3" target_port="$4" cf_token="${5:-}" node_name="${6:-}"
-    validate_domain "$relay_domain" || { print_error "中转域名无效"; return 1; }
-    validate_port "$listen_port" || { print_error "中转端口无效"; return 1; }
-    validate_domain "$target_host" || validate_ip "$target_host" || { print_error "落地地址无效"; return 1; }
-    validate_port "$target_port" || { print_error "落地端口无效"; return 1; }
-    [[ -z "$node_name" ]] || reality_validate_node_name "$node_name" || { print_error "节点名称无效"; return 1; }
-    # 同机若已有落地机 state，先加载以保留既有落地参数（纯重装中转、不导入链接的场景）。
-    # 但本次若通过导入落地 vless 链接带入了客户端 Reality 身份(公钥/UUID/SNI/ShortID)，
-    # 这些导入值必须覆盖磁盘旧值——否则中转客户端链接会错误地沿用本机旧落地身份，
-    # 与真实落地机的 Reality 握手参数不匹配，导致节点不通。
-    local _imp_uuid="${REALITY_UUID:-}" _imp_sni="${REALITY_SNI:-}" \
-          _imp_pbk="${REALITY_PUBLIC_KEY:-}" _imp_sid="${REALITY_SHORT_ID:-}" \
-          _imp_node="${REALITY_NODE_DOMAIN:-}" _imp_port="${REALITY_PORT:-}" \
-          _imp_pkey="${REALITY_PRIVATE_KEY:-}"
-    reality_load_state || true
-    # 仅当本次带入了完整客户端身份(以公钥为准)时整体回填，避免把导入身份与磁盘旧
-    # 私钥拼接成不一致的混合身份；导入链接不含私钥，显式置空。
-    if [[ -n "$_imp_pbk" ]]; then
-        REALITY_UUID="$_imp_uuid"
-        REALITY_SNI="$_imp_sni"
-        REALITY_PUBLIC_KEY="$_imp_pbk"
-        REALITY_SHORT_ID="$_imp_sid"
-        REALITY_NODE_DOMAIN="$_imp_node"
-        REALITY_PORT="$_imp_port"
-        REALITY_PRIVATE_KEY="$_imp_pkey"
-    fi
-    reality_require_supported_os || return 1
-    reality_install_realm_binary || return 1
-    mkdir -p /etc/realm "$REALITY_CONFIG_DIR"
-    reality_backup_file "$REALITY_REALM_CONFIG"
-    reality_render_realm_config "$listen_port" "$target_host" "$target_port" > "$REALITY_REALM_CONFIG"
-    chmod 600 "$REALITY_REALM_CONFIG"
+# 校验并加载一条线路到 RLY_* 全局；校验失败跳过
+reality_relay_load_route() {
+    local file="$1"
+    [[ -f "$file" ]] || return 1
+    validate_conf_file "$file" || { print_warn "中转线路文件校验失败，已跳过: $file"; return 1; }
+    RLY_NAME=""; RLY_LISTEN_PORT=""; RLY_CONNECT_HOST=""; RLY_TARGET_HOST=""; RLY_TARGET_PORT=""
+    RLY_UUID=""; RLY_SNI=""; RLY_PUBLIC_KEY=""; RLY_SHORT_ID=""; RLY_FLOW=""
+    # shellcheck disable=SC1090
+    source "$file"
+}
+
+# 用当前 RLY_* 写出一条线路文件（值经 reality_state_quote，满足 validate_conf_file）
+reality_relay_write_route() {
+    local port="$1" file
+    file="$REALITY_RELAY_DIR/relay-${port}.conf"
+    mkdir -p "$REALITY_RELAY_DIR"
+    cat > "$file" <<EOF
+RLY_NAME=$(reality_state_quote "${RLY_NAME:-}")
+RLY_LISTEN_PORT=$(reality_state_quote "${RLY_LISTEN_PORT:-}")
+RLY_CONNECT_HOST=$(reality_state_quote "${RLY_CONNECT_HOST:-}")
+RLY_TARGET_HOST=$(reality_state_quote "${RLY_TARGET_HOST:-}")
+RLY_TARGET_PORT=$(reality_state_quote "${RLY_TARGET_PORT:-}")
+RLY_UUID=$(reality_state_quote "${RLY_UUID:-}")
+RLY_SNI=$(reality_state_quote "${RLY_SNI:-}")
+RLY_PUBLIC_KEY=$(reality_state_quote "${RLY_PUBLIC_KEY:-}")
+RLY_SHORT_ID=$(reality_state_quote "${RLY_SHORT_ID:-}")
+RLY_FLOW=$(reality_state_quote "${RLY_FLOW:-}")
+EOF
+    chmod 600 "$file"
+}
+
+# 用当前 RLY_* 写该线路客户端链接/JSON（身份=落地机，host:port=本机中转入口）
+reality_relay_write_client_artifacts() {
+    local port="${RLY_LISTEN_PORT:-}" host="${RLY_CONNECT_HOST:-}" name="${RLY_NAME:-relay-${RLY_LISTEN_PORT:-0}}" json_name
+    [[ -n "$host" && -n "$port" && -n "${RLY_UUID:-}" && -n "${RLY_SNI:-}" && -n "${RLY_PUBLIC_KEY:-}" && -n "${RLY_SHORT_ID:-}" ]] || return 1
+    mkdir -p "$REALITY_RELAY_DIR"
+    json_name=$(reality_json_escape "$name")
+    reality_build_vless_link "$RLY_UUID" "$host" "$port" "$RLY_SNI" "$RLY_PUBLIC_KEY" "$RLY_SHORT_ID" "$name" > "$REALITY_RELAY_DIR/relay-${port}.link.txt"
+    cat > "$REALITY_RELAY_DIR/relay-${port}.client.json" <<EOF
+{"type":"vless","tag":"${json_name}","server":"${host}","server_port":${port},"uuid":"${RLY_UUID}","flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":"${RLY_SNI}","utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":"${RLY_PUBLIC_KEY}","short_id":"${RLY_SHORT_ID}"}}}
+EOF
+    chmod 600 "$REALITY_RELAY_DIR/relay-${port}.link.txt" "$REALITY_RELAY_DIR/relay-${port}.client.json"
+}
+
+# 由全部线路渲染 realm 多端点配置（保持单端点格式：log.level + [[endpoints]]）
+reality_render_realm_config_multi() {
+    local f
+    echo 'log.level = "warn"'
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        reality_relay_load_route "$f" || continue
+        validate_port "$RLY_LISTEN_PORT" || continue
+        [[ -n "$RLY_TARGET_HOST" && -n "$RLY_TARGET_PORT" ]] || continue
+        cat <<EOF
+
+[[endpoints]]
+listen = "0.0.0.0:${RLY_LISTEN_PORT}"
+remote = "${RLY_TARGET_HOST}:${RLY_TARGET_PORT}"
+EOF
+    done < <(reality_relay_route_files)
+}
+
+# 写 realm systemd 单元
+reality_relay_ensure_service() {
     cat > /etc/systemd/system/realm.service <<'EOF'
 [Unit]
 Description=Realm TCP Relay
@@ -15319,6 +15353,251 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
+    systemctl daemon-reload
+}
+
+# 旧版单中转字段（REALITY_RELAY_*）一次性迁移为一条线路
+reality_relay_migrate_legacy() {
+    [[ -n "${REALITY_RELAY_TARGET_HOST:-}" && -n "${REALITY_RELAY_PORT:-}" ]] || return 0
+    [[ -z "$(reality_relay_route_files)" ]] || return 0
+    validate_port "$REALITY_RELAY_PORT" || return 0
+    RLY_NAME="$(reality_effective_node_name)"
+    RLY_LISTEN_PORT="$REALITY_RELAY_PORT"
+    RLY_CONNECT_HOST="${REALITY_RELAY_DOMAIN:-${REALITY_NODE_DOMAIN:-}}"
+    RLY_TARGET_HOST="$REALITY_RELAY_TARGET_HOST"
+    RLY_TARGET_PORT="${REALITY_RELAY_TARGET_PORT:-}"
+    RLY_UUID="${REALITY_UUID:-}"; RLY_SNI="${REALITY_SNI:-}"
+    RLY_PUBLIC_KEY="${REALITY_PUBLIC_KEY:-}"; RLY_SHORT_ID="${REALITY_SHORT_ID:-}"
+    RLY_FLOW="${REALITY_FLOW:-xtls-rprx-vision}"
+    reality_relay_write_route "$RLY_LISTEN_PORT"
+    reality_relay_write_client_artifacts || true
+    REALITY_RELAY_DOMAIN=""; REALITY_RELAY_PORT=""
+    REALITY_RELAY_TARGET_HOST=""; REALITY_RELAY_TARGET_PORT=""
+    reality_write_state
+}
+
+# 根据 relays 目录重建 realm 配置、放行端口、刷新各线路客户端产物并重启 realm
+reality_relay_regenerate() {
+    mkdir -p /etc/realm "$REALITY_CONFIG_DIR" "$REALITY_RELAY_DIR"
+    reality_relay_migrate_legacy
+    if [[ -z "$(reality_relay_route_files)" ]]; then
+        systemctl disable --now realm >/dev/null 2>&1 || true
+        rm -f "$REALITY_REALM_CONFIG"
+        return 0
+    fi
+    reality_install_realm_binary || return 1
+    reality_backup_file "$REALITY_REALM_CONFIG"
+    reality_render_realm_config_multi > "$REALITY_REALM_CONFIG"
+    chmod 600 "$REALITY_REALM_CONFIG"
+    reality_relay_ensure_service
+    local f
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        reality_relay_load_route "$f" || continue
+        validate_port "$RLY_LISTEN_PORT" || continue
+        firewall_apply_realm_port "$RLY_LISTEN_PORT" >/dev/null 2>&1 || true
+        reality_relay_write_client_artifacts || true
+    done < <(reality_relay_route_files)
+    systemctl enable realm >/dev/null 2>&1 || true
+    systemctl restart realm || return 1
+}
+
+# 交互：添加一条中转线路（导入下游落地 vless 链接）
+reality_relay_add() {
+    print_title "添加中转线路（导入落地 vless 链接）"
+    reality_require_supported_os || return 1
+    reality_load_state || true
+    local link=""
+    read -e -r -p "粘贴落地机 vless:// 链接: " link
+    # 快照本机落地身份，避免被链接解析覆盖
+    local _s_uuid="${REALITY_UUID:-}" _s_node="${REALITY_NODE_DOMAIN:-}" _s_port="${REALITY_PORT:-}" \
+          _s_sni="${REALITY_SNI:-}" _s_pbk="${REALITY_PUBLIC_KEY:-}" _s_sid="${REALITY_SHORT_ID:-}" _s_flow="${REALITY_FLOW:-}"
+    reality_parse_vless_link "$link" || { print_error "落地机 vless 链接解析失败"; return 1; }
+    RLY_TARGET_HOST="$REALITY_NODE_DOMAIN"; RLY_TARGET_PORT="$REALITY_PORT"
+    RLY_UUID="$REALITY_UUID"; RLY_SNI="$REALITY_SNI"; RLY_PUBLIC_KEY="$REALITY_PUBLIC_KEY"
+    RLY_SHORT_ID="$REALITY_SHORT_ID"; RLY_FLOW="${REALITY_FLOW:-xtls-rprx-vision}"
+    # 恢复本机落地身份
+    REALITY_UUID="$_s_uuid"; REALITY_NODE_DOMAIN="$_s_node"; REALITY_PORT="$_s_port"
+    REALITY_SNI="$_s_sni"; REALITY_PUBLIC_KEY="$_s_pbk"; REALITY_SHORT_ID="$_s_sid"; REALITY_FLOW="$_s_flow"
+    validate_domain "$RLY_TARGET_HOST" || validate_ip "$RLY_TARGET_HOST" || { print_error "落地地址无效"; return 1; }
+    validate_port "$RLY_TARGET_PORT" || { print_error "落地端口无效"; return 1; }
+    [[ -n "$RLY_PUBLIC_KEY" && -n "$RLY_UUID" && -n "$RLY_SHORT_ID" ]] || { print_error "链接缺少 Reality 参数(pbk/uuid/sid)"; return 1; }
+    # 客户端连接域名：默认复用本机落地/中转域名
+    local connect_default="${REALITY_NODE_DOMAIN:-${REALITY_RELAY_DOMAIN:-}}"
+    RLY_CONNECT_HOST=""
+    if [[ -n "$connect_default" ]]; then
+        RLY_CONNECT_HOST="$connect_default"
+        echo "客户端连接地址: ${RLY_CONNECT_HOST}（复用本机域名，按端口区分线路）"
+    else
+        while [[ -z "$RLY_CONNECT_HOST" ]]; do
+            read -e -r -p "客户端连接本机的域名/IP: " RLY_CONNECT_HOST
+            validate_domain "$RLY_CONNECT_HOST" || validate_ip "$RLY_CONNECT_HOST" || { print_error "地址无效"; RLY_CONNECT_HOST=""; }
+        done
+    fi
+    # 监听端口：唯一、未占用、不等于落地端口
+    local def_port; def_port=$(reality_random_port 2>/dev/null || echo "")
+    RLY_LISTEN_PORT=""
+    while true; do
+        read -e -r -p "本机中转监听端口 [${def_port}]: " RLY_LISTEN_PORT
+        RLY_LISTEN_PORT="${RLY_LISTEN_PORT:-$def_port}"
+        validate_port "$RLY_LISTEN_PORT" || { print_error "端口无效"; continue; }
+        if [[ -n "${REALITY_PORT:-}" && "$RLY_LISTEN_PORT" == "${REALITY_PORT}" ]]; then print_error "不能与本机落地端口相同"; continue; fi
+        [[ -f "$REALITY_RELAY_DIR/relay-${RLY_LISTEN_PORT}.conf" ]] && { print_error "该端口已有中转线路"; continue; }
+        if reality_port_in_use "$RLY_LISTEN_PORT"; then print_error "端口已被占用"; continue; fi
+        break
+    done
+    # 线路名称
+    local def_name="relay-${RLY_LISTEN_PORT}"
+    read -e -r -p "线路名称/备注 [${def_name}]: " RLY_NAME
+    RLY_NAME="${RLY_NAME:-$def_name}"
+    reality_validate_node_name "$RLY_NAME" || { print_error "名称无效：1-64 位英文/数字/空格/点/下划线/短横线"; return 1; }
+    reality_relay_write_route "$RLY_LISTEN_PORT"
+    reality_relay_regenerate || { print_error "Realm 配置应用失败"; return 1; }
+    # 交互式 UFW 引导（仅本端口）
+    firewall_apply_realm_port "$RLY_LISTEN_PORT"
+    local _fw_rc=$?
+    if [[ $_fw_rc -eq 2 ]]; then
+        if [[ -t 0 ]] && confirm "UFW 未启用，是否现在跳转防火墙菜单启用并放行中转端口?"; then
+            ufw_setup
+            firewall_apply_realm_port "$RLY_LISTEN_PORT" || print_warn "UFW 仍未生效，请确认云安全组已放行 ${RLY_LISTEN_PORT}/tcp"
+        else
+            print_warn "已跳过本地防火墙配置，请确认云安全组已放行 ${RLY_LISTEN_PORT}/tcp"
+        fi
+    fi
+    # 角色刷新
+    reality_load_state || true
+    if [[ "${REALITY_ROLE:-}" == *"landing"* ]]; then REALITY_ROLE="landing+relay"; else REALITY_ROLE="relay"; fi
+    reality_write_state
+    print_success "中转线路已添加: ${RLY_NAME} (本机 ${RLY_CONNECT_HOST}:${RLY_LISTEN_PORT} -> ${RLY_TARGET_HOST}:${RLY_TARGET_PORT})"
+    echo ""
+    [[ -f "$REALITY_RELAY_DIR/relay-${RLY_LISTEN_PORT}.link.txt" ]] && cat "$REALITY_RELAY_DIR/relay-${RLY_LISTEN_PORT}.link.txt"
+    pause
+}
+
+# 列出全部中转线路及客户端链接
+reality_relay_list() {
+    print_title "中转线路列表"
+    local f n=0
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        reality_relay_load_route "$f" || continue
+        n=$((n+1))
+        draw_line
+        echo "线路 ${n}: ${RLY_NAME}"
+        echo "  本机入口: ${RLY_CONNECT_HOST}:${RLY_LISTEN_PORT}"
+        echo "  转发目标: ${RLY_TARGET_HOST}:${RLY_TARGET_PORT}"
+        local lf="$REALITY_RELAY_DIR/relay-${RLY_LISTEN_PORT}.link.txt"
+        [[ -f "$lf" ]] && { echo "  客户端链接:"; cat "$lf"; }
+    done < <(reality_relay_route_files)
+    [[ $n -eq 0 ]] && print_warn "暂无中转线路"
+    pause
+}
+
+# 删除一条中转线路
+reality_relay_remove() {
+    print_title "删除中转线路"
+    local files=() f
+    while IFS= read -r f; do [[ -n "$f" ]] && files+=("$f"); done < <(reality_relay_route_files)
+    [[ ${#files[@]} -gt 0 ]] || { print_warn "暂无中转线路"; pause; return 0; }
+    local i=1
+    for f in "${files[@]}"; do
+        reality_relay_load_route "$f" && echo "  ${i}. ${RLY_NAME} (${RLY_CONNECT_HOST}:${RLY_LISTEN_PORT} -> ${RLY_TARGET_HOST}:${RLY_TARGET_PORT})"
+        i=$((i+1))
+    done
+    local sel; read -e -r -p "选择要删除的线路序号 [0=取消]: " sel
+    [[ "$sel" =~ ^[0-9]+$ ]] || { print_error "无效序号"; pause; return 1; }
+    [[ "$sel" -ge 1 && "$sel" -le ${#files[@]} ]] || return 0
+    f="${files[$((sel-1))]}"
+    reality_relay_load_route "$f" || { print_error "读取失败"; pause; return 1; }
+    confirm "确认删除中转线路 ${RLY_NAME} (端口 ${RLY_LISTEN_PORT})?" || return 0
+    local port="$RLY_LISTEN_PORT"
+    rm -f "$f" "$REALITY_RELAY_DIR/relay-${port}.link.txt" "$REALITY_RELAY_DIR/relay-${port}.client.json"
+    if command_exists ufw && ufw_is_active; then ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true; fi
+    reality_relay_regenerate || true
+    reality_load_state || true
+    if [[ -z "$(reality_relay_route_files)" ]]; then
+        if [[ "${REALITY_ROLE:-}" == *"landing"* ]]; then REALITY_ROLE="landing"; else REALITY_ROLE=""; fi
+        reality_write_state
+    fi
+    print_success "已删除中转线路 (端口 ${port})"
+    pause
+}
+
+# 中转线路管理子菜单
+reality_relay_menu() {
+    while true; do
+        print_title "中转线路管理（A 给多台落地机做中转）"
+        echo "1. 添加中转线路（导入落地链接）"
+        echo "2. 查看线路及客户端链接"
+        echo "3. 删除中转线路"
+        echo "0. 返回"
+        read -e -r -p "请选择: " c
+        case "$c" in
+            1) reality_relay_add ;;
+            2) reality_relay_list ;;
+            3) reality_relay_remove ;;
+            0|q|Q) break ;;
+            *) print_error "无效选项"; sleep 1 ;;
+        esac
+    done
+}
+
+firewall_remove_reality_ports() {
+    command_exists ufw || return 0
+    ufw_is_active || return 0
+    local port f
+    for port in "${REALITY_PORT:-}" "${REALITY_RELAY_PORT:-}"; do
+        validate_port "$port" || continue
+        ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
+    done
+    # 回收所有中转线路监听端口
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        reality_relay_load_route "$f" || continue
+        validate_port "$RLY_LISTEN_PORT" || continue
+        ufw delete allow "${RLY_LISTEN_PORT}/tcp" >/dev/null 2>&1 || true
+    done < <(reality_relay_route_files)
+}
+
+reality_install_relay() {
+    local relay_domain="$1" listen_port="$2" target_host="$3" target_port="$4" cf_token="${5:-}" node_name="${6:-}"
+    validate_domain "$relay_domain" || { print_error "中转域名无效"; return 1; }
+    validate_port "$listen_port" || { print_error "中转端口无效"; return 1; }
+    validate_domain "$target_host" || validate_ip "$target_host" || { print_error "落地地址无效"; return 1; }
+    validate_port "$target_port" || { print_error "落地端口无效"; return 1; }
+    [[ -z "$node_name" ]] || reality_validate_node_name "$node_name" || { print_error "节点名称无效"; return 1; }
+    # 同机若已有落地机 state，先加载以保留既有落地参数（纯重装中转、不导入链接的场景）。
+    # 但本次若通过导入落地 vless 链接带入了客户端 Reality 身份(公钥/UUID/SNI/ShortID)，
+    # 这些导入值必须覆盖磁盘旧值——否则中转客户端链接会错误地沿用本机旧落地身份，
+    # 与真实落地机的 Reality 握手参数不匹配，导致节点不通。
+    local _imp_uuid="${REALITY_UUID:-}" _imp_sni="${REALITY_SNI:-}" \
+          _imp_pbk="${REALITY_PUBLIC_KEY:-}" _imp_sid="${REALITY_SHORT_ID:-}" \
+          _imp_node="${REALITY_NODE_DOMAIN:-}" _imp_port="${REALITY_PORT:-}" \
+          _imp_pkey="${REALITY_PRIVATE_KEY:-}" _imp_flow="${REALITY_FLOW:-}"
+    reality_load_state || true
+    if [[ -n "$_imp_pbk" ]]; then
+        REALITY_UUID="$_imp_uuid"
+        REALITY_SNI="$_imp_sni"
+        REALITY_PUBLIC_KEY="$_imp_pbk"
+        REALITY_SHORT_ID="$_imp_sid"
+        REALITY_NODE_DOMAIN="$_imp_node"
+        REALITY_PORT="$_imp_port"
+        REALITY_PRIVATE_KEY="$_imp_pkey"
+        REALITY_FLOW="$_imp_flow"
+    fi
+    reality_require_supported_os || return 1
+    # 写为一条独立身份的中转线路（relays 目录是 realm 配置的唯一真相源）。
+    RLY_NAME="${node_name:-$(reality_effective_node_name)}"
+    RLY_LISTEN_PORT="$listen_port"
+    RLY_CONNECT_HOST="$relay_domain"
+    RLY_TARGET_HOST="$target_host"
+    RLY_TARGET_PORT="$target_port"
+    RLY_UUID="${REALITY_UUID:-}"; RLY_SNI="${REALITY_SNI:-}"
+    RLY_PUBLIC_KEY="${REALITY_PUBLIC_KEY:-}"; RLY_SHORT_ID="${REALITY_SHORT_ID:-}"
+    RLY_FLOW="${REALITY_FLOW:-xtls-rprx-vision}"
+    reality_relay_write_route "$listen_port"
+    if [[ -n "$cf_token" ]]; then reality_sync_cloudflare_dns "$relay_domain" "$cf_token"; fi
+    reality_relay_regenerate || return 1
     firewall_apply_realm_port "$listen_port"
     local _fw_rc=$?
     if [[ $_fw_rc -eq 1 ]]; then
@@ -15332,25 +15611,14 @@ EOF
             print_warn "已跳过本地防火墙配置，请确认云安全组已放行 ${listen_port}/tcp"
         fi
     fi
-    systemctl daemon-reload
-    systemctl enable realm >/dev/null || return 1
-    systemctl restart realm || return 1
     if [[ -n "${REALITY_UUID:-}" && "${REALITY_ROLE:-}" == *"landing"* ]]; then
         REALITY_ROLE="landing+relay"
     else
         REALITY_ROLE="relay"
     fi
     [[ -n "$node_name" ]] && REALITY_NODE_NAME="$node_name"
-    REALITY_RELAY_DOMAIN="$relay_domain"
-    REALITY_RELAY_PORT="$listen_port"
-    REALITY_RELAY_TARGET_HOST="$target_host"
-    REALITY_RELAY_TARGET_PORT="$target_port"
-    if [[ -n "$cf_token" ]]; then reality_sync_cloudflare_dns "$REALITY_RELAY_DOMAIN" "$cf_token"; fi
     reality_write_state
-    if [[ -n "${REALITY_UUID:-}" && -n "${REALITY_SNI:-}" && -n "${REALITY_PUBLIC_KEY:-}" && -n "${REALITY_SHORT_ID:-}" ]]; then
-        reality_write_client_artifacts
-    fi
-    print_success "Realm 单跳中转安装完成"
+    print_success "Realm 中转线路安装完成"
     reality_show_info
 }
 
@@ -15471,8 +15739,20 @@ reality_show_info() {
     [[ -n "${REALITY_RELAY_TARGET_HOST:-}" ]] && echo "中转目标: ${REALITY_RELAY_TARGET_HOST}:${REALITY_RELAY_TARGET_PORT}"
     if [[ -f "$REALITY_LINK_FILE" ]]; then
         draw_line
+        echo "落地客户端链接:"
         cat "$REALITY_LINK_FILE"
     fi
+    # 多路中转线路：每条独立身份、独立客户端链接
+    local _f _n=0
+    while IFS= read -r _f; do
+        [[ -n "$_f" ]] || continue
+        reality_relay_load_route "$_f" || continue
+        _n=$((_n+1))
+        draw_line
+        echo "中转线路 ${_n}: ${RLY_NAME}  本机 ${RLY_CONNECT_HOST}:${RLY_LISTEN_PORT} -> ${RLY_TARGET_HOST}:${RLY_TARGET_PORT}"
+        local _lf="$REALITY_RELAY_DIR/relay-${RLY_LISTEN_PORT}.link.txt"
+        [[ -f "$_lf" ]] && cat "$_lf"
+    done < <(reality_relay_route_files)
     pause
 }
 
@@ -15659,6 +15939,9 @@ reality_delete_node_info() {
     reality_backup_file "$REALITY_SINGBOX_CONFIG"
     rm -f "$REALITY_REALM_CONFIG"
     rm -f "$REALITY_STATE_FILE" "$REALITY_LINK_FILE" "$REALITY_CLIENT_JSON"
+    # 清理多路中转线路（保留 backups 目录，不 rm -rf 整个配置目录）
+    rm -f "$REALITY_RELAY_DIR"/relay-*.conf "$REALITY_RELAY_DIR"/relay-*.link.txt "$REALITY_RELAY_DIR"/relay-*.client.json 2>/dev/null || true
+    rmdir "$REALITY_RELAY_DIR" 2>/dev/null || true
     print_success "Reality/Realm 节点信息已删除"
     pause
 }
@@ -15693,7 +15976,7 @@ reality_menu() {
     while true; do
         print_title "Sing-box Reality 节点"
         echo "1. 安装/重装落地机"
-        echo "2. 安装/重装中转机"
+        echo "2. 中转线路管理（多落地中转）"
         echo "3. 查看/修改节点信息"
         echo "4. 检查服务状态"
         echo "5. 重启服务"
@@ -15705,7 +15988,7 @@ reality_menu() {
         read -e -r -p "请选择: " c
         case "$c" in
             1) reality_install_wizard --landing ;;
-            2) reality_install_wizard --relay ;;
+            2) reality_relay_menu ;;
             3) reality_info_menu ;;
             4) reality_status ;;
             5) reality_restart ;;

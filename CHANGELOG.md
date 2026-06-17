@@ -4,6 +4,19 @@
 
 ## [Unreleased]
 
+## [v14.3] — 2026-06-17
+
+### Added
+- **Reality 中转支持「单落地 + 多路中转」拓扑**：A 机可同时作为自己的 sing-box Reality 落地，并为多台线路较差的落地机 B/C/D… 做 Realm TCP 中转。每条线路独立存储自己的落地 Reality 身份（UUID/SNI/公钥/ShortID），互不串扰，各自生成一条客户端链接；客户端复用本机域名、按监听端口区分各线路。
+  - 新增 `${REALITY_CONFIG_DIR}/relays/` 目录作为 realm 配置的唯一真相源，每条线路一个 `relay-<port>.conf`（经 `reality_state_quote`，满足 `validate_conf_file` 的 owner/mode/字面量校验）。
+  - 菜单「2. 中转线路管理（多落地中转）」：添加（导入落地链接）/查看链接/删除；`reality_render_realm_config_multi` 渲染多 `[[endpoints]]`，`reality_relay_regenerate` 统一重建配置、放行端口、刷新各线路客户端产物并重启 realm。
+  - 删除节点信息与 `firewall_remove_reality_ports` 同步回收所有中转线路监听端口；删除仅清理 relays 路由/链接，保留 backups、不 `rm -rf` 配置目录。
+  - 旧版单中转字段（`REALITY_RELAY_*`）首次操作时自动迁移为一条线路并清空旧字段，既有安装平滑过渡。
+
+### Fixed
+- **[P0] 中转机安装 Realm 必失败**：上游 `zhboner/realm` 发布包不附带任何 sha256/SHA256SUMS 校验文件，原「校验文件缺失即拒绝安装」逻辑导致中转链路永远装不上。改为固定 `REALITY_REALM_VERSION` + 内置各架构 sha256，下载后仍强制 `sha256sum -c` 校验，既可安装又保留供应链校验，且不再依赖 `releases/latest` API。
+- **[P0] 中转导入落地链接时客户端链接错用本机旧落地身份**：同机已有自身落地 state 时，`reality_install_relay` 在 `reality_load_state` 处用本机旧身份覆盖了刚解析出的导入身份，致使客户端 Reality 握手参数与真实落地机不匹配、节点不通。新多路模型按线路隔离身份，从架构上根除该类问题。
+
 ## [v14.2] — 2026-06-12
 
 ### Fixed
