@@ -780,8 +780,26 @@ reality_install_relay() {
     validate_domain "$target_host" || validate_ip "$target_host" || { print_error "落地地址无效"; return 1; }
     validate_port "$target_port" || { print_error "落地端口无效"; return 1; }
     [[ -z "$node_name" ]] || reality_validate_node_name "$node_name" || { print_error "节点名称无效"; return 1; }
-    # 若同机已存在落地机 state，先加载再写入中转字段，避免重装中转时清空 UUID/私钥/SNI 等落地机参数。
+    # 同机若已有落地机 state，先加载以保留既有落地参数（纯重装中转、不导入链接的场景）。
+    # 但本次若通过导入落地 vless 链接带入了客户端 Reality 身份(公钥/UUID/SNI/ShortID)，
+    # 这些导入值必须覆盖磁盘旧值——否则中转客户端链接会错误地沿用本机旧落地身份，
+    # 与真实落地机的 Reality 握手参数不匹配，导致节点不通。
+    local _imp_uuid="${REALITY_UUID:-}" _imp_sni="${REALITY_SNI:-}" \
+          _imp_pbk="${REALITY_PUBLIC_KEY:-}" _imp_sid="${REALITY_SHORT_ID:-}" \
+          _imp_node="${REALITY_NODE_DOMAIN:-}" _imp_port="${REALITY_PORT:-}" \
+          _imp_pkey="${REALITY_PRIVATE_KEY:-}"
     reality_load_state || true
+    # 仅当本次带入了完整客户端身份(以公钥为准)时整体回填，避免把导入身份与磁盘旧
+    # 私钥拼接成不一致的混合身份；导入链接不含私钥，显式置空。
+    if [[ -n "$_imp_pbk" ]]; then
+        REALITY_UUID="$_imp_uuid"
+        REALITY_SNI="$_imp_sni"
+        REALITY_PUBLIC_KEY="$_imp_pbk"
+        REALITY_SHORT_ID="$_imp_sid"
+        REALITY_NODE_DOMAIN="$_imp_node"
+        REALITY_PORT="$_imp_port"
+        REALITY_PRIVATE_KEY="$_imp_pkey"
+    fi
     reality_require_supported_os || return 1
     reality_install_realm_binary || return 1
     mkdir -p /etc/realm "$REALITY_CONFIG_DIR"
