@@ -1027,6 +1027,9 @@ reality_relay_remove() {
 
 # 中转线路管理子菜单
 reality_relay_menu() {
+    # 旧版单中转安装首次进入本菜单时，自动把 REALITY_RELAY_* 迁移为一条线路，
+    # 使其在列表中可见、可管理（仅转换表示，不重启 realm）。
+    reality_load_state 2>/dev/null && reality_relay_migrate_legacy 2>/dev/null || true
     while true; do
         print_title "中转线路管理（A 给多台落地机做中转）"
         echo "1. 添加中转线路（导入落地链接）"
