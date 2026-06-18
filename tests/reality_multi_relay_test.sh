@@ -120,6 +120,20 @@ ck "迁移后旧字段已清空" '[[ -z "$REALITY_RELAY_TARGET_HOST" && -z "$REA
 reality_relay_load_route "$REALITY_RELAY_DIR/relay-53000.conf"
 ck "迁移线路携带原身份+目标" '[[ "$RLY_UUID" == "leg-uuid" && "$RLY_TARGET_HOST" == "old.land.com" && "$RLY_TARGET_PORT" == "33964" ]]'
 
+echo "[T7] 细节优化：脱敏/链接视图/回滚/诊断中转段"
+MOD="$ROOT/modules/15-singbox-reality.sh"
+ck "mask_secret 长串脱敏" '[[ "$(reality_mask_secret 0123456789abcdef0123)" == "012345…0123" ]]'
+ck "mask_secret 短串原样" '[[ "$(reality_mask_secret short)" == "short" ]]'
+ck "存在 reality_show_links 函数" 'grep -q "^reality_show_links()" "$MOD"'
+ck "info 菜单选项2 改为输出链接视图" 'grep -q "2) reality_show_links" "$MOD"'
+ck "relay_add 含解析核对/确认" 'grep -q "以上落地参数是否正确" "$MOD"'
+add_body="$(awk "/^reality_relay_add\\(\\)/,/^}/" "$MOD")"
+ck "relay_add 含失败回滚" 'grep -q "正在回滚本条线路" <<< "$add_body"'
+ck "relay_add 多处可取消(0/q)" 'grep -q "0=取消" <<< "$add_body"'
+diag_body="$(awk "/^reality_diagnose\\(\\)/,/^}/" "$MOD")"
+ck "diagnose 含 realm 服务检查" 'grep -q "realm 中转服务" <<< "$diag_body"'
+ck "diagnose 含每线路监听检查" 'grep -q "中转线路 .* 监听" <<< "$diag_body"'
+
 echo ""
 echo "==== reality_multi_relay_test: PASS=$pass FAIL=$fail ===="
 [[ $fail -eq 0 ]] && echo "reality_multi_relay_test: PASS" || { echo "reality_multi_relay_test: FAIL"; exit 1; }

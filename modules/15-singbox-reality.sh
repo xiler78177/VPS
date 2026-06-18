@@ -99,6 +99,11 @@ reality_urlencode() {
     printf '%s' "$out"
 }
 
+reality_mask_secret() {
+    local s="${1:-}" n=${#1}
+    if (( n <= 12 )); then printf '%s' "$s"; else printf '%s…%s' "${s:0:6}" "${s: -4}"; fi
+}
+
 reality_json_escape() {
     local s="$1"
     s=${s//\\/\\\\}
@@ -947,38 +952,49 @@ reality_relay_add() {
     reality_require_supported_os || return 1
     reality_load_state || true
     local link=""
-    read -e -r -p "粘贴落地机 vless:// 链接: " link
+    read -e -r -p "粘贴落地机 vless:// 链接 (留空取消): " link
+    [[ -n "$link" ]] || { print_info "已取消"; pause; return 0; }
     # 快照本机落地身份，避免被链接解析覆盖
     local _s_uuid="${REALITY_UUID:-}" _s_node="${REALITY_NODE_DOMAIN:-}" _s_port="${REALITY_PORT:-}" \
           _s_sni="${REALITY_SNI:-}" _s_pbk="${REALITY_PUBLIC_KEY:-}" _s_sid="${REALITY_SHORT_ID:-}" _s_flow="${REALITY_FLOW:-}"
-    reality_parse_vless_link "$link" || { print_error "落地机 vless 链接解析失败"; return 1; }
+    reality_parse_vless_link "$link" || { print_error "落地机 vless 链接解析失败"; pause; return 1; }
     RLY_TARGET_HOST="$REALITY_NODE_DOMAIN"; RLY_TARGET_PORT="$REALITY_PORT"
     RLY_UUID="$REALITY_UUID"; RLY_SNI="$REALITY_SNI"; RLY_PUBLIC_KEY="$REALITY_PUBLIC_KEY"
     RLY_SHORT_ID="$REALITY_SHORT_ID"; RLY_FLOW="${REALITY_FLOW:-xtls-rprx-vision}"
     # 恢复本机落地身份
     REALITY_UUID="$_s_uuid"; REALITY_NODE_DOMAIN="$_s_node"; REALITY_PORT="$_s_port"
     REALITY_SNI="$_s_sni"; REALITY_PUBLIC_KEY="$_s_pbk"; REALITY_SHORT_ID="$_s_sid"; REALITY_FLOW="$_s_flow"
-    validate_domain "$RLY_TARGET_HOST" || validate_ip "$RLY_TARGET_HOST" || { print_error "落地地址无效"; return 1; }
-    validate_port "$RLY_TARGET_PORT" || { print_error "落地端口无效"; return 1; }
-    [[ -n "$RLY_PUBLIC_KEY" && -n "$RLY_UUID" && -n "$RLY_SHORT_ID" ]] || { print_error "链接缺少 Reality 参数(pbk/uuid/sid)"; return 1; }
-    # 客户端连接域名：默认复用本机落地/中转域名
-    local connect_default="${REALITY_NODE_DOMAIN:-${REALITY_RELAY_DOMAIN:-}}"
+    validate_domain "$RLY_TARGET_HOST" || validate_ip "$RLY_TARGET_HOST" || { print_error "落地地址无效"; pause; return 1; }
+    validate_port "$RLY_TARGET_PORT" || { print_error "落地端口无效"; pause; return 1; }
+    [[ -n "$RLY_PUBLIC_KEY" && -n "$RLY_UUID" && -n "$RLY_SHORT_ID" ]] || { print_error "链接缺少 Reality 参数(pbk/uuid/sid)"; pause; return 1; }
+    # 解析结果核对页（任意 read 处输入 0/q 可取消返回）
+    draw_line
+    echo "已解析落地机参数，请核对:"
+    echo "  转发目标 : ${RLY_TARGET_HOST}:${RLY_TARGET_PORT}"
+    echo "  SNI      : ${RLY_SNI}"
+    echo "  UUID     : $(reality_mask_secret "$RLY_UUID")"
+    echo "  公钥(pbk): $(reality_mask_secret "$RLY_PUBLIC_KEY")"
+    echo "  ShortID  : ${RLY_SHORT_ID}"
+    draw_line
+    confirm "以上落地参数是否正确?" || { print_info "已取消"; pause; return 0; }
+    # 客户端连接域名：默认复用本机落地/中转域名，可覆盖
+    local connect_default="${REALITY_NODE_DOMAIN:-${REALITY_RELAY_DOMAIN:-}}" in_host=""
     RLY_CONNECT_HOST=""
-    if [[ -n "$connect_default" ]]; then
-        RLY_CONNECT_HOST="$connect_default"
-        echo "客户端连接地址: ${RLY_CONNECT_HOST}（复用本机域名，按端口区分线路）"
-    else
-        while [[ -z "$RLY_CONNECT_HOST" ]]; do
-            read -e -r -p "客户端连接本机的域名/IP: " RLY_CONNECT_HOST
-            validate_domain "$RLY_CONNECT_HOST" || validate_ip "$RLY_CONNECT_HOST" || { print_error "地址无效"; RLY_CONNECT_HOST=""; }
-        done
-    fi
+    while [[ -z "$RLY_CONNECT_HOST" ]]; do
+        read -e -r -p "客户端连接本机的域名/IP [${connect_default:-必填}] (0=取消): " in_host
+        in_host="${in_host:-$connect_default}"
+        [[ "$in_host" == "0" || "$in_host" == "q" ]] && { print_info "已取消"; pause; return 0; }
+        validate_domain "$in_host" || validate_ip "$in_host" || { print_error "地址无效"; continue; }
+        RLY_CONNECT_HOST="$in_host"
+    done
+    [[ "$RLY_CONNECT_HOST" == "$connect_default" && -n "$connect_default" ]] && echo "（复用本机域名，按端口区分线路）"
     # 监听端口：唯一、未占用、不等于落地端口
     local def_port; def_port=$(reality_random_port 2>/dev/null || echo "")
     RLY_LISTEN_PORT=""
     while true; do
-        read -e -r -p "本机中转监听端口 [${def_port}]: " RLY_LISTEN_PORT
+        read -e -r -p "本机中转监听端口 [${def_port}] (0=取消): " RLY_LISTEN_PORT
         RLY_LISTEN_PORT="${RLY_LISTEN_PORT:-$def_port}"
+        [[ "$RLY_LISTEN_PORT" == "0" || "$RLY_LISTEN_PORT" == "q" ]] && { print_info "已取消"; pause; return 0; }
         validate_port "$RLY_LISTEN_PORT" || { print_error "端口无效"; continue; }
         if [[ -n "${REALITY_PORT:-}" && "$RLY_LISTEN_PORT" == "${REALITY_PORT}" ]]; then print_error "不能与本机落地端口相同"; continue; fi
         [[ -f "$REALITY_RELAY_DIR/relay-${RLY_LISTEN_PORT}.conf" ]] && { print_error "该端口已有中转线路"; continue; }
@@ -989,13 +1005,19 @@ reality_relay_add() {
     local def_name="relay-${RLY_LISTEN_PORT}"
     read -e -r -p "线路名称/备注 [${def_name}]: " RLY_NAME
     RLY_NAME="${RLY_NAME:-$def_name}"
-    reality_validate_node_name "$RLY_NAME" || { print_error "名称无效：1-64 位英文/数字/空格/点/下划线/短横线"; return 1; }
+    reality_validate_node_name "$RLY_NAME" || { print_error "名称无效：1-64 位英文/数字/空格/点/下划线/短横线"; pause; return 1; }
     reality_relay_write_route "$RLY_LISTEN_PORT"
-    reality_relay_regenerate || { print_error "Realm 配置应用失败"; return 1; }
-    # 交互式 UFW 引导（仅本端口）
-    firewall_apply_realm_port "$RLY_LISTEN_PORT"
-    local _fw_rc=$?
-    if [[ $_fw_rc -eq 2 ]]; then
+    # 应用失败时回滚刚加的线路，避免把 realm 留在半残/停止状态
+    if ! reality_relay_regenerate; then
+        print_error "Realm 配置应用失败，正在回滚本条线路"
+        rm -f "$REALITY_RELAY_DIR/relay-${RLY_LISTEN_PORT}.conf" \
+              "$REALITY_RELAY_DIR/relay-${RLY_LISTEN_PORT}.link.txt" \
+              "$REALITY_RELAY_DIR/relay-${RLY_LISTEN_PORT}.client.json"
+        reality_relay_regenerate || true   # 用剩余线路恢复到原先可用状态
+        pause; return 1
+    fi
+    # 防火墙：regenerate 已对所有线路放行；此处仅在 UFW 未启用时给交互引导
+    if command_exists ufw && ! ufw_is_active; then
         if [[ -t 0 ]] && confirm "UFW 未启用，是否现在跳转防火墙菜单启用并放行中转端口?"; then
             ufw_setup
             firewall_apply_realm_port "$RLY_LISTEN_PORT" || print_warn "UFW 仍未生效，请确认云安全组已放行 ${RLY_LISTEN_PORT}/tcp"
@@ -1319,49 +1341,80 @@ reality_diagnose() {
     print_title "Reality 诊断/自检"
     reality_load_state || { print_error "未发现状态文件: $REALITY_STATE_FILE"; pause; return 1; }
 
-    local connect_domain="${REALITY_RELAY_DOMAIN:-$REALITY_NODE_DOMAIN}"
-    local connect_port="${REALITY_RELAY_PORT:-$REALITY_PORT}"
+    local has_landing=0; [[ -n "${REALITY_PORT:-}" && -n "${REALITY_NODE_DOMAIN:-}" ]] && has_landing=1
+    # 连接核对目标：优先落地域名；纯中转机回落到首条线路的连接域名
+    local connect_domain="${REALITY_NODE_DOMAIN:-}" connect_port="${REALITY_PORT:-}"
+    if [[ -z "$connect_domain" ]]; then
+        local _first; _first=$(reality_relay_route_files | head -n1)
+        if [[ -n "$_first" ]] && reality_relay_load_route "$_first"; then
+            connect_domain="$RLY_CONNECT_HOST"; connect_port="$RLY_LISTEN_PORT"
+        fi
+    fi
     local public_ip="" dns_ip="" system_dns=""
 
     echo "节点角色: ${REALITY_ROLE:-unknown}"
-    echo "客户端连接: ${connect_domain}:${connect_port}"
-    echo "落地端口: ${REALITY_PORT:-unknown}"
-    echo "REALITY SNI: ${REALITY_SNI:-unknown}"
+    echo "客户端连接: ${connect_domain:-未设置}:${connect_port:-未设置}"
+    [[ "$has_landing" -eq 1 ]] && echo "落地端口: ${REALITY_PORT}"
+    [[ -n "${REALITY_SNI:-}" ]] && echo "落地 SNI: ${REALITY_SNI}"
     echo ""
 
-    if command_exists sing-box; then
-        sing-box version 2>/dev/null | head -n 1 || true
-        if [[ -f "$REALITY_SINGBOX_CONFIG" ]]; then
-            sing-box check -c "$REALITY_SINGBOX_CONFIG" >/dev/null 2>&1 \
-                && print_success "sing-box 配置检查通过" \
-                || print_error "sing-box 配置检查失败"
-        fi
-    else
-        print_warn "sing-box 未安装"
-    fi
-
-    if command_exists systemctl; then
-        systemctl is-active --quiet sing-box \
-            && print_success "sing-box 服务 active" \
-            || print_error "sing-box 服务未运行"
-    fi
-
-    if command_exists ss; then
-        if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${REALITY_PORT}$"; then
-            print_success "本机正在监听 Reality 端口: ${REALITY_PORT}/tcp"
+    if [[ "$has_landing" -eq 1 ]]; then
+        if command_exists sing-box; then
+            sing-box version 2>/dev/null | head -n 1 || true
+            if [[ -f "$REALITY_SINGBOX_CONFIG" ]]; then
+                sing-box check -c "$REALITY_SINGBOX_CONFIG" >/dev/null 2>&1 \
+                    && print_success "sing-box 配置检查通过" \
+                    || print_error "sing-box 配置检查失败"
+            fi
         else
-            print_error "本机未监听 Reality 端口: ${REALITY_PORT}/tcp"
+            print_warn "sing-box 未安装"
+        fi
+
+        if command_exists systemctl; then
+            systemctl is-active --quiet sing-box \
+                && print_success "sing-box 服务 active" \
+                || print_error "sing-box 服务未运行"
+        fi
+
+        if command_exists ss; then
+            if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${REALITY_PORT}$"; then
+                print_success "本机正在监听 Reality 端口: ${REALITY_PORT}/tcp"
+            else
+                print_error "本机未监听 Reality 端口: ${REALITY_PORT}/tcp"
+            fi
+        fi
+
+        if command_exists ufw; then
+            if ufw status 2>/dev/null | grep -q "${REALITY_PORT}/tcp"; then
+                print_success "UFW 已放行 Reality 端口: ${REALITY_PORT}/tcp"
+            else
+                print_warn "UFW 状态中未看到 ${REALITY_PORT}/tcp 放行规则"
+            fi
         fi
     fi
 
-    if command_exists ufw; then
-        if ufw status 2>/dev/null | grep -q "${REALITY_PORT}/tcp"; then
-            print_success "UFW 已放行 Reality 端口: ${REALITY_PORT}/tcp"
-        else
-            print_warn "UFW 状态中未看到 ${REALITY_PORT}/tcp 放行规则"
+    # 中转线路诊断：realm 服务 + 各线路监听端口
+    if [[ -n "$(reality_relay_route_files)" ]]; then
+        echo ""
+        if command_exists systemctl; then
+            systemctl is-active --quiet realm \
+                && print_success "realm 中转服务 active" \
+                || print_error "realm 中转服务未运行"
         fi
+        local _rf
+        while IFS= read -r _rf; do
+            [[ -n "$_rf" ]] || continue
+            reality_relay_load_route "$_rf" || continue
+            validate_port "$RLY_LISTEN_PORT" || continue
+            if command_exists ss && ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${RLY_LISTEN_PORT}$"; then
+                print_success "中转线路 ${RLY_NAME}: 监听 ${RLY_LISTEN_PORT}/tcp -> ${RLY_TARGET_HOST}:${RLY_TARGET_PORT}"
+            else
+                print_error "中转线路 ${RLY_NAME}: 未监听 ${RLY_LISTEN_PORT}/tcp（realm 可能未启动或端口冲突）"
+            fi
+        done < <(reality_relay_route_files)
     fi
 
+    echo ""
     echo "监听地址: ${REALITY_LISTEN_HOST:-0.0.0.0}$([[ "${REALITY_LISTEN_HOST:-}" == "::" ]] && echo '（双栈 IPv4+IPv6）')"
 
     local public_ip6 dns_ip6 has_v4_path=0 has_v6_path=0
@@ -1399,11 +1452,13 @@ reality_diagnose() {
         [[ "${REALITY_LISTEN_HOST:-}" != "::" ]] && print_warn "当前监听地址非 :: —— IPv6-only 机器需重装落地机(菜单 11→1)使其绑定 ::，否则 IPv6 客户端无法连接。"
     fi
 
-    if reality_verify_sni "$REALITY_SNI"; then
-        print_success "SNI TLS/SAN 校验通过: $REALITY_SNI"
-    else
-        print_warn "SNI TLS/SAN 校验失败或当前网络不可达: $REALITY_SNI"
-        tail -n 5 "${REALITY_SNI_CHECK_LOG:-/dev/null}" 2>/dev/null || true
+    if [[ -n "${REALITY_SNI:-}" ]]; then
+        if reality_verify_sni "$REALITY_SNI"; then
+            print_success "SNI TLS/SAN 校验通过: $REALITY_SNI"
+        else
+            print_warn "SNI TLS/SAN 校验失败或当前网络不可达: $REALITY_SNI"
+            tail -n 5 "${REALITY_SNI_CHECK_LOG:-/dev/null}" 2>/dev/null || true
+        fi
     fi
 
     if [[ "${REALITY_ROLE:-}" == *"landing"* ]]; then
@@ -1515,6 +1570,27 @@ reality_uninstall() {
     reality_delete_node_info
 }
 
+reality_show_links() {
+    print_title "客户端链接"
+    reality_load_state || { print_warn "未发现 Reality 状态文件"; pause; return 0; }
+    local any=0
+    if [[ -f "$REALITY_LINK_FILE" ]]; then
+        echo "落地节点 (${REALITY_NODE_DOMAIN:-本机}):"
+        cat "$REALITY_LINK_FILE"; echo ""; any=1
+    fi
+    local _f
+    while IFS= read -r _f; do
+        [[ -n "$_f" ]] || continue
+        reality_relay_load_route "$_f" || continue
+        local _lf="$REALITY_RELAY_DIR/relay-${RLY_LISTEN_PORT}.link.txt"
+        [[ -f "$_lf" ]] || continue
+        echo "中转线路 ${RLY_NAME} (${RLY_CONNECT_HOST}:${RLY_LISTEN_PORT} -> ${RLY_TARGET_HOST}:${RLY_TARGET_PORT}):"
+        cat "$_lf"; echo ""; any=1
+    done < <(reality_relay_route_files)
+    [[ $any -eq 0 ]] && print_warn "暂无可输出的客户端链接"
+    pause
+}
+
 reality_info_menu() {
     fix_terminal
     while true; do
@@ -1527,7 +1603,7 @@ reality_info_menu() {
         read -e -r -p "请选择: " c
         case "$c" in
             1) reality_show_info ;;
-            2) reality_show_info ;;
+            2) reality_show_links ;;
             3) reality_update_node_name ;;
             4) reality_delete_node_info ;;
             0|q|Q) break ;;
