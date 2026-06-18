@@ -15504,13 +15504,17 @@ reality_relay_add() {
     read -e -r -p "线路名称/备注 [${def_name}]: " RLY_NAME
     RLY_NAME="${RLY_NAME:-$def_name}"
     reality_validate_node_name "$RLY_NAME" || { print_error "名称无效：1-64 位英文/数字/空格/点/下划线/短横线"; pause; return 1; }
-    reality_relay_write_route "$RLY_LISTEN_PORT"
+    # 固定本条新线路标识：reality_relay_regenerate 内部会遍历所有线路并复用 RLY_* 全局，
+    # 返回后 RLY_* 已是“最后一条线路”的值；后续引用必须用这些 local，否则报错/回滚会指向别的线路。
+    local new_port="$RLY_LISTEN_PORT" new_name="$RLY_NAME" new_chost="$RLY_CONNECT_HOST" \
+          new_thost="$RLY_TARGET_HOST" new_tport="$RLY_TARGET_PORT"
+    reality_relay_write_route "$new_port"
     # 应用失败时回滚刚加的线路，避免把 realm 留在半残/停止状态
     if ! reality_relay_regenerate; then
         print_error "Realm 配置应用失败，正在回滚本条线路"
-        rm -f "$REALITY_RELAY_DIR/relay-${RLY_LISTEN_PORT}.conf" \
-              "$REALITY_RELAY_DIR/relay-${RLY_LISTEN_PORT}.link.txt" \
-              "$REALITY_RELAY_DIR/relay-${RLY_LISTEN_PORT}.client.json"
+        rm -f "$REALITY_RELAY_DIR/relay-${new_port}.conf" \
+              "$REALITY_RELAY_DIR/relay-${new_port}.link.txt" \
+              "$REALITY_RELAY_DIR/relay-${new_port}.client.json"
         reality_relay_regenerate || true   # 用剩余线路恢复到原先可用状态
         pause; return 1
     fi
@@ -15518,18 +15522,18 @@ reality_relay_add() {
     if command_exists ufw && ! ufw_is_active; then
         if [[ -t 0 ]] && confirm "UFW 未启用，是否现在跳转防火墙菜单启用并放行中转端口?"; then
             ufw_setup
-            firewall_apply_realm_port "$RLY_LISTEN_PORT" || print_warn "UFW 仍未生效，请确认云安全组已放行 ${RLY_LISTEN_PORT}/tcp"
+            firewall_apply_realm_port "$new_port" || print_warn "UFW 仍未生效，请确认云安全组已放行 ${new_port}/tcp"
         else
-            print_warn "已跳过本地防火墙配置，请确认云安全组已放行 ${RLY_LISTEN_PORT}/tcp"
+            print_warn "已跳过本地防火墙配置，请确认云安全组已放行 ${new_port}/tcp"
         fi
     fi
     # 角色刷新
     reality_load_state || true
     if [[ "${REALITY_ROLE:-}" == *"landing"* ]]; then REALITY_ROLE="landing+relay"; else REALITY_ROLE="relay"; fi
     reality_write_state
-    print_success "中转线路已添加: ${RLY_NAME} (本机 ${RLY_CONNECT_HOST}:${RLY_LISTEN_PORT} -> ${RLY_TARGET_HOST}:${RLY_TARGET_PORT})"
+    print_success "中转线路已添加: ${new_name} (本机 ${new_chost}:${new_port} -> ${new_thost}:${new_tport})"
     echo ""
-    [[ -f "$REALITY_RELAY_DIR/relay-${RLY_LISTEN_PORT}.link.txt" ]] && cat "$REALITY_RELAY_DIR/relay-${RLY_LISTEN_PORT}.link.txt"
+    [[ -f "$REALITY_RELAY_DIR/relay-${new_port}.link.txt" ]] && cat "$REALITY_RELAY_DIR/relay-${new_port}.link.txt"
     pause
 }
 

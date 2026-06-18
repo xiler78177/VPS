@@ -138,6 +138,30 @@ diag_body="$(awk "/^reality_diagnose\\(\\)/,/^}/" "$MOD")"
 ck "diagnose 含 realm 服务检查" 'grep -q "realm 中转服务" <<< "$diag_body"'
 ck "diagnose 含每线路监听检查" 'grep -q "中转线路 .* 监听" <<< "$diag_body"'
 
+echo "[T8] 回归：添加线路后报告/回滚必须用 local，不被 regenerate 遍历覆盖 RLY_*"
+# relay_add 必须把新线路标识固定为 local，再在 regenerate 之后引用
+ck "relay_add 捕获 local new_port" 'grep -q "local new_port=" <<< "$add_body"'
+ck "relay_add 成功提示用 new_* 而非 RLY_*" 'grep -q "本机 \${new_chost}:\${new_port}" <<< "$add_body"'
+ck "relay_add 链接展示用 relay-\${new_port}" 'grep -q "relay-\${new_port}.link.txt" <<< "$add_body"'
+ck "relay_add 回滚 rm 用 new_port" 'grep -q "relay-\${new_port}.conf" <<< "$add_body"'
+# 行为：证实 regenerate 会覆盖 RLY_*（故调用方必须先存 local）；且各线路文件本身正确
+rm -rf "$REALITY_RELAY_DIR"; mkdir -p "$REALITY_RELAY_DIR"
+RLY_NAME="A"; RLY_LISTEN_PORT="22222"; RLY_CONNECT_HOST="a.example.com"
+RLY_TARGET_HOST="sanjose.land"; RLY_TARGET_PORT="44231"
+RLY_UUID="uuid-A"; RLY_SNI="a.sni"; RLY_PUBLIC_KEY="PBK_A"; RLY_SHORT_ID="SIDA"; RLY_FLOW="xtls-rprx-vision"
+reality_relay_write_route 22222; reality_relay_write_client_artifacts
+RLY_NAME="B"; RLY_LISTEN_PORT="99999"; RLY_CONNECT_HOST="a.example.com"
+RLY_TARGET_HOST="mcdool.land"; RLY_TARGET_PORT="53487"
+RLY_UUID="uuid-B"; RLY_SNI="b.sni"; RLY_PUBLIC_KEY="PBK_B"; RLY_SHORT_ID="SIDB"; RLY_FLOW="xtls-rprx-vision"
+reality_relay_write_route 99999; reality_relay_write_client_artifacts
+# 模拟“刚添加 A”，捕获 local，再 regenerate
+new_port="22222"; new_thost="sanjose.land"
+RLY_NAME="A"; RLY_LISTEN_PORT="22222"; RLY_TARGET_HOST="sanjose.land"
+reality_relay_regenerate >/dev/null 2>&1 || true
+ck "regenerate 之后 RLY_* 被覆盖(印证 bug 成因)" '[[ "$RLY_LISTEN_PORT" != "22222" ]]'
+ck "用 local new_port 仍能取到 A 的链接(修复点)" 'grep -q "@a.example.com:22222?" "$REALITY_RELAY_DIR/relay-${new_port}.link.txt" && grep -q "pbk=PBK_A" "$REALITY_RELAY_DIR/relay-${new_port}.link.txt"'
+
+
 echo ""
 echo "==== reality_multi_relay_test: PASS=$pass FAIL=$fail ===="
 [[ $fail -eq 0 ]] && echo "reality_multi_relay_test: PASS" || { echo "reality_multi_relay_test: FAIL"; exit 1; }
