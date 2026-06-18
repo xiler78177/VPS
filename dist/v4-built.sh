@@ -15536,19 +15536,21 @@ reality_relay_add() {
 # 列出全部中转线路及客户端链接
 reality_relay_list() {
     print_title "中转线路列表"
-    local f n=0
+    local f n=0 st
     while IFS= read -r f; do
         [[ -n "$f" ]] || continue
         reality_relay_load_route "$f" || continue
         n=$((n+1))
-        draw_line
-        echo "线路 ${n}: ${RLY_NAME}"
-        echo "  本机入口: ${RLY_CONNECT_HOST}:${RLY_LISTEN_PORT}"
-        echo "  转发目标: ${RLY_TARGET_HOST}:${RLY_TARGET_PORT}"
-        local lf="$REALITY_RELAY_DIR/relay-${RLY_LISTEN_PORT}.link.txt"
-        [[ -f "$lf" ]] && { echo "  客户端链接:"; cat "$lf"; }
+        st="[未监听]"
+        if command_exists ss && ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${RLY_LISTEN_PORT}$"; then st="[监听中]"; fi
+        echo "${n}. ${RLY_NAME}  本机:${RLY_LISTEN_PORT} -> ${RLY_TARGET_HOST}:${RLY_TARGET_PORT}  ${st}"
     done < <(reality_relay_route_files)
-    [[ $n -eq 0 ]] && print_warn "暂无中转线路"
+    if [[ $n -eq 0 ]]; then
+        print_warn "暂无中转线路"
+    else
+        echo ""
+        print_info "完整客户端链接请到「查看/修改节点信息 → 查看节点信息」获取"
+    fi
     pause
 }
 
@@ -15590,7 +15592,7 @@ reality_relay_menu() {
     while true; do
         print_title "中转线路管理（A 给多台落地机做中转）"
         echo "1. 添加中转线路（导入落地链接）"
-        echo "2. 查看线路及客户端链接"
+        echo "2. 查看中转线路（清单/状态）"
         echo "3. 删除中转线路"
         echo "0. 返回"
         read -e -r -p "请选择: " c
@@ -16068,42 +16070,19 @@ reality_uninstall() {
     reality_delete_node_info
 }
 
-reality_show_links() {
-    print_title "客户端链接"
-    reality_load_state || { print_warn "未发现 Reality 状态文件"; pause; return 0; }
-    local any=0
-    if [[ -f "$REALITY_LINK_FILE" ]]; then
-        echo "落地节点 (${REALITY_NODE_DOMAIN:-本机}):"
-        cat "$REALITY_LINK_FILE"; echo ""; any=1
-    fi
-    local _f
-    while IFS= read -r _f; do
-        [[ -n "$_f" ]] || continue
-        reality_relay_load_route "$_f" || continue
-        local _lf="$REALITY_RELAY_DIR/relay-${RLY_LISTEN_PORT}.link.txt"
-        [[ -f "$_lf" ]] || continue
-        echo "中转线路 ${RLY_NAME} (${RLY_CONNECT_HOST}:${RLY_LISTEN_PORT} -> ${RLY_TARGET_HOST}:${RLY_TARGET_PORT}):"
-        cat "$_lf"; echo ""; any=1
-    done < <(reality_relay_route_files)
-    [[ $any -eq 0 ]] && print_warn "暂无可输出的客户端链接"
-    pause
-}
-
 reality_info_menu() {
     fix_terminal
     while true; do
         print_title "查看/修改节点信息"
-        echo "1. 查看节点信息"
-        echo "2. 输出客户端链接"
-        echo "3. 修改节点名称/备注"
-        echo "4. 删除节点信息"
+        echo "1. 查看节点信息（含客户端链接）"
+        echo "2. 修改节点名称/备注"
+        echo "3. 删除节点信息"
         echo "0. 返回"
         read -e -r -p "请选择: " c
         case "$c" in
             1) reality_show_info ;;
-            2) reality_show_links ;;
-            3) reality_update_node_name ;;
-            4) reality_delete_node_info ;;
+            2) reality_update_node_name ;;
+            3) reality_delete_node_info ;;
             0|q|Q) break ;;
             *) print_error "无效选项"; sleep 1 ;;
         esac

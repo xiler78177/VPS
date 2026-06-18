@@ -124,8 +124,12 @@ echo "[T7] 细节优化：脱敏/链接视图/回滚/诊断中转段"
 MOD="$ROOT/modules/15-singbox-reality.sh"
 ck "mask_secret 长串脱敏" '[[ "$(reality_mask_secret 0123456789abcdef0123)" == "012345…0123" ]]'
 ck "mask_secret 短串原样" '[[ "$(reality_mask_secret short)" == "short" ]]'
-ck "存在 reality_show_links 函数" 'grep -q "^reality_show_links()" "$MOD"'
-ck "info 菜单选项2 改为输出链接视图" 'grep -q "2) reality_show_links" "$MOD"'
+ck "已移除冗余 reality_show_links" '! grep -q "reality_show_links" "$MOD"'
+info_body="$(awk "/^reality_info_menu\\(\\)/,/^}/" "$MOD")"
+ck "info 菜单不再有独立输出链接项" '! grep -q "输出客户端链接" <<< "$info_body"'
+list_body="$(awk "/^reality_relay_list\\(\\)/,/^}/" "$MOD")"
+ck "中转线路列表只显示清单(不 dump 链接)" '! grep -q "link.txt" <<< "$list_body"'
+ck "中转线路列表显示监听状态" 'grep -q "监听中" <<< "$list_body"'
 ck "relay_add 含解析核对/确认" 'grep -q "以上落地参数是否正确" "$MOD"'
 add_body="$(awk "/^reality_relay_add\\(\\)/,/^}/" "$MOD")"
 ck "relay_add 含失败回滚" 'grep -q "正在回滚本条线路" <<< "$add_body"'
