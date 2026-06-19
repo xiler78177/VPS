@@ -252,6 +252,58 @@ DDNS_INTERVAL=\"$interval\""
     return 0
 }
 
+# 顶层（交互菜单）安全解析 conf：与生成脚本 ddns-update.sh 内嵌的同名解析器逻辑一致，
+# 但诊断走顶层的 log_action（heredoc 里的 log 仅存在于生成脚本中）。
+# ddns_list / ddns_delete 复用本函数——与本文件 get_public_ipv4(顶层)/get_ip(生成脚本) 的双份模式一致。
+parse_ddns_conf() {
+    local conf="$1" line key val
+    local fown fmode
+    fown=$(stat -c '%U' "$conf" 2>/dev/null || echo "")
+    fmode=$(stat -c '%a' "$conf" 2>/dev/null || echo "")
+    if [[ "$fown" != "root" ]]; then
+        log_action "DDNS 解析跳过：owner 非 root: $conf (owner=$fown)"
+        return 1
+    fi
+    if [[ "$fmode" =~ ^[0-7]+$ ]] && (( 8#${fmode} & 022 )); then
+        log_action "DDNS 解析跳过：权限过宽: $conf (mode=$fmode)"
+        return 1
+    fi
+    DDNS_DOMAIN="" DDNS_TOKEN="" DDNS_ZONE_ID=""
+    DDNS_IPV4="" DDNS_IPV6="" DDNS_PROXIED="" DDNS_INTERVAL=""
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        [[ -z "${line// }" ]] && continue
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        if [[ "$line" =~ ^(DDNS_DOMAIN|DDNS_TOKEN|DDNS_ZONE_ID|DDNS_IPV4|DDNS_IPV6|DDNS_PROXIED|DDNS_INTERVAL)=\"([^\"\$\`\\]*)\"$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            val="${BASH_REMATCH[2]}"
+            case "$key" in
+                DDNS_DOMAIN)   DDNS_DOMAIN="$val" ;;
+                DDNS_TOKEN)    DDNS_TOKEN="$val" ;;
+                DDNS_ZONE_ID)  DDNS_ZONE_ID="$val" ;;
+                DDNS_IPV4)     DDNS_IPV4="$val" ;;
+                DDNS_IPV6)     DDNS_IPV6="$val" ;;
+                DDNS_PROXIED)  DDNS_PROXIED="$val" ;;
+                DDNS_INTERVAL) DDNS_INTERVAL="$val" ;;
+            esac
+        else
+            log_action "DDNS 解析跳过：格式异常行: $conf"
+            return 1
+        fi
+    done < "$conf"
+    [[ -n "$DDNS_DOMAIN" && -n "$DDNS_TOKEN" && -n "$DDNS_ZONE_ID" ]] || {
+        log_action "DDNS 解析跳过：必填字段缺失: $conf"
+        return 1
+    }
+    DDNS_IPV4=${DDNS_IPV4:-false}
+    DDNS_IPV6=${DDNS_IPV6:-false}
+    DDNS_PROXIED=${DDNS_PROXIED:-false}
+    [[ "$DDNS_IPV4" == "true" || "$DDNS_IPV4" == "false" ]] || DDNS_IPV4="false"
+    [[ "$DDNS_IPV6" == "true" || "$DDNS_IPV6" == "false" ]] || DDNS_IPV6="false"
+    [[ "$DDNS_PROXIED" == "true" || "$DDNS_PROXIED" == "false" ]] || DDNS_PROXIED="false"
+    return 0
+}
+
 ddns_list() {
     print_title "DDNS 配置列表"
     [[ ! -d "$DDNS_CONFIG_DIR" || -z "$(ls -A "$DDNS_CONFIG_DIR" 2>/dev/null)" ]] && { print_warn "暂无 DDNS 配置"; pause; return; }

@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 ### Fixed
+- **DDNS 配置列表/删除菜单报 `parse_ddns_conf: command not found`**：`parse_ddns_conf` 仅定义在 `ddns_create_script` 生成的 `ddns-update.sh`（heredoc `<< 'EOF' … EOF`，行 50–200）内部，是那个独立 cron 脚本的私有函数；而交互菜单的 `ddns_list` / `ddns_delete` 在主脚本**顶层**调用它，顶层并无此函数 → 列表/删除菜单报 `command not found` 且无法显示已配置域名（cron 自动更新因生成脚本自带副本，不受影响）。修复：在主脚本顶层补一份 `parse_ddns_conf`（逻辑与 heredoc 内副本一致，诊断改走顶层 `log_action`），与本文件 `get_public_ipv4`(顶层)/`get_ip`(生成脚本) 既有的“双份”模式一致。
 - **添加中转线路后提示/回滚指向错误线路**：`reality_relay_add` 在 `reality_relay_regenerate` 之后继续引用 `RLY_*` 全局，而 regenerate 内部遍历所有线路会把 `RLY_*` 覆盖为“最后一条线路”，导致成功提示、展示链接、UFW 端口、失败回滚 `rm` 全部指向另一条已存在的线路（如添加 sanjose 却显示/可能误删 mcdool）。新线路实际写入是正确的，仅事后引用错乱。修复：写入前把端口/名称/目标/连接域名固定为 local，regenerate 之后一律用 local 引用。
 
 ### Changed
