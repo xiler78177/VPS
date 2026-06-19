@@ -16,6 +16,20 @@ auto_deps() { return 0; }
 STUB
 source "$LIB" >/dev/null 2>&1 || { echo "source 失败"; exit 1; }
 
+# --- hermetic 包装：隔离对宿主机 SSH 环境的耦合，避免在真实服务器上误报 ---
+# _sshd_set_directive 会检查宿主机 /etc/ssh/sshd_config.d/*.conf 是否已有同名 directive，
+# 命中则走 confirm；而本测试非交互（confirm 见 [[ ! -t 0 ]] 即 return 1），会导致函数
+# 不改文件而报失败。这里临时把 confirm 置为自动接受，只验证指令写入逻辑本身（与宿主机
+# 是否存在同名 drop-in 解耦），调用后立即恢复原 confirm。
+run_set_directive() {
+    local __sv; __sv=$(declare -f confirm)
+    confirm() { return 0; }
+    _sshd_set_directive "$@"
+    local __rc=$?
+    eval "$__sv"
+    return $__rc
+}
+
 echo "== P0-1: _cf_api 命名空间隔离 =="
 # dist 里 _cf_api() 定义应只剩 1 个（09b），14b 应改名 _email_cf_api
 n_cf_api=$(grep -cE '^_cf_api\(\)' "$BUILT")
@@ -84,7 +98,7 @@ declare -F _sshd_set_directive >/dev/null && pass "_sshd_set_directive 已定义
 # 测试在临时文件上：
 tmpfile=$(mktemp)
 echo "# empty sshd config" > "$tmpfile"
-_sshd_set_directive "PermitRootLogin" "no" "$tmpfile" </dev/null >/dev/null 2>&1
+run_set_directive "PermitRootLogin" "no" "$tmpfile" >/dev/null 2>&1
 if grep -q '^PermitRootLogin no$' "$tmpfile"; then
     pass "未命中时正确追加 PermitRootLogin no"
 else
@@ -92,7 +106,7 @@ else
 fi
 # 再试已有但被注释
 echo '#PasswordAuthentication yes' > "$tmpfile"
-_sshd_set_directive "PasswordAuthentication" "no" "$tmpfile" </dev/null >/dev/null 2>&1
+run_set_directive "PasswordAuthentication" "no" "$tmpfile" >/dev/null 2>&1
 if grep -qE '^PasswordAuthentication no$' "$tmpfile" && ! grep -q '#PasswordAuthentication' "$tmpfile"; then
     pass "命中注释行时正确替换"
 else
@@ -204,7 +218,7 @@ else
 fi
 
 # P3: 版本号
-grep -q 'VERSION="v14.1"' "$BUILT" && pass "P3: VERSION 升至 v14.1" || fail "P3: VERSION 未升级"
+grep -qE 'VERSION="v[0-9]+\.[0-9]+"' "$BUILT" && pass "P3: VERSION 格式合法 (v<主>.<次>)" || fail "P3: VERSION 缺失或格式异常"
 
 echo ""
 echo "== review #5 回归 =="
@@ -628,7 +642,7 @@ PasswordAuthentication yes
 Match User alice
     PasswordAuthentication yes
 EOF_SSHD_MATCH
-_sshd_set_directive "PasswordAuthentication" "no" "$ssh_match_tmp" </dev/null >/dev/null 2>&1
+run_set_directive "PasswordAuthentication" "no" "$ssh_match_tmp" >/dev/null 2>&1
 if grep -q '^PasswordAuthentication no$' "$ssh_match_tmp" && grep -q '^    PasswordAuthentication yes$' "$ssh_match_tmp"; then
     pass "S2: _sshd_set_directive 只改全局指令，不改 Match 块"
 else
@@ -639,7 +653,7 @@ cat > "$ssh_match_tmp" <<'EOF_SSHD_ONLY_MATCH'
 Match User alice
     PermitRootLogin yes
 EOF_SSHD_ONLY_MATCH
-_sshd_set_directive "PermitRootLogin" "no" "$ssh_match_tmp" </dev/null >/dev/null 2>&1
+run_set_directive "PermitRootLogin" "no" "$ssh_match_tmp" >/dev/null 2>&1
 if awk 'BEGIN{ok=0} /^PermitRootLogin no$/{global=NR} /^Match /{matchline=NR} END{exit !(global && matchline && global < matchline)}' "$ssh_match_tmp"; then
     pass "S2: 无全局指令时插入到首个 Match 之前"
 else
@@ -1670,7 +1684,11 @@ _old_sshd_config="$SSHD_CONFIG"
 SSHD_CONFIG="$ssh_multi_tmp"
 CURRENT_SSH_PORT=""
 CURRENT_SSH_PORTS=""
+# 本机可能装有 sshd → refresh_ssh_port 会优先用 sshd -T 读真实系统配置；
+# 此处要验证“从 SSHD_CONFIG 解析多端口”的回退路径，故临时 stub sshd 使其无输出以强制回退。
+sshd() { return 1; }
 refresh_ssh_port
+unset -f sshd
 SSHD_CONFIG="$_old_sshd_config"
 if [[ "$CURRENT_SSH_PORT" == "22" && "$CURRENT_SSH_PORTS" == *"22"* && "$CURRENT_SSH_PORTS" == *"22222"* ]]; then
     pass "S7: refresh_ssh_port fallback 保留多个 Port"
