@@ -541,6 +541,65 @@ else
     fail "H2: 旧 UFW 端口规则删除顺序不安全"
 fi
 
+# H2b: socket activation 误判回归（锁机事故根因）。
+# ssh.socket enabled-but-inactive 是 Debian/Ubuntu 默认常态，真正监听 22 的是 ssh.service。
+# _ssh_socket_unit 绝不能因 is-enabled 命中就把普通机器误判为 socket activation，
+# 否则会写 socket drop-in + 重启 ssh.socket，造成 socket/service 冲突锁死（只能 DD）。
+_h2b_tmp=$(mktemp)
+(
+    is_systemd() { return 0; }
+    systemctl() {
+        local verb="" unit=""
+        for a in "$@"; do
+            case "$a" in
+                is-active|is-enabled) verb="$a" ;;
+                ssh.socket|sshd.socket) unit="$a" ;;
+            esac
+        done
+        case "$verb:$unit" in
+            is-active:ssh.socket)  return 3 ;;   # inactive（普通机器常态）
+            is-enabled:ssh.socket) return 0 ;;   # enabled
+            *) return 3 ;;
+        esac
+    }
+    if _ssh_socket_unit >/dev/null 2>&1; then echo FAIL; else echo PASS; fi
+) > "$_h2b_tmp" 2>/dev/null
+[[ "$(cat "$_h2b_tmp")" == PASS ]] \
+    && pass "H2b: enabled-but-inactive ssh.socket 不被误判为 socket activation（锁机事故根因）" \
+    || fail "H2b: ssh.socket enabled-but-inactive 被误判为 activation —— 会锁死机器"
+rm -f "$_h2b_tmp"
+
+# H2c: 真正 active 的 ssh.socket 仍须被识别为 socket activation
+_h2c_tmp=$(mktemp)
+(
+    is_systemd() { return 0; }
+    systemctl() {
+        local verb="" unit=""
+        for a in "$@"; do
+            case "$a" in
+                is-active|is-enabled|show) verb="$a" ;;
+                ssh.socket|sshd.socket) unit="$a" ;;
+            esac
+        done
+        case "$verb:$unit" in
+            is-active:ssh.socket) return 0 ;;    # active → 真 socket activation
+            show:ssh.socket) echo "Listen=[::]:22 (Stream)"; return 0 ;;
+            *) return 3 ;;
+        esac
+    }
+    if [[ "$(_ssh_socket_unit 2>/dev/null)" == ssh.socket ]]; then echo PASS; else echo FAIL; fi
+) > "$_h2c_tmp" 2>/dev/null
+[[ "$(cat "$_h2c_tmp")" == PASS ]] \
+    && pass "H2c: active 的 ssh.socket 仍被识别为 socket activation" \
+    || fail "H2c: active 的 ssh.socket 未被识别"
+rm -f "$_h2c_tmp"
+
+# H2d: 源码层面断言 _ssh_socket_unit 不再用 is-enabled 判据（排除注释行，注释里会引用该词解释原因）
+socket_unit_body=$(awk '/^_ssh_socket_unit\(\)/,/^}/' "$BUILT")
+echo "$socket_unit_body" | grep -v '^[[:space:]]*#' | grep -q 'is-enabled' \
+    && fail "H2d: _ssh_socket_unit 仍含 is-enabled —— enabled-but-inactive 会误判锁机" \
+    || pass "H2d: _ssh_socket_unit 已移除 is-enabled 判据"
+
 # H4: 禁用密码/root 登录前必须做技术前置校验，并用 sshd -T 复验最终有效值。
 declare -F _ssh_authorized_keys_available >/dev/null && pass "H4: authorized_keys 前置校验 helper 已定义" || fail "H4: 缺 _ssh_authorized_keys_available"
 declare -F _ssh_non_root_sudo_available >/dev/null && pass "H4: 非 root sudo 用户校验 helper 已定义" || fail "H4: 缺 _ssh_non_root_sudo_available"

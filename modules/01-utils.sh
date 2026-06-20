@@ -197,9 +197,18 @@ is_systemd() {
 _ssh_socket_unit() {
     is_systemd || return 1
     local unit
+    # 只认 is-active：真正在做 socket activation 的系统，其 ssh.socket 必然 active。
+    # 绝不能用 is-enabled —— 大量 Debian/Ubuntu 镜像上 ssh.socket 是 enabled-but-inactive，
+    # 实际监听 22 的是传统 ssh.service。误判为 socket activation 会写 socket drop-in 改端口，
+    # 与 ssh.service 冲突，导致改回原端口也连不上、只能重装系统（已发生生产事故）。
     for unit in ssh.socket sshd.socket; do
-        systemctl is-active --quiet "$unit" 2>/dev/null && { echo "$unit"; return 0; }
-        systemctl is-enabled --quiet "$unit" 2>/dev/null && { echo "$unit"; return 0; }
+        if systemctl is-active --quiet "$unit" 2>/dev/null; then
+            # 二次确认：该 socket 确实在监听 SSH（有 ListenStream），排除空壳 active。
+            if systemctl show "$unit" -p Listen 2>/dev/null | grep -q 'Stream'; then
+                echo "$unit"
+                return 0
+            fi
+        fi
     done
     return 1
 }
