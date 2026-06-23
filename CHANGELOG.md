@@ -4,7 +4,10 @@
 
 ## [Unreleased]
 
+## [v14.4] — 2026-06-23
+
 ### Fixed
+- **[P0] Oracle/Ubuntu 修改 SSH 端口后仍无法远程连接**：修复两类锁外场景。其一，Oracle Cloud 默认镜像常见 `iptables`/`nftables` INPUT 链仅放行 22 且尾部 `REJECT`，但 UFW 处于 inactive；`ssh_change_port` 现在会在 UFW 未启用时检测 `iptables`/`ip6tables`/`firewalld`，先放行新 SSH 端口并尽量持久化，失败或用户取消则拒绝继续改端口。其二，systemd `ssh.socket` 在 `BindIPv6Only=ipv6-only` 下写裸 `ListenStream=<port>` 会只监听 IPv6；socket drop-in 改为同时写 `0.0.0.0:<port>` 与 `[::]:<port>`，确保 IPv4/IPv6 都真实监听。
 - **（测试）`smoke_p0p1p2.sh` 4 条 SSH/版本断言改为 hermetic**，消除在真实服务器上的误报（仅改测试，未动产品代码）：`P2-7`/`S2` 改走新增的 `run_set_directive` 包装——临时令 `confirm` 自动接受，绕开"宿主机 `/etc/ssh/sshd_config.d/` 存在同名 drop-in 时触发 confirm、而非交互终端下 `confirm` 直接拒绝→函数不改文件"导致的假失败；`S7` 临时 stub `sshd` 强制走 `refresh_ssh_port` 的 `SSHD_CONFIG` 多端口回退路径（原先在装有 sshd 的机器上会因优先 `sshd -T` 读到真实系统端口而误报）；`P3` 版本断言由钉死 `v14.1` 改为 `v<主>.<次>` 格式校验，不再随发布版本漂移。
 - **DDNS 配置列表/删除菜单报 `parse_ddns_conf: command not found`**：`parse_ddns_conf` 仅定义在 `ddns_create_script` 生成的 `ddns-update.sh`（heredoc `<< 'EOF' … EOF`，行 50–200）内部，是那个独立 cron 脚本的私有函数；而交互菜单的 `ddns_list` / `ddns_delete` 在主脚本**顶层**调用它，顶层并无此函数 → 列表/删除菜单报 `command not found` 且无法显示已配置域名（cron 自动更新因生成脚本自带副本，不受影响）。修复：在主脚本顶层补一份 `parse_ddns_conf`（逻辑与 heredoc 内副本一致，诊断改走顶层 `log_action`），与本文件 `get_public_ipv4`(顶层)/`get_ip`(生成脚本) 既有的“双份”模式一致。
 - **添加中转线路后提示/回滚指向错误线路**：`reality_relay_add` 在 `reality_relay_regenerate` 之后继续引用 `RLY_*` 全局，而 regenerate 内部遍历所有线路会把 `RLY_*` 覆盖为“最后一条线路”，导致成功提示、展示链接、UFW 端口、失败回滚 `rm` 全部指向另一条已存在的线路（如添加 sanjose 却显示/可能误删 mcdool）。新线路实际写入是正确的，仅事后引用错乱。修复：写入前把端口/名称/目标/连接域名固定为 local，regenerate 之后一律用 local 引用。

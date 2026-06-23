@@ -600,6 +600,87 @@ echo "$socket_unit_body" | grep -v '^[[:space:]]*#' | grep -q 'is-enabled' \
     && fail "H2d: _ssh_socket_unit 仍含 is-enabled —— enabled-but-inactive 会误判锁机" \
     || pass "H2d: _ssh_socket_unit 已移除 is-enabled 判据"
 
+# H2e/H2f: UFW 未启用但 iptables/nft INPUT 有 REJECT/DROP 时，SSH 改端口必须先放行新端口。
+declare -F firewall_prepare_non_ufw_ssh_port >/dev/null \
+    && pass "H2e: 非 UFW 本地防火墙预放行 helper 已定义" \
+    || fail "H2e: 缺 firewall_prepare_non_ufw_ssh_port"
+declare -F firewall_rollback_ssh_port >/dev/null \
+    && pass "H2e: 非 UFW 防火墙回滚 helper 已定义" \
+    || fail "H2e: 缺 firewall_rollback_ssh_port"
+echo "$ssh_change_body" | grep -q 'firewall_prepare_non_ufw_ssh_port' \
+    && pass "H2e: ssh_change_port 在 UFW 未启用时检查 iptables/nftables" \
+    || fail "H2e: ssh_change_port 未处理 UFW 以外的本地防火墙"
+echo "$ssh_change_body" | grep -Fq 'ListenStream=0.0.0.0:${port}' \
+    && echo "$ssh_change_body" | grep -Fq 'ListenStream=[::]:${port}' \
+    && pass "H2e: socket activation drop-in 同时监听 IPv4 和 IPv6" \
+    || fail "H2e: socket drop-in 不能只写裸 ListenStream=\${port}（会在 BindIPv6Only=ipv6-only 下丢 IPv4）"
+
+_h2e_tmp=$(mktemp)
+(
+    command_exists() { [[ "$1" == "iptables" ]]; }
+    iptables() {
+        if [[ "$1" == "-S" && "$2" == "INPUT" ]]; then
+            cat <<'EOF_FW'
+-P INPUT ACCEPT
+-A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+-A INPUT -p icmp -j ACCEPT
+-A INPUT -i lo -j ACCEPT
+-A INPUT -p tcp -m state --state NEW -m tcp --dport 22 -j ACCEPT
+-A INPUT -j REJECT --reject-with icmp-host-prohibited
+EOF_FW
+            return 0
+        fi
+        return 1
+    }
+    if _firewall_iptables_input_restrictive iptables &&
+       _firewall_iptables_has_tcp_accept iptables 22 &&
+       ! _firewall_iptables_has_tcp_accept iptables 22222; then
+        echo PASS
+    else
+        echo FAIL
+    fi
+) > "$_h2e_tmp" 2>/dev/null
+[[ "$(cat "$_h2e_tmp")" == PASS ]] \
+    && pass "H2e: 能识别 Oracle/iptables 风格 INPUT REJECT 只放行旧 22 的锁外场景" \
+    || fail "H2e: 未识别 iptables INPUT REJECT 导致的新端口阻断"
+rm -f "$_h2e_tmp"
+
+_h2f_tmp=$(mktemp)
+_h2f_insert=$(mktemp)
+(
+    PLATFORM=debian
+    is_systemd() { return 1; }
+    command_exists() { [[ "$1" == "iptables" ]]; }
+    confirm() { return 0; }
+    iptables() {
+        if [[ "$1" == "-S" && "$2" == "INPUT" ]]; then
+            cat <<'EOF_FW'
+-P INPUT ACCEPT
+-A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+-A INPUT -p tcp -m state --state NEW -m tcp --dport 22 -j ACCEPT
+-A INPUT -j REJECT --reject-with icmp-host-prohibited
+EOF_FW
+            return 0
+        fi
+        if [[ "$1" == "-I" && "$2" == "INPUT" ]]; then
+            printf '%s\n' "$*" > "$_h2f_insert"
+            return 0
+        fi
+        return 1
+    }
+    if firewall_prepare_non_ufw_ssh_port 22222 >/dev/null 2>&1 &&
+       [[ " $FIREWALL_SSH_OPEN_BACKENDS " == *" iptables "* ]] &&
+       grep -q -- '--dport 22222' "$_h2f_insert"; then
+        echo PASS
+    else
+        echo FAIL
+    fi
+) > "$_h2f_tmp" 2>/dev/null
+[[ "$(cat "$_h2f_tmp")" == PASS ]] \
+    && pass "H2f: UFW inactive + iptables REJECT 时会先插入新 SSH 端口 ACCEPT" \
+    || fail "H2f: 未在 iptables REJECT 前预放行新 SSH 端口"
+rm -f "$_h2f_tmp" "$_h2f_insert"
+
 # H4: 禁用密码/root 登录前必须做技术前置校验，并用 sshd -T 复验最终有效值。
 declare -F _ssh_authorized_keys_available >/dev/null && pass "H4: authorized_keys 前置校验 helper 已定义" || fail "H4: 缺 _ssh_authorized_keys_available"
 declare -F _ssh_non_root_sudo_available >/dev/null && pass "H4: 非 root sudo 用户校验 helper 已定义" || fail "H4: 缺 _ssh_non_root_sudo_available"

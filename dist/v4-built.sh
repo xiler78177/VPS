@@ -1,6 +1,6 @@
 #!/bin/bash
 
-readonly VERSION="v14.2"
+readonly VERSION="v14.4"
 readonly SCRIPT_NAME="server-manage"
 readonly CONFIG_FILE="/etc/${SCRIPT_NAME}.conf"
 readonly CACHE_DIR="/var/cache/${SCRIPT_NAME}"
@@ -1520,6 +1520,180 @@ ufw_add() {
     pause
 }
 
+FIREWALL_SSH_OPEN_BACKENDS=""
+
+_firewall_iptables_input_restrictive() {
+    local bin="$1"
+    command_exists "$bin" || return 1
+    "$bin" -S INPUT 2>/dev/null | awk '
+        $1=="-P" && $2=="INPUT" && ($3=="DROP" || $3=="REJECT") { found=1 }
+        $1=="-A" && $2=="INPUT" && $0 ~ / -j (DROP|REJECT)( |$)/ { found=1 }
+        END { exit found ? 0 : 1 }
+    '
+}
+
+_firewall_iptables_has_tcp_accept() {
+    local bin="$1" port="$2"
+    validate_port "$port" || return 1
+    command_exists "$bin" || return 1
+    "$bin" -S INPUT 2>/dev/null | awk -v p="$port" '
+        $1=="-A" && $2=="INPUT" &&
+        $0 ~ / -j ACCEPT( |$)/ &&
+        $0 ~ /(^| )-p tcp( |$)/ &&
+        $0 ~ ("(^| )--dport " p "($| )") { found=1 }
+        END { exit found ? 0 : 1 }
+    '
+}
+
+_firewall_iptables_insert_tcp_accept() {
+    local bin="$1" port="$2" comment="${3:-server-manage SSH}"
+    validate_port "$port" || return 1
+    command_exists "$bin" || return 1
+    _firewall_iptables_has_tcp_accept "$bin" "$port" && return 0
+
+    "$bin" -I INPUT 1 -p tcp -m state --state NEW -m tcp --dport "$port" \
+        -m comment --comment "$comment" -j ACCEPT 2>/dev/null && return 0
+    "$bin" -I INPUT 1 -p tcp -m tcp --dport "$port" -j ACCEPT
+}
+
+_firewall_iptables_delete_tcp_accept() {
+    local bin="$1" port="$2" comment="${3:-server-manage SSH}"
+    validate_port "$port" || return 1
+    command_exists "$bin" || return 0
+    "$bin" -D INPUT -p tcp -m state --state NEW -m tcp --dport "$port" \
+        -m comment --comment "$comment" -j ACCEPT 2>/dev/null && return 0
+    "$bin" -D INPUT -p tcp -m tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+}
+
+_firewall_iptables_save_rules() {
+    local save_bin="$1" rules_file="$2" tmpfile
+    [[ -f "$rules_file" ]] || return 2
+    command_exists "$save_bin" || return 2
+    tmpfile=$(mktemp "$(dirname "$rules_file")/.tmp.server-manage.iptables.XXXXXX") || return 1
+    _tmp_register "$tmpfile"
+    if ! "$save_bin" > "$tmpfile"; then
+        rm -f "$tmpfile"
+        _tmp_unregister "$tmpfile"
+        return 1
+    fi
+    chmod --reference="$rules_file" "$tmpfile" 2>/dev/null || true
+    chown --reference="$rules_file" "$tmpfile" 2>/dev/null || true
+    if ! mv "$tmpfile" "$rules_file"; then
+        rm -f "$tmpfile" 2>/dev/null || true
+        _tmp_unregister "$tmpfile"
+        return 1
+    fi
+    _tmp_unregister "$tmpfile"
+    return 0
+}
+
+_firewall_save_after_iptables_change() {
+    local backend="$1" rc
+    case "$backend" in
+        iptables)
+            if _firewall_iptables_save_rules iptables-save /etc/iptables/rules.v4; then rc=0; else rc=$?; fi
+            case "$rc" in
+                0) print_info "已同步持久化 /etc/iptables/rules.v4" ;;
+                1) print_warn "IPv4 运行时规则已更新，但持久化 /etc/iptables/rules.v4 失败，请手动检查。" ;;
+                2) print_warn "IPv4 运行时规则已更新，但未检测到 /etc/iptables/rules.v4；重启后可能丢失。" ;;
+            esac
+            ;;
+        ip6tables)
+            if _firewall_iptables_save_rules ip6tables-save /etc/iptables/rules.v6; then rc=0; else rc=$?; fi
+            case "$rc" in
+                0) print_info "已同步持久化 /etc/iptables/rules.v6" ;;
+                1) print_warn "IPv6 运行时规则已更新，但持久化 /etc/iptables/rules.v6 失败，请手动检查。" ;;
+                2) print_warn "IPv6 运行时规则已更新，但未检测到 /etc/iptables/rules.v6；重启后可能丢失。" ;;
+            esac
+            ;;
+    esac
+}
+
+# firewall_prepare_non_ufw_ssh_port <port> [comment]
+# 在 UFW 未启用时，为 SSH 改端口场景处理常见的本地防火墙：
+# - firewalld: 运行时 + permanent 放行
+# - iptables/ip6tables(nft backend 也兼容): INPUT 存在 DROP/REJECT 时插入新端口 ACCEPT，并在已存在
+#   /etc/iptables/rules.v4/v6 时同步持久化
+#
+# 返回值:
+#   0 = 已确保或未检测到本地阻断
+#   1 = 自动放行失败
+#   2 = 检测到可能阻断但用户取消/无法自动确认
+firewall_prepare_non_ufw_ssh_port() {
+    local port="$1" comment="${2:-SSH-New}"
+    FIREWALL_SSH_OPEN_BACKENDS=""
+    validate_port "$port" || { print_error "端口无效: $port"; return 1; }
+    [[ "$PLATFORM" == "openwrt" ]] && return 0
+
+    if is_systemd && systemctl is-active --quiet firewalld 2>/dev/null; then
+        print_warn "检测到 firewalld 正在运行；SSH 新端口必须同步放行。"
+        if ! command_exists firewall-cmd; then
+            print_error "firewalld 活跃但 firewall-cmd 不可用，拒绝继续修改 SSH 端口。"
+            return 1
+        fi
+        if ! confirm "是否通过 firewalld 放行 ${port}/tcp（运行时 + permanent）？"; then
+            return 2
+        fi
+        firewall-cmd --add-port="${port}/tcp" >/dev/null || return 1
+        firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || \
+            print_warn "firewalld permanent 规则写入失败；本次运行时已放行，但重启后可能丢失。"
+        FIREWALL_SSH_OPEN_BACKENDS+=" firewalld"
+        print_success "firewalld 已放行 ${port}/tcp。"
+        return 0
+    fi
+
+    local restrictive=0 changed=0 backend
+    for backend in iptables ip6tables; do
+        command_exists "$backend" || continue
+        _firewall_iptables_input_restrictive "$backend" || continue
+        restrictive=1
+        if _firewall_iptables_has_tcp_accept "$backend" "$port"; then
+            print_info "${backend} 已存在 ${port}/tcp 放行规则。"
+            continue
+        fi
+        print_warn "检测到 ${backend} INPUT 链存在 DROP/REJECT，且未放行新 SSH 端口 ${port}/tcp。"
+        if ! confirm "是否自动插入 ${backend} 放行规则并尽量持久化？"; then
+            [[ -n "$FIREWALL_SSH_OPEN_BACKENDS" ]] && firewall_rollback_ssh_port "$port" "$FIREWALL_SSH_OPEN_BACKENDS" "$comment"
+            return 2
+        fi
+        if ! _firewall_iptables_insert_tcp_accept "$backend" "$port" "$comment"; then
+            print_error "${backend} 插入 ${port}/tcp 放行规则失败。"
+            [[ -n "$FIREWALL_SSH_OPEN_BACKENDS" ]] && firewall_rollback_ssh_port "$port" "$FIREWALL_SSH_OPEN_BACKENDS" "$comment"
+            return 1
+        fi
+        FIREWALL_SSH_OPEN_BACKENDS+=" ${backend}"
+        changed=1
+        print_success "${backend} 已放行 ${port}/tcp。"
+        _firewall_save_after_iptables_change "$backend"
+    done
+
+    if [[ $restrictive -eq 0 ]]; then
+        print_info "未检测到 UFW 以外的本地 INPUT DROP/REJECT；仍请确认云安全组已放行 ${port}/tcp。"
+    elif [[ $changed -eq 0 ]]; then
+        print_info "检测到本地防火墙限制，但新端口已有放行规则。"
+    fi
+    return 0
+}
+
+firewall_rollback_ssh_port() {
+    local port="$1" backends="${2:-}" comment="${3:-SSH-New}" backend
+    validate_port "$port" || return 0
+    for backend in $backends; do
+        case "$backend" in
+            iptables|ip6tables)
+                _firewall_iptables_delete_tcp_accept "$backend" "$port" "$comment"
+                _firewall_save_after_iptables_change "$backend"
+                ;;
+            firewalld)
+                if command_exists firewall-cmd; then
+                    firewall-cmd --remove-port="${port}/tcp" >/dev/null 2>&1 || true
+                    firewall-cmd --permanent --remove-port="${port}/tcp" >/dev/null 2>&1 || true
+                fi
+                ;;
+        esac
+    done
+}
+
 # firewall_allow_tcp_port <port> [comment]
 # 返回值:
 #   0 = 已成功放行
@@ -2886,17 +3060,32 @@ ssh_change_port() {
         cat > "$socket_dropin" <<EOF
 [Socket]
 ListenStream=
-ListenStream=${port}
+ListenStream=0.0.0.0:${port}
+ListenStream=[::]:${port}
 EOF
         systemctl daemon-reload 2>/dev/null || true
     fi
 
     # 先放行新端口（防止改完连不上）
-    local ufw_opened=0
+    local ufw_opened=0 firewall_opened_backends=""
     if ufw_is_active; then
         ufw allow "$port/tcp" comment "SSH-New" >/dev/null
         ufw_opened=1
         print_success "UFW 已放行新端口 $port。"
+    else
+        if declare -F firewall_prepare_non_ufw_ssh_port >/dev/null; then
+            if ! firewall_prepare_non_ufw_ssh_port "$port" "SSH-New"; then
+                print_error "无法确认本地防火墙已放行新 SSH 端口，拒绝继续修改以避免失联。"
+                print_info "请先手动放行 ${port}/tcp（云安全组 + 本机防火墙），再重试。"
+                pause; return
+            fi
+            firewall_opened_backends="$FIREWALL_SSH_OPEN_BACKENDS"
+        else
+            print_warn "未找到非 UFW 防火墙检测 helper；请确认云安全组/iptables/nftables 已放行 ${port}/tcp。"
+            if ! confirm "仍要继续修改 SSH 端口？"; then
+                pause; return
+            fi
+        fi
     fi
 
     # 写入端口配置
@@ -2915,6 +3104,7 @@ EOF
             systemctl daemon-reload 2>/dev/null || true
         fi
         [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
+        [[ -n "$firewall_opened_backends" ]] && firewall_rollback_ssh_port "$port" "$firewall_opened_backends" "SSH-New"
         pause; return
     fi
 
@@ -2926,6 +3116,7 @@ EOF
             systemctl daemon-reload 2>/dev/null || true
         fi
         [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
+        [[ -n "$firewall_opened_backends" ]] && firewall_rollback_ssh_port "$port" "$firewall_opened_backends" "SSH-New"
         _restart_sshd || true
         pause; return
     fi
@@ -2946,6 +3137,7 @@ EOF
             systemctl daemon-reload 2>/dev/null || true
         fi
         [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
+        [[ -n "$firewall_opened_backends" ]] && firewall_rollback_ssh_port "$port" "$firewall_opened_backends" "SSH-New"
         _restart_sshd || true
         pause; return
     fi
@@ -2956,9 +3148,10 @@ EOF
         effective_port=$(sshd -T 2>/dev/null | awk 'tolower($1)=="port"{print $2; exit}')
         if [[ "$effective_port" != "$port" ]]; then
             print_error "重启后 sshd -T 解析端口仍为 ${effective_port:-未知}，与目标 $port 不一致。"
-            print_error "可能仍被其他 drop-in 文件覆盖。已回滚配置，UFW 规则保持原状。"
+            print_error "可能仍被其他 drop-in 文件覆盖。已回滚配置和本次新增防火墙规则。"
             mv "$backup_file" "$target_conf" 2>/dev/null || true
             [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
+            [[ -n "$firewall_opened_backends" ]] && firewall_rollback_ssh_port "$port" "$firewall_opened_backends" "SSH-New"
             _restart_sshd || true
             pause; return
         fi

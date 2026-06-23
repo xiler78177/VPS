@@ -102,17 +102,32 @@ ssh_change_port() {
         cat > "$socket_dropin" <<EOF
 [Socket]
 ListenStream=
-ListenStream=${port}
+ListenStream=0.0.0.0:${port}
+ListenStream=[::]:${port}
 EOF
         systemctl daemon-reload 2>/dev/null || true
     fi
 
     # 先放行新端口（防止改完连不上）
-    local ufw_opened=0
+    local ufw_opened=0 firewall_opened_backends=""
     if ufw_is_active; then
         ufw allow "$port/tcp" comment "SSH-New" >/dev/null
         ufw_opened=1
         print_success "UFW 已放行新端口 $port。"
+    else
+        if declare -F firewall_prepare_non_ufw_ssh_port >/dev/null; then
+            if ! firewall_prepare_non_ufw_ssh_port "$port" "SSH-New"; then
+                print_error "无法确认本地防火墙已放行新 SSH 端口，拒绝继续修改以避免失联。"
+                print_info "请先手动放行 ${port}/tcp（云安全组 + 本机防火墙），再重试。"
+                pause; return
+            fi
+            firewall_opened_backends="$FIREWALL_SSH_OPEN_BACKENDS"
+        else
+            print_warn "未找到非 UFW 防火墙检测 helper；请确认云安全组/iptables/nftables 已放行 ${port}/tcp。"
+            if ! confirm "仍要继续修改 SSH 端口？"; then
+                pause; return
+            fi
+        fi
     fi
 
     # 写入端口配置
@@ -131,6 +146,7 @@ EOF
             systemctl daemon-reload 2>/dev/null || true
         fi
         [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
+        [[ -n "$firewall_opened_backends" ]] && firewall_rollback_ssh_port "$port" "$firewall_opened_backends" "SSH-New"
         pause; return
     fi
 
@@ -142,6 +158,7 @@ EOF
             systemctl daemon-reload 2>/dev/null || true
         fi
         [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
+        [[ -n "$firewall_opened_backends" ]] && firewall_rollback_ssh_port "$port" "$firewall_opened_backends" "SSH-New"
         _restart_sshd || true
         pause; return
     fi
@@ -162,6 +179,7 @@ EOF
             systemctl daemon-reload 2>/dev/null || true
         fi
         [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
+        [[ -n "$firewall_opened_backends" ]] && firewall_rollback_ssh_port "$port" "$firewall_opened_backends" "SSH-New"
         _restart_sshd || true
         pause; return
     fi
@@ -172,9 +190,10 @@ EOF
         effective_port=$(sshd -T 2>/dev/null | awk 'tolower($1)=="port"{print $2; exit}')
         if [[ "$effective_port" != "$port" ]]; then
             print_error "重启后 sshd -T 解析端口仍为 ${effective_port:-未知}，与目标 $port 不一致。"
-            print_error "可能仍被其他 drop-in 文件覆盖。已回滚配置，UFW 规则保持原状。"
+            print_error "可能仍被其他 drop-in 文件覆盖。已回滚配置和本次新增防火墙规则。"
             mv "$backup_file" "$target_conf" 2>/dev/null || true
             [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
+            [[ -n "$firewall_opened_backends" ]] && firewall_rollback_ssh_port "$port" "$firewall_opened_backends" "SSH-New"
             _restart_sshd || true
             pause; return
         fi
