@@ -81,6 +81,10 @@ REALITY_CONFIG_DIR="/etc/server-manage/reality"
 REALITY_STATE_FILE="${REALITY_CONFIG_DIR}/state.conf"
 REALITY_LINK_FILE="${REALITY_CONFIG_DIR}/client-link.txt"
 REALITY_CLIENT_JSON="${REALITY_CONFIG_DIR}/client.json"
+REALITY_LINK_FILE_V4="${REALITY_CONFIG_DIR}/client-link-v4.txt"
+REALITY_LINK_FILE_V6="${REALITY_CONFIG_DIR}/client-link-v6.txt"
+REALITY_CLIENT_JSON_V4="${REALITY_CONFIG_DIR}/client-v4.json"
+REALITY_CLIENT_JSON_V6="${REALITY_CONFIG_DIR}/client-v6.json"
 REALITY_BACKUP_DIR="${REALITY_CONFIG_DIR}/backups"
 REALITY_RELAY_DIR="${REALITY_CONFIG_DIR}/relays"
 REALITY_SINGBOX_CONFIG="/etc/sing-box/config.json"
@@ -4796,7 +4800,8 @@ _cf_dns_delete() {
         return 1
     fi
     local rid=$(echo "$resp" | jq -r '.result[0].id // empty')
-    [[ -n "$rid" ]] && _cf_api DELETE "/zones/$zone_id/dns_records/$rid" "$token"
+    [[ -n "$rid" ]] || return 0
+    _cf_api DELETE "/zones/$zone_id/dns_records/$rid" "$token" >/dev/null
 }
 
 # 通用 DNS 记录更新
@@ -14958,6 +14963,13 @@ reality_render_singbox_config() {
     private_key=$(reality_json_escape "$private_key")
     sni=$(reality_json_escape "$sni")
     short_id=$(reality_json_escape "$short_id")
+    if [[ "${REALITY_DNS_MODE:-auto}" == "split" && -n "${REALITY_PORT_V6:-}" ]]; then
+        local listen_host_v4="${REALITY_LISTEN_HOST_V4:-0.0.0.0}" listen_host_v6="${REALITY_LISTEN_HOST_V6:-::}" port_v6="${REALITY_PORT_V6}"
+        cat <<EOF
+{"log":{"disabled":true},"inbounds":[{"type":"vless","tag":"vless-reality-ipv4","listen":"${listen_host_v4}","listen_port":${port},"users":[{"name":"main","uuid":"${uuid}","flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":"${sni}","reality":{"enabled":true,"handshake":{"server":"${sni}","server_port":443},"private_key":"${private_key}","short_id":["${short_id}"],"max_time_difference":"1m"}}},{"type":"vless","tag":"vless-reality-ipv6","listen":"${listen_host_v6}","listen_port":${port_v6},"users":[{"name":"main","uuid":"${uuid}","flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":"${sni}","reality":{"enabled":true,"handshake":{"server":"${sni}","server_port":443},"private_key":"${private_key}","short_id":["${short_id}"],"max_time_difference":"1m"}}}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}
+EOF
+        return 0
+    fi
     cat <<EOF
 {"log":{"disabled":true},"inbounds":[{"type":"vless","tag":"vless-reality-in","listen":"${listen_host}","listen_port":${port},"users":[{"name":"main","uuid":"${uuid}","flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":"${sni}","reality":{"enabled":true,"handshake":{"server":"${sni}","server_port":443},"private_key":"${private_key}","short_id":["${short_id}"],"max_time_difference":"1m"}}}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}
 EOF
@@ -15018,6 +15030,7 @@ EOF
 
 reality_resolve_public_a() {
     local domain="$1" resp ip
+    [[ -n "$domain" ]] || return 1
     command_exists curl || return 1
     resp=$(curl -fsS --max-time 8 -H 'accept: application/dns-json' \
         "https://cloudflare-dns.com/dns-query?name=${domain}&type=A" 2>/dev/null) || return 1
@@ -15032,6 +15045,7 @@ reality_resolve_public_a() {
 
 reality_resolve_public_aaaa() {
     local domain="$1" resp ip
+    [[ -n "$domain" ]] || return 1
     command_exists curl || return 1
     resp=$(curl -fsS --max-time 8 -H 'accept: application/dns-json' \
         "https://cloudflare-dns.com/dns-query?name=${domain}&type=AAAA" 2>/dev/null) || return 1
@@ -15255,13 +15269,21 @@ reality_write_state() {
 REALITY_ROLE=$(reality_state_quote "${REALITY_ROLE:-}")
 REALITY_NODE_NAME=$(reality_state_quote "${REALITY_NODE_NAME:-}")
 REALITY_NODE_DOMAIN=$(reality_state_quote "${REALITY_NODE_DOMAIN:-}")
+REALITY_DNS_MODE=$(reality_state_quote "${REALITY_DNS_MODE:-}")
+REALITY_NODE_DOMAIN_V4=$(reality_state_quote "${REALITY_NODE_DOMAIN_V4:-}")
+REALITY_NODE_DOMAIN_V6=$(reality_state_quote "${REALITY_NODE_DOMAIN_V6:-}")
+REALITY_NODE_NAME_V4=$(reality_state_quote "${REALITY_NODE_NAME_V4:-}")
+REALITY_NODE_NAME_V6=$(reality_state_quote "${REALITY_NODE_NAME_V6:-}")
 REALITY_SNI=$(reality_state_quote "${REALITY_SNI:-}")
 REALITY_PORT=$(reality_state_quote "${REALITY_PORT:-}")
+REALITY_PORT_V6=$(reality_state_quote "${REALITY_PORT_V6:-}")
 REALITY_UUID=$(reality_state_quote "${REALITY_UUID:-}")
 REALITY_PRIVATE_KEY=$(reality_state_quote "${REALITY_PRIVATE_KEY:-}")
 REALITY_PUBLIC_KEY=$(reality_state_quote "${REALITY_PUBLIC_KEY:-}")
 REALITY_SHORT_ID=$(reality_state_quote "${REALITY_SHORT_ID:-}")
 REALITY_LISTEN_HOST=$(reality_state_quote "${REALITY_LISTEN_HOST:-}")
+REALITY_LISTEN_HOST_V4=$(reality_state_quote "${REALITY_LISTEN_HOST_V4:-}")
+REALITY_LISTEN_HOST_V6=$(reality_state_quote "${REALITY_LISTEN_HOST_V6:-}")
 REALITY_RELAY_DOMAIN=$(reality_state_quote "${REALITY_RELAY_DOMAIN:-}")
 REALITY_RELAY_PORT=$(reality_state_quote "${REALITY_RELAY_PORT:-}")
 REALITY_RELAY_TARGET_HOST=$(reality_state_quote "${REALITY_RELAY_TARGET_HOST:-}")
@@ -15297,6 +15319,34 @@ reality_effective_node_name() {
     fi
 }
 
+reality_normalize_dns_mode() {
+    local mode="${1:-auto}"
+    mode="${mode,,}"
+    case "$mode" in
+        auto|dual|both|same|same-domain|"") echo "auto" ;;
+        ipv4|ip4|v4|4) echo "ipv4" ;;
+        ipv6|ip6|v6|6) echo "ipv6" ;;
+        split|dual-node|dual-nodes|split-dual|v4v6|ipv4-ipv6) echo "split" ;;
+        *) return 1 ;;
+    esac
+}
+
+reality_dns_mode_label() {
+    case "${1:-auto}" in
+        ipv4) echo "IPv4-only 单节点（仅 A 记录）" ;;
+        ipv6) echo "IPv6-only 单节点（仅 AAAA 记录）" ;;
+        split) echo "IPv4+IPv6 双节点（A-only + AAAA-only，两端口/两链接）" ;;
+        *) echo "自动/双栈单节点（同域名 A/AAAA）" ;;
+    esac
+}
+
+reality_node_name_with_suffix() {
+    local base="${1:-singbox-reality}" suffix="$2" max
+    max=$((64 - ${#suffix}))
+    (( max < 1 )) && max=1
+    printf '%s%s' "${base:0:max}" "$suffix"
+}
+
 reality_prompt_node_name() {
     local default_name="${1:-}" name=""
     [[ -n "$default_name" ]] || default_name="$(reality_default_node_name)"
@@ -15315,18 +15365,41 @@ reality_prompt_node_name() {
     done
 }
 
+reality_write_one_client_artifact() {
+    local link_path="$1" json_path="$2" link_host="$3" link_port="$4" name="$5" json_name
+    [[ -n "$link_path" && -n "$json_path" && -n "$link_host" && -n "$link_port" ]] || return 1
+    json_name=$(reality_json_escape "$name")
+    reality_build_vless_link "$REALITY_UUID" "$link_host" "$link_port" "$REALITY_SNI" "$REALITY_PUBLIC_KEY" "$REALITY_SHORT_ID" "$name" > "$link_path"
+    cat > "$json_path" <<EOF
+{"type":"vless","tag":"${json_name}","server":"${link_host}","server_port":${link_port},"uuid":"${REALITY_UUID}","flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":"${REALITY_SNI}","utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":"${REALITY_PUBLIC_KEY}","short_id":"${REALITY_SHORT_ID}"}}}
+EOF
+    chmod 600 "$link_path" "$json_path"
+}
+
 reality_write_client_artifacts() {
+    mkdir -p "$REALITY_CONFIG_DIR"
+    local mode="${REALITY_DNS_MODE:-auto}"
+    mode=$(reality_normalize_dns_mode "$mode" 2>/dev/null || echo "auto")
+    if [[ "$mode" == "split" ]]; then
+        local host_v4="${REALITY_NODE_DOMAIN_V4:-$REALITY_NODE_DOMAIN}" host_v6="${REALITY_NODE_DOMAIN_V6:-}"
+        local port_v4="${REALITY_PORT}" port_v6="${REALITY_PORT_V6:-}"
+        local name_v4="${REALITY_NODE_NAME_V4:-}" name_v6="${REALITY_NODE_NAME_V6:-}"
+        [[ -n "$host_v4" && -n "$host_v6" && -n "$port_v4" && -n "$port_v6" ]] || return 1
+        [[ -n "$name_v4" ]] || name_v4="$(reality_node_name_with_suffix "$(reality_effective_node_name)" "-ipv4")"
+        [[ -n "$name_v6" ]] || name_v6="$(reality_node_name_with_suffix "$(reality_effective_node_name)" "-ipv6")"
+        reality_write_one_client_artifact "$REALITY_LINK_FILE_V4" "$REALITY_CLIENT_JSON_V4" "$host_v4" "$port_v4" "$name_v4" || return 1
+        reality_write_one_client_artifact "$REALITY_LINK_FILE_V6" "$REALITY_CLIENT_JSON_V6" "$host_v6" "$port_v6" "$name_v6" || return 1
+        cat "$REALITY_LINK_FILE_V4" "$REALITY_LINK_FILE_V6" > "$REALITY_LINK_FILE"
+        cp -f "$REALITY_CLIENT_JSON_V4" "$REALITY_CLIENT_JSON"
+        chmod 600 "$REALITY_LINK_FILE" "$REALITY_CLIENT_JSON"
+        return 0
+    fi
+
     local link_host="${REALITY_RELAY_DOMAIN:-$REALITY_NODE_DOMAIN}" link_port="${REALITY_RELAY_PORT:-$REALITY_PORT}" name
     [[ -n "$link_host" && -n "$link_port" ]] || return 1
     name="$(reality_effective_node_name)"
-    local json_name
-    json_name=$(reality_json_escape "$name")
-    mkdir -p "$REALITY_CONFIG_DIR"
-    reality_build_vless_link "$REALITY_UUID" "$link_host" "$link_port" "$REALITY_SNI" "$REALITY_PUBLIC_KEY" "$REALITY_SHORT_ID" "$name" > "$REALITY_LINK_FILE"
-    cat > "$REALITY_CLIENT_JSON" <<EOF
-{"type":"vless","tag":"${json_name}","server":"${link_host}","server_port":${link_port},"uuid":"${REALITY_UUID}","flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":"${REALITY_SNI}","utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":"${REALITY_PUBLIC_KEY}","short_id":"${REALITY_SHORT_ID}"}}}
-EOF
-    chmod 600 "$REALITY_LINK_FILE" "$REALITY_CLIENT_JSON"
+    reality_write_one_client_artifact "$REALITY_LINK_FILE" "$REALITY_CLIENT_JSON" "$link_host" "$link_port" "$name"
+    rm -f "$REALITY_LINK_FILE_V4" "$REALITY_LINK_FILE_V6" "$REALITY_CLIENT_JSON_V4" "$REALITY_CLIENT_JSON_V6" 2>/dev/null || true
 }
 
 reality_detect_ips() {
@@ -15335,12 +15408,55 @@ reality_detect_ips() {
     [[ -n "$REALITY_IPV6" && "$REALITY_IPV6" != *:* ]] && REALITY_IPV6=""
 }
 
+reality_cf_delete_dns_type() {
+    local domain="$1" token="$2" type="$3" zone_id resp id ids=()
+    [[ -z "$domain" || -z "$token" || -z "$type" ]] && return 1
+    command_exists jq || install_package "jq" "silent" || return 1
+    zone_id=$(_cf_get_zone_id "$domain" "$token") || return 1
+    [[ -n "$zone_id" ]] || return 1
+    resp=$(_cf_api GET "/zones/$zone_id/dns_records?type=$type&name=$domain&per_page=100" "$token") || return 1
+    _cf_api_ok "$resp" || return 1
+    mapfile -t ids < <(jq -r '.result[].id // empty' <<< "$resp" 2>/dev/null)
+    for id in "${ids[@]}"; do
+        [[ -n "$id" ]] || continue
+        _cf_api DELETE "/zones/$zone_id/dns_records/$id" "$token" >/dev/null || return 1
+    done
+}
+
 reality_sync_cloudflare_dns() {
-    local domain="$1" token="$2"
+    local domain="$1" token="$2" mode="${3:-auto}"
     [[ -z "$domain" || -z "$token" ]] && return 1
+    mode=$(reality_normalize_dns_mode "$mode" 2>/dev/null || echo "auto")
     reality_detect_ips
-    [[ -n "$REALITY_IPV4" || -n "$REALITY_IPV6" ]] || { print_error "未检测到公网 IP"; return 1; }
-    cf_dns_sync_node_grey "$token" "$domain" "$REALITY_IPV4" "$REALITY_IPV6" "true" "5"
+    case "$mode" in
+        ipv4)
+            [[ -n "$REALITY_IPV4" ]] || { print_error "未检测到公网 IPv4，无法同步 IPv4-only 节点"; return 1; }
+            cf_dns_sync_node_grey "$token" "$domain" "$REALITY_IPV4" "" "true" "5" || return 1
+            reality_cf_delete_dns_type "$domain" "$token" "AAAA" || { print_error "清理 ${domain} 的 AAAA 记录失败；IPv4-only 节点可能仍被解析到 IPv6"; return 1; }
+            ;;
+        ipv6)
+            [[ -n "$REALITY_IPV6" ]] || { print_error "未检测到公网 IPv6，无法同步 IPv6-only 节点"; return 1; }
+            cf_dns_sync_node_grey "$token" "$domain" "" "$REALITY_IPV6" "true" "5" || return 1
+            reality_cf_delete_dns_type "$domain" "$token" "A" || { print_error "清理 ${domain} 的 A 记录失败；IPv6-only 节点可能仍被解析到 IPv4"; return 1; }
+            ;;
+        *)
+            [[ -n "$REALITY_IPV4" || -n "$REALITY_IPV6" ]] || { print_error "未检测到公网 IP"; return 1; }
+            cf_dns_sync_node_grey "$token" "$domain" "$REALITY_IPV4" "$REALITY_IPV6" "true" "5"
+            ;;
+    esac
+}
+
+reality_sync_cloudflare_dns_by_state() {
+    local token="$1" mode
+    [[ -n "$token" ]] || return 1
+    mode=$(reality_normalize_dns_mode "${REALITY_DNS_MODE:-auto}" 2>/dev/null || echo "auto")
+    if [[ "$mode" == "split" ]]; then
+        [[ -n "${REALITY_NODE_DOMAIN_V4:-}" && -n "${REALITY_NODE_DOMAIN_V6:-}" ]] || { print_error "双节点模式缺少 IPv4/IPv6 域名"; return 1; }
+        reality_sync_cloudflare_dns "$REALITY_NODE_DOMAIN_V4" "$token" "ipv4" || return 1
+        reality_sync_cloudflare_dns "$REALITY_NODE_DOMAIN_V6" "$token" "ipv6" || return 1
+    else
+        reality_sync_cloudflare_dns "$REALITY_NODE_DOMAIN" "$token" "$mode"
+    fi
 }
 
 reality_cf_zone_names_from_json() {
@@ -15372,7 +15488,7 @@ reality_join_subdomain() {
 }
 
 reality_prompt_domain_with_zones() {
-    local purpose="$1" token="$2" zone="" prefix="" zones=() i choice domain
+    local purpose="$1" token="$2" default_prefix="${3:-$(hostname)-reality}" zone="" prefix="" zones=() i choice domain
     if [[ -n "$token" ]]; then
         mapfile -t zones < <(reality_cf_list_zones "$token" 2>/dev/null || true)
     fi
@@ -15389,8 +15505,8 @@ reality_prompt_domain_with_zones() {
         done
         while true; do
             echo "  只需要填写自定义前缀，脚本会拼接为完整域名并自动创建/更新 Cloudflare 灰云 DNS。" >&2
-            read -e -r -p "${purpose}自定义前缀 [$(hostname)-reality]: " prefix
-            prefix=${prefix:-$(hostname)-reality}
+            read -e -r -p "${purpose}自定义前缀 [${default_prefix}]: " prefix
+            prefix=${prefix:-$default_prefix}
             domain=$(reality_join_subdomain "$prefix" "$zone")
             validate_domain "$domain" && { echo "$domain"; return 0; }
             print_error "域名前缀无效" >&2
@@ -15417,10 +15533,24 @@ reality_prompt_cf_token() {
 
 reality_install_landing() {
     local node_domain="$1" sni="$2" port="$3" cf_token="${4:-}" node_name="${5:-}"
-    validate_domain "$node_domain" || { print_error "节点域名无效"; return 1; }
+    local dns_mode="${6:-auto}" node_domain_v4="${7:-}" node_domain_v6="${8:-}" port_v6="${9:-}"
+    local node_name_v4="${10:-}" node_name_v6="${11:-}"
+    dns_mode=$(reality_normalize_dns_mode "$dns_mode") || { print_error "网络/DNS 模式无效"; return 1; }
     validate_domain "$sni" || { print_error "SNI 域名无效"; return 1; }
     validate_port "$port" || { print_error "端口无效"; return 1; }
     [[ -z "$node_name" ]] || reality_validate_node_name "$node_name" || { print_error "节点名称无效"; return 1; }
+    if [[ "$dns_mode" == "split" ]]; then
+        node_domain_v4="${node_domain_v4:-$node_domain}"
+        validate_domain "$node_domain_v4" || { print_error "IPv4 节点域名无效"; return 1; }
+        validate_domain "$node_domain_v6" || { print_error "IPv6 节点域名无效"; return 1; }
+        [[ "$node_domain_v4" != "$node_domain_v6" ]] || { print_error "双节点模式下 IPv4/IPv6 域名不能相同"; return 1; }
+        validate_port "$port_v6" || { print_error "IPv6 端口无效"; return 1; }
+        [[ "$port" != "$port_v6" ]] || { print_error "双节点模式下 IPv4/IPv6 监听端口不能相同"; return 1; }
+        [[ -z "$node_name_v4" ]] || reality_validate_node_name "$node_name_v4" || { print_error "IPv4 节点名称无效"; return 1; }
+        [[ -z "$node_name_v6" ]] || reality_validate_node_name "$node_name_v6" || { print_error "IPv6 节点名称无效"; return 1; }
+    else
+        validate_domain "$node_domain" || { print_error "节点域名无效"; return 1; }
+    fi
     reality_load_state || true
     local had_relay=0
     [[ "${REALITY_ROLE:-}" == *"relay"* ]] && had_relay=1
@@ -15437,31 +15567,66 @@ reality_install_landing() {
         REALITY_ROLE="landing"
     fi
     REALITY_NODE_NAME="$node_name"
-    REALITY_NODE_DOMAIN="$node_domain"
+    REALITY_DNS_MODE="$dns_mode"
     REALITY_SNI="$sni"
     REALITY_PORT="$port"
-    # 重新探测监听地址：IPv6-only / 双栈机器绑定 ::，纯 IPv4 机器绑定 0.0.0.0。
-    # 每次安装都重新探测，使旧节点重装即自愈为正确的绑定地址。
-    REALITY_LISTEN_HOST="$(reality_detect_listen_host)"
+    REALITY_PORT_V6=""
+    REALITY_NODE_DOMAIN_V4=""
+    REALITY_NODE_DOMAIN_V6=""
+    REALITY_NODE_NAME_V4=""
+    REALITY_NODE_NAME_V6=""
+    REALITY_LISTEN_HOST_V4=""
+    REALITY_LISTEN_HOST_V6=""
+    if [[ "$dns_mode" == "split" ]]; then
+        REALITY_NODE_DOMAIN="$node_domain_v4"
+        REALITY_NODE_DOMAIN_V4="$node_domain_v4"
+        REALITY_NODE_DOMAIN_V6="$node_domain_v6"
+        REALITY_PORT_V6="$port_v6"
+        REALITY_NODE_NAME_V4="${node_name_v4:-$(reality_node_name_with_suffix "${node_name:-$(reality_default_node_name)}" "-ipv4")}"
+        REALITY_NODE_NAME_V6="${node_name_v6:-$(reality_node_name_with_suffix "${node_name:-$(reality_default_node_name)}" "-ipv6")}"
+        REALITY_LISTEN_HOST="split"
+        REALITY_LISTEN_HOST_V4="0.0.0.0"
+        REALITY_LISTEN_HOST_V6="::"
+    else
+        REALITY_NODE_DOMAIN="$node_domain"
+        case "$dns_mode" in
+            ipv4) REALITY_LISTEN_HOST="0.0.0.0" ;;
+            ipv6) REALITY_LISTEN_HOST="::" ;;
+            *)
+                # 重新探测监听地址：IPv6-only / 双栈机器绑定 ::，纯 IPv4 机器绑定 0.0.0.0。
+                # 每次安装都重新探测，使旧节点重装即自愈为正确的绑定地址。
+                REALITY_LISTEN_HOST="$(reality_detect_listen_host)"
+                ;;
+        esac
+    fi
     local new_config
     new_config=$(reality_render_singbox_config "$REALITY_UUID" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID") || return 1
-    firewall_apply_reality_port "$REALITY_PORT"
-    local _fw_rc=$?
-    if [[ $_fw_rc -eq 1 ]]; then
-        return 1
-    elif [[ $_fw_rc -eq 2 ]]; then
+    local _fw_rc _fw_need_setup=0 _fw_port
+    for _fw_port in "$REALITY_PORT" "${REALITY_PORT_V6:-}"; do
+        [[ -n "$_fw_port" ]] || continue
+        firewall_apply_reality_port "$_fw_port"
+        _fw_rc=$?
+        if [[ $_fw_rc -eq 1 ]]; then
+            return 1
+        elif [[ $_fw_rc -eq 2 ]]; then
+            _fw_need_setup=1
+        fi
+    done
+    if [[ $_fw_need_setup -eq 1 ]]; then
         if [[ -t 0 ]] && confirm "UFW 未启用，是否现在跳转防火墙菜单启用并放行 Reality 端口?"; then
             ufw_setup
-            # 启用后重试一次；仍失败则只警告，不中断安装
-            firewall_apply_reality_port "$REALITY_PORT" || \
-                print_warn "UFW 仍未生效，请确认云安全组已放行 ${REALITY_PORT}/tcp"
+            for _fw_port in "$REALITY_PORT" "${REALITY_PORT_V6:-}"; do
+                [[ -n "$_fw_port" ]] || continue
+                firewall_apply_reality_port "$_fw_port" || \
+                    print_warn "UFW 仍未生效，请确认云安全组已放行 ${_fw_port}/tcp"
+            done
         else
-            print_warn "已跳过本地防火墙配置，请确认云安全组已放行 ${REALITY_PORT}/tcp"
+            print_warn "已跳过本地防火墙配置，请确认云安全组已放行 Reality 端口: ${REALITY_PORT}${REALITY_PORT_V6:+/${REALITY_PORT_V6}}/tcp"
         fi
     fi
     systemctl enable sing-box >/dev/null || return 1
     reality_apply_singbox_config "$new_config" || return 1
-    [[ -n "$cf_token" ]] && reality_sync_cloudflare_dns "$REALITY_NODE_DOMAIN" "$cf_token"
+    [[ -n "$cf_token" ]] && reality_sync_cloudflare_dns_by_state "$cf_token"
     reality_write_state
     reality_write_client_artifacts
     print_success "Sing-box Reality 落地机安装完成"
@@ -15868,7 +16033,7 @@ firewall_remove_reality_ports() {
     command_exists ufw || return 0
     ufw_is_active || return 0
     local port f
-    for port in "${REALITY_PORT:-}" "${REALITY_RELAY_PORT:-}"; do
+    for port in "${REALITY_PORT:-}" "${REALITY_PORT_V6:-}" "${REALITY_RELAY_PORT:-}"; do
         validate_port "$port" || continue
         ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
     done
@@ -15945,25 +16110,61 @@ reality_install_relay() {
 }
 
 reality_prompt_port() {
-    local prompt="$1" port
-    port=$(reality_random_port) || { print_error "无法生成可用随机端口"; return 1; }
-    read -e -r -p "${prompt} [${port}]: " input_port
-    input_port=${input_port:-$port}
-    validate_port "$input_port" || { print_error "端口无效"; return 1; }
-    echo "$input_port"
+    local prompt="$1" forbidden="${2:-}" port input_port
+    while true; do
+        port=$(reality_random_port) || { print_error "无法生成可用随机端口"; return 1; }
+        [[ -n "$forbidden" && "$port" == "$forbidden" ]] && continue
+        read -e -r -p "${prompt} [${port}]: " input_port
+        input_port=${input_port:-$port}
+        validate_port "$input_port" || { print_error "端口无效"; continue; }
+        if [[ -n "$forbidden" && "$input_port" == "$forbidden" ]]; then
+            print_error "端口不能与 ${forbidden} 相同"
+            continue
+        fi
+        echo "$input_port"
+        return 0
+    done
+}
+
+reality_prompt_landing_dns_mode() {
+    local choice
+    reality_detect_ips
+    echo -e "${C_CYAN}节点网络/DNS 模式:${C_RESET}" >&2
+    echo "  当前检测: IPv4=${REALITY_IPV4:-N/A}  IPv6=${REALITY_IPV6:-N/A}" >&2
+    echo "  1. 自动/双栈单节点：同一域名写入可用的 A/AAAA（保持旧行为）" >&2
+    echo "  2. IPv4-only 单节点：域名仅保留 A 记录" >&2
+    echo "  3. IPv6-only 单节点：域名仅保留 AAAA 记录" >&2
+    echo "  4. IPv4+IPv6 双节点：两个域名、两个端口、两条客户端链接（推荐双栈线路对比）" >&2
+    while true; do
+        read -e -r -p "请选择网络模式 [1]: " choice
+        case "${choice:-1}" in
+            1) echo "auto"; return 0 ;;
+            2) echo "ipv4"; return 0 ;;
+            3) echo "ipv6"; return 0 ;;
+            4) echo "split"; return 0 ;;
+            *) print_error "无效选择" >&2 ;;
+        esac
+    done
 }
 
 reality_install_wizard() {
-    local role="" node="" sni="" port="" cf_token="" relay_domain="" relay_port="" target_host="" target_port="" landing_link="" node_name=""
+    local role="" node="" node_v4="" node_v6="" dns_mode="" sni="" port="" port_v6="" cf_token="" relay_domain="" relay_port="" target_host="" target_port="" landing_link="" node_name="" node_name_v4="" node_name_v6=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --landing) role="landing"; shift ;;
             --relay) role="relay"; shift ;;
             --both) role="both"; shift ;;
             --name|--node-name) node_name="$2"; shift 2 ;;
+            --name-v4|--node-name-v4) node_name_v4="$2"; shift 2 ;;
+            --name-v6|--node-name-v6) node_name_v6="$2"; shift 2 ;;
             --node) node="$2"; shift 2 ;;
+            --node-v4|--ipv4-node) node_v4="$2"; shift 2 ;;
+            --node-v6|--ipv6-node) node_v6="$2"; shift 2 ;;
+            --dns-mode|--network-mode) dns_mode="$2"; shift 2 ;;
+            --split|--dual-node|--dual-nodes) dns_mode="split"; shift ;;
             --sni) sni="$2"; shift 2 ;;
             --port) port="$2"; shift 2 ;;
+            --port-v6|--ipv6-port) port_v6="$2"; shift 2 ;;
             --cf-token) cf_token="$2"; shift 2 ;;
             --relay-domain) relay_domain="$2"; shift 2 ;;
             --relay-port) relay_port="$2"; shift 2 ;;
@@ -15992,22 +16193,53 @@ reality_install_wizard() {
         if [[ -z "$cf_token" ]]; then
             cf_token=$(reality_prompt_cf_token)
         fi
-        while [[ -z "$node" ]]; do
-            echo -e "${C_CYAN}节点连接域名说明:${C_RESET}"
-            echo "  这是客户端实际连接的节点域名，会写入 vless:// 链接的 @host 部分。"
-            echo "  脚本会通过 Cloudflare API 自动创建/更新此域名到当前 VPS 公网 IP，并强制 Cloudflare 灰云。"
-            echo "  这里不是让你手动去 Cloudflare 添加记录；如果 Token 能列出 zone，只需要填写自定义前缀。"
-            echo "  示例: 选择 example.com 后输入 node-us-01，脚本会生成 node-us-01.example.com -> 当前 VPS 公网 IP"
-            node=$(reality_prompt_domain_with_zones "节点连接" "$cf_token")
-            validate_domain "$node" || { print_error "域名无效"; node=""; }
-        done
+        if [[ -z "$dns_mode" ]]; then
+            dns_mode=$(reality_prompt_landing_dns_mode)
+        fi
+        dns_mode=$(reality_normalize_dns_mode "$dns_mode") || { print_error "网络/DNS 模式无效: $dns_mode"; return 1; }
+        if [[ "$dns_mode" == "split" ]]; then
+            [[ -n "$node_v4" || -z "$node" ]] || node_v4="$node"
+            while [[ -z "$node_v4" ]]; do
+                echo -e "${C_CYAN}IPv4 节点连接域名说明:${C_RESET}"
+                echo "  该域名会被同步为 A-only，用于客户端强制走 IPv4 线路。"
+                node_v4=$(reality_prompt_domain_with_zones "IPv4 节点连接" "$cf_token" "$(hostname)-reality-v4")
+                validate_domain "$node_v4" || { print_error "IPv4 节点域名无效"; node_v4=""; }
+            done
+            while [[ -z "$node_v6" ]]; do
+                echo -e "${C_CYAN}IPv6 节点连接域名说明:${C_RESET}"
+                echo "  该域名会被同步为 AAAA-only，用于客户端强制走 IPv6 线路。"
+                node_v6=$(reality_prompt_domain_with_zones "IPv6 节点连接" "$cf_token" "$(hostname)-reality-v6")
+                validate_domain "$node_v6" || { print_error "IPv6 节点域名无效"; node_v6=""; }
+            done
+            [[ "$node_v4" != "$node_v6" ]] || { print_error "双节点模式下 IPv4/IPv6 域名不能相同"; return 1; }
+            node="$node_v4"
+        else
+            while [[ -z "$node" ]]; do
+                echo -e "${C_CYAN}节点连接域名说明:${C_RESET}"
+                echo "  这是客户端实际连接的节点域名，会写入 vless:// 链接的 @host 部分。"
+                echo "  脚本会通过 Cloudflare API 自动创建/更新此域名到当前 VPS 公网 IP，并强制 Cloudflare 灰云。"
+                echo "  这里不是让你手动去 Cloudflare 添加记录；如果 Token 能列出 zone，只需要填写自定义前缀。"
+                echo "  示例: 选择 example.com 后输入 node-us-01，脚本会生成 node-us-01.example.com -> 当前 VPS 公网 IP"
+                node=$(reality_prompt_domain_with_zones "节点连接" "$cf_token")
+                validate_domain "$node" || { print_error "域名无效"; node=""; }
+            done
+        fi
         if [[ -z "$node_name" ]]; then
             REALITY_NODE_DOMAIN="$node"
             node_name=$(reality_prompt_node_name "$(reality_default_node_name)")
         fi
+        if [[ "$dns_mode" == "split" ]]; then
+            [[ -n "$node_name_v4" ]] || node_name_v4=$(reality_node_name_with_suffix "$node_name" "-ipv4")
+            [[ -n "$node_name_v6" ]] || node_name_v6=$(reality_node_name_with_suffix "$node_name" "-ipv6")
+        fi
         [[ -z "$sni" ]] && sni=$(reality_prompt_sni)
-        [[ -z "$port" ]] && port=$(reality_prompt_port "Reality 监听端口")
-        reality_install_landing "$node" "$sni" "$port" "$cf_token" "$node_name" || return 1
+        if [[ "$dns_mode" == "split" ]]; then
+            [[ -z "$port" ]] && port=$(reality_prompt_port "IPv4 Reality 监听端口")
+            [[ -z "$port_v6" ]] && port_v6=$(reality_prompt_port "IPv6 Reality 监听端口" "$port")
+        else
+            [[ -z "$port" ]] && port=$(reality_prompt_port "Reality 监听端口")
+        fi
+        reality_install_landing "$node" "$sni" "$port" "$cf_token" "$node_name" "$dns_mode" "$node_v4" "$node_v6" "$port_v6" "$node_name_v4" "$node_name_v6" || return 1
     fi
     if [[ "$role" == "relay" || "$role" == "both" ]]; then
         if [[ -n "$landing_link" ]]; then
@@ -16051,10 +16283,17 @@ reality_install_wizard() {
 reality_show_info() {
     print_title "Sing-box Reality 节点信息"
     reality_load_state || { print_warn "未发现 Reality 状态文件"; pause; return 0; }
+    local mode; mode=$(reality_normalize_dns_mode "${REALITY_DNS_MODE:-auto}" 2>/dev/null || echo "auto")
     echo -e "角色: ${C_GREEN}${REALITY_ROLE:-未知}${C_RESET}"
     echo "节点名称: $(reality_effective_node_name)"
-    [[ -n "${REALITY_NODE_DOMAIN:-}" ]] && echo "落地域名: $REALITY_NODE_DOMAIN"
-    [[ -n "${REALITY_PORT:-}" ]] && echo "Reality端口: $REALITY_PORT"
+    echo "网络模式: $(reality_dns_mode_label "$mode")"
+    if [[ "$mode" == "split" ]]; then
+        [[ -n "${REALITY_NODE_DOMAIN_V4:-}" ]] && echo "IPv4节点: ${REALITY_NODE_DOMAIN_V4}:${REALITY_PORT} (${REALITY_NODE_NAME_V4:-IPv4})"
+        [[ -n "${REALITY_NODE_DOMAIN_V6:-}" ]] && echo "IPv6节点: ${REALITY_NODE_DOMAIN_V6}:${REALITY_PORT_V6} (${REALITY_NODE_NAME_V6:-IPv6})"
+    else
+        [[ -n "${REALITY_NODE_DOMAIN:-}" ]] && echo "落地域名: $REALITY_NODE_DOMAIN"
+        [[ -n "${REALITY_PORT:-}" ]] && echo "Reality端口: $REALITY_PORT"
+    fi
     [[ -n "${REALITY_SNI:-}" ]] && echo "SNI: $REALITY_SNI"
     [[ -n "${REALITY_RELAY_DOMAIN:-}" ]] && echo "中转域名: $REALITY_RELAY_DOMAIN"
     [[ -n "${REALITY_RELAY_PORT:-}" ]] && echo "中转端口: $REALITY_RELAY_PORT"
@@ -16099,6 +16338,7 @@ reality_diagnose() {
     print_title "Reality 诊断/自检"
     reality_load_state || { print_error "未发现状态文件: $REALITY_STATE_FILE"; pause; return 1; }
 
+    local mode; mode=$(reality_normalize_dns_mode "${REALITY_DNS_MODE:-auto}" 2>/dev/null || echo "auto")
     local has_landing=0; [[ -n "${REALITY_PORT:-}" && -n "${REALITY_NODE_DOMAIN:-}" ]] && has_landing=1
     # 连接核对目标：优先落地域名；纯中转机回落到首条线路的连接域名
     local connect_domain="${REALITY_NODE_DOMAIN:-}" connect_port="${REALITY_PORT:-}"
@@ -16111,8 +16351,14 @@ reality_diagnose() {
     local public_ip="" dns_ip="" system_dns=""
 
     echo "节点角色: ${REALITY_ROLE:-unknown}"
+    echo "网络模式: $(reality_dns_mode_label "$mode")"
     echo "客户端连接: ${connect_domain:-未设置}:${connect_port:-未设置}"
-    [[ "$has_landing" -eq 1 ]] && echo "落地端口: ${REALITY_PORT}"
+    if [[ "$has_landing" -eq 1 && "$mode" == "split" ]]; then
+        echo "IPv4节点: ${REALITY_NODE_DOMAIN_V4:-未设置}:${REALITY_PORT:-未设置}"
+        echo "IPv6节点: ${REALITY_NODE_DOMAIN_V6:-未设置}:${REALITY_PORT_V6:-未设置}"
+    elif [[ "$has_landing" -eq 1 ]]; then
+        echo "落地端口: ${REALITY_PORT}"
+    fi
     [[ -n "${REALITY_SNI:-}" ]] && echo "落地 SNI: ${REALITY_SNI}"
     echo ""
 
@@ -16135,19 +16381,27 @@ reality_diagnose() {
         fi
 
         if command_exists ss; then
-            if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${REALITY_PORT}$"; then
-                print_success "本机正在监听 Reality 端口: ${REALITY_PORT}/tcp"
-            else
-                print_error "本机未监听 Reality 端口: ${REALITY_PORT}/tcp"
-            fi
+            local _rp
+            for _rp in "${REALITY_PORT:-}" "${REALITY_PORT_V6:-}"; do
+                validate_port "$_rp" || continue
+                if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${_rp}$"; then
+                    print_success "本机正在监听 Reality 端口: ${_rp}/tcp"
+                else
+                    print_error "本机未监听 Reality 端口: ${_rp}/tcp"
+                fi
+            done
         fi
 
         if command_exists ufw; then
-            if ufw status 2>/dev/null | grep -q "${REALITY_PORT}/tcp"; then
-                print_success "UFW 已放行 Reality 端口: ${REALITY_PORT}/tcp"
-            else
-                print_warn "UFW 状态中未看到 ${REALITY_PORT}/tcp 放行规则"
-            fi
+            local _up
+            for _up in "${REALITY_PORT:-}" "${REALITY_PORT_V6:-}"; do
+                validate_port "$_up" || continue
+                if ufw status 2>/dev/null | grep -q "${_up}/tcp"; then
+                    print_success "UFW 已放行 Reality 端口: ${_up}/tcp"
+                else
+                    print_warn "UFW 状态中未看到 ${_up}/tcp 放行规则"
+                fi
+            done
         fi
     fi
 
@@ -16173,7 +16427,11 @@ reality_diagnose() {
     fi
 
     echo ""
-    echo "监听地址: ${REALITY_LISTEN_HOST:-0.0.0.0}$([[ "${REALITY_LISTEN_HOST:-}" == "::" ]] && echo '（双栈 IPv4+IPv6）')"
+    if [[ "$mode" == "split" ]]; then
+        echo "监听地址: IPv4=${REALITY_LISTEN_HOST_V4:-0.0.0.0}:${REALITY_PORT:-?}  IPv6=[${REALITY_LISTEN_HOST_V6:-::}]:${REALITY_PORT_V6:-?}"
+    else
+        echo "监听地址: ${REALITY_LISTEN_HOST:-0.0.0.0}$([[ "${REALITY_LISTEN_HOST:-}" == "::" ]] && echo '（双栈 IPv4+IPv6）')"
+    fi
 
     local public_ip6 dns_ip6 has_v4_path=0 has_v6_path=0
     public_ip=$(get_public_ipv4 2>/dev/null || true)
@@ -16204,6 +16462,17 @@ reality_diagnose() {
         [[ "$public_ip6" == "$dns_ip6" ]] \
             && print_success "IPv6 DNS 解析与本机公网一致" \
             || print_warn "IPv6 DNS 解析与本机公网不一致（DDNS 未同步）"
+    fi
+    if [[ "$mode" == "split" ]]; then
+        local v4_a="" v4_aaaa="" v6_a="" v6_aaaa=""
+        v4_a=$(reality_resolve_public_a "${REALITY_NODE_DOMAIN_V4:-}" 2>/dev/null || true)
+        v4_aaaa=$(reality_resolve_public_aaaa "${REALITY_NODE_DOMAIN_V4:-}" 2>/dev/null || true)
+        v6_a=$(reality_resolve_public_a "${REALITY_NODE_DOMAIN_V6:-}" 2>/dev/null || true)
+        v6_aaaa=$(reality_resolve_public_aaaa "${REALITY_NODE_DOMAIN_V6:-}" 2>/dev/null || true)
+        [[ -n "$v4_a" ]] && print_success "IPv4 节点 A 记录存在: ${REALITY_NODE_DOMAIN_V4} -> ${v4_a}" || print_warn "IPv4 节点缺少 A 记录: ${REALITY_NODE_DOMAIN_V4}"
+        [[ -z "$v4_aaaa" ]] && print_success "IPv4 节点未发现 AAAA 记录（符合 A-only）" || print_warn "IPv4 节点仍存在 AAAA 记录: ${v4_aaaa}"
+        [[ -n "$v6_aaaa" ]] && print_success "IPv6 节点 AAAA 记录存在: ${REALITY_NODE_DOMAIN_V6} -> ${v6_aaaa}" || print_warn "IPv6 节点缺少 AAAA 记录: ${REALITY_NODE_DOMAIN_V6}"
+        [[ -z "$v6_a" ]] && print_success "IPv6 节点未发现 A 记录（符合 AAAA-only）" || print_warn "IPv6 节点仍存在 A 记录: ${v6_a}"
     fi
     if [[ "$has_v6_path" -eq 1 && "$has_v4_path" -eq 0 ]]; then
         print_info "本机为 IPv6-only：请确认节点域名已有 AAAA 记录、监听地址为 ::、且客户端网络支持 IPv6。"
@@ -16249,6 +16518,8 @@ reality_rotate_user() {
     reality_load_state || { print_error "未安装落地机配置"; pause; return 1; }
     [[ -n "${REALITY_PRIVATE_KEY:-}" && -n "${REALITY_PORT:-}" && -n "${REALITY_SNI:-}" && -n "${REALITY_SHORT_ID:-}" ]] || { print_error "状态文件缺少落地机参数"; pause; return 1; }
     validate_port "$REALITY_PORT" || { print_error "状态文件端口无效: ${REALITY_PORT:-空}"; pause; return 1; }
+    local mode; mode=$(reality_normalize_dns_mode "${REALITY_DNS_MODE:-auto}" 2>/dev/null || echo "auto")
+    [[ "$mode" != "split" ]] || validate_port "${REALITY_PORT_V6:-}" || { print_error "双节点状态文件 IPv6 端口无效: ${REALITY_PORT_V6:-空}"; pause; return 1; }
     local old_uuid="$REALITY_UUID" new_uuid new_config
     new_uuid=$(reality_generate_uuid) || return 1
     new_config=$(reality_render_singbox_config "$new_uuid" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID") || return 1
@@ -16266,6 +16537,8 @@ reality_rotate_key() {
     reality_load_state || { print_error "未安装落地机配置"; pause; return 1; }
     [[ -n "${REALITY_UUID:-}" && -n "${REALITY_PORT:-}" && -n "${REALITY_SNI:-}" ]] || { print_error "状态文件缺少落地机参数"; pause; return 1; }
     validate_port "$REALITY_PORT" || { print_error "状态文件端口无效: ${REALITY_PORT:-空}"; pause; return 1; }
+    local mode; mode=$(reality_normalize_dns_mode "${REALITY_DNS_MODE:-auto}" 2>/dev/null || echo "auto")
+    [[ "$mode" != "split" ]] || validate_port "${REALITY_PORT_V6:-}" || { print_error "双节点状态文件 IPv6 端口无效: ${REALITY_PORT_V6:-空}"; pause; return 1; }
     local old_private_key="$REALITY_PRIVATE_KEY" old_public_key="$REALITY_PUBLIC_KEY" old_short_id="$REALITY_SHORT_ID" keys new_config
     keys=$(reality_generate_keypair) || return 1
     REALITY_PRIVATE_KEY=$(sed -n '1p' <<< "$keys")
@@ -16285,10 +16558,17 @@ reality_rotate_key() {
 
 reality_cf_sync_menu() {
     reality_load_state || { print_error "未发现状态文件"; pause; return 1; }
-    local domain="${REALITY_RELAY_DOMAIN:-$REALITY_NODE_DOMAIN}" token=""
-    [[ -n "$domain" ]] || { print_error "状态文件缺少域名"; pause; return 1; }
+    local domain="${REALITY_RELAY_DOMAIN:-$REALITY_NODE_DOMAIN}" token="" mode
+    mode=$(reality_normalize_dns_mode "${REALITY_DNS_MODE:-auto}" 2>/dev/null || echo "auto")
+    if [[ "$mode" != "split" ]]; then
+        [[ -n "$domain" ]] || { print_error "状态文件缺少域名"; pause; return 1; }
+    fi
     read -s -r -p "Cloudflare API Token: " token; echo ""
-    reality_sync_cloudflare_dns "$domain" "$token"
+    if [[ "$mode" == "split" ]]; then
+        reality_sync_cloudflare_dns_by_state "$token"
+    else
+        reality_sync_cloudflare_dns "$domain" "$token" "$mode"
+    fi
     pause
 }
 
@@ -16298,6 +16578,10 @@ reality_update_node_name() {
     old_name="$(reality_effective_node_name)"
     new_name=$(reality_prompt_node_name "$old_name") || return 1
     REALITY_NODE_NAME="$new_name"
+    if [[ "$(reality_normalize_dns_mode "${REALITY_DNS_MODE:-auto}" 2>/dev/null || echo auto)" == "split" ]]; then
+        REALITY_NODE_NAME_V4="$(reality_node_name_with_suffix "$new_name" "-ipv4")"
+        REALITY_NODE_NAME_V6="$(reality_node_name_with_suffix "$new_name" "-ipv6")"
+    fi
     reality_write_state
     if [[ -n "${REALITY_UUID:-}" && -n "${REALITY_SNI:-}" && -n "${REALITY_PUBLIC_KEY:-}" && -n "${REALITY_SHORT_ID:-}" ]]; then
         reality_write_client_artifacts || true
@@ -16316,7 +16600,8 @@ reality_delete_node_info() {
     systemctl daemon-reload 2>/dev/null || true
     reality_backup_file "$REALITY_SINGBOX_CONFIG"
     rm -f "$REALITY_REALM_CONFIG"
-    rm -f "$REALITY_STATE_FILE" "$REALITY_LINK_FILE" "$REALITY_CLIENT_JSON"
+    rm -f "$REALITY_STATE_FILE" "$REALITY_LINK_FILE" "$REALITY_CLIENT_JSON" \
+          "$REALITY_LINK_FILE_V4" "$REALITY_LINK_FILE_V6" "$REALITY_CLIENT_JSON_V4" "$REALITY_CLIENT_JSON_V6"
     # 清理多路中转线路（保留 backups 目录，不 rm -rf 整个配置目录）
     rm -f "$REALITY_RELAY_DIR"/relay-*.conf "$REALITY_RELAY_DIR"/relay-*.link.txt "$REALITY_RELAY_DIR"/relay-*.client.json 2>/dev/null || true
     rmdir "$REALITY_RELAY_DIR" 2>/dev/null || true

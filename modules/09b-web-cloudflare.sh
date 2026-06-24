@@ -123,7 +123,8 @@ _cf_dns_delete() {
         return 1
     fi
     local rid=$(echo "$resp" | jq -r '.result[0].id // empty')
-    [[ -n "$rid" ]] && _cf_api DELETE "/zones/$zone_id/dns_records/$rid" "$token"
+    [[ -n "$rid" ]] || return 0
+    _cf_api DELETE "/zones/$zone_id/dns_records/$rid" "$token" >/dev/null
 }
 
 # 通用 DNS 记录更新

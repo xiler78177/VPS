@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+### Added
+- **Reality 落地机新增 IPv4/IPv6 网络模式选择**：安装/重装落地机时可选择“自动/双栈单节点”“IPv4-only”“IPv6-only”或“IPv4+IPv6 双节点”。双节点模式会在同一台 VPS 上渲染两个 sing-box Reality 入站：IPv4 入站绑定 `0.0.0.0:<port>`、IPv6 入站绑定 `[::]:<port-v6>`，并生成两条客户端链接，分别使用 A-only 与 AAAA-only 域名，方便双栈机器按线路质量在客户端手动选择 IPv4/IPv6。
+  - 新增 `--dns-mode/--network-mode split|ipv4|ipv6|auto`、`--node-v4`、`--node-v6`、`--port-v6` 等 CLI 参数；菜单模式下会分别提示 IPv4/IPv6 域名与端口。
+  - Cloudflare 同步支持按节点模式写入 DNS：IPv4-only 会清理同名 AAAA，IPv6-only 会清理同名 A；双节点模式分别同步 IPv4 域名 A 记录与 IPv6 域名 AAAA 记录，并写入独立 DDNS 配置。
+  - 客户端产物新增 `client-link-v4.txt` / `client-link-v6.txt` 与 `client-v4.json` / `client-v6.json`；兼容的 `client-link.txt` 在双节点模式下同时包含两条链接。
+
 ## [v14.4] — 2026-06-23
 
 ### Fixed

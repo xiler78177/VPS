@@ -100,6 +100,12 @@ assert_contains '"short_id":["a1b2c3d4e5f60708"]' "$config" "config should inclu
 config6="$(REALITY_LISTEN_HOST=:: reality_render_singbox_config '11111111-1111-4111-8111-111111111111' 'priv-key' '23456' 'www.example.com' 'a1b2c3d4e5f60708')"
 assert_contains '"listen":"::"' "$config6" "config should bind :: for dual-stack/IPv6-only"
 
+split_config="$(REALITY_DNS_MODE=split REALITY_PORT_V6=34567 REALITY_LISTEN_HOST_V4=0.0.0.0 REALITY_LISTEN_HOST_V6=:: reality_render_singbox_config '11111111-1111-4111-8111-111111111111' 'priv-key' '23456' 'www.example.com' 'a1b2c3d4e5f60708')"
+assert_contains '"tag":"vless-reality-ipv4"' "$split_config" "split mode should render an IPv4 Reality inbound"
+assert_contains '"listen":"0.0.0.0","listen_port":23456' "$split_config" "split mode IPv4 inbound should bind 0.0.0.0 on IPv4 port"
+assert_contains '"tag":"vless-reality-ipv6"' "$split_config" "split mode should render an IPv6 Reality inbound"
+assert_contains '"listen":"::","listen_port":34567' "$split_config" "split mode IPv6 inbound should bind :: on IPv6 port"
+
 link="$(reality_build_vless_link '11111111-1111-4111-8111-111111111111' 'node.example.com' '23456' 'www.example.com' 'pub-key' 'a1b2c3d4e5f60708' 'node-01')"
 assert_contains 'vless://11111111-1111-4111-8111-111111111111@node.example.com:23456?' "$link" "link should use node host and port"
 assert_contains 'security=reality' "$link" "link should use reality security"
@@ -120,6 +126,32 @@ assert_contains 'vless://11111111-1111-4111-8111-111111111111@relay.example.com:
 assert_contains 'sni=www.example.com' "$relay_link" "relay link should preserve landing SNI"
 assert_contains 'pbk=pub-key' "$relay_link" "relay link should preserve landing public key"
 assert_contains 'sid=a1b2c3d4e5f60708' "$relay_link" "relay link should preserve landing short id"
+
+REALITY_CONFIG_DIR="$reality_test_tmp/reality"
+REALITY_LINK_FILE="${REALITY_CONFIG_DIR}/client-link.txt"
+REALITY_CLIENT_JSON="${REALITY_CONFIG_DIR}/client.json"
+REALITY_LINK_FILE_V4="${REALITY_CONFIG_DIR}/client-link-v4.txt"
+REALITY_LINK_FILE_V6="${REALITY_CONFIG_DIR}/client-link-v6.txt"
+REALITY_CLIENT_JSON_V4="${REALITY_CONFIG_DIR}/client-v4.json"
+REALITY_CLIENT_JSON_V6="${REALITY_CONFIG_DIR}/client-v6.json"
+REALITY_DNS_MODE="split"
+REALITY_NODE_DOMAIN_V4="v4.example.com"
+REALITY_NODE_DOMAIN_V6="v6.example.com"
+REALITY_PORT="23456"
+REALITY_PORT_V6="34567"
+REALITY_UUID="11111111-1111-4111-8111-111111111111"
+REALITY_SNI="www.example.com"
+REALITY_PUBLIC_KEY="pub-key"
+REALITY_SHORT_ID="a1b2c3d4e5f60708"
+REALITY_NODE_NAME="node"
+reality_write_client_artifacts
+assert_contains '@v4.example.com:23456?' "$(cat "$REALITY_LINK_FILE_V4")" "split mode should write IPv4-only client link"
+assert_contains '@v6.example.com:34567?' "$(cat "$REALITY_LINK_FILE_V6")" "split mode should write IPv6-only client link"
+assert_contains '@v4.example.com:23456?' "$(cat "$REALITY_LINK_FILE")" "combined split link file should include IPv4 node"
+assert_contains '@v6.example.com:34567?' "$(cat "$REALITY_LINK_FILE")" "combined split link file should include IPv6 node"
+assert_contains '"server":"v6.example.com","server_port":34567' "$(cat "$REALITY_CLIENT_JSON_V6")" "split mode should write IPv6 client JSON"
+REALITY_DNS_MODE=""
+REALITY_PORT_V6=""
 
 payload="$(reality_cf_dns_payload 'A' 'node.example.com' '203.0.113.10')"
 assert_contains '"proxied":false' "$payload" "Cloudflare node DNS payload must force grey-cloud"
@@ -224,4 +256,3 @@ if [[ -f dist/v4-built.sh ]]; then
     assert_contains 'reality_smart_sni_selection' "$dist_prompt_body" "dist should use enhanced SNI prompt"
 fi
 echo "reality_module_static_test: PASS"
-
