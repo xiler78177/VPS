@@ -1,5 +1,5 @@
 # modules/00-constants.sh - 全局常量、变量、平台检测
-readonly VERSION="v14.4"
+readonly VERSION="v14.5"
 readonly SCRIPT_NAME="server-manage"
 readonly CONFIG_FILE="/etc/${SCRIPT_NAME}.conf"
 readonly CACHE_DIR="/var/cache/${SCRIPT_NAME}"

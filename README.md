@@ -1,6 +1,6 @@
 # VPS Server Manage
 
-**Version: v14.4**
+**Version: v14.5**
 
 一站式 Linux 服务器管理脚本，集成安全防护、Web 服务、WireGuard VPN、临时邮箱、Docker 管理等常用运维功能。
 

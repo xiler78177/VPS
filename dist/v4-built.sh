@@ -1,6 +1,6 @@
 #!/bin/bash
 
-readonly VERSION="v14.4"
+readonly VERSION="v14.5"
 readonly SCRIPT_NAME="server-manage"
 readonly CONFIG_FILE="/etc/${SCRIPT_NAME}.conf"
 readonly CACHE_DIR="/var/cache/${SCRIPT_NAME}"
