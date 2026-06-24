@@ -14779,14 +14779,11 @@ REALITY_CANDIDATE_SNI=(
     "tags.tiqcdn.com"
     "cdn.bizibly.com"
     "cdn.bizible.com"
-    "ocsp2.apple.com"
     "s0.awsstatic.com"
     "a0.awsstatic.com"
-    "apps.mzstatic.com"
     "sisu.xboxlive.com"
     "s.mp.marsflag.com"
     "c.s-microsoft.com"
-    "statici.icloud.com"
     "beacon.gtv-pub.com"
     "ts1.tc.mm.bing.net"
     "ts2.tc.mm.bing.net"
@@ -14805,12 +14802,10 @@ REALITY_CANDIDATE_SNI=(
     "assets.adobedtm.com"
     "lpcdn.lpsnmedia.net"
     "res-1.cdn.office.net"
-    "is1-ssl.mzstatic.com"
     "intelcorp.scene7.com"
     "cdnssl.clicktale.net"
     "catalog.gamepass.com"
     "consent.trustarc.com"
-    "gsp-ssl.ls.apple.com"
     "munchkin.marketo.net"
     "cdn77.api.userway.org"
     "cua-chat-ui.tesla.com"
@@ -14818,19 +14813,14 @@ REALITY_CANDIDATE_SNI=(
     "static.cloud.coveo.com"
     "devblogs.microsoft.com"
     "s7mbrstream.scene7.com"
-    "fpinit.itunes.apple.com"
     "digitalassets.tesla.com"
     "d.impactradius-event.com"
     "downloadmirror.intel.com"
-    "iosapps.itunes.apple.com"
-    "se-edge.itunes.apple.com"
     "publisher.liveperson.net"
     "tag-logger.demandbase.com"
     "services.digitaleast.mobi"
-    "configuration.ls.apple.com"
     "gray-wowt-prod.gtv-cdn.com"
     "visualstudio.microsoft.com"
-    "amp-api-edge.apps.apple.com"
     "store-images.s-microsoft.com"
     "github.gallerycdn.vsassets.io"
     "vscjava.gallerycdn.vsassets.io"
@@ -14839,7 +14829,6 @@ REALITY_CANDIDATE_SNI=(
     "gray-config-prod.api.arc-cdn.net"
     "gray.video-player.arcpublishing.com"
     "i7158c100-ds-aksb-a.akamaihd.net"
-    "downloaddispatch.itunes.apple.com"
     "img-prod-cms-rt-microsoft-com.akamaized.net"
 )
 
@@ -14879,6 +14868,69 @@ reality_port_in_use() {
         lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 && return 0
     fi
     return 1
+}
+
+reality_detect_local_ipv6_addr() {
+    # 用于 split 双节点“IPv4/IPv6 共用 443”场景：
+    #   IPv4 入站继续绑定 0.0.0.0:443；
+    #   IPv6 入站必须绑定具体本机公网 IPv6:443，避免 [::]:443 与 0.0.0.0:443 在 bindv6only=0 下冲突。
+    # 只接受公网可路由地址，跳过 fe80::/10 与 fc00::/7。
+    if [[ -n "${REALITY_LISTEN_HOST_V6:-}" && "${REALITY_LISTEN_HOST_V6}" != "::" ]]; then
+        printf '%s' "$REALITY_LISTEN_HOST_V6"
+        return 0
+    fi
+    command_exists ip || return 1
+    ip -o -6 addr show scope global 2>/dev/null | awk '
+        {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "inet6") {
+                    split($(i + 1), a, "/")
+                    addr = tolower(a[1])
+                    if (addr !~ /^fe80:/ && addr !~ /^fc/ && addr !~ /^fd/) {
+                        if ($0 !~ / temporary / && $0 !~ / deprecated /) {
+                            found = 1
+                            print a[1]
+                            exit
+                        }
+                        if (fallback == "") fallback = a[1]
+                    }
+                }
+            }
+        }
+        END { if (!found && fallback != "") print fallback }'
+}
+
+reality_prepare_split_listen_hosts() {
+    local port_v4="$1" port_v6="$2" v6_addr
+    REALITY_LISTEN_HOST="split"
+    REALITY_LISTEN_HOST_V4="${REALITY_LISTEN_HOST_V4:-0.0.0.0}"
+    if [[ "$port_v4" == "$port_v6" ]]; then
+        v6_addr="$(reality_detect_local_ipv6_addr 2>/dev/null || true)"
+        if [[ -z "$v6_addr" || "$v6_addr" == "::" ]]; then
+            print_error "IPv4/IPv6 双节点共用 ${port_v4}/tcp 需要绑定具体本机公网 IPv6，未检测到可用 IPv6。"
+            print_error "请改用不同端口，或确认系统已有全局 IPv6 地址后重试。"
+            return 1
+        fi
+        REALITY_LISTEN_HOST_V6="$v6_addr"
+    else
+        REALITY_LISTEN_HOST_V6="${REALITY_LISTEN_HOST_V6:-::}"
+    fi
+}
+
+reality_warn_sni_risk() {
+    local sni="${1,,}"
+    [[ -n "$sni" ]] || return 0
+    if [[ "$sni" == *apple* || "$sni" == *icloud* || "$sni" == *itunes* || "$sni" == *mzstatic* ]]; then
+        print_warn "REALITY SNI/handshake 目标疑似 Apple/iCloud 系域名；Xray v26.3.27 已提示这类目标可能增加 IP 被封锁风险。"
+    fi
+}
+
+reality_warn_port_risk() {
+    local port="$1" label="${2:-Reality}"
+    validate_port "$port" || return 0
+    if [[ "$port" != "443" ]]; then
+        print_warn "${label} 监听端口为 ${port}，不是 443；Xray v26.3.27 已提示 REALITY 非 443 监听可能增加 IP 被封锁风险。"
+    fi
 }
 
 reality_random_port() {
@@ -15335,7 +15387,7 @@ reality_dns_mode_label() {
     case "${1:-auto}" in
         ipv4) echo "IPv4-only 单节点（仅 A 记录）" ;;
         ipv6) echo "IPv6-only 单节点（仅 AAAA 记录）" ;;
-        split) echo "IPv4+IPv6 双节点（A-only + AAAA-only，两端口/两链接）" ;;
+        split) echo "IPv4+IPv6 双节点（A-only + AAAA-only，独立链接，优先共用 443）" ;;
         *) echo "自动/双栈单节点（同域名 A/AAAA）" ;;
     esac
 }
@@ -15538,6 +15590,8 @@ reality_install_landing() {
     dns_mode=$(reality_normalize_dns_mode "$dns_mode") || { print_error "网络/DNS 模式无效"; return 1; }
     validate_domain "$sni" || { print_error "SNI 域名无效"; return 1; }
     validate_port "$port" || { print_error "端口无效"; return 1; }
+    reality_warn_sni_risk "$sni"
+    reality_warn_port_risk "$port" "Reality"
     [[ -z "$node_name" ]] || reality_validate_node_name "$node_name" || { print_error "节点名称无效"; return 1; }
     if [[ "$dns_mode" == "split" ]]; then
         node_domain_v4="${node_domain_v4:-$node_domain}"
@@ -15545,7 +15599,7 @@ reality_install_landing() {
         validate_domain "$node_domain_v6" || { print_error "IPv6 节点域名无效"; return 1; }
         [[ "$node_domain_v4" != "$node_domain_v6" ]] || { print_error "双节点模式下 IPv4/IPv6 域名不能相同"; return 1; }
         validate_port "$port_v6" || { print_error "IPv6 端口无效"; return 1; }
-        [[ "$port" != "$port_v6" ]] || { print_error "双节点模式下 IPv4/IPv6 监听端口不能相同"; return 1; }
+        reality_warn_port_risk "$port_v6" "IPv6 Reality"
         [[ -z "$node_name_v4" ]] || reality_validate_node_name "$node_name_v4" || { print_error "IPv4 节点名称无效"; return 1; }
         [[ -z "$node_name_v6" ]] || reality_validate_node_name "$node_name_v6" || { print_error "IPv6 节点名称无效"; return 1; }
     else
@@ -15584,9 +15638,9 @@ reality_install_landing() {
         REALITY_PORT_V6="$port_v6"
         REALITY_NODE_NAME_V4="${node_name_v4:-$(reality_node_name_with_suffix "${node_name:-$(reality_default_node_name)}" "-ipv4")}"
         REALITY_NODE_NAME_V6="${node_name_v6:-$(reality_node_name_with_suffix "${node_name:-$(reality_default_node_name)}" "-ipv6")}"
-        REALITY_LISTEN_HOST="split"
-        REALITY_LISTEN_HOST_V4="0.0.0.0"
-        REALITY_LISTEN_HOST_V6="::"
+        REALITY_LISTEN_HOST_V4=""
+        REALITY_LISTEN_HOST_V6=""
+        reality_prepare_split_listen_hosts "$REALITY_PORT" "$REALITY_PORT_V6" || return 1
     else
         REALITY_NODE_DOMAIN="$node_domain"
         case "$dns_mode" in
@@ -15905,8 +15959,12 @@ reality_relay_add() {
         RLY_CONNECT_HOST="$in_host"
     done
     [[ "$RLY_CONNECT_HOST" == "$connect_default" && -n "$connect_default" ]] && echo "（复用本机域名，按端口区分线路）"
-    # 监听端口：唯一、未占用、不等于落地端口
-    local def_port; def_port=$(reality_random_port 2>/dev/null || echo "")
+    # 监听端口：唯一、未占用、不等于本机落地端口；优先推荐 443，无法使用时再回落随机端口。
+    local def_port="443"
+    if [[ "${REALITY_PORT:-}" == "443" || -f "$REALITY_RELAY_DIR/relay-443.conf" ]] || reality_port_in_use 443; then
+        def_port=$(reality_random_port 2>/dev/null || echo "")
+        print_warn "本机 443/tcp 已被占用或已用于落地/其他中转，本条线路默认回落到随机端口；非 443 入口伪装弱于 443。"
+    fi
     RLY_LISTEN_PORT=""
     while true; do
         read -e -r -p "本机中转监听端口 [${def_port}] (0=取消): " RLY_LISTEN_PORT
@@ -15916,6 +15974,10 @@ reality_relay_add() {
         if [[ -n "${REALITY_PORT:-}" && "$RLY_LISTEN_PORT" == "${REALITY_PORT}" ]]; then print_error "不能与本机落地端口相同"; continue; fi
         [[ -f "$REALITY_RELAY_DIR/relay-${RLY_LISTEN_PORT}.conf" ]] && { print_error "该端口已有中转线路"; continue; }
         if reality_port_in_use "$RLY_LISTEN_PORT"; then print_error "端口已被占用"; continue; fi
+        reality_warn_port_risk "$RLY_LISTEN_PORT" "Realm 中转入口"
+        if [[ "$RLY_LISTEN_PORT" != "443" && -t 0 ]] && ! confirm "确认使用非 443 中转入口端口?"; then
+            continue
+        fi
         break
     done
     # 线路名称
@@ -16052,6 +16114,7 @@ reality_install_relay() {
     validate_port "$listen_port" || { print_error "中转端口无效"; return 1; }
     validate_domain "$target_host" || validate_ip "$target_host" || { print_error "落地地址无效"; return 1; }
     validate_port "$target_port" || { print_error "落地端口无效"; return 1; }
+    reality_warn_port_risk "$listen_port" "Realm 中转入口"
     [[ -z "$node_name" ]] || reality_validate_node_name "$node_name" || { print_error "节点名称无效"; return 1; }
     # 同机若已有落地机 state，先加载以保留既有落地参数（纯重装中转、不导入链接的场景）。
     # 但本次若通过导入落地 vless 链接带入了客户端 Reality 身份(公钥/UUID/SNI/ShortID)，
@@ -16072,6 +16135,7 @@ reality_install_relay() {
         REALITY_PRIVATE_KEY="$_imp_pkey"
         REALITY_FLOW="$_imp_flow"
     fi
+    reality_warn_sni_risk "${REALITY_SNI:-}"
     reality_require_supported_os || return 1
     # 写为一条独立身份的中转线路（relays 目录是 realm 配置的唯一真相源）。
     RLY_NAME="${node_name:-$(reality_effective_node_name)}"
@@ -16110,18 +16174,71 @@ reality_install_relay() {
 }
 
 reality_prompt_port() {
-    local prompt="$1" forbidden="${2:-}" port input_port
+    local prompt="$1" forbidden="${2:-}" choice port input_port
     while true; do
-        port=$(reality_random_port) || { print_error "无法生成可用随机端口"; return 1; }
-        [[ -n "$forbidden" && "$port" == "$forbidden" ]] && continue
-        read -e -r -p "${prompt} [${port}]: " input_port
-        input_port=${input_port:-$port}
+        echo -e "${C_CYAN}${prompt} 端口策略:${C_RESET}" >&2
+        echo "  1. 使用 443（推荐：最符合正常 HTTPS/REALITY 伪装）" >&2
+        echo "  2. 自定义端口（非 443 会提示风险）" >&2
+        echo "  3. 随机高位端口（仅备用；非 443 伪装弱于 443）" >&2
+        read -e -r -p "请选择端口策略 [1]: " choice
+        case "${choice:-1}" in
+            1)
+                input_port="443"
+                ;;
+            2)
+                read -e -r -p "${prompt} 自定义端口: " input_port
+                ;;
+            3)
+                while true; do
+                    port=$(reality_random_port) || { print_error "无法生成可用随机端口"; return 1; }
+                    [[ -n "$forbidden" && "$port" == "$forbidden" ]] && continue
+                    input_port="$port"
+                    break
+                done
+                ;;
+            *) print_error "无效选择"; continue ;;
+        esac
         validate_port "$input_port" || { print_error "端口无效"; continue; }
         if [[ -n "$forbidden" && "$input_port" == "$forbidden" ]]; then
             print_error "端口不能与 ${forbidden} 相同"
             continue
         fi
+        if reality_port_in_use "$input_port"; then
+            print_warn "端口 ${input_port}/tcp 当前已被监听。若这是重装同一个 sing-box/realm 服务通常可以继续；否则启动可能失败。"
+            if [[ -t 0 ]] && ! confirm "仍继续使用 ${input_port}/tcp?"; then
+                continue
+            fi
+        fi
+        reality_warn_port_risk "$input_port" "$prompt"
+        if [[ "$input_port" != "443" && -t 0 ]] && ! confirm "确认使用非 443 Reality/Realm 入口端口?"; then
+            continue
+        fi
         echo "$input_port"
+        return 0
+    done
+}
+
+reality_prompt_split_ports() {
+    local choice p4="" p6=""
+    while true; do
+        echo -e "${C_CYAN}IPv4/IPv6 双 Reality 端口策略:${C_RESET}" >&2
+        echo "  1. IPv4 与 IPv6 均使用 443（推荐；脚本会让 IPv6 入站绑定具体 IPv6，避免端口冲突）" >&2
+        echo "  2. IPv4 使用 443，IPv6 单独选择端口" >&2
+        echo "  3. IPv6 使用 443，IPv4 单独选择端口" >&2
+        echo "  4. IPv4/IPv6 分别选择端口（非 443 会提示风险）" >&2
+        read -e -r -p "请选择端口策略 [1]: " choice
+        case "${choice:-1}" in
+            1) p4="443"; p6="443" ;;
+            2) p4="443"; p6=$(reality_prompt_port "IPv6 Reality 监听") || return 1 ;;
+            3) p6="443"; p4=$(reality_prompt_port "IPv4 Reality 监听") || return 1 ;;
+            4)
+                p4=$(reality_prompt_port "IPv4 Reality 监听") || return 1
+                p6=$(reality_prompt_port "IPv6 Reality 监听") || return 1
+                ;;
+            *) print_error "无效选择"; continue ;;
+        esac
+        validate_port "$p4" && validate_port "$p6" || { print_error "端口无效"; continue; }
+        printf '%s %s\n' "$p4" "$p6"
         return 0
     done
 }
@@ -16134,7 +16251,7 @@ reality_prompt_landing_dns_mode() {
     echo "  1. 自动/双栈单节点：同一域名写入可用的 A/AAAA（保持旧行为）" >&2
     echo "  2. IPv4-only 单节点：域名仅保留 A 记录" >&2
     echo "  3. IPv6-only 单节点：域名仅保留 AAAA 记录" >&2
-    echo "  4. IPv4+IPv6 双节点：两个域名、两个端口、两条客户端链接（推荐双栈线路对比）" >&2
+    echo "  4. IPv4+IPv6 双节点：两个域名、两条客户端链接，端口优先共用 443（推荐双栈线路对比）" >&2
     while true; do
         read -e -r -p "请选择网络模式 [1]: " choice
         case "${choice:-1}" in
@@ -16148,7 +16265,7 @@ reality_prompt_landing_dns_mode() {
 }
 
 reality_install_wizard() {
-    local role="" node="" node_v4="" node_v6="" dns_mode="" sni="" port="" port_v6="" cf_token="" relay_domain="" relay_port="" target_host="" target_port="" landing_link="" node_name="" node_name_v4="" node_name_v6=""
+    local role="" node="" node_v4="" node_v6="" dns_mode="" sni="" port="" port_v6="" cf_token="" relay_domain="" relay_port="" target_host="" target_port="" landing_link="" node_name="" node_name_v4="" node_name_v6="" _split_ports=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --landing) role="landing"; shift ;;
@@ -16234,10 +16351,19 @@ reality_install_wizard() {
         fi
         [[ -z "$sni" ]] && sni=$(reality_prompt_sni)
         if [[ "$dns_mode" == "split" ]]; then
-            [[ -z "$port" ]] && port=$(reality_prompt_port "IPv4 Reality 监听端口")
-            [[ -z "$port_v6" ]] && port_v6=$(reality_prompt_port "IPv6 Reality 监听端口" "$port")
+            if [[ -z "$port" && -z "$port_v6" ]]; then
+                _split_ports="$(reality_prompt_split_ports)" || return 1
+                read -r port port_v6 <<< "$_split_ports"
+            elif [[ -z "$port" && "$port_v6" == "443" ]]; then
+                port="443"
+            elif [[ -z "$port_v6" && "$port" == "443" ]]; then
+                port_v6="443"
+            else
+                [[ -z "$port" ]] && port=$(reality_prompt_port "IPv4 Reality 监听")
+                [[ -z "$port_v6" ]] && port_v6=$(reality_prompt_port "IPv6 Reality 监听")
+            fi
         else
-            [[ -z "$port" ]] && port=$(reality_prompt_port "Reality 监听端口")
+            [[ -z "$port" ]] && port=$(reality_prompt_port "Reality 监听")
         fi
         reality_install_landing "$node" "$sni" "$port" "$cf_token" "$node_name" "$dns_mode" "$node_v4" "$node_v6" "$port_v6" "$node_name_v4" "$node_name_v6" || return 1
     fi
@@ -16268,9 +16394,12 @@ reality_install_wizard() {
             REALITY_RELAY_DOMAIN="$relay_domain"
             node_name=$(reality_prompt_node_name "$(reality_default_node_name)")
         fi
-        [[ -z "$relay_port" ]] && relay_port=$(reality_prompt_port "Realm 中转监听端口")
+        local _relay_forbidden_port=""
+        [[ "$role" == "both" ]] && _relay_forbidden_port="$port"
+        [[ -z "$relay_port" ]] && relay_port=$(reality_prompt_port "Realm 中转监听" "$_relay_forbidden_port")
         if [[ "$role" == "both" ]]; then
             target_host="127.0.0.1"; target_port="$port"
+            [[ "$relay_port" != "$port" ]] || { print_error "本机中转端口不能与本机落地 Reality 端口相同"; return 1; }
         else
             while [[ -z "$target_host" ]]; do read -e -r -p "落地机域名/IP: " target_host; validate_domain "$target_host" || validate_ip "$target_host" || { print_error "地址无效"; target_host=""; }; done
             while [[ -z "$target_port" ]]; do read -e -r -p "落地机 Reality 端口: " target_port; validate_port "$target_port" || { print_error "端口无效"; target_port=""; }; done
