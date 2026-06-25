@@ -14994,7 +14994,10 @@ reality_detect_listen_host() {
     #   否则 → "0.0.0.0"（纯 IPv4）。
     # 用本地接口判断而非公网探测，避免网络抖动导致 IPv6-only 机器误绑 0.0.0.0 而对外不可达。
     # 可用 REALITY_LISTEN_HOST 覆盖（测试/特殊网络）。
-    if [[ -n "${REALITY_LISTEN_HOST:-}" ]]; then printf '%s' "$REALITY_LISTEN_HOST"; return 0; fi
+    # "split" 是双节点模式的哨兵值（sing-box 入站走 REALITY_LISTEN_HOST_V4/V6，不用此变量），
+    # 不是合法 bind 地址；realm 等消费者遇到它时必须回落到接口探测（split 必有 IPv6→绑 ::），
+    # 否则会渲染出 listen = "split:<port>" 致 realm 无法启动。
+    if [[ -n "${REALITY_LISTEN_HOST:-}" && "${REALITY_LISTEN_HOST}" != "split" ]]; then printf '%s' "$REALITY_LISTEN_HOST"; return 0; fi
     if command_exists ip && ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'; then
         printf '%s' "::"
     else
@@ -15070,7 +15073,8 @@ reality_cf_dns_payload() {
 
 reality_render_realm_config() {
     local listen_port="$1" target_host="$2" target_port="$3"
-    local listen_host; listen_host="${REALITY_LISTEN_HOST:-$(reality_detect_listen_host)}"
+    # 经 reality_detect_listen_host 解析，以处理 split 哨兵值（直接读 REALITY_LISTEN_HOST 会把 "split" 当 bind 地址）。
+    local listen_host; listen_host="$(reality_detect_listen_host)"
     cat <<EOF
 log.level = "warn"
 
@@ -15834,7 +15838,8 @@ EOF
 # 由全部线路渲染 realm 多端点配置（保持单端点格式：log.level + [[endpoints]]）
 reality_render_realm_config_multi() {
     local f listen_host
-    listen_host="${REALITY_LISTEN_HOST:-$(reality_detect_listen_host)}"
+    # 经 reality_detect_listen_host 解析，避免 split 哨兵值直接当 bind 地址渲染出 listen = "split:<port>"
+    listen_host="$(reality_detect_listen_host)"
     echo 'log.level = "warn"'
     while IFS= read -r f; do
         [[ -n "$f" ]] || continue

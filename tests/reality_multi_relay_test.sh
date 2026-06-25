@@ -73,6 +73,13 @@ ck "含 C 端点 listen/remote" 'grep -q "listen = \"0.0.0.0:51883\"" <<< "$cfg"
 cfg6="$(REALITY_LISTEN_HOST=:: reality_render_realm_config_multi)"
 ck "IPv6 监听渲染为 [::]:port" 'grep -q "listen = \"\[::\]:51882\"" <<< "$cfg6"'
 
+# 回归：split 双节点落地的哨兵值 REALITY_LISTEN_HOST=split 不得当作 realm bind 地址泄漏，
+# 否则会渲染出非法的 listen = "split:<port>" 致 realm 无法启动（split 必有 IPv6→应回落 ::）。
+cfg_split="$(REALITY_LISTEN_HOST=split reality_render_realm_config_multi)"
+ck "split 哨兵不泄漏为 listen=split:port" '! grep -q "listen = \"split:" <<< "$cfg_split"'
+cfg_split_single="$(REALITY_LISTEN_HOST=split reality_render_realm_config 51999 land.example.com 443)"
+ck "单端点渲染同样不泄漏 split 哨兵" '! grep -q "listen = \"split:" <<< "$cfg_split_single"'
+
 lb="$(cat "$REALITY_RELAY_DIR/relay-51882.link.txt")"
 lc="$(cat "$REALITY_RELAY_DIR/relay-51883.link.txt")"
 ck "B 链接=B身份@A域名:51882" '[[ "$lb" == "vless://uuid-B@a.example.com:51882?"*"sni=sniB.com"*"pbk=PBK_B"*"sid=SIDB"* ]]'

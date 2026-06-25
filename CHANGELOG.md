@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- **[P1] split 双节点落地机无法再叠加 Realm 中转线路**：split（IPv4+IPv6 双节点）落地安装会把 `REALITY_LISTEN_HOST` 持久化为哨兵值 `"split"`（真正的 IPv4/IPv6 监听地址走 `REALITY_LISTEN_HOST_V4/V6`，sing-box 入站不读此变量）。但 realm 渲染器 `reality_render_realm_config` / `reality_render_realm_config_multi` 当时以 `${REALITY_LISTEN_HOST:-…}` 解析 bind 地址——非空的 `"split"` 直接短路、被当成字面 bind host，渲染出非法的 `listen = "split:<port>"`，realm 无法启动；该机再添加任何中转线路都会触发 `reality_relay_add` 的应用失败回滚（机器不至于半残，但 split 落地机就是加不了中转）。修复：`reality_detect_listen_host` 显式把 `"split"` 当作未设置处理并回落接口探测（split 必有全局 IPv6 → 绑 `::` 双栈），两个 realm 渲染器改为统一经它解析、不再直接读裸变量。新增 2 条回归断言（单/多端点渲染均不得泄漏 `split:` 哨兵）。
+
 ## [v14.5] — 2026-06-24
 
 ### Added
