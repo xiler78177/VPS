@@ -39,6 +39,12 @@ export REALITY_BACKUP_DIR="$REALITY_CONFIG_DIR/backups"
 export REALITY_RELAY_DIR="$REALITY_CONFIG_DIR/relays"
 export REALITY_REALM_CONFIG="$TMP/realm.toml"
 export REALITY_LISTEN_HOST="0.0.0.0"   # 固定监听地址，使渲染断言不受测试机 IPv6 影响
+# CDN 链路常量（构建产物里由 00-constants.sh 提供；测试不 source 它，需手动指向临时目录，
+# 否则 set -u 下 reality_show_info 等引用未绑定的 CDN 常量会直接终止脚本）
+export REALITY_CDN_STATE_FILE="$REALITY_CONFIG_DIR/cdn.conf"
+export REALITY_CDN_LINK_FILE="$REALITY_CONFIG_DIR/cdn-link.txt"
+export REALITY_CDN_CLIENT_JSON="$REALITY_CONFIG_DIR/cdn-client.json"
+export REALITY_CDN_ORIGIN_PORT="8443"
 mkdir -p "$REALITY_CONFIG_DIR" "$REALITY_RELAY_DIR"
 
 # 避免 source 时拉起 SNI 增强模块
@@ -168,6 +174,48 @@ reality_relay_regenerate >/dev/null 2>&1 || true
 ck "regenerate 之后 RLY_* 被覆盖(印证 bug 成因)" '[[ "$RLY_LISTEN_PORT" != "22222" ]]'
 ck "用 local new_port 仍能取到 A 的链接(修复点)" 'grep -q "@a.example.com:22222?" "$REALITY_RELAY_DIR/relay-${new_port}.link.txt" && grep -q "pbk=PBK_A" "$REALITY_RELAY_DIR/relay-${new_port}.link.txt"'
 
+
+echo "[T9] CDN 链路 WS 入站：合并渲染 + rotate 后存活（最高风险点）"
+# CDN state 文件常量在测试顶部未导出，这里单独指向临时目录
+export REALITY_CDN_STATE_FILE="$REALITY_CONFIG_DIR/cdn.conf"
+# 落地身份（render 必需）
+REALITY_DNS_MODE="auto"; REALITY_PORT="443"; REALITY_PORT_V6=""
+# 未启用 CDN 时：渲染不得含 WS 入站
+rm -f "$REALITY_CDN_STATE_FILE"
+cfg_nocdn="$(reality_render_singbox_config uid-x pk-x 443 sni.x sid-x)"
+ck "未装 CDN → 无 vless-cdn-ws 入站" '! grep -q "vless-cdn-ws" <<< "$cfg_nocdn"'
+ck "未装 CDN → 渲染为合法单 reality 入站" 'grep -q "vless-reality-in" <<< "$cfg_nocdn"'
+
+# 写 CDN state（复用模块函数），再渲染
+REALITY_CDN_DOMAIN="cdn.example.com"; REALITY_CDN_UUID="cdn-uuid-123"
+REALITY_CDN_WS_PATH="/secretpath00"; REALITY_CDN_INNER_PORT="58999"
+REALITY_CDN_ORIGIN_PORT="8443"; REALITY_CDN_PREFER_IP=""; REALITY_CDN_NODE_NAME="cdn-test"
+reality_cdn_write_state
+ck "reality_cdn_enabled 识别已启用" 'reality_cdn_enabled'
+cfg_cdn="$(reality_render_singbox_config uid-x pk-x 443 sni.x sid-x)"
+ck "装 CDN → 含 vless-cdn-ws 入站" 'grep -q "vless-cdn-ws" <<< "$cfg_cdn"'
+ck "WS 入站绑 127.0.0.1:内部端口" 'grep -q "\"listen\":\"127.0.0.1\",\"listen_port\":58999" <<< "$cfg_cdn"'
+ck "WS 入站含 ws path" 'grep -q "\"path\":\"/secretpath00\"" <<< "$cfg_cdn"'
+ck "WS 入站仍保留 reality 入站(并存非替换)" 'grep -q "vless-reality-in" <<< "$cfg_cdn"'
+# rotate key/user 模拟：换 uuid/key 重渲，WS 入站必须仍在（核心回归）
+cfg_rot="$(reality_render_singbox_config new-uuid new-pk 443 sni.x new-sid)"
+ck "rotate 重渲后 WS 入站仍存活" 'grep -q "vless-cdn-ws" <<< "$cfg_rot"'
+ck "rotate 重渲后 reality 入站换了新 uuid" 'grep -q "new-uuid" <<< "$cfg_rot"'
+# split 双节点 + CDN：两个 reality 入站 + 1 个 WS 入站
+cfg_split_cdn="$(REALITY_DNS_MODE=split REALITY_PORT_V6=443 reality_render_singbox_config uid-x pk-x 443 sni.x sid-x)"
+ck "split+CDN → 含 WS 入站" 'grep -q "vless-cdn-ws" <<< "$cfg_split_cdn"'
+ck "split+CDN → 含 IPv4+IPv6 两个 reality 入站" 'grep -q "vless-reality-ipv4" <<< "$cfg_split_cdn" && grep -q "vless-reality-ipv6" <<< "$cfg_split_cdn"'
+# CDN 客户端链接：server=优选IP，host/sni=真实域名
+REALITY_CDN_PREFER_IP="1.2.3.4"
+link_cdn="$(reality_cdn_build_link "$REALITY_CDN_PREFER_IP" "cdn-test")"
+ck "CDN 链接 server=优选IP" '[[ "$link_cdn" == "vless://cdn-uuid-123@1.2.3.4:443?"* ]]'
+ck "CDN 链接 host/sni=真实域名" 'grep -q "sni=cdn.example.com" <<< "$link_cdn" && grep -q "host=cdn.example.com" <<< "$link_cdn"'
+ck "CDN 链接 type=ws + path" 'grep -q "type=ws" <<< "$link_cdn" && grep -q "path=%2Fsecretpath00" <<< "$link_cdn"'
+# 卸载语义：删 state 后渲染回到无 WS 入站
+rm -f "$REALITY_CDN_STATE_FILE"
+ck "删 state → reality_cdn_enabled 为否" '! reality_cdn_enabled'
+cfg_after="$(reality_render_singbox_config uid-x pk-x 443 sni.x sid-x)"
+ck "卸载后渲染无 WS 入站" '! grep -q "vless-cdn-ws" <<< "$cfg_after"'
 
 echo ""
 echo "==== reality_multi_relay_test: PASS=$pass FAIL=$fail ===="

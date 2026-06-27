@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### Added
+- **Reality 节点新增「加挂 CDN 链路」（CF 橙云 + 优选 IP，治晚高峰）**：在不动现有 Reality 直连链路（灰云）的前提下，为节点并存一条 **VLESS+WS+TLS** 橙云链路，把「国内→落地 IP」被运营商干扰的那一跳换成「国内→CF 优选边缘→CF 骨干→回源」。Reality 菜单新增「10. 加挂 CDN 链路 / 11. 卸载 CDN 链路」，对应 CLI `cdn-install` / `cdn-uninstall`。
+  - **合并渲染（关键约束）**：CDN 的 VLESS-WS 入站作为额外 inbound **合并进 `reality_render_singbox_config` 的每条渲染路径**（读独立 CDN state），而非事后追加——确保 rotate UUID / rotate key / 改名 / 重装等任何触发整体重渲染的操作都不会把 WS 入站冲掉。split 双节点模式下同样并存。
+  - **443 冲突处理**：Reality 仍独占 `0.0.0.0:443` 灰云直连；CDN 回源 nginx 监听独立端口（默认 `8443`，`REALITY_CDN_ORIGIN_PORT`），并自动建一条 **CF Origin Rule** 把 CDN 域名的回源端口改写到该端口。WS 入站只绑 `127.0.0.1:<随机内部端口>`（明文），由 nginx 做 TLS 终止 + 隐秘 path 反代，其余路径返回 444。
+  - **证书/DNS**：复用 certbot **DNS-01**（橙云后面 HTTP-01 会被拦）签发 `cdn.<域名>` 证书并配置续签 hook；CF DNS 同步为**橙云 A/AAAA**（proxied=true）。
+  - **优选 IP 自动化（国内机侧脚本，不进 v4-built.sh）**：新增 `scripts/cdn-preferip/` —— **B** `preferip-collect.sh` 封装 [XIU2/CloudflareSpeedTest](https://github.com/XIU2/CloudflareSpeedTest) 在国内机优选 CF 边缘 IP（必须国内侧跑，海外结果作废；无结果不写空值）；**C** `preferip-push.sh` 经公网 https + secret 前缀 `PATCH /api/sub/:name` 把优选 IP 刷进一条 **sub-store 专用 local 订阅**的 server 字段（host/sni 保留真实 CDN 域名，CF 靠 Host 头回源；绝不碰用户现有订阅）；`preferip-cron.sh` 串联两者供国内机 cron 调用。客户端订阅该专用订阅，刷新即换 IP。
+  - 新增针对最高风险点的回归断言（`tests/reality_multi_relay_test.sh` T9）：装 CDN 后含 `vless-cdn-ws` 入站且 rotate key 重渲后仍存活、与 Reality 入站并存（含 split）、卸载后干净移除；合并配置经 `sing-box check` 校验通过。
+
 ### Fixed
 - **[P1] split 双节点落地机无法再叠加 Realm 中转线路**：split（IPv4+IPv6 双节点）落地安装会把 `REALITY_LISTEN_HOST` 持久化为哨兵值 `"split"`（真正的 IPv4/IPv6 监听地址走 `REALITY_LISTEN_HOST_V4/V6`，sing-box 入站不读此变量）。但 realm 渲染器 `reality_render_realm_config` / `reality_render_realm_config_multi` 当时以 `${REALITY_LISTEN_HOST:-…}` 解析 bind 地址——非空的 `"split"` 直接短路、被当成字面 bind host，渲染出非法的 `listen = "split:<port>"`，realm 无法启动；该机再添加任何中转线路都会触发 `reality_relay_add` 的应用失败回滚（机器不至于半残，但 split 落地机就是加不了中转）。修复：`reality_detect_listen_host` 显式把 `"split"` 当作未设置处理并回落接口探测（split 必有全局 IPv6 → 绑 `::` 双栈），两个 realm 渲染器改为统一经它解析、不再直接读裸变量。新增 2 条回归断言（单/多端点渲染均不得泄漏 `split:` 哨兵）。
 
