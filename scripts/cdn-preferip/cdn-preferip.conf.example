@@ -1,0 +1,32 @@
+# cdn-preferip 配置样例
+# 用法：cp cdn-preferip.conf.example cdn-preferip.conf 后按实际填写。
+# 本配置在【国内机】使用：B(优选IP) + C(回写 sub-store) 都读它。
+# 决策：国内机优选 → 直接走公网 https PATCH 刷新 sub-store 专用订阅。
+
+# ── sub-store（公网 https + secret 前缀；secret 即事实鉴权，务必全程 HTTPS）──
+# base = 协议+域名+secret 前缀，不含 /api。真实 API = ${SUBSTORE_BASE}/api/...
+SUBSTORE_BASE="https://sub.niubao.cf/9Gg78hWFEguXZBT3oHPY"
+# 专用订阅名（在 sub-store 里新建一条 local 订阅，名字与此一致；C 只动这一条，绝不碰其它）
+SUBSTORE_SUB_NAME="cdn-preferip"
+
+# ── CDN 节点参数（来自落地机 A 的 cdn-link.txt / cdn 菜单输出）──
+# server 字段会被优选 IP 替换；host/sni 永远是真实 CDN 域名，CF 靠 Host 头回源。
+CDN_UUID="00000000-0000-0000-0000-000000000000"
+CDN_DOMAIN="cdn-us-01.niubao.cf"
+CDN_WS_PATH="/0123456789abcdef"
+CDN_NODE_NAME="cdn-us-01"
+
+# ── CloudflareSpeedTest（XIU2/CloudflareSpeedTest）──
+# 取前 N 个最优 IP（默认 1）。多个时写入多条节点（同参数、不同 server）。
+CFST_TOP_N="1"
+# 传给 CloudflareSpeedTest 的额外参数（按需调）：
+#   -dd 关闭下载测速只测延迟（更快但不测带宽）；-tl 平均延迟上限ms；-sl 下载速度下限MB/s
+CFST_EXTRA_ARGS="-dn 10 -tl 200"
+# CloudflareSpeedTest 可执行文件路径（留空=在 PATH 里找 CloudflareST / cfst）
+CFST_BIN=""
+# 测速用 IP 段文件（留空=用 CloudflareSpeedTest 自带 ip.txt）
+CFST_IP_FILE=""
+
+# ── 行为 ──
+# 优选结果为空时是否保留上次（true=不推空值，强烈建议 true）
+KEEP_ON_EMPTY="true"
