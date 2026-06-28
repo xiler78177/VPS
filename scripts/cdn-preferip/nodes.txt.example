@@ -1,0 +1,15 @@
+# CDN 节点清单 —— 优选程序每天会把每行的 server 换成当天最快的 CF IP。
+# 复制本文件为 nodes.txt 后按格式填写(nodes.txt 不进 git，含你的真实节点)。
+#
+# 格式:  区域备注|节点的 vless 链接
+#   · 区域备注  = 你想要的节点名(客户端里就显示这个)，如  香港-lycheen-1-CDN
+#   · vless链接 = VPS 建 CDN 节点(Reality 菜单 10)时打印的那条链接，整条粘进来即可
+#                 (链接里的 server 填什么都行，会被当天优选 IP 覆盖)
+#   · 加机器 = 粘一行   删机器 = 删一行   行首 # 为注释、空行忽略
+#   · 程序只改写 server(IP) 和 #备注名；host/sni/uuid/path 全部原样保留
+#   · 优选 IP 是「你→CF边缘」的最优解，对所有节点通用，所以一次优选服务全部节点
+#
+# 示例(把下面两行换成你自己的，有几台 VPS 就写几行):
+
+香港-lycheen-1-CDN|vless://你的UUID@你的cdn域名:443?encryption=none&security=tls&sni=你的cdn域名&fp=chrome&type=ws&host=你的cdn域名&path=%2F你的隐秘path#随便填会被覆盖
+日本-zouter-1-CDN|vless://你的UUID@第二台cdn域名:443?encryption=none&security=tls&sni=第二台cdn域名&fp=chrome&type=ws&host=第二台cdn域名&path=%2F第二台path#随便填

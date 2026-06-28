@@ -19,9 +19,8 @@ load_conf() {
     source "$CDN_PREFERIP_CONF"
     : "${SUBSTORE_BASE:?配置缺少 SUBSTORE_BASE}"
     : "${SUBSTORE_SUB_NAME:?配置缺少 SUBSTORE_SUB_NAME}"
-    : "${CDN_UUID:?配置缺少 CDN_UUID}"
-    : "${CDN_DOMAIN:?配置缺少 CDN_DOMAIN}"
-    : "${CDN_WS_PATH:?配置缺少 CDN_WS_PATH}"
+    # CDN_UUID/DOMAIN/WS_PATH 仅旧「单节点」模式需要;新「多节点」(nodes.txt)模式从链接里读,故改可选
+    CDN_UUID="${CDN_UUID:-}"; CDN_DOMAIN="${CDN_DOMAIN:-}"; CDN_WS_PATH="${CDN_WS_PATH:-}"
     CDN_NODE_NAME="${CDN_NODE_NAME:-cdn-${CDN_DOMAIN%%.*}}"
     CFST_TOP_N="${CFST_TOP_N:-1}"
     KEEP_ON_EMPTY="${KEEP_ON_EMPTY:-true}"
@@ -32,6 +31,7 @@ load_conf() {
 # URL-encode（用于 ws path 等）
 urlencode() {
     local s="$1" out="" i c
+    local LC_ALL=C   # 关键:按字节处理,正确编码中文等多字节 UTF-8(否则会编成 Unicode 码点)
     for ((i=0; i<${#s}; i++)); do
         c="${s:i:1}"
         case "$c" in
@@ -48,6 +48,23 @@ build_cdn_link() {
     local server="$1" name="${2:-$CDN_NODE_NAME}"
     printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&host=%s&path=%s#%s' \
         "$CDN_UUID" "$server" "$CDN_DOMAIN" "$CDN_DOMAIN" "$(urlencode "$CDN_WS_PATH")" "$(urlencode "$name")"
+}
+
+# 多节点模式:把一条现成 vless 链接的 server 换成优选IP、备注换成指定名,其余(uuid/port/host/sni/path)原样保留。
+# 用法: rewrite_vless "<原链接>" "<优选IP>" "<新备注名>"  →  stdout 新链接
+rewrite_vless() {
+    local link="$1" newip="$2" newname="$3"
+    [[ "$link" == vless://* ]] || return 1
+    local body="${link#vless://}"
+    body="${body%%#*}"                          # 去掉原 #备注
+    local uuid="${body%%@*}"                     # UUID(@前)
+    local after="${body#*@}"                     # HOST:PORT?QUERY
+    local hostport="${after%%\?*}"               # HOST:PORT
+    local query=""; [[ "$after" == *\?* ]] && query="${after#*\?}"
+    local port="${hostport##*:}"; [[ "$port" == "$hostport" ]] && port="443"
+    local out="vless://${uuid}@${newip}:${port}"
+    [[ -n "$query" ]] && out="${out}?${query}"
+    printf '%s#%s' "$out" "$(urlencode "$newname")"
 }
 
 # ── sub-store API ──

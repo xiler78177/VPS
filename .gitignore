@@ -1,2 +1,7 @@
 .claude/
 .vscode/
+
+# cdn-preferip 本地部署产物 / 含敏感凭据，勿入库
+scripts/cdn-preferip/cdn-preferip.conf
+scripts/cdn-preferip/nodes.txt
+scripts/cdn-preferip/preferip.result
