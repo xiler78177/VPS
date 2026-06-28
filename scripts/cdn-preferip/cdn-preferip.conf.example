@@ -5,14 +5,14 @@
 
 # ── sub-store（公网 https + secret 前缀；secret 即事实鉴权，务必全程 HTTPS）──
 # base = 协议+域名+secret 前缀，不含 /api。真实 API = ${SUBSTORE_BASE}/api/...
-SUBSTORE_BASE="https://sub.niubao.cf/9Gg78hWFEguXZBT3oHPY"
+SUBSTORE_BASE="https://sub.example.com/你的secret前缀"
 # 专用订阅名（在 sub-store 里新建一条 local 订阅，名字与此一致；C 只动这一条，绝不碰其它）
 SUBSTORE_SUB_NAME="cdn-preferip"
 
 # ── CDN 节点参数（来自落地机 A 的 cdn-link.txt / cdn 菜单输出）──
 # server 字段会被优选 IP 替换；host/sni 永远是真实 CDN 域名，CF 靠 Host 头回源。
 CDN_UUID="00000000-0000-0000-0000-000000000000"
-CDN_DOMAIN="cdn-us-01.niubao.cf"
+CDN_DOMAIN="cdn-us-01.example.com"
 CDN_WS_PATH="/0123456789abcdef"
 CDN_NODE_NAME="cdn-us-01"
 
