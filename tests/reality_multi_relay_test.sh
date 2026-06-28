@@ -211,11 +211,29 @@ link_cdn="$(reality_cdn_build_link "$REALITY_CDN_PREFER_IP" "cdn-test")"
 ck "CDN 链接 server=优选IP" '[[ "$link_cdn" == "vless://cdn-uuid-123@1.2.3.4:443?"* ]]'
 ck "CDN 链接 host/sni=真实域名" 'grep -q "sni=cdn.example.com" <<< "$link_cdn" && grep -q "host=cdn.example.com" <<< "$link_cdn"'
 ck "CDN 链接 type=ws + path" 'grep -q "type=ws" <<< "$link_cdn" && grep -q "path=%2Fsecretpath00" <<< "$link_cdn"'
+link_cdn6="$(reality_cdn_build_link "2606:4700::1111" "cdn-v6")"
+ck "CDN 链接 IPv6 server 自动加方括号" '[[ "$link_cdn6" == "vless://cdn-uuid-123@[2606:4700::1111]:443?"* ]]'
+link_reality6="$(reality_build_vless_link "uid6" "2001:db8::1" "443" "sni.x" "pbk6" "sid6" "node-v6")"
+ck "Reality 链接 IPv6 server 自动加方括号" '[[ "$link_reality6" == "vless://uid6@[2001:db8::1]:443?"* ]]'
+reality_parse_vless_link "$link_reality6"
+ck "解析 bracket IPv6 vless 链接不截断 host/port" '[[ "$REALITY_NODE_DOMAIN" == "2001:db8::1" && "$REALITY_PORT" == "443" ]]'
 # 卸载语义：删 state 后渲染回到无 WS 入站
 rm -f "$REALITY_CDN_STATE_FILE"
 ck "删 state → reality_cdn_enabled 为否" '! reality_cdn_enabled'
 cfg_after="$(reality_render_singbox_config uid-x pk-x 443 sni.x sid-x)"
 ck "卸载后渲染无 WS 入站" '! grep -q "vless-cdn-ws" <<< "$cfg_after"'
+
+# 卸载回归：sing-box 重渲失败时必须恢复 CDN state，避免旧 config 仍有 WS 入站但 state 丢失。
+REALITY_CDN_DOMAIN="cdn.example.com"; REALITY_CDN_UUID="cdn-uuid-123"
+REALITY_CDN_WS_PATH="/secretpath00"; REALITY_CDN_INNER_PORT="58999"
+REALITY_CDN_ORIGIN_PORT="8443"; REALITY_CDN_PREFER_IP=""; REALITY_CDN_NODE_NAME="cdn-test"
+reality_cdn_write_state
+REALITY_ROLE="landing"; REALITY_NODE_DOMAIN="node.example.com"; REALITY_DNS_MODE="auto"
+REALITY_PORT="443"; REALITY_UUID="uid-x"; REALITY_PRIVATE_KEY="pk-x"; REALITY_PUBLIC_KEY="pbk-x"; REALITY_SNI="sni.x"; REALITY_SHORT_ID="sid-x"
+reality_write_state
+reality_apply_singbox_config(){ return 1; }
+reality_cdn_uninstall >/dev/null 2>&1 || true
+ck "CDN 卸载失败回滚会恢复 state" '[[ -f "$REALITY_CDN_STATE_FILE" ]] && grep -q "REALITY_CDN_DOMAIN" "$REALITY_CDN_STATE_FILE"'
 
 echo ""
 echo "==== reality_multi_relay_test: PASS=$pass FAIL=$fail ===="

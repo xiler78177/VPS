@@ -77,6 +77,7 @@ REALITY_CANDIDATE_SNI=(
 
 reality_urlencode() {
     local s="$1" out="" i c
+    local LC_ALL=C
     for ((i=0; i<${#s}; i++)); do
         c="${s:i:1}"
         case "$c" in
@@ -86,6 +87,26 @@ reality_urlencode() {
         esac
     done
     printf '%s' "$out"
+}
+
+reality_uri_host() {
+    # vless:// URI 中 IPv6 literal 必须加 []，否则 host:port 无法可靠解析。
+    local host="${1:-}"
+    if [[ "$host" == \[*\] ]]; then
+        printf '%s' "$host"
+    elif [[ "$host" == *:* ]]; then
+        printf '[%s]' "$host"
+    else
+        printf '%s' "$host"
+    fi
+}
+
+reality_validate_ws_path() {
+    local path="${1:-}"
+    [[ "$path" == /* ]] || return 1
+    [[ ${#path} -ge 2 && ${#path} -le 128 ]] || return 1
+    # 仅允许对 nginx location / sing-box WS path 都安全的可见字符。
+    [[ "$path" =~ ^/[A-Za-z0-9._~/-]+$ ]]
 }
 
 reality_mask_secret() {
@@ -293,13 +314,22 @@ reality_cdn_enabled() {
         # shellcheck disable=SC1090
         validate_conf_file "$REALITY_CDN_STATE_FILE" 2>/dev/null && source "$REALITY_CDN_STATE_FILE" 2>/dev/null
         [[ -n "${REALITY_CDN_UUID:-}" && -n "${REALITY_CDN_WS_PATH:-}" && -n "${REALITY_CDN_INNER_PORT:-}" ]]
+        validate_port "${REALITY_CDN_INNER_PORT:-}" 2>/dev/null
+        reality_validate_ws_path "${REALITY_CDN_WS_PATH:-}" 2>/dev/null
     )
 }
 
 # 写 CDN state（值经 reality_state_quote，满足 validate_conf_file 的 owner/600/字面量校验）
 reality_cdn_write_state() {
     mkdir -p "$REALITY_CONFIG_DIR"
-    cat > "$REALITY_CDN_STATE_FILE" <<EOF
+    chmod 700 "$REALITY_CONFIG_DIR" 2>/dev/null || true
+    validate_domain "${REALITY_CDN_DOMAIN:-}" || { print_error "CDN 域名无效: ${REALITY_CDN_DOMAIN:-空}"; return 1; }
+    [[ -n "${REALITY_CDN_UUID:-}" ]] || { print_error "CDN UUID 为空"; return 1; }
+    reality_validate_ws_path "${REALITY_CDN_WS_PATH:-}" || { print_error "CDN WS path 无效: ${REALITY_CDN_WS_PATH:-空}"; return 1; }
+    validate_port "${REALITY_CDN_INNER_PORT:-}" || { print_error "CDN 内部端口无效: ${REALITY_CDN_INNER_PORT:-空}"; return 1; }
+    validate_port "${REALITY_CDN_ORIGIN_PORT:-}" || { print_error "CDN 回源端口无效: ${REALITY_CDN_ORIGIN_PORT:-空}"; return 1; }
+    local content
+    content=$(cat <<EOF
 REALITY_CDN_DOMAIN=$(reality_state_quote "${REALITY_CDN_DOMAIN:-}")
 REALITY_CDN_UUID=$(reality_state_quote "${REALITY_CDN_UUID:-}")
 REALITY_CDN_WS_PATH=$(reality_state_quote "${REALITY_CDN_WS_PATH:-}")
@@ -308,7 +338,8 @@ REALITY_CDN_ORIGIN_PORT=$(reality_state_quote "${REALITY_CDN_ORIGIN_PORT:-}")
 REALITY_CDN_PREFER_IP=$(reality_state_quote "${REALITY_CDN_PREFER_IP:-}")
 REALITY_CDN_NODE_NAME=$(reality_state_quote "${REALITY_CDN_NODE_NAME:-}")
 EOF
-    chmod 600 "$REALITY_CDN_STATE_FILE"
+)
+    reality_write_secure_file "$REALITY_CDN_STATE_FILE" "$content"
 }
 
 # 加载 CDN state 到全局（供向导/卸载/产物使用；渲染入站走子 shell 不调它）
@@ -329,6 +360,7 @@ reality_cdn_inbound_json() {
         validate_conf_file "$REALITY_CDN_STATE_FILE" 2>/dev/null && source "$REALITY_CDN_STATE_FILE" 2>/dev/null || exit 0
         [[ -n "${REALITY_CDN_UUID:-}" && -n "${REALITY_CDN_WS_PATH:-}" && -n "${REALITY_CDN_INNER_PORT:-}" ]] || exit 0
         validate_port "${REALITY_CDN_INNER_PORT}" 2>/dev/null || exit 0
+        reality_validate_ws_path "${REALITY_CDN_WS_PATH}" 2>/dev/null || exit 0
         local u p path
         u=$(reality_json_escape "$REALITY_CDN_UUID")
         path=$(reality_json_escape "$REALITY_CDN_WS_PATH")
@@ -340,11 +372,12 @@ reality_cdn_inbound_json() {
 
 # 生成 CDN 客户端 vless 链接（WS+TLS）。server=优选IP(默认=域名)，host/sni=真实 cdn 域名。
 reality_cdn_build_link() {
-    local server="$1" name="$2" encoded_name encoded_path
+    local server="$1" name="$2" encoded_name encoded_path server_uri
     encoded_name=$(reality_urlencode "$name")
     encoded_path=$(reality_urlencode "$REALITY_CDN_WS_PATH")
+    server_uri=$(reality_uri_host "$server")
     printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&host=%s&path=%s#%s\n' \
-        "$REALITY_CDN_UUID" "$server" "$REALITY_CDN_DOMAIN" "$REALITY_CDN_DOMAIN" "$encoded_path" "$encoded_name"
+        "$REALITY_CDN_UUID" "$server_uri" "$REALITY_CDN_DOMAIN" "$REALITY_CDN_DOMAIN" "$encoded_path" "$encoded_name"
 }
 
 # 写 CDN 客户端产物（链接 + sing-box JSON）。server 优先用优选 IP，无则回落域名。
@@ -353,12 +386,15 @@ reality_cdn_write_client_artifacts() {
     local server="${REALITY_CDN_PREFER_IP:-$REALITY_CDN_DOMAIN}"
     local name="${REALITY_CDN_NODE_NAME:-cdn-$( printf '%s' "$REALITY_CDN_DOMAIN" | cut -d. -f1 )}"
     [[ -n "$REALITY_CDN_UUID" && -n "$REALITY_CDN_DOMAIN" && -n "$REALITY_CDN_WS_PATH" ]] || return 1
+    reality_validate_ws_path "$REALITY_CDN_WS_PATH" || return 1
     local json_name; json_name=$(reality_json_escape "$name")
     local json_path; json_path=$(reality_json_escape "$REALITY_CDN_WS_PATH")
     local json_host; json_host=$(reality_json_escape "$REALITY_CDN_DOMAIN")
+    local json_server; json_server=$(reality_json_escape "$server")
+    local json_uuid; json_uuid=$(reality_json_escape "$REALITY_CDN_UUID")
     reality_cdn_build_link "$server" "$name" > "$REALITY_CDN_LINK_FILE"
     cat > "$REALITY_CDN_CLIENT_JSON" <<EOF
-{"type":"vless","tag":"${json_name}","server":"${server}","server_port":443,"uuid":"${REALITY_CDN_UUID}","tls":{"enabled":true,"server_name":"${json_host}","utls":{"enabled":true,"fingerprint":"chrome"}},"transport":{"type":"ws","path":"${json_path}","headers":{"Host":"${json_host}"}}}
+{"type":"vless","tag":"${json_name}","server":"${json_server}","server_port":443,"uuid":"${json_uuid}","tls":{"enabled":true,"server_name":"${json_host}","utls":{"enabled":true,"fingerprint":"chrome"}},"transport":{"type":"ws","path":"${json_path}","headers":{"Host":"${json_host}"}}}
 EOF
     chmod 600 "$REALITY_CDN_LINK_FILE" "$REALITY_CDN_CLIENT_JSON"
 }
@@ -366,6 +402,10 @@ EOF
 # 渲染 CDN 回源 nginx 站点：TLS 终止 + 隐秘 WS path 反代到内部端口；其余路径 444 断开。
 reality_cdn_render_nginx_conf() {
     local domain="$1" origin_port="$2" ws_path="$3" inner_port="$4" cert_dir="$5"
+    validate_domain "$domain" || return 1
+    validate_port "$origin_port" || return 1
+    validate_port "$inner_port" || return 1
+    reality_validate_ws_path "$ws_path" || return 1
     cat <<EOF
 # CDN 回源站点 (VLESS+WS+TLS) for ${domain}
 # Generated by ${SCRIPT_NAME} ${VERSION}
@@ -418,6 +458,8 @@ reality_cdn_sync_dns_orange() {
 reality_cdn_apply_origin_rule() {
     local domain="$1" token="$2" origin_port="$3" zone_id existing existing_rules filtered new_rule final err
     command_exists jq || install_package "jq" "silent" || return 1
+    validate_domain "$domain" || { print_error "Origin Rule: 域名无效"; return 1; }
+    validate_port "$origin_port" || { print_error "Origin Rule: 回源端口无效"; return 1; }
     zone_id=$(_cf_get_zone_id "$domain" "$token") || return 1
     [[ -n "$zone_id" ]] || { print_error "Origin Rule: 无法获取 Zone ID"; return 1; }
     existing=$(_cf_get_origin_ruleset "$token" "$zone_id") || true
@@ -435,14 +477,15 @@ reality_cdn_apply_origin_rule() {
 
 reality_build_vless_link() {
     local uuid="$1" node="$2" port="$3" sni="$4" public_key="$5" short_id="$6" name="${7:-singbox-reality}"
-    local encoded_name
+    local encoded_name node_uri
     encoded_name=$(reality_urlencode "$name")
+    node_uri=$(reality_uri_host "$node")
     printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&flow=xtls-rprx-vision#%s\n' \
-        "$uuid" "$node" "$port" "$sni" "$public_key" "$short_id" "$encoded_name"
+        "$uuid" "$node_uri" "$port" "$sni" "$public_key" "$short_id" "$encoded_name"
 }
 
 reality_parse_vless_link() {
-    local link="$1" body user hostport query param key value
+    local link="$1" body user hostport query param key value host port
     [[ "$link" == vless://* ]] || return 1
     body="${link#vless://}"
     user="${body%@*}"
@@ -451,8 +494,16 @@ reality_parse_vless_link() {
     query="${body#*\?}"
     query="${query%%#*}"
     REALITY_UUID="$user"
-    REALITY_NODE_DOMAIN="${hostport%:*}"
-    REALITY_PORT="${hostport##*:}"
+    if [[ "$hostport" == \[*\]:* ]]; then
+        host="${hostport#\[}"
+        host="${host%%\]*}"
+        port="${hostport##*\]:}"
+    else
+        host="${hostport%:*}"
+        port="${hostport##*:}"
+    fi
+    REALITY_NODE_DOMAIN="$host"
+    REALITY_PORT="$port"
     while IFS= read -r param; do
         key="${param%%=*}"
         value="${param#*=}"
@@ -656,7 +707,32 @@ reality_backup_file() {
     local file="$1"
     [[ -f "$file" ]] || return 0
     mkdir -p "$REALITY_BACKUP_DIR"
+    chmod 700 "$REALITY_BACKUP_DIR" 2>/dev/null || true
     cp -a "$file" "$REALITY_BACKUP_DIR/$(basename "$file").$(date +%Y%m%d-%H%M%S).bak"
+}
+
+reality_write_secure_file() {
+    # 原子写入含密钥/UUID/path 的状态文件，避免 “cat > file; chmod 600”
+    # 在宽 umask 下出现短暂 0644 暴露窗口。
+    local file="$1" content="$2" dir tmp
+    dir="$(dirname "$file")"
+    mkdir -p "$dir" || return 1
+    chmod 700 "$dir" 2>/dev/null || true
+    tmp=$(mktemp "${dir}/.tmp.server-manage.reality.XXXXXX") || return 1
+    if declare -F _tmp_register >/dev/null 2>&1; then _tmp_register "$tmp"; fi
+    if ! printf '%s\n' "$content" > "$tmp"; then
+        rm -f -- "$tmp" 2>/dev/null || true
+        if declare -F _tmp_unregister >/dev/null 2>&1; then _tmp_unregister "$tmp"; fi
+        return 1
+    fi
+    chmod 600 "$tmp" 2>/dev/null || true
+    if ! mv "$tmp" "$file"; then
+        rm -f -- "$tmp" 2>/dev/null || true
+        if declare -F _tmp_unregister >/dev/null 2>&1; then _tmp_unregister "$tmp"; fi
+        return 1
+    fi
+    if declare -F _tmp_unregister >/dev/null 2>&1; then _tmp_unregister "$tmp"; fi
+    return 0
 }
 
 reality_apply_singbox_config() {
@@ -724,7 +800,9 @@ reality_state_quote() {
 
 reality_write_state() {
     mkdir -p "$REALITY_CONFIG_DIR"
-    cat > "$REALITY_STATE_FILE" <<EOF
+    chmod 700 "$REALITY_CONFIG_DIR" 2>/dev/null || true
+    local content
+    content=$(cat <<EOF
 REALITY_ROLE=$(reality_state_quote "${REALITY_ROLE:-}")
 REALITY_NODE_NAME=$(reality_state_quote "${REALITY_NODE_NAME:-}")
 REALITY_NODE_DOMAIN=$(reality_state_quote "${REALITY_NODE_DOMAIN:-}")
@@ -748,7 +826,8 @@ REALITY_RELAY_PORT=$(reality_state_quote "${REALITY_RELAY_PORT:-}")
 REALITY_RELAY_TARGET_HOST=$(reality_state_quote "${REALITY_RELAY_TARGET_HOST:-}")
 REALITY_RELAY_TARGET_PORT=$(reality_state_quote "${REALITY_RELAY_TARGET_PORT:-}")
 EOF
-    chmod 600 "$REALITY_STATE_FILE"
+)
+    reality_write_secure_file "$REALITY_STATE_FILE" "$content"
 }
 
 reality_load_state() {
@@ -827,10 +906,16 @@ reality_prompt_node_name() {
 reality_write_one_client_artifact() {
     local link_path="$1" json_path="$2" link_host="$3" link_port="$4" name="$5" json_name
     [[ -n "$link_path" && -n "$json_path" && -n "$link_host" && -n "$link_port" ]] || return 1
+    validate_port "$link_port" || return 1
     json_name=$(reality_json_escape "$name")
+    local json_host; json_host=$(reality_json_escape "$link_host")
+    local json_uuid; json_uuid=$(reality_json_escape "$REALITY_UUID")
+    local json_sni; json_sni=$(reality_json_escape "$REALITY_SNI")
+    local json_public_key; json_public_key=$(reality_json_escape "$REALITY_PUBLIC_KEY")
+    local json_short_id; json_short_id=$(reality_json_escape "$REALITY_SHORT_ID")
     reality_build_vless_link "$REALITY_UUID" "$link_host" "$link_port" "$REALITY_SNI" "$REALITY_PUBLIC_KEY" "$REALITY_SHORT_ID" "$name" > "$link_path"
     cat > "$json_path" <<EOF
-{"type":"vless","tag":"${json_name}","server":"${link_host}","server_port":${link_port},"uuid":"${REALITY_UUID}","flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":"${REALITY_SNI}","utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":"${REALITY_PUBLIC_KEY}","short_id":"${REALITY_SHORT_ID}"}}}
+{"type":"vless","tag":"${json_name}","server":"${json_host}","server_port":${link_port},"uuid":"${json_uuid}","flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":"${json_sni}","utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":"${json_public_key}","short_id":"${json_short_id}"}}}
 EOF
     chmod 600 "$link_path" "$json_path"
 }
@@ -1230,7 +1315,9 @@ reality_relay_write_route() {
     local port="$1" file
     file="$REALITY_RELAY_DIR/relay-${port}.conf"
     mkdir -p "$REALITY_RELAY_DIR"
-    cat > "$file" <<EOF
+    chmod 700 "$REALITY_RELAY_DIR" 2>/dev/null || true
+    local content
+    content=$(cat <<EOF
 RLY_NAME=$(reality_state_quote "${RLY_NAME:-}")
 RLY_LISTEN_PORT=$(reality_state_quote "${RLY_LISTEN_PORT:-}")
 RLY_CONNECT_HOST=$(reality_state_quote "${RLY_CONNECT_HOST:-}")
@@ -1242,18 +1329,26 @@ RLY_PUBLIC_KEY=$(reality_state_quote "${RLY_PUBLIC_KEY:-}")
 RLY_SHORT_ID=$(reality_state_quote "${RLY_SHORT_ID:-}")
 RLY_FLOW=$(reality_state_quote "${RLY_FLOW:-}")
 EOF
-    chmod 600 "$file"
+)
+    reality_write_secure_file "$file" "$content"
 }
 
 # 用当前 RLY_* 写该线路客户端链接/JSON（身份=落地机，host:port=本机中转入口）
 reality_relay_write_client_artifacts() {
     local port="${RLY_LISTEN_PORT:-}" host="${RLY_CONNECT_HOST:-}" name="${RLY_NAME:-relay-${RLY_LISTEN_PORT:-0}}" json_name
     [[ -n "$host" && -n "$port" && -n "${RLY_UUID:-}" && -n "${RLY_SNI:-}" && -n "${RLY_PUBLIC_KEY:-}" && -n "${RLY_SHORT_ID:-}" ]] || return 1
+    validate_port "$port" || return 1
     mkdir -p "$REALITY_RELAY_DIR"
+    chmod 700 "$REALITY_RELAY_DIR" 2>/dev/null || true
     json_name=$(reality_json_escape "$name")
+    local json_host; json_host=$(reality_json_escape "$host")
+    local json_uuid; json_uuid=$(reality_json_escape "$RLY_UUID")
+    local json_sni; json_sni=$(reality_json_escape "$RLY_SNI")
+    local json_public_key; json_public_key=$(reality_json_escape "$RLY_PUBLIC_KEY")
+    local json_short_id; json_short_id=$(reality_json_escape "$RLY_SHORT_ID")
     reality_build_vless_link "$RLY_UUID" "$host" "$port" "$RLY_SNI" "$RLY_PUBLIC_KEY" "$RLY_SHORT_ID" "$name" > "$REALITY_RELAY_DIR/relay-${port}.link.txt"
     cat > "$REALITY_RELAY_DIR/relay-${port}.client.json" <<EOF
-{"type":"vless","tag":"${json_name}","server":"${host}","server_port":${port},"uuid":"${RLY_UUID}","flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":"${RLY_SNI}","utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":"${RLY_PUBLIC_KEY}","short_id":"${RLY_SHORT_ID}"}}}
+{"type":"vless","tag":"${json_name}","server":"${json_host}","server_port":${port},"uuid":"${json_uuid}","flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":"${json_sni}","utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":"${json_public_key}","short_id":"${json_short_id}"}}}
 EOF
     chmod 600 "$REALITY_RELAY_DIR/relay-${port}.link.txt" "$REALITY_RELAY_DIR/relay-${port}.client.json"
 }
@@ -2160,6 +2255,7 @@ reality_update_node_name() {
 # 选一个未占用的内部 WS 端口（127.0.0.1，高位随机）
 reality_cdn_pick_inner_port() {
     local p
+    validate_port "${REALITY_CDN_ORIGIN_PORT:-8443}" || return 1
     for _ in $(seq 1 200); do
         p=$(reality_random_port) || return 1
         [[ "$p" == "${REALITY_PORT:-}" || "$p" == "${REALITY_PORT_V6:-}" ]] && continue
@@ -2190,6 +2286,19 @@ reality_cdn_install() {
     command_exists nginx || { print_error "Nginx 未安装。请先用 Web 菜单「添加域名」安装 nginx/certbot 依赖。"; pause; return 1; }
     command_exists certbot || { print_error "certbot 未安装。请先用 Web 菜单「添加域名」安装依赖。"; pause; return 1; }
 
+    local had_cdn_state=0 old_cdn_state=""
+    if [[ -f "$REALITY_CDN_STATE_FILE" ]]; then
+        had_cdn_state=1
+        old_cdn_state=$(cat "$REALITY_CDN_STATE_FILE" 2>/dev/null || true)
+        if reality_cdn_load_state 2>/dev/null && [[ -n "${REALITY_CDN_DOMAIN:-}" ]]; then
+            print_warn "检测到已存在 CDN 链路: ${REALITY_CDN_DOMAIN}（覆盖前会保留旧 state，失败自动恢复）"
+            confirm "是否覆盖重建 CDN 链路?" || { print_info "已取消"; pause; return 0; }
+        else
+            print_warn "检测到旧 CDN state 但校验失败；继续会覆盖它。"
+            confirm "是否覆盖旧 CDN state?" || { print_info "已取消"; pause; return 0; }
+        fi
+    fi
+
     echo "  说明：Reality 直连链路（灰云）原样保留；这里新增一条 CDN 链路并存。"
     echo "  CDN 链路用 CF 橙云 + 优选 IP，把「国内→落地IP」被干扰的那跳换成「国内→CF边缘→回源」。"
     echo "  回源用真实证书 Full(strict)；因 Reality 已占 443，CDN 回源走独立端口 ${REALITY_CDN_ORIGIN_PORT}（自动建 CF Origin Rule 改写回源端口）。"
@@ -2216,6 +2325,8 @@ reality_cdn_install() {
     inner_port=$(reality_cdn_pick_inner_port) || { print_error "无法分配内部 WS 端口"; pause; return 1; }
     ws_path=$(reality_cdn_gen_ws_path)
     local origin_port="${REALITY_CDN_ORIGIN_PORT:-8443}"
+    validate_port "$origin_port" || { print_error "CDN 回源端口无效: ${origin_port}"; pause; return 1; }
+    reality_validate_ws_path "$ws_path" || { print_error "生成的 WS path 无效: ${ws_path}"; pause; return 1; }
 
     draw_line
     echo "CDN 链路配置确认:"
@@ -2269,7 +2380,11 @@ systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || true
     # 2) nginx 回源站
     echo -e "\n${C_CYAN}=== [2] 部署 nginx 回源站 (端口 ${origin_port}) ===${C_RESET}"
     _ensure_ssl_params
-    local nginx_conf; nginx_conf=$(reality_cdn_render_nginx_conf "$cdn_domain" "$origin_port" "$ws_path" "$inner_port" "$cert_dir")
+    local nginx_conf
+    nginx_conf=$(reality_cdn_render_nginx_conf "$cdn_domain" "$origin_port" "$ws_path" "$inner_port" "$cert_dir") || {
+        print_error "渲染 nginx 回源站失败，请检查域名/端口/path。"
+        pause; return 1
+    }
     if ! _nginx_deploy_conf "$cdn_domain" "$nginx_conf"; then
         print_error "nginx 回源站部署失败，已中止。"
         pause; return 1
@@ -2285,11 +2400,19 @@ systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || true
     REALITY_CDN_ORIGIN_PORT="$origin_port"
     REALITY_CDN_PREFER_IP=""
     REALITY_CDN_NODE_NAME="$cdn_name"
-    reality_cdn_write_state
+    if ! reality_cdn_write_state; then
+        print_error "写入 CDN state 失败，已中止。"
+        pause; return 1
+    fi
     local new_config
     new_config=$(reality_render_singbox_config "$REALITY_UUID" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID") || { print_error "渲染失败"; pause; return 1; }
     if ! reality_apply_singbox_config "$new_config"; then
-        print_error "sing-box 应用失败（已回滚原配置）。CDN state 已写，但 WS 入站未生效；修复后可重试。"
+        if [[ "$had_cdn_state" -eq 1 ]]; then
+            reality_write_secure_file "$REALITY_CDN_STATE_FILE" "$old_cdn_state" || print_warn "恢复旧 CDN state 失败，请手动检查 ${REALITY_CDN_STATE_FILE}"
+        else
+            rm -f "$REALITY_CDN_STATE_FILE"
+        fi
+        print_error "sing-box 应用失败（已回滚原配置）。已恢复安装前 CDN state，避免后续重渲染误带半成品 WS 入站。"
         pause; return 1
     fi
     print_success "sing-box 已合并 CDN WS 入站"
@@ -2336,12 +2459,18 @@ reality_cdn_uninstall() {
     reality_cdn_load_state || { print_warn "未发现 CDN 链路配置"; pause; return 0; }
     confirm "确认卸载 CDN 链路 ${REALITY_CDN_DOMAIN:-}? Reality 直连链路不受影响。" || return 0
     local cdn_domain="${REALITY_CDN_DOMAIN:-}" origin_port="${REALITY_CDN_ORIGIN_PORT:-8443}"
+    local old_cdn_state
+    old_cdn_state=$(cat "$REALITY_CDN_STATE_FILE" 2>/dev/null || true)
     # 先删 state，使重渲不再带 WS 入站
     rm -f "$REALITY_CDN_STATE_FILE"
     if reality_load_state && [[ -n "${REALITY_UUID:-}" && -n "${REALITY_PORT:-}" ]]; then
         local cfg
-        cfg=$(reality_render_singbox_config "$REALITY_UUID" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID")
-        reality_apply_singbox_config "$cfg" || print_warn "sing-box 重渲失败，请手动检查 ${REALITY_SINGBOX_CONFIG}"
+        if ! cfg=$(reality_render_singbox_config "$REALITY_UUID" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID") || \
+           ! reality_apply_singbox_config "$cfg"; then
+            reality_write_secure_file "$REALITY_CDN_STATE_FILE" "$old_cdn_state" || true
+            print_error "sing-box 重渲失败，已恢复 CDN state；未删除 nginx 回源站/产物，避免出现“配置仍生效但 state 丢失”。"
+            pause; return 1
+        fi
     fi
     # 删 nginx 回源站
     if [[ -n "$cdn_domain" ]]; then

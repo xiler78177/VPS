@@ -19,14 +19,35 @@ CDN_NODE_NAME="cdn-us-01"
 # ── CloudflareSpeedTest（XIU2/CloudflareSpeedTest）──
 # 取前 N 个最优 IP（默认 1）。多个时写入多条节点（同参数、不同 server）。
 CFST_TOP_N="1"
+# 按节点 CF 地区码分组优选：
+#   auto = nodes.txt 使用「备注|HKG|vless://...」这类格式时，按地区码分别跑 -httping -cfcolo
+#   off  = 保持旧逻辑，全节点统一使用全局 Top1
+CFST_COLO_MODE="auto"
+# 旧格式「备注|vless链接」没有地区码时的默认地区码；留空则使用全局优选。
+# 示例: DEFAULT_CF_COLO="HKG"；多个候选可写 "NRT,KIX"
+DEFAULT_CF_COLO=""
 # 传给 CloudflareSpeedTest 的额外参数（按需调）：
 #   -dd 关闭下载测速只测延迟（更快但不测带宽）；-tl 平均延迟上限ms；-sl 下载速度下限MB/s
 CFST_EXTRA_ARGS="-dn 10 -tl 200"
+# 多轮测速次数。>1 时会多次运行 CFST 汇总候选，降低单次随机抽样/网络抖动影响。
+CFST_ROUNDS="1"
+# 候选选择策略：
+#   cfst     = 沿用 CFST 输出顺序（下载测速开启时通常按速度排序）
+#   latency  = 在 CFST_EXTRA_ARGS 已过滤丢包/带宽后，优先选择平均延迟最低
+#   speed    = 优先选择平均下载速度最高
+#   balanced = 多轮命中次数优先，其次低延迟，再其次高带宽
+CFST_PICK_MODE="cfst"
 # CloudflareSpeedTest 可执行文件路径（留空=在 PATH 里找 CloudflareST / cfst）
 CFST_BIN=""
 # 测速用 IP 段文件（留空=用 CloudflareSpeedTest 自带 ip.txt）
+# IPv4: ip.txt；IPv6: ipv6.txt；XIU2/CloudflareSpeedTest 支持 IPv4+IPv6 混合文件。
 CFST_IP_FILE=""
 
 # ── 行为 ──
 # 优选结果为空时是否保留上次（true=不推空值，强烈建议 true）
 KEEP_ON_EMPTY="true"
+# 某节点地区无结果时如何处理：
+#   keep   = 仅该节点保留 nodes.txt 原 server，其它有结果的节点照常更新（推荐）
+#   abort  = 中止整批 PATCH，完全不改 sub-store
+#   global = 回退到全局优选 IP（可能跨地区负优化，谨慎）
+MISSING_COLO_POLICY="keep"
