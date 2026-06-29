@@ -48,12 +48,13 @@ EOF
 }
 
 write_fake_curl() {
-    local dir="$1" payload_file="$2"
+    local dir="$1" payload_file="$2" cf_file="${3:-}"
     cat > "$dir/curl" <<'SH'
 #!/usr/bin/env bash
 set -u
 method="GET"
 data=""
+url=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -X) method="$2"; shift 2 ;;
@@ -66,11 +67,45 @@ while [[ $# -gt 0 ]]; do
 done
 case "$method" in
     GET)
-        printf '{"status":"success","data":{"name":"cdn-preferip","displayName":"cdn-preferip","source":"local","content":""}}\n'
+        if [[ "$url" == *"/client/v4/zones?name="* ]]; then
+            printf '{"success":true,"errors":[],"messages":[],"result":[{"id":"zone-123","name":"example.com"}]}\n'
+        elif [[ "$url" == *"/client/v4/zones/"*"/dns_records?type=A&name="* ]]; then
+            printf '{"success":true,"errors":[],"messages":[],"result":[{"id":"rec-a-1","type":"A","name":"prefer.example.com","content":"172.67.1.1"}]}\n'
+        elif [[ "$url" == *"/client/v4/zones/"*"/dns_records?type=AAAA&name="* ]]; then
+            printf '{"success":true,"errors":[],"messages":[],"result":[{"id":"rec-aaaa-1","type":"AAAA","name":"prefer6.example.com","content":"2606:4700::1"}]}\n'
+        else
+            printf '{"status":"success","data":{"name":"cdn-preferip","displayName":"cdn-preferip","source":"local","content":""}}\n'
+        fi
         ;;
-    PATCH|POST)
-        printf '%s' "$data" > "${PATCH_PAYLOAD:?}"
-        printf '{"status":"success"}\n'
+    PATCH|POST|PUT)
+        if [[ "$url" == *"/client/v4/"* ]]; then
+            : "${CF_PAYLOAD_FILE:?}"
+            {
+                printf 'METHOD=%s\n' "$method"
+                printf 'URL=%s\n' "$url"
+                printf '%s\n' "$data"
+            } >> "$CF_PAYLOAD_FILE"
+            if [[ "$url" == *"/dns_records" ]]; then
+                printf '{"success":true,"errors":[],"messages":[],"result":{"id":"rec-new"}}\n'
+            else
+                printf '{"success":true,"errors":[],"messages":[],"result":[{"id":"zone-123"}]}\n'
+            fi
+        else
+            printf '%s' "$data" > "${PATCH_PAYLOAD:?}"
+            printf '{"status":"success"}\n'
+        fi
+        ;;
+    DELETE)
+        if [[ "$url" == *"/client/v4/"* ]]; then
+            : "${CF_PAYLOAD_FILE:?}"
+            {
+                printf 'METHOD=%s\n' "$method"
+                printf 'URL=%s\n' "$url"
+            } >> "$CF_PAYLOAD_FILE"
+            printf '{"success":true,"errors":[],"messages":[],"result":{"id":"deleted"}}\n'
+        else
+            printf '{"status":"success"}\n'
+        fi
         ;;
     *)
         printf '{"status":"failed","message":"unexpected method"}\n'
@@ -79,6 +114,9 @@ esac
 SH
     chmod +x "$dir/curl"
     export PATCH_PAYLOAD="$payload_file"
+    if [[ -n "$cf_file" ]]; then
+        export CF_PAYLOAD_FILE="$cf_file"
+    fi
 }
 
 echo "== cdn-preferip: collect 空结果不覆盖旧文件 =="
@@ -139,6 +177,64 @@ EOF
 TMPDIR="$TMP" CDN_PREFERIP_CONF="$conf" RESULT_FILE="$result" NODES_FILE="$nodes" "$CDN_DIR/preferip-collect.sh" >/tmp/cdn-pref-rounds.out 2>/tmp/cdn-pref-rounds.err \
     && pass "多轮 collect 成功" || fail "多轮 collect 失败"
 ck "latency 模式选最低延迟 IP" "grep -Eq '^HKG\\|104\\.20\\.0\\.3\\|' '$result'"
+
+echo ""
+echo "== cdn-preferip: DNS 模式保持 entry 域名并同步 Cloudflare A 记录 =="
+fakebin="$TMP/fakebin"; mkdir -p "$fakebin"
+payload_dns="$TMP/patch-payload-dns.json"
+cf_payload="$TMP/cf-payload.txt"
+write_fake_curl "$fakebin" "$payload_dns" "$cf_payload"
+conf="$TMP/dns.conf"; nodes="$TMP/dns.nodes"; result="$TMP/dns.result"
+write_base_conf "$conf" "/bin/false"
+cat >> "$conf" <<'EOF'
+PREFERIP_SERVER_MODE="dns"
+PREFERIP_CF_API_TOKEN="fake-token"
+PREFERIP_CF_ZONE_ID="zone-123"
+PREFERIP_DNS_PROXIED="false"
+PREFERIP_DNS_DELETE_STALE="true"
+EOF
+cat > "$nodes" <<'EOF'
+HK-DNS|HKG|entry=prefer.example.com|vless://00000000-0000-0000-0000-000000000001@old.example:443?type=ws&security=tls&host=hk.example&path=%2Fhk&sni=hk.example#old
+EOF
+cat > "$result" <<'EOF'
+# cdn-preferip result v3: colo|ip|avg_latency_ms|avg_speed_mbps|rounds_hit
+HKG|172.67.66.8|80.00|10.00|1
+EOF
+PATH="$fakebin:$PATH" CDN_PREFERIP_CONF="$conf" RESULT_FILE="$result" NODES_FILE="$nodes" "$CDN_DIR/preferip-push.sh" >/tmp/cdn-pref-dns.out 2>/tmp/cdn-pref-dns.err \
+    && pass "DNS 模式 push 成功" || fail "DNS 模式 push 失败"
+content_dns="$(jq -r '.content' "$payload_dns")"
+ck "DNS 模式订阅里 server 保持为入口域名" "grep -q '@prefer.example.com:443' <<< \"\$content_dns\""
+ck "DNS 模式仍保留真实 host/sni" "grep -q 'sni=hk.example' <<< \"\$content_dns\""
+ck "DNS 模式调用 Cloudflare API" "grep -q '^METHOD=PUT\\|^METHOD=POST' '$cf_payload'"
+ck "DNS 模式 DNS 记录内容是优选 IP" "grep -q '172.67.66.8' '$cf_payload'"
+
+echo ""
+echo "== cdn-preferip: DNS 模式同步 IPv6 AAAA 记录 =="
+payload_dns6="$TMP/patch-payload-dns6.json"
+cf_payload6="$TMP/cf-payload6.txt"
+write_fake_curl "$fakebin" "$payload_dns6" "$cf_payload6"
+conf="$TMP/dns6.conf"; nodes="$TMP/dns6.nodes"; result="$TMP/dns6.result"
+write_base_conf "$conf" "/bin/false"
+cat >> "$conf" <<'EOF'
+PREFERIP_SERVER_MODE="dns"
+PREFERIP_CF_API_TOKEN="fake-token"
+PREFERIP_CF_ZONE_ID="zone-123"
+PREFERIP_DNS_PROXIED="false"
+PREFERIP_DNS_DELETE_STALE="true"
+EOF
+cat > "$nodes" <<'EOF'
+HK-DNS6|HKG|ipv6|entry=prefer6.example.com|vless://00000000-0000-0000-0000-000000000002@old6.example.com:443?type=ws&security=tls&host=hk6.example.com&path=%2Fhk6&sni=hk6.example.com#old
+EOF
+cat > "$result" <<'EOF'
+# cdn-preferip result v3: colo|ip|avg_latency_ms|avg_speed_mbps|rounds_hit
+HKG@IPV6|2606:4700::1234|70.00|8.00|1
+EOF
+PATH="$fakebin:$PATH" CDN_PREFERIP_CONF="$conf" RESULT_FILE="$result" NODES_FILE="$nodes" "$CDN_DIR/preferip-push.sh" >/tmp/cdn-pref-dns6.out 2>/tmp/cdn-pref-dns6.err \
+    && pass "IPv6 DNS 模式 push 成功" || fail "IPv6 DNS 模式 push 失败"
+content_dns6="$(jq -r '.content' "$payload_dns6")"
+ck "IPv6 DNS 模式订阅里 server 保持为入口域名" "grep -q '@prefer6.example.com:443' <<< \"\$content_dns6\""
+ck "IPv6 DNS 模式调用 Cloudflare API" "grep -q '^METHOD=PUT\\|^METHOD=POST' '$cf_payload6'"
+ck "IPv6 DNS 模式同步 AAAA 记录内容" "grep -q '2606:4700::1234' '$cf_payload6'"
 
 echo ""
 echo "== cdn-preferip: 缺地区结果 keep 原 server，且不隐式回退 GLOBAL =="

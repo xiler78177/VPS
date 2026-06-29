@@ -297,12 +297,40 @@ select_entry_for_node() {
     return 1
 }
 
+dns_domain_for_node() {
+    local domain="${NODE_ENTRY_DOMAIN:-}"
+    if [[ -z "$domain" ]]; then
+        [[ "$PREFERIP_SERVER_MODE" == "dns" ]] || return 1
+        domain="$(vless_server "$NODE_LINK" 2>/dev/null || true)"
+        [[ -n "$domain" ]] || return 1
+        is_ip_literal "$domain" && return 1
+    fi
+    printf '%s' "$domain"
+}
+
+should_use_dns_mode() {
+    local domain="${1:-}"
+    case "$PREFERIP_SERVER_MODE" in
+        ip) return 1 ;;
+        dns)
+            [[ -n "$domain" && -n "$PREFERIP_CF_API_TOKEN" ]] || return 1
+            return 0
+            ;;
+        auto)
+            [[ -n "$domain" && -n "$PREFERIP_CF_API_TOKEN" ]] || return 1
+            return 0
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 state_payload=""
 content=""
 n=0
 kept=0
 fallback_global=0
 now_epoch="$(date +%s)"
+declare -A dns_domain_seen=()
 
 if [[ -f "$NODES_FILE" ]]; then
     # ── 多节点模式：nodes.txt 每行「备注|vless链接」或「备注|CF地区码|vless链接」 ──
@@ -318,6 +346,16 @@ if [[ -f "$NODES_FILE" ]]; then
         if select_entry_for_node "$key" "$NODE_NOTE" "$NODE_LINK"; then
             selected="$SELECTED_ENTRY"
         fi
+
+        dns_domain=""
+        if dns_domain="$(dns_domain_for_node 2>/dev/null || true)" && should_use_dns_mode "$dns_domain"; then
+            if [[ -n "${dns_domain_seen[$dns_domain]:-}" && "${dns_domain_seen[$dns_domain]}" != "$NODE_NOTE" ]]; then
+                log "警告: DNS 域名 ${dns_domain} 被多个节点复用（${dns_domain_seen[$dns_domain]} / ${NODE_NOTE}），后写入者会覆盖前者"
+            else
+                dns_domain_seen["$dns_domain"]="$NODE_NOTE"
+            fi
+        fi
+
         if [[ -z "$selected" && "$key" != "GLOBAL" && "$MISSING_COLO_POLICY" == "global" ]]; then
             if select_entry_for_node "GLOBAL" "$NODE_NOTE" "$NODE_LINK"; then
                 selected="$SELECTED_ENTRY"
@@ -328,10 +366,18 @@ if [[ -f "$NODES_FILE" ]]; then
         if [[ -z "$selected" ]]; then
             case "$MISSING_COLO_POLICY" in
                 keep)
-                    best="$(vless_server "$NODE_LINK" 2>/dev/null || true)"
-                    [[ -n "$best" ]] || die "节点 ${NODE_NOTE} 需要地区 ${key} 的优选 IP，但结果文件缺失，且无法从原链接提取 server"
+                    state_ip_value="${state_ip[$NODE_NOTE]:-}"
+                    if [[ -z "$state_ip_value" && "$PREFERIP_SERVER_MODE" != "dns" ]]; then
+                        state_ip_value="$(vless_server "$NODE_LINK" 2>/dev/null || true)"
+                    fi
+                    [[ -n "$state_ip_value" || "$PREFERIP_SERVER_MODE" == "dns" ]] || die "节点 ${NODE_NOTE} 需要地区 ${key} 的优选 IP，但结果文件缺失，且无法从原链接提取 server"
+                    best="$state_ip_value"
                     kept=$((kept+1))
-                    log "节点 ${NODE_NOTE}: colo=${key} 无可用候选，按 MISSING_COLO_POLICY=keep 保留原 server=${best}"
+                    if [[ -n "$best" ]]; then
+                        log "节点 ${NODE_NOTE}: colo=${key} 无可用候选，按 MISSING_COLO_POLICY=keep 保留原 server=${best}"
+                    else
+                        log "节点 ${NODE_NOTE}: colo=${key} 无可用候选，按 MISSING_COLO_POLICY=keep 保留入口域名 ${dns_domain:-<none>}，等待下次有 IP 再同步"
+                    fi
                     lat=""; speed=""; count=""; event="kept"
                     ;;
                 abort|*)
@@ -344,10 +390,24 @@ if [[ -f "$NODES_FILE" ]]; then
             event="applied"
             log "节点 ${NODE_NOTE}: colo=${key} server=${best} latency=${lat:-?}ms speed=${speed:-?}MB/s rounds=${count:-?} assign=${PREFERIP_ASSIGN_MODE} sticky=${PREFERIP_STICKY}"
         fi
-        new="$(rewrite_vless "$NODE_LINK" "$best" "$NODE_NOTE")" || { log "解析失败，跳过: $NODE_NOTE"; continue; }
+
+        server_value="$best"
+        state_ip_value="$best"
+        if should_use_dns_mode "${dns_domain:-}" && [[ -n "${dns_domain:-}" ]]; then
+            server_value="$dns_domain"
+            if is_ip_literal "$state_ip_value"; then
+                if ! cf_dns_sync_entry_domain "$dns_domain" "$state_ip_value" "$PREFERIP_CF_API_TOKEN" "$PREFERIP_CF_ZONE_ID" >/dev/null; then
+                    die "节点 ${NODE_NOTE} 的 DNS 解析同步失败（${dns_domain} -> ${state_ip_value}）"
+                fi
+            else
+                log "节点 ${NODE_NOTE}: DNS 入口 ${dns_domain} 暂未拿到可同步的 IP，保留现有 DNS 记录"
+            fi
+            log "节点 ${NODE_NOTE}: colo=${key} dns=${dns_domain} -> ${state_ip_value} latency=${lat:-?}ms speed=${speed:-?}MB/s rounds=${count:-?} assign=${PREFERIP_ASSIGN_MODE} sticky=${PREFERIP_STICKY}"
+        fi
+        new="$(rewrite_vless "$NODE_LINK" "$server_value" "$NODE_NOTE")" || { log "解析失败，跳过: $NODE_NOTE"; continue; }
         content+="${new}"$'\n'
-        state_payload+="${NODE_NOTE}"$'\t'"${key}"$'\t'"${best}"$'\t'"${lat:-}"$'\t'"${speed:-}"$'\t'"${count:-}"$'\t'"${now_epoch}"$'\n'
-        append_history_event "$key" "$best" "${lat:-}" "${speed:-}" "${count:-}" "$event" "$NODE_NOTE"
+        state_payload+="${NODE_NOTE}"$'\t'"${key}"$'\t'"${state_ip_value}"$'\t'"${lat:-}"$'\t'"${speed:-}"$'\t'"${count:-}"$'\t'"${now_epoch}"$'\n'
+        append_history_event "$key" "$state_ip_value" "${lat:-}" "${speed:-}" "${count:-}" "$event" "$NODE_NOTE"
         n=$((n+1))
     done < "$NODES_FILE"
     log "多节点模式：从 nodes.txt 生成 ${n} 个节点（保留原 server=${kept}，全局回退=${fallback_global}）"

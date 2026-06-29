@@ -74,6 +74,26 @@ load_conf() {
     PREFERIP_BAD_FILE="${PREFERIP_BAD_FILE:-$CDN_PREFERIP_DIR/bad-ip.txt}"
     PREFERIP_BACKUP_DIR="${PREFERIP_BACKUP_DIR:-$CDN_PREFERIP_DIR/backup}"
     PREFERIP_LOCK_FILE="${PREFERIP_LOCK_FILE:-$CDN_PREFERIP_DIR/preferip.lock}"
+    PREFERIP_SERVER_MODE="${PREFERIP_SERVER_MODE:-ip}"
+    PREFERIP_SERVER_MODE="${PREFERIP_SERVER_MODE,,}"
+    case "$PREFERIP_SERVER_MODE" in
+        ip|dns|auto) ;;
+        *) die "PREFERIP_SERVER_MODE 只能是 ip / dns / auto" ;;
+    esac
+    PREFERIP_DNS_TTL="${PREFERIP_DNS_TTL:-1}"
+    [[ "$PREFERIP_DNS_TTL" =~ ^[0-9]+$ && "$PREFERIP_DNS_TTL" -ge 1 ]] || die "PREFERIP_DNS_TTL 必须是 >=1 的整数"
+    PREFERIP_CF_API_TOKEN="${PREFERIP_CF_API_TOKEN:-${CF_API_TOKEN:-${CLOUDFLARE_API_TOKEN:-}}}"
+    PREFERIP_CF_ZONE_ID="${PREFERIP_CF_ZONE_ID:-}"
+    PREFERIP_DNS_PROXIED="${PREFERIP_DNS_PROXIED:-false}"
+    PREFERIP_DNS_PROXIED="${PREFERIP_DNS_PROXIED,,}"
+    case "$PREFERIP_DNS_PROXIED" in
+        true|false) ;;
+        *) die "PREFERIP_DNS_PROXIED 只能是 true / false" ;;
+    esac
+    PREFERIP_DNS_DELETE_STALE="${PREFERIP_DNS_DELETE_STALE:-true}"
+    if [[ "$PREFERIP_SERVER_MODE" == "dns" && -z "$PREFERIP_CF_API_TOKEN" ]]; then
+        die "PREFERIP_SERVER_MODE=dns 需要配置 Cloudflare API Token（PREFERIP_CF_API_TOKEN / CF_API_TOKEN / CLOUDFLARE_API_TOKEN）"
+    fi
     # 公网 https 务必加密传输 secret
     [[ "$SUBSTORE_BASE" == https://* ]] || log "警告: SUBSTORE_BASE 非 https，secret 前缀会明文暴露在链路上"
 }
@@ -169,42 +189,73 @@ result_key_ip_version() {
 }
 
 NODE_NOTE=""; NODE_COLO=""; NODE_IP_VERSION=""; NODE_LINK=""
+NODE_ENTRY_DOMAIN=""
+validate_dns_name() {
+    local name="${1:-}"
+    [[ "$name" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
+}
+
 parse_node_line() {
-    # 兼容三种格式：
+    # 兼容格式：
     #   旧: 备注|vless链接
     #   新: 备注|CF地区码|vless链接       例如: 香港-01|HKG|vless://...
     #   混合池: 备注|CF地区码|ipv6|vless链接 或 备注|HKG@ipv6|vless://...
+    #   DNS入口: 备注|CF地区码|entry=prefer.example.com|vless://...
+    #            备注|CF地区码|ipv6|entry=prefer6.example.com|vless://...
     # 地区码可填多个逗号分隔候选，例如: 日本-01|NRT,KIX|vless://...
-    local raw="${1:-}" trimmed f1 f2 f3 f4 rest cv
-    NODE_NOTE=""; NODE_COLO=""; NODE_IP_VERSION=""; NODE_LINK=""
+    local raw="${1:-}" trimmed cv i link_idx=-1 token token_l value
+    local -a fields=()
+    NODE_NOTE=""; NODE_COLO=""; NODE_IP_VERSION=""; NODE_LINK=""; NODE_ENTRY_DOMAIN=""
     [[ -n "${raw//[[:space:]]/}" ]] || return 1
     trimmed="$(trim "$raw")"
     [[ "$trimmed" == \#* ]] && return 1
-    IFS='|' read -r f1 f2 f3 f4 rest <<< "$raw"
-    f1="$(trim "$f1")"; f2="$(trim "$f2")"; f3="$(trim "$f3")"; f4="$(trim "$f4")"
-    if [[ "$f2" == vless://* ]]; then
-        NODE_NOTE="$f1"
-        NODE_COLO="${DEFAULT_CF_COLO:-}"
-        NODE_IP_VERSION="${DEFAULT_CF_IP_VERSION:-}"
-        NODE_LINK="$f2"
-    elif [[ "$f3" == vless://* ]]; then
-        NODE_NOTE="$f1"
-        NODE_COLO="$f2"
-        NODE_IP_VERSION="${DEFAULT_CF_IP_VERSION:-}"
-        NODE_LINK="$f3"
-    elif [[ "$f4" == vless://* ]]; then
-        NODE_NOTE="$f1"
-        NODE_COLO="$f2"
-        NODE_IP_VERSION="$f3"
-        NODE_LINK="$f4"
-    else
-        return 1
-    fi
+    IFS='|' read -ra fields <<< "$raw"
+    [[ ${#fields[@]} -ge 2 ]] || return 1
+    NODE_NOTE="$(trim "${fields[0]}")"
+    for ((i=1; i<${#fields[@]}; i++)); do
+        token="$(trim "${fields[$i]}")"
+        if [[ "$token" == vless://* ]]; then
+            NODE_LINK="$token"
+            link_idx="$i"
+            break
+        fi
+    done
+    [[ "$link_idx" -gt 0 ]] || return 1
     [[ -n "$NODE_NOTE" && "$NODE_LINK" == vless://* ]] || return 1
-    if [[ -n "$NODE_COLO" ]]; then
-        cv="$(split_colo_version "$NODE_COLO")" || return 1
-        NODE_COLO="${cv%%|*}"
-        [[ -z "$NODE_IP_VERSION" && "$cv" == *"|"* ]] && NODE_IP_VERSION="${cv#*|}"
+
+    NODE_COLO="${DEFAULT_CF_COLO:-}"
+    NODE_IP_VERSION="${DEFAULT_CF_IP_VERSION:-}"
+    for ((i=1; i<link_idx; i++)); do
+        token="$(trim "${fields[$i]}")"
+        [[ -n "$token" ]] || continue
+        token_l="${token,,}"
+        case "$token_l" in
+            ipv4|v4|ip4|ipv6|v6|ip6)
+                NODE_IP_VERSION="$(normalize_ip_version "$token")" || return 1
+                ;;
+            entry=*|dns=*|server=*)
+                value="${token#*=}"
+                value="$(trim "$value")"
+                [[ -n "$value" ]] && NODE_ENTRY_DOMAIN="$value"
+                ;;
+            *.*)
+                if [[ -z "$NODE_ENTRY_DOMAIN" && "$token" != *":"* && "$token" != *"/"* ]]; then
+                    NODE_ENTRY_DOMAIN="$token"
+                else
+                    return 1
+                fi
+                ;;
+            *)
+                cv="$(split_colo_version "$token")" || return 1
+                NODE_COLO="${cv%%|*}"
+                value="${cv#*|}"
+                [[ -n "$value" && "$value" != "$cv" ]] && NODE_IP_VERSION="$value"
+                ;;
+        esac
+    done
+    if [[ -n "$NODE_ENTRY_DOMAIN" ]]; then
+        NODE_ENTRY_DOMAIN="${NODE_ENTRY_DOMAIN,,}"
+        validate_dns_name "$NODE_ENTRY_DOMAIN" || return 1
     fi
     if [[ -n "$NODE_IP_VERSION" ]]; then
         NODE_IP_VERSION="$(normalize_ip_version "$NODE_IP_VERSION")" || return 1
@@ -310,6 +361,159 @@ vless_query_param() {
         fi
     done
     return 1
+}
+
+cf_api() {
+    local method="$1" path="$2" token="$3"; shift 3
+    local url="https://api.cloudflare.com/client/v4${path}"
+    curl -fsS --max-time 30 -X "$method" "$url" \
+        -H "Authorization: Bearer $token" \
+        -H "Content-Type: application/json" "$@"
+}
+
+cf_api_ok() { [[ "$(jq -r '.success // false' 2>/dev/null <<< "$1")" == "true" ]]; }
+cf_api_err() { jq -r '.errors[0].message // "未知错误"' 2>/dev/null <<< "$1" || echo "未知错误"; }
+
+cf_list_zones() {
+    local token="$1" query="${2:-}" per_page="${3:-50}"
+    local page=1 resp all='[]' total_pages count endpoint
+    while true; do
+        endpoint="/zones?per_page=${per_page}&page=${page}"
+        [[ -n "$query" ]] && endpoint="${endpoint}&${query}"
+        resp="$(cf_api GET "$endpoint" "$token")" || return 1
+        if ! cf_api_ok "$resp"; then
+            echo "$resp"
+            return 1
+        fi
+        all="$(jq -c --argjson acc "$all" '$acc + (.result // [])' <<< "$resp" 2>/dev/null)" || {
+            echo '{"success":false,"errors":[{"message":"解析 Zone 分页响应失败"}]}'
+            return 1
+        }
+        total_pages="$(jq -r '.result_info.total_pages // empty' <<< "$resp" 2>/dev/null)"
+        count="$(jq -r '.result | length' <<< "$resp" 2>/dev/null)"
+        if [[ "$total_pages" =~ ^[0-9]+$ ]]; then
+            (( page >= total_pages )) && break
+        else
+            [[ "$count" =~ ^[0-9]+$ ]] || count=0
+            (( count < per_page )) && break
+        fi
+        page=$((page + 1))
+    done
+    jq -n --argjson result "$all" '{success:true, errors:[], messages:[], result:$result}'
+}
+
+cf_get_zone_id() {
+    local domain="$1" token="$2" current resp zid try
+    current="$domain"
+    while [[ "$current" == *"."* ]]; do
+        resp="$(cf_api GET "/zones?name=$current" "$token")" || return 1
+        if cf_api_ok "$resp"; then
+            zid="$(jq -r '.result[0].id // empty' <<< "$resp")"
+            [[ -n "$zid" ]] && { printf '%s' "$zid"; return 0; }
+        fi
+        current="${current#*.}"
+    done
+    resp="$(cf_list_zones "$token")" || return 1
+    if cf_api_ok "$resp"; then
+        try="$domain"
+        while [[ "$try" == *"."* ]]; do
+            zid="$(jq -r --arg d "$try" '.result[] | select(.name == $d) | .id' <<< "$resp" | head -n1)"
+            [[ -n "$zid" ]] && { printf '%s' "$zid"; return 0; }
+            try="${try#*.}"
+        done
+    fi
+    return 1
+}
+
+cf_dns_upsert_record() {
+    local zone_id="$1" token="$2" type="$3" name="$4" content="$5" proxied="${6:-false}"
+    local records record_id count data resp extra_ids
+    records="$(cf_api GET "/zones/$zone_id/dns_records?type=$type&name=$name" "$token")" || return 1
+    if ! cf_api_ok "$records"; then
+        log "读取 $type DNS 记录失败: $(cf_api_err "$records")"
+        return 1
+    fi
+    record_id="$(jq -r '.result[0].id // empty' <<< "$records")"
+    count="$(jq -r '.result | length' <<< "$records")"
+    if [[ "$count" -gt 1 ]]; then
+        log "警告: 存在 ${count} 条 $type 记录，将保留第一条并清理多余记录。"
+        extra_ids="$(jq -r '.result[1:][] | .id // empty' <<< "$records")"
+    else
+        extra_ids=""
+    fi
+    data="$(jq -n --arg type "$type" --arg name "$name" --arg content "$content" --argjson proxied "$proxied" --argjson ttl "${PREFERIP_DNS_TTL:-1}" \
+        '{type:$type, name:$name, content:$content, ttl:$ttl, proxied:$proxied}')"
+    if [[ -n "$record_id" ]]; then
+        resp="$(cf_api PUT "/zones/$zone_id/dns_records/$record_id" "$token" --data "$data")" || return 1
+    else
+        resp="$(cf_api POST "/zones/$zone_id/dns_records" "$token" --data "$data")" || return 1
+    fi
+    if cf_api_ok "$resp"; then
+        while IFS= read -r extra_id; do
+            [[ -n "$extra_id" ]] || continue
+            resp="$(cf_api DELETE "/zones/$zone_id/dns_records/$extra_id" "$token")" || return 1
+            if ! cf_api_ok "$resp"; then
+                log "删除多余 $type DNS 记录失败: $(cf_api_err "$resp")"
+                return 1
+            fi
+        done <<< "$extra_ids"
+        printf '%s' "$resp"
+        return 0
+    fi
+    log "DNS 记录 ${name} ${type} 更新失败: $(cf_api_err "$resp")"
+    return 1
+}
+
+cf_dns_delete_records() {
+    local zone_id="$1" token="$2" type="$3" name="$4"
+    local records ids id resp
+    records="$(cf_api GET "/zones/$zone_id/dns_records?type=$type&name=$name" "$token")" || return 1
+    if ! cf_api_ok "$records"; then
+        log "读取待清理 $type DNS 记录失败: $(cf_api_err "$records")"
+        return 1
+    fi
+    ids="$(jq -r '.result[].id // empty' <<< "$records")"
+    [[ -n "$ids" ]] || return 0
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        resp="$(cf_api DELETE "/zones/$zone_id/dns_records/$id" "$token")" || return 1
+        if ! cf_api_ok "$resp"; then
+            log "删除 stale DNS 记录失败: $(cf_api_err "$resp")"
+            return 1
+        fi
+    done <<< "$ids"
+}
+
+cf_ip_family() {
+    local ip="${1:-}"
+    if [[ "$ip" == *:* ]]; then
+        printf 'AAAA'
+    else
+        printf 'A'
+    fi
+}
+
+cf_dns_sync_entry_domain() {
+    local domain="$1" ip="$2" token="${3:-$PREFERIP_CF_API_TOKEN}" zone_id="${4:-$PREFERIP_CF_ZONE_ID}" family delete_stale proxied
+    [[ -n "$domain" && -n "$ip" ]] || return 1
+    is_ip_literal "$ip" || return 1
+    [[ -n "$token" ]] || die "DNS 模式需要 Cloudflare API Token（PREFERIP_CF_API_TOKEN / CF_API_TOKEN / CLOUDFLARE_API_TOKEN）"
+    family="$(cf_ip_family "$ip")"
+    delete_stale="${PREFERIP_DNS_DELETE_STALE:-true}"
+    proxied="${PREFERIP_DNS_PROXIED:-false}"
+    [[ "$proxied" == "true" || "$proxied" == "false" ]] || proxied="false"
+    if [[ -z "$zone_id" ]]; then
+        zone_id="$(cf_get_zone_id "$domain" "$token")" || return 1
+        [[ -n "$zone_id" ]] || return 1
+    fi
+    cf_dns_upsert_record "$zone_id" "$token" "$family" "$domain" "$ip" "$proxied" >/dev/null || return 1
+    if [[ "$delete_stale" == "true" ]]; then
+        case "$family" in
+            A) cf_dns_delete_records "$zone_id" "$token" AAAA "$domain" || return 1 ;;
+            AAAA) cf_dns_delete_records "$zone_id" "$token" A "$domain" || return 1 ;;
+        esac
+    fi
+    printf '%s|%s|%s' "$zone_id" "$family" "$ip"
 }
 
 # 拼一条 CDN 客户端 vless 链接：server=优选IP，host/sni=真实域名。
