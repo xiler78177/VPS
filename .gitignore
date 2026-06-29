@@ -5,6 +5,7 @@
 scripts/cdn-preferip/cdn-preferip.conf
 scripts/cdn-preferip/nodes.txt
 scripts/cdn-preferip/preferip.result
+scripts/cdn-preferip/preferip.rendered.txt
 scripts/cdn-preferip/preferip.state.tsv
 scripts/cdn-preferip/preferip.history.csv
 scripts/cdn-preferip/bad-ip.txt

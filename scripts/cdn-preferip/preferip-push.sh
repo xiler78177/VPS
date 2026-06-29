@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# scripts/cdn-preferip/preferip-push.sh  (C 块：回写 sub-store)
+# scripts/cdn-preferip/preferip-push.sh  (C 块：生成本地节点文件 + 可选同步 DNS)
 #
 # 多节点模式(推荐)：读 nodes.txt，每行可写：
 #   旧格式: 区域备注|vless链接
 #   新格式: 区域备注|CF地区码|vless链接    例如 香港-01|HKG|vless://...
 #   混合池: 区域备注|CF地区码|ipv6|vless链接 或 区域备注|HKG@ipv6|vless://...
-#   C 会按每个节点的 CF 地区码选择对应优选 IP；host/sni/uuid/path 全保留，一次性 PATCH 到专用订阅。
+#   C 会按每个节点的 CF 地区码选择对应优选 IP；host/sni/uuid/path 全保留，输出到本地渲染文件。
 # 单节点模式(旧/兼容)：若无 nodes.txt 但 conf 填了 CDN_UUID/DOMAIN/WS_PATH，则按单节点拼。
 #
-# 安全：只动 SUBSTORE_SUB_NAME 这一条专用订阅。secret 不入日志。
-# 兜底：优选结果为空则不推(KEEP_ON_EMPTY=true)，避免把订阅刷成空 server。
+# 安全：只写本地输出文件和可选 DNS，不依赖任何订阅后端。
+# 兜底：优选结果为空则不写新文件(KEEP_ON_EMPTY=true)，避免把客户端刷成空 server。
 # 缺地区结果策略：MISSING_COLO_POLICY=keep/abort/global；默认 keep，仅更新有结果的节点。
 
 set -u
@@ -18,7 +18,6 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/lib.sh"
 load_conf
 require_cmd curl
-require_cmd jq
 
 RESULT_FILE="${RESULT_FILE:-$HERE/preferip.result}"
 NODES_FILE="${NODES_FILE:-$HERE/nodes.txt}"
@@ -48,6 +47,11 @@ candidate_entries() {
     printf '%s' "${candidates_by_key[$key]:-}" | sed '/^[[:space:]]*$/d'
 }
 
+candidate_count() {
+    local key="$1"
+    candidate_entries "$key" | wc -l | tr -d '[:space:]'
+}
+
 entry_ip() { local e="$1"; printf '%s' "${e%%|*}"; }
 entry_lat() { local e="$1" a b c d; IFS='|' read -r a b c d <<< "$e"; printf '%s' "$b"; }
 entry_speed() { local e="$1" a b c d; IFS='|' read -r a b c d <<< "$e"; printf '%s' "$c"; }
@@ -63,7 +67,7 @@ first_ip_for_key() {
 # 1) 读优选 IP（B 的产出，兼容 v1/v2/v3）
 if [[ ! -s "$RESULT_FILE" ]]; then
     log "优选结果文件不存在或为空: $RESULT_FILE"
-    [[ "${KEEP_ON_EMPTY}" == "true" ]] && { log "KEEP_ON_EMPTY=true：不推空值，保留 sub-store 现状。"; exit 1; }
+    [[ "${KEEP_ON_EMPTY}" == "true" ]] && { log "KEEP_ON_EMPTY=true：不覆盖上次输出文件。"; exit 1; }
     die "无优选 IP 可推送"
 fi
 while IFS= read -r raw || [[ -n "$raw" ]]; do
@@ -237,27 +241,9 @@ probe_candidate() {
     return 1
 }
 
-backup_substore_content() {
-    local sub_json="$1" stamp file keep
-    is_true "$PREFERIP_BACKUP_ENABLE" || return 0
-    [[ -n "$sub_json" && "$sub_json" != "null" ]] || return 0
-    mkdir -p "$PREFERIP_BACKUP_DIR" 2>/dev/null || return 0
-    stamp="$(date '+%Y%m%d-%H%M%S')"
-    file="$PREFERIP_BACKUP_DIR/${SUBSTORE_SUB_NAME}.${stamp}.txt"
-    jq -r '.content // ""' <<< "$sub_json" > "$file" 2>/dev/null || return 0
-    chmod 600 "$file" 2>/dev/null || true
-    keep="${PREFERIP_BACKUP_KEEP:-20}"
-    if [[ "$keep" =~ ^[0-9]+$ && "$keep" -gt 0 ]]; then
-        find "$PREFERIP_BACKUP_DIR" -maxdepth 1 -type f -name "${SUBSTORE_SUB_NAME}.*.txt" -printf '%T@ %p\n' 2>/dev/null \
-            | sort -rn | awk -v keep="$keep" 'NR>keep{sub($1" ",""); print}' \
-            | while IFS= read -r old; do [[ -n "$old" ]] && rm -f -- "$old"; done
-    fi
-    log "已备份当前 sub-store 内容 → $file"
-}
-
 SELECTED_ENTRY=""
 select_entry_for_node() {
-    local key="$1" note="$2" link="$3" selected current_ip current_entry ip entry
+    local key="$1" note="$2" link="$3" selected current_ip current_entry ip entry pool_count
     SELECTED_ENTRY=""
     if pick_candidate "$key"; then
         selected="$PICKED_ENTRY"
@@ -269,7 +255,9 @@ select_entry_for_node() {
     if [[ -z "$current_ip" ]]; then
         current_ip="$(vless_server "$link" 2>/dev/null || true)"
     fi
-    if is_true "$PREFERIP_STICKY" && [[ -n "$current_ip" ]]; then
+    pool_count="$(candidate_count "$key")"
+    if is_true "$PREFERIP_STICKY" && [[ -n "$current_ip" ]] \
+        && ! [[ "$PREFERIP_ASSIGN_MODE" == "round_robin" && "$pool_count" -gt 1 ]]; then
         current_entry="$(find_candidate_by_ip "$key" "$current_ip" 2>/dev/null || true)"
         if [[ -n "$current_entry" ]] && ! is_blacklisted "$key" "$current_ip"; then
             if should_keep_current "$current_entry" "$selected"; then
@@ -297,15 +285,27 @@ select_entry_for_node() {
     return 1
 }
 
+DNS_DOMAIN_FOR_NODE=""
+DNS_DOMAIN_ERROR=""
 dns_domain_for_node() {
-    local domain="${NODE_ENTRY_DOMAIN:-}"
-    if [[ -z "$domain" ]]; then
-        [[ "$PREFERIP_SERVER_MODE" == "dns" ]] || return 1
-        domain="$(vless_server "$NODE_LINK" 2>/dev/null || true)"
-        [[ -n "$domain" ]] || return 1
-        is_ip_literal "$domain" && return 1
+    local domain="${NODE_ENTRY_DOMAIN:-}" origin_sni origin_host origin_server
+    DNS_DOMAIN_FOR_NODE=""
+    DNS_DOMAIN_ERROR=""
+    [[ -n "$domain" ]] || return 1
+    origin_sni="$(vless_query_param "$NODE_LINK" sni 2>/dev/null || true)"
+    origin_host="$(vless_query_param "$NODE_LINK" host 2>/dev/null || true)"
+    origin_server="$(vless_server "$NODE_LINK" 2>/dev/null || true)"
+    origin_sni="${origin_sni,,}"; origin_host="${origin_host,,}"; origin_server="${origin_server,,}"
+    # DNS 固定入口必须是“独立入口域名”。如果把原 CDN 回源域名/Host/SNI 当 entry，
+    # 程序会把它改成 DNS-only 优选 IP，等于破坏 Cloudflare 橙云回源记录。
+    if [[ -n "$origin_sni" && "$domain" == "$origin_sni" ]] \
+        || [[ -n "$origin_host" && "$domain" == "$origin_host" ]] \
+        || { [[ -n "$origin_server" && "$domain" == "$origin_server" ]] && ! is_ip_literal "$origin_server"; }; then
+        DNS_DOMAIN_ERROR="节点 ${NODE_NOTE} 的 entry=${domain} 与原 CDN 域名/Host/SNI 相同；请改用独立入口域名（如 prefer-xxx.example.com），禁止修改原橙云回源记录"
+        return 2
     fi
-    printf '%s' "$domain"
+    DNS_DOMAIN_FOR_NODE="$domain"
+    return 0
 }
 
 should_use_dns_mode() {
@@ -324,6 +324,52 @@ should_use_dns_mode() {
     esac
 }
 
+planned_dns_family_for_node() {
+    local key ip
+    case "${NODE_IP_VERSION:-}" in
+        ipv4) printf 'A'; return 0 ;;
+        ipv6) printf 'AAAA'; return 0 ;;
+    esac
+    key="$(result_key_for_node "${NODE_COLO:-}" "${NODE_IP_VERSION:-}")"
+    [[ "$CFST_COLO_MODE" == "off" ]] && key="GLOBAL"
+    ip="$(first_ip_for_key "$key" 2>/dev/null || true)"
+    if [[ -z "$ip" && "$key" != "GLOBAL" && "$MISSING_COLO_POLICY" == "global" ]]; then
+        ip="$(first_ip_for_key "GLOBAL" 2>/dev/null || true)"
+    fi
+    [[ -z "$ip" ]] && ip="${state_ip[$NODE_NOTE]:-}"
+    [[ -z "$ip" ]] && ip="$(vless_server "$NODE_LINK" 2>/dev/null || true)"
+    if is_ip_literal "$ip"; then
+        cf_ip_family "$ip"
+        return 0
+    fi
+    return 1
+}
+
+add_dns_family_plan() {
+    local domain="$1" family="$2" cur="${dns_domain_family_plan[$domain]:-}"
+    [[ -n "$domain" && -n "$family" ]] || return 0
+    [[ " $cur " == *" $family "* ]] && return 0
+    dns_domain_family_plan["$domain"]="${cur:+$cur }$family"
+}
+
+dns_domain_has_dual_family_plan() {
+    local plan="${dns_domain_family_plan[$1]:-}"
+    [[ " $plan " == *" A "* && " $plan " == *" AAAA "* ]]
+}
+
+build_dns_family_plan() {
+    local raw domain family
+    [[ "$PREFERIP_SERVER_MODE" == "ip" ]] && return 0
+    [[ -f "$NODES_FILE" ]] || return 0
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
+        parse_node_line "$raw" || continue
+        domain="${NODE_ENTRY_DOMAIN:-}"
+        [[ -n "$domain" ]] || continue
+        family="$(planned_dns_family_for_node 2>/dev/null || true)"
+        [[ -n "$family" ]] && add_dns_family_plan "$domain" "$family"
+    done < "$NODES_FILE"
+}
+
 state_payload=""
 content=""
 n=0
@@ -331,8 +377,10 @@ kept=0
 fallback_global=0
 now_epoch="$(date +%s)"
 declare -A dns_domain_seen=()
+declare -A dns_domain_family_plan=()
 
 if [[ -f "$NODES_FILE" ]]; then
+    build_dns_family_plan
     # ── 多节点模式：nodes.txt 每行「备注|vless链接」或「备注|CF地区码|vless链接」 ──
     while IFS= read -r raw || [[ -n "$raw" ]]; do
         if ! parse_node_line "$raw"; then
@@ -348,9 +396,25 @@ if [[ -f "$NODES_FILE" ]]; then
         fi
 
         dns_domain=""
-        if dns_domain="$(dns_domain_for_node 2>/dev/null || true)" && should_use_dns_mode "$dns_domain"; then
+        if [[ "$PREFERIP_SERVER_MODE" != "ip" ]]; then
+            if [[ "$PREFERIP_SERVER_MODE" == "dns" && -z "${NODE_ENTRY_DOMAIN:-}" ]]; then
+                die "PREFERIP_SERVER_MODE=dns 时，节点 ${NODE_NOTE} 必须显式配置 entry=独立入口域名；不会再隐式使用原链接 server，避免误改原 CDN 橙云记录"
+            fi
+            dns_rc=0
+            if dns_domain_for_node; then
+                dns_domain="$DNS_DOMAIN_FOR_NODE"
+            else
+                dns_rc=$?
+                [[ "$dns_rc" -eq 2 ]] && die "$DNS_DOMAIN_ERROR"
+            fi
+        fi
+        if should_use_dns_mode "$dns_domain"; then
             if [[ -n "${dns_domain_seen[$dns_domain]:-}" && "${dns_domain_seen[$dns_domain]}" != "$NODE_NOTE" ]]; then
-                log "警告: DNS 域名 ${dns_domain} 被多个节点复用（${dns_domain_seen[$dns_domain]} / ${NODE_NOTE}），后写入者会覆盖前者"
+                if dns_domain_has_dual_family_plan "$dns_domain"; then
+                    log "提示: DNS 域名 ${dns_domain} 被多个节点复用为双栈入口（${dns_domain_seen[$dns_domain]} / ${NODE_NOTE}），本轮将同时维护 A+AAAA"
+                else
+                    log "警告: DNS 域名 ${dns_domain} 被多个节点复用（${dns_domain_seen[$dns_domain]} / ${NODE_NOTE}），同 family 后写入者会覆盖前者"
+                fi
             else
                 dns_domain_seen["$dns_domain"]="$NODE_NOTE"
             fi
@@ -381,7 +445,7 @@ if [[ -f "$NODES_FILE" ]]; then
                     lat=""; speed=""; count=""; event="kept"
                     ;;
                 abort|*)
-                    die "节点 ${NODE_NOTE} 需要地区 ${key} 的可用优选 IP，但结果缺失/探活失败；MISSING_COLO_POLICY=abort，已中止 PATCH"
+                    die "节点 ${NODE_NOTE} 需要地区 ${key} 的可用优选 IP，但结果缺失/探活失败；MISSING_COLO_POLICY=abort，已中止生成"
                     ;;
             esac
         else
@@ -394,9 +458,15 @@ if [[ -f "$NODES_FILE" ]]; then
         server_value="$best"
         state_ip_value="$best"
         if should_use_dns_mode "${dns_domain:-}" && [[ -n "${dns_domain:-}" ]]; then
+            dns_delete_stale="${PREFERIP_DNS_DELETE_STALE:-true}"
+            if dns_domain_has_dual_family_plan "$dns_domain"; then
+                dns_delete_stale="false"
+                log "节点 ${NODE_NOTE}: DNS 入口 ${dns_domain} 计划同时维护 A+AAAA，跳过 stale family 删除"
+            fi
             server_value="$dns_domain"
             if is_ip_literal "$state_ip_value"; then
-                if ! cf_dns_sync_entry_domain "$dns_domain" "$state_ip_value" "$PREFERIP_CF_API_TOKEN" "$PREFERIP_CF_ZONE_ID" >/dev/null; then
+                require_cmd jq
+                if ! cf_dns_sync_entry_domain "$dns_domain" "$state_ip_value" "$PREFERIP_CF_API_TOKEN" "$PREFERIP_CF_ZONE_ID" "$dns_delete_stale" >/dev/null; then
                     die "节点 ${NODE_NOTE} 的 DNS 解析同步失败（${dns_domain} -> ${state_ip_value}）"
                 fi
             else
@@ -438,29 +508,17 @@ else
     log "单节点模式：生成 ${n} 个节点"
 fi
 
-# 3) PATCH 专用订阅（不存在则 POST 新建 local 订阅）
-sub_json="$(substore_get_sub "$SUBSTORE_SUB_NAME" 2>/dev/null || true)"
-if [[ -n "$sub_json" && "$sub_json" != "null" ]]; then
-    backup_substore_content "$sub_json"
-    payload="$(jq -c --arg c "$content" '.content=$c' <<< "$sub_json")"
-    log "专用订阅已存在，PATCH 更新 content"
-    if resp="$(substore_api PATCH "/sub/$(urlencode "$SUBSTORE_SUB_NAME")" --data "$payload")"; then
-        [[ "$(jq -r '.status // empty' <<< "$resp")" == "success" ]] \
-            && log "PATCH 成功" || { log "PATCH 返回非 success: $(jq -c '.' <<< "$resp" 2>/dev/null)"; exit 1; }
-    else
-        die "PATCH 请求失败（网络/secret/路径？）"
-    fi
-else
-    payload="$(jq -nc --arg n "$SUBSTORE_SUB_NAME" --arg c "$content" \
-        '{name:$n, displayName:$n, source:"local", content:$c}')"
-    log "专用订阅不存在，POST 新建 local 订阅 ${SUBSTORE_SUB_NAME}"
-    if resp="$(substore_api POST "/subs" --data "$payload")"; then
-        [[ "$(jq -r '.status // empty' <<< "$resp")" == "success" ]] \
-            && log "新建成功" || { log "新建返回非 success: $(jq -c '.' <<< "$resp" 2>/dev/null)"; exit 1; }
-    else
-        die "新建请求失败"
-    fi
-fi
+# 3) 写出本地渲染文件（供客户端/其他自动化拉取）
+rendered_file="${PREFERIP_OUTPUT_FILE:-$HERE/preferip.rendered.txt}"
+mkdir -p "$(dirname "$rendered_file")" 2>/dev/null || true
+render_tmp="$(mktemp)"
+{
+    printf '# generated: %s\n' "$(date '+%F %T')"
+    printf '%s' "$content"
+} > "$render_tmp"
+mv "$render_tmp" "$rendered_file"
+chmod 600 "$rendered_file" 2>/dev/null || true
+log "已生成本地节点文件 → $rendered_file"
 
 if [[ -n "${PREFERIP_STATE_FILE:-}" ]]; then
     mkdir -p "$(dirname "$PREFERIP_STATE_FILE")" 2>/dev/null || true
@@ -471,4 +529,4 @@ if [[ -n "${PREFERIP_STATE_FILE:-}" ]]; then
     } > "$state_tmp"
     mv "$state_tmp" "$PREFERIP_STATE_FILE"
 fi
-log "完成：${SUBSTORE_SUB_NAME} 已更新 ${n} 个 CDN 节点。客户端刷新订阅即生效。"
+log "完成：已更新 ${n} 个 CDN 节点。客户端获取本地节点文件或入口 DNS 即生效。"

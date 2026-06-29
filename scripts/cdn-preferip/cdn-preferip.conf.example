@@ -1,13 +1,11 @@
 # cdn-preferip 配置样例
 # 用法：cp cdn-preferip.conf.example cdn-preferip.conf 后按实际填写。
-# 本配置在【国内机】使用：B(优选IP) + C(回写 sub-store) 都读它。
-# 决策：国内机优选 → 直接走公网 https PATCH 刷新 sub-store 专用订阅。
+# 本配置在【国内机】使用：B(优选IP) + C(生成本地节点文件) 都读它。
+# 决策：国内机优选 → 直接生成本地渲染文件；可选同步入口域名 DNS。
 
-# ── sub-store（公网 https + secret 前缀；secret 即事实鉴权，务必全程 HTTPS）──
-# base = 协议+域名+secret 前缀，不含 /api。真实 API = ${SUBSTORE_BASE}/api/...
-SUBSTORE_BASE="https://sub.example.com/你的secret前缀"
-# 专用订阅名（在 sub-store 里新建一条 local 订阅，名字与此一致；C 只动这一条，绝不碰其它）
-SUBSTORE_SUB_NAME="cdn-preferip"
+# ── 本地输出文件 ──
+# C 会把优选后的节点写到这个文件。客户端或其他自动化从这里读取。
+PREFERIP_OUTPUT_FILE=""
 
 # ── CDN 节点参数（来自落地机 A 的 cdn-link.txt / cdn 菜单输出）──
 # server 字段会被优选 IP 替换；host/sni 永远是真实 CDN 域名，CF 靠 Host 头回源。
@@ -18,7 +16,7 @@ CDN_NODE_NAME="cdn-us-01"
 
 # ── CloudflareSpeedTest（XIU2/CloudflareSpeedTest）──
 # 取前 N 个最优 IP（默认 1）。多个时写入多条节点（同参数、不同 server）。
-CFST_TOP_N="1"
+CFST_TOP_N="3"
 # 按节点 CF 地区码分组优选：
 #   auto = nodes.txt 使用「备注|HKG|vless://...」这类格式时，按地区码分别跑 -httping -cfcolo
 #   off  = 保持旧逻辑，全节点统一使用全局 Top1
@@ -30,15 +28,15 @@ DEFAULT_CF_COLO=""
 DEFAULT_CF_IP_VERSION=""
 # 传给 CloudflareSpeedTest 的额外参数（按需调）：
 #   -dd 关闭下载测速只测延迟（更快但不测带宽）；-tl 平均延迟上限ms；-sl 下载速度下限MB/s
-CFST_EXTRA_ARGS="-dn 10 -tl 200"
+CFST_EXTRA_ARGS="-n 100 -dn 5 -dt 10 -tl 180 -tlr 0 -sl 1"
 # 多轮测速次数。>1 时会多次运行 CFST 汇总候选，降低单次随机抽样/网络抖动影响。
-CFST_ROUNDS="1"
+CFST_ROUNDS="3"
 # 候选选择策略：
 #   cfst     = 沿用 CFST 输出顺序（下载测速开启时通常按速度排序）
 #   latency  = 在 CFST_EXTRA_ARGS 已过滤丢包/带宽后，优先选择平均延迟最低
 #   speed    = 优先选择平均下载速度最高
 #   balanced = 多轮命中次数优先，其次低延迟，再其次高带宽
-CFST_PICK_MODE="cfst"
+CFST_PICK_MODE="speed"
 # 二阶段复测：先粗筛 TopN，再只对候选 IP 做更长/更严格复测（更稳，但耗时更久）
 CFST_STAGE2_ENABLE="false"
 CFST_STAGE2_TOP_N="20"
@@ -58,7 +56,7 @@ CFST_IPV6_FILE=""
 KEEP_ON_EMPTY="true"
 # 某节点地区无结果时如何处理：
 #   keep   = 仅该节点保留 nodes.txt 原 server，其它有结果的节点照常更新（推荐）
-#   abort  = 中止整批 PATCH，完全不改 sub-store
+#   abort  = 中止整批生成，完全不改输出文件
 #   global = 回退到全局优选 IP（可能跨地区负优化，谨慎）
 MISSING_COLO_POLICY="keep"
 
@@ -78,18 +76,21 @@ PREFERIP_PROBE_ENABLE="false"
 PREFERIP_PROBE_TIMEOUT="6"
 PREFERIP_PROBE_ACCEPT_CODES="200,204,301,302,400,401,403,404,426"
 PREFERIP_BAD_TTL_HOURS="24"
+# DNS 固定入口模式：
+# - ip：直接把优选 IP 写进渲染文件 server。
+# - auto：nodes.txt 写了 entry=独立入口域名时同步 DNS；没写则走 ip。
+# - dns：要求每个节点显式写 entry=独立入口域名；禁止隐式使用原 CDN host/sni。
+# entry 域名应保持 DNS only；原 CDN 回源域名应继续保持橙云并指向真实源站。
 PREFERIP_SERVER_MODE="ip"
 PREFERIP_CF_API_TOKEN=""
 PREFERIP_CF_ZONE_ID=""
 PREFERIP_DNS_TTL="1"
 PREFERIP_DNS_PROXIED="false"
+# true 时会清理同 entry 的另一种 family；但若本轮计划同时维护 A+AAAA，会自动跳过互删。
 PREFERIP_DNS_DELETE_STALE="true"
 
 # ── 状态 / 历史 / 备份 / 锁 ──
 PREFERIP_STATE_FILE=""
 PREFERIP_HISTORY_FILE=""
 PREFERIP_BAD_FILE=""
-PREFERIP_BACKUP_ENABLE="true"
-PREFERIP_BACKUP_KEEP="20"
-PREFERIP_BACKUP_DIR=""
 PREFERIP_LOCK_FILE=""

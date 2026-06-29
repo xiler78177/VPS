@@ -304,7 +304,7 @@ EOF
 # 127.0.0.1:<内部端口>（明文），由 nginx 在 REALITY_CDN_ORIGIN_PORT 上做 TLS 终止
 # + 反代到该内部端口，CF 橙云 Full(strict) 回源。客户端把 server 字段填优选 IP、
 # host/sni 填真实 cdn 域名，CF 靠 Host 头路由回源。
-# 优选 IP 时效仅几天，由国内机定时跑 CloudflareSpeedTest（B）+ sub-store PATCH（C）刷新。
+# 优选 IP 时效仅几天，由国内机定时跑 CloudflareSpeedTest（B）+ 本地渲染/入口 DNS 同步（C）刷新。
 # ============================================================================
 
 # CDN 是否已启用（state 文件存在且关键字段齐全）
@@ -397,6 +397,28 @@ reality_cdn_write_client_artifacts() {
 {"type":"vless","tag":"${json_name}","server":"${json_server}","server_port":443,"uuid":"${json_uuid}","tls":{"enabled":true,"server_name":"${json_host}","utls":{"enabled":true,"fingerprint":"chrome"}},"transport":{"type":"ws","path":"${json_path}","headers":{"Host":"${json_host}"}}}
 EOF
     chmod 600 "$REALITY_CDN_LINK_FILE" "$REALITY_CDN_CLIENT_JSON"
+}
+
+reality_cdn_nginx_site_name() {
+    local domain="${1:-}"
+    printf 'reality-cdn-%s' "$domain"
+}
+
+reality_cdn_remove_nginx_conf() {
+    local domain="$1" site legacy_av legacy_en f
+    [[ -n "$domain" ]] || return 0
+    site="$(reality_cdn_nginx_site_name "$domain")"
+    rm -f "/etc/nginx/sites-enabled/${site}.conf" "/etc/nginx/sites-available/${site}.conf"
+    # 兼容旧版本曾使用 ${domain}.conf 的 CDN 回源站点；只删除带 CDN 生成标记的文件，
+    # 避免误删 Web 菜单托管的同名站点。
+    legacy_av="/etc/nginx/sites-available/${domain}.conf"
+    legacy_en="/etc/nginx/sites-enabled/${domain}.conf"
+    for f in "$legacy_en" "$legacy_av"; do
+        [[ -f "$f" ]] || continue
+        if grep -q "CDN 回源站点 (VLESS+WS+TLS) for ${domain}" "$f" 2>/dev/null; then
+            rm -f "$f"
+        fi
+    done
 }
 
 # 渲染 CDN 回源 nginx 站点：TLS 终止 + 隐秘 WS path 反代到内部端口；其余路径 444 断开。
@@ -2385,7 +2407,9 @@ systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || true
         print_error "渲染 nginx 回源站失败，请检查域名/端口/path。"
         pause; return 1
     }
-    if ! _nginx_deploy_conf "$cdn_domain" "$nginx_conf"; then
+    local nginx_site
+    nginx_site="$(reality_cdn_nginx_site_name "$cdn_domain")"
+    if ! _nginx_deploy_conf "$nginx_site" "$nginx_conf"; then
         print_error "nginx 回源站部署失败，已中止。"
         pause; return 1
     fi
@@ -2445,7 +2469,7 @@ systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || true
     echo ""
     echo "  下一步（B/C，在国内机执行）:"
     echo "   - B: 跑 CloudflareSpeedTest 优选 CF 边缘 IP（必须国内侧跑）"
-    echo "   - C: 把优选 IP 经 sub-store PATCH 刷进专用订阅的 server 字段（host/sni 保留 ${cdn_domain}）"
+    echo "   - C: 生成本地节点文件；如启用固定入口模式，则只更新独立 entry 域名的 DNS（host/sni 保留 ${cdn_domain}）"
     echo "   仓库已提供脚本：scripts/cdn-preferip/（见同目录 README）"
     draw_line
     log_action "CDN link installed: domain=$cdn_domain origin_port=$origin_port inner=$inner_port"
@@ -2474,7 +2498,7 @@ reality_cdn_uninstall() {
     fi
     # 删 nginx 回源站
     if [[ -n "$cdn_domain" ]]; then
-        rm -f "/etc/nginx/sites-enabled/${cdn_domain}.conf" "/etc/nginx/sites-available/${cdn_domain}.conf"
+        reality_cdn_remove_nginx_conf "$cdn_domain"
         if command_exists nginx && nginx -t >/dev/null 2>&1; then _nginx_reload >/dev/null 2>&1 || true; fi
     fi
     # 回收端口

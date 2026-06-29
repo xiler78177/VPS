@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # scripts/cdn-preferip/lib.sh
-# B/C 共享：配置加载、日志、节点串拼装、sub-store API 封装。
+# B/C 共享：配置加载、日志、节点串拼装、Cloudflare DNS 同步。
 # 不进 v4-built.sh；在【国内机】独立运行。
 
 set -u
@@ -17,16 +17,10 @@ load_conf() {
     [[ -f "$CDN_PREFERIP_CONF" ]] || die "配置文件不存在: $CDN_PREFERIP_CONF（请 cp cdn-preferip.conf.example cdn-preferip.conf 后填写）"
     # shellcheck disable=SC1090
     source "$CDN_PREFERIP_CONF"
-    : "${SUBSTORE_BASE:?配置缺少 SUBSTORE_BASE}"
-    : "${SUBSTORE_SUB_NAME:?配置缺少 SUBSTORE_SUB_NAME}"
-    SUBSTORE_BASE="${SUBSTORE_BASE%/}"
-    if [[ "$SUBSTORE_BASE" == */api ]]; then
-        SUBSTORE_BASE="${SUBSTORE_BASE%/api}"
-        log "提示: SUBSTORE_BASE 已自动去掉末尾 /api，脚本会自行拼接 /api"
-    fi
     # CDN_UUID/DOMAIN/WS_PATH 仅旧「单节点」模式需要;新「多节点」(nodes.txt)模式从链接里读,故改可选
     CDN_UUID="${CDN_UUID:-}"; CDN_DOMAIN="${CDN_DOMAIN:-}"; CDN_WS_PATH="${CDN_WS_PATH:-}"
     CDN_NODE_NAME="${CDN_NODE_NAME:-cdn-${CDN_DOMAIN%%.*}}"
+    PREFERIP_OUTPUT_FILE="${PREFERIP_OUTPUT_FILE:-$CDN_PREFERIP_DIR/preferip.rendered.txt}"
     CFST_TOP_N="${CFST_TOP_N:-1}"
     [[ "$CFST_TOP_N" =~ ^[0-9]+$ && "$CFST_TOP_N" -ge 1 ]] || die "CFST_TOP_N 必须是 >=1 的整数"
     DEFAULT_CF_COLO="${DEFAULT_CF_COLO:-}"
@@ -42,7 +36,7 @@ load_conf() {
     esac
     # 某节点所需地区没有结果时：
     #   keep   = 保留 nodes.txt 原链接里的 server，仅更新有结果的节点（推荐）
-    #   abort  = 中止整次 PATCH，完全保留 sub-store 现状
+    #   abort  = 中止整次生成，完全保留上次输出文件
     #   global = 回退到全局优选 IP（仅在明确接受跨地区覆盖时使用）
     MISSING_COLO_POLICY="${MISSING_COLO_POLICY:-keep}"
     MISSING_COLO_POLICY="${MISSING_COLO_POLICY,,}"
@@ -67,12 +61,9 @@ load_conf() {
     PREFERIP_PROBE_TIMEOUT="${PREFERIP_PROBE_TIMEOUT:-6}"
     PREFERIP_PROBE_ACCEPT_CODES="${PREFERIP_PROBE_ACCEPT_CODES:-200,204,301,302,400,401,403,404,426}"
     PREFERIP_BAD_TTL_HOURS="${PREFERIP_BAD_TTL_HOURS:-24}"
-    PREFERIP_BACKUP_ENABLE="${PREFERIP_BACKUP_ENABLE:-true}"
-    PREFERIP_BACKUP_KEEP="${PREFERIP_BACKUP_KEEP:-20}"
     PREFERIP_STATE_FILE="${PREFERIP_STATE_FILE:-$CDN_PREFERIP_DIR/preferip.state.tsv}"
     PREFERIP_HISTORY_FILE="${PREFERIP_HISTORY_FILE:-$CDN_PREFERIP_DIR/preferip.history.csv}"
     PREFERIP_BAD_FILE="${PREFERIP_BAD_FILE:-$CDN_PREFERIP_DIR/bad-ip.txt}"
-    PREFERIP_BACKUP_DIR="${PREFERIP_BACKUP_DIR:-$CDN_PREFERIP_DIR/backup}"
     PREFERIP_LOCK_FILE="${PREFERIP_LOCK_FILE:-$CDN_PREFERIP_DIR/preferip.lock}"
     PREFERIP_SERVER_MODE="${PREFERIP_SERVER_MODE:-ip}"
     PREFERIP_SERVER_MODE="${PREFERIP_SERVER_MODE,,}"
@@ -94,8 +85,6 @@ load_conf() {
     if [[ "$PREFERIP_SERVER_MODE" == "dns" && -z "$PREFERIP_CF_API_TOKEN" ]]; then
         die "PREFERIP_SERVER_MODE=dns 需要配置 Cloudflare API Token（PREFERIP_CF_API_TOKEN / CF_API_TOKEN / CLOUDFLARE_API_TOKEN）"
     fi
-    # 公网 https 务必加密传输 secret
-    [[ "$SUBSTORE_BASE" == https://* ]] || log "警告: SUBSTORE_BASE 非 https，secret 前缀会明文暴露在链路上"
 }
 
 trim() {
@@ -494,12 +483,12 @@ cf_ip_family() {
 }
 
 cf_dns_sync_entry_domain() {
-    local domain="$1" ip="$2" token="${3:-$PREFERIP_CF_API_TOKEN}" zone_id="${4:-$PREFERIP_CF_ZONE_ID}" family delete_stale proxied
+    local domain="$1" ip="$2" token="${3:-$PREFERIP_CF_API_TOKEN}" zone_id="${4:-$PREFERIP_CF_ZONE_ID}" delete_stale_override="${5:-}" family delete_stale proxied
     [[ -n "$domain" && -n "$ip" ]] || return 1
     is_ip_literal "$ip" || return 1
     [[ -n "$token" ]] || die "DNS 模式需要 Cloudflare API Token（PREFERIP_CF_API_TOKEN / CF_API_TOKEN / CLOUDFLARE_API_TOKEN）"
     family="$(cf_ip_family "$ip")"
-    delete_stale="${PREFERIP_DNS_DELETE_STALE:-true}"
+    delete_stale="${delete_stale_override:-${PREFERIP_DNS_DELETE_STALE:-true}}"
     proxied="${PREFERIP_DNS_PROXIED:-false}"
     [[ "$proxied" == "true" || "$proxied" == "false" ]] || proxied="false"
     if [[ -z "$zone_id" ]]; then
@@ -538,25 +527,4 @@ rewrite_vless() {
     local out="vless://${uuid}@$(uri_host "$newip"):${port}"
     [[ -n "$query" ]] && out="${out}?${query}"
     printf '%s#%s' "$out" "$(urlencode "$newname")"
-}
-
-# ── sub-store API ──
-# 真实路由（已实测）：GET /api/subs、GET/PATCH/DELETE /api/sub/:name、PUT /api/subs
-substore_api() {
-    local method="$1" path="$2"; shift 2
-    curl -fsS --max-time 30 -X "$method" "${SUBSTORE_BASE}/api${path}" \
-        -H "Content-Type: application/json" "$@"
-}
-
-# 取单条订阅 JSON（.data）；不存在返回非 0
-substore_get_sub() {
-    local name="$1" resp
-    resp=$(substore_api GET "/sub/$(urlencode "$name")") || return 1
-    [[ "$(jq -r '.status // empty' <<< "$resp")" == "success" ]] || return 1
-    jq -c '.data' <<< "$resp"
-}
-
-# 该专用订阅是否已存在
-substore_sub_exists() {
-    substore_get_sub "$1" >/dev/null 2>&1
 }
