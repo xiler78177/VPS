@@ -15077,8 +15077,8 @@ reality_cdn_enabled() {
     (
         # shellcheck disable=SC1090
         validate_conf_file "$REALITY_CDN_STATE_FILE" 2>/dev/null && source "$REALITY_CDN_STATE_FILE" 2>/dev/null
-        [[ -n "${REALITY_CDN_UUID:-}" && -n "${REALITY_CDN_WS_PATH:-}" && -n "${REALITY_CDN_INNER_PORT:-}" ]]
-        validate_port "${REALITY_CDN_INNER_PORT:-}" 2>/dev/null
+        [[ -n "${REALITY_CDN_UUID:-}" && -n "${REALITY_CDN_WS_PATH:-}" && -n "${REALITY_CDN_INNER_PORT:-}" ]] && \
+        validate_port "${REALITY_CDN_INNER_PORT:-}" 2>/dev/null && \
         reality_validate_ws_path "${REALITY_CDN_WS_PATH:-}" 2>/dev/null
     )
 }

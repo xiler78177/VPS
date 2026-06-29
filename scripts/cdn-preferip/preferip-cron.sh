@@ -8,6 +8,17 @@
 
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+source "$HERE/lib.sh"
+load_conf
+
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"$PREFERIP_LOCK_FILE"
+    if ! flock -n 9; then
+        echo "==== [$(date '+%F %T')] 已有 cdn-preferip 任务在运行，跳过本次 ===="
+        exit 0
+    fi
+fi
 
 echo "==== [$(date '+%F %T')] cdn-preferip 优选+回写 开始 ===="
 if "$HERE/preferip-collect.sh"; then

@@ -31,6 +31,11 @@ CFST_ROUNDS="1"
 CFST_PICK_MODE="cfst"
 KEEP_ON_EMPTY="true"
 MISSING_COLO_POLICY="keep"
+PREFERIP_STATE_FILE="$TMP/state.tsv"
+PREFERIP_HISTORY_FILE="$TMP/history.csv"
+PREFERIP_BAD_FILE="$TMP/bad-ip.txt"
+PREFERIP_BACKUP_DIR="$TMP/backup"
+PREFERIP_LOCK_FILE="$TMP/preferip.lock"
 EOF
 }
 
@@ -133,7 +138,7 @@ HK-CDN|HKG|vless://00000000-0000-0000-0000-000000000001@old.example:443?type=ws&
 EOF
 TMPDIR="$TMP" CDN_PREFERIP_CONF="$conf" RESULT_FILE="$result" NODES_FILE="$nodes" "$CDN_DIR/preferip-collect.sh" >/tmp/cdn-pref-rounds.out 2>/tmp/cdn-pref-rounds.err \
     && pass "多轮 collect 成功" || fail "多轮 collect 失败"
-ck "latency 模式选最低延迟 IP" "grep -qx 'HKG|104.20.0.3' '$result'"
+ck "latency 模式选最低延迟 IP" "grep -Eq '^HKG\\|104\\.20\\.0\\.3\\|' '$result'"
 
 echo ""
 echo "== cdn-preferip: 缺地区结果 keep 原 server，且不隐式回退 GLOBAL =="
@@ -195,8 +200,8 @@ HK-v6|HKG|ipv6|vless://00000000-0000-0000-0000-000000000002@old-v6.example:443?t
 EOF
 CDN_PREFERIP_CONF="$conf" RESULT_FILE="$result" NODES_FILE="$nodes" "$CDN_DIR/preferip-collect.sh" >/tmp/cdn-pref-mixed.out 2>/tmp/cdn-pref-mixed.err \
     && pass "混合池 collect 成功" || fail "混合池 collect 失败"
-ck "IPv4 分组写入 HKG" "grep -qx 'HKG|1.1.1.1' '$result'"
-ck "IPv6 分组写入 HKG@IPV6" "grep -qx 'HKG@IPV6|2606:4700::abcd' '$result'"
+ck "IPv4 分组写入 HKG" "grep -Eq '^HKG\\|1\\.1\\.1\\.1\\|' '$result'"
+ck "IPv6 分组写入 HKG@IPV6" "grep -Eq '^HKG@IPV6\\|2606:4700::abcd\\|' '$result'"
 
 payload_mixed="$TMP/patch-payload-mixed.json"
 write_fake_curl "$fakebin" "$payload_mixed"
@@ -238,7 +243,7 @@ MISSING_COLO_POLICY="keep"
 EOF
 CDN_PREFERIP_CONF="$conf" RESULT_FILE="$result" NODES_FILE="$nodes" "$CDN_DIR/preferip-collect.sh" >/tmp/cdn-pref-partial.out 2>/tmp/cdn-pref-partial.err \
     && pass "部分分组失败时 collect 仍成功" || fail "部分分组失败时 collect 不应失败"
-ck "部分失败时仍写入成功分组" "grep -qx 'HKG|1.0.0.1' '$result'"
+ck "部分失败时仍写入成功分组" "grep -Eq '^HKG\\|1\\.0\\.0\\.1\\|' '$result'"
 ck "部分失败时不写空 IPv6 分组" "! grep -q 'HKG@IPV6' '$result'"
 
 echo ""
@@ -258,6 +263,107 @@ PATH="$fakebin:$PATH" CDN_PREFERIP_CONF="$conf" RESULT_FILE="$result" NODES_FILE
     && pass "push IPv6 成功" || fail "push IPv6 失败"
 content6="$(jq -r '.content' "$payload6")"
 ck "IPv6 server 写入 vless 时带方括号" "grep -q '@\\[2606:4700::1234\\]:443' <<< \"\$content6\""
+
+echo ""
+echo "== cdn-preferip: TopN 多 IP 池按同地区节点轮询分配 =="
+payload_pool="$TMP/patch-payload-pool.json"
+write_fake_curl "$fakebin" "$payload_pool"
+conf="$TMP/pool.conf"; nodes="$TMP/pool.nodes"; result="$TMP/pool.result"
+write_base_conf "$conf" "/bin/false"
+cat >> "$conf" <<EOF
+PREFERIP_STATE_FILE="$TMP/pool-state.tsv"
+PREFERIP_BACKUP_DIR="$TMP/pool-backup"
+PREFERIP_ASSIGN_MODE="round_robin"
+PREFERIP_STICKY="false"
+EOF
+cat > "$nodes" <<'EOF'
+HK-1|HKG|vless://00000000-0000-0000-0000-000000000001@old1.example:443?type=ws&security=tls&host=hk1.example&path=%2Fhk&sni=hk1.example#old
+HK-2|HKG|vless://00000000-0000-0000-0000-000000000002@old2.example:443?type=ws&security=tls&host=hk2.example&path=%2Fhk&sni=hk2.example#old
+HK-3|HKG|vless://00000000-0000-0000-0000-000000000003@old3.example:443?type=ws&security=tls&host=hk3.example&path=%2Fhk&sni=hk3.example#old
+EOF
+cat > "$result" <<'EOF'
+# cdn-preferip result v3: colo|ip|avg_latency_ms|avg_speed_mbps|rounds_hit
+HKG|1.1.1.1|80.00|10.00|1
+HKG|1.1.1.2|82.00|11.00|1
+HKG|1.1.1.3|84.00|12.00|1
+EOF
+PATH="$fakebin:$PATH" CDN_PREFERIP_CONF="$conf" RESULT_FILE="$result" NODES_FILE="$nodes" "$CDN_DIR/preferip-push.sh" >/tmp/cdn-pref-pool.out 2>/tmp/cdn-pref-pool.err \
+    && pass "TopN 池化 push 成功" || fail "TopN 池化 push 失败"
+content_pool="$(jq -r '.content' "$payload_pool")"
+ck "HK-1 使用候选池第 1 个 IP" "grep -q '@1.1.1.1:443' <<< \"\$content_pool\""
+ck "HK-2 使用候选池第 2 个 IP" "grep -q '@1.1.1.2:443' <<< \"\$content_pool\""
+ck "HK-3 使用候选池第 3 个 IP" "grep -q '@1.1.1.3:443' <<< \"\$content_pool\""
+ck "PATCH 前生成 sub-store 备份" "find '$TMP/pool-backup' -type f -name 'cdn-preferip.*.txt' | grep -q ."
+
+echo ""
+echo "== cdn-preferip: sticky 稳态切换避免无明显收益时频繁换 IP =="
+payload_sticky="$TMP/patch-payload-sticky.json"
+write_fake_curl "$fakebin" "$payload_sticky"
+conf="$TMP/sticky.conf"; nodes="$TMP/sticky.nodes"; result="$TMP/sticky.result"; state="$TMP/sticky-state.tsv"
+write_base_conf "$conf" "/bin/false"
+cat >> "$conf" <<EOF
+PREFERIP_STATE_FILE="$state"
+PREFERIP_ASSIGN_MODE="first"
+PREFERIP_STICKY="true"
+PREFERIP_SWITCH_MIN_SPEED_GAIN_PERCENT="20"
+PREFERIP_SWITCH_MIN_LATENCY_GAIN_MS="20"
+EOF
+cat > "$nodes" <<'EOF'
+HK-1|HKG|vless://00000000-0000-0000-0000-000000000001@old1.example:443?type=ws&security=tls&host=hk1.example&path=%2Fhk&sni=hk1.example#old
+EOF
+cat > "$state" <<'EOF'
+# note	key	server	avg_latency_ms	avg_speed_mbps	rounds_hit	updated_at_epoch
+HK-1	HKG	1.1.1.2	90.00	10.00	1	100
+EOF
+cat > "$result" <<'EOF'
+# cdn-preferip result v3: colo|ip|avg_latency_ms|avg_speed_mbps|rounds_hit
+HKG|1.1.1.1|85.00|11.00|1
+HKG|1.1.1.2|90.00|10.00|1
+EOF
+PATH="$fakebin:$PATH" CDN_PREFERIP_CONF="$conf" RESULT_FILE="$result" NODES_FILE="$nodes" "$CDN_DIR/preferip-push.sh" >/tmp/cdn-pref-sticky.out 2>/tmp/cdn-pref-sticky.err \
+    && pass "sticky push 成功" || fail "sticky push 失败"
+content_sticky="$(jq -r '.content' "$payload_sticky")"
+ck "新候选收益不足时保持当前 state IP" "grep -q '@1.1.1.2:443' <<< \"\$content_sticky\""
+
+echo ""
+echo "== cdn-preferip: 二阶段复测用候选池重新排序 =="
+cat > "$TMP/cfst-stage2" <<'SH'
+#!/usr/bin/env bash
+out=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac
+done
+n=$(($(cat "$TMPDIR/cfst-stage2-count" 2>/dev/null || echo 0)+1))
+echo "$n" > "$TMPDIR/cfst-stage2-count"
+if [[ "$n" -eq 1 ]]; then
+    cat > "$out" <<CSV
+IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码
+104.20.0.1,4,4,0.00,100.00,100.00,HKG
+104.20.0.2,4,4,0.00,70.00,10.00,HKG
+CSV
+else
+    cat > "$out" <<CSV
+IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码
+104.20.0.1,4,4,0.00,120.00,1.00,HKG
+104.20.0.2,4,4,0.00,60.00,50.00,HKG
+CSV
+fi
+SH
+chmod +x "$TMP/cfst-stage2"
+conf="$TMP/stage2.conf"; nodes="$TMP/stage2.nodes"; result="$TMP/stage2.result"
+write_base_conf "$conf" "$TMP/cfst-stage2"
+cat >> "$conf" <<'EOF'
+CFST_PICK_MODE="speed"
+CFST_STAGE2_ENABLE="true"
+CFST_STAGE2_TOP_N="2"
+CFST_STAGE2_ROUNDS="1"
+EOF
+cat > "$nodes" <<'EOF'
+HK-CDN|HKG|vless://00000000-0000-0000-0000-000000000001@old.example:443?type=ws&security=tls&host=hk.example&path=%2Fhk&sni=hk.example#old
+EOF
+TMPDIR="$TMP" CDN_PREFERIP_CONF="$conf" RESULT_FILE="$result" NODES_FILE="$nodes" "$CDN_DIR/preferip-collect.sh" >/tmp/cdn-pref-stage2.out 2>/tmp/cdn-pref-stage2.err \
+    && pass "二阶段 collect 成功" || fail "二阶段 collect 失败"
+ck "二阶段复测后按二阶段速度选择 IP" "grep -Eq '^HKG\\|104\\.20\\.0\\.2\\|60\\.00\\|50\\.00\\|1' '$result'"
 
 echo ""
 echo "== 汇总 =="

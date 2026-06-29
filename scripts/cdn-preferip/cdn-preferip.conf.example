@@ -39,6 +39,11 @@ CFST_ROUNDS="1"
 #   speed    = 优先选择平均下载速度最高
 #   balanced = 多轮命中次数优先，其次低延迟，再其次高带宽
 CFST_PICK_MODE="cfst"
+# 二阶段复测：先粗筛 TopN，再只对候选 IP 做更长/更严格复测（更稳，但耗时更久）
+CFST_STAGE2_ENABLE="false"
+CFST_STAGE2_TOP_N="20"
+CFST_STAGE2_ROUNDS="2"
+CFST_STAGE2_EXTRA_ARGS="$CFST_EXTRA_ARGS"
 # CloudflareSpeedTest 可执行文件路径（留空=在 PATH 里找 CloudflareST / cfst）
 CFST_BIN=""
 # 默认测速用 IP 段文件（留空=用 CloudflareSpeedTest 自带 ip.txt）。
@@ -56,3 +61,29 @@ KEEP_ON_EMPTY="true"
 #   abort  = 中止整批 PATCH，完全不改 sub-store
 #   global = 回退到全局优选 IP（可能跨地区负优化，谨慎）
 MISSING_COLO_POLICY="keep"
+
+# ── 优选 IP 池化 / 稳态切换 / 探活 ──
+# CFST_TOP_N>1 时，同一地区的多个节点可轮询分配多个优选 IP，避免所有节点压在同一个 IP。
+#   round_robin = 同地区节点按候选池轮询分配；first = 保持所有节点使用第一名
+PREFERIP_ASSIGN_MODE="round_robin"
+# 稳态切换：当前 IP 仍在候选池且没有被新候选明显超越时，不频繁换 IP。
+PREFERIP_STICKY="true"
+PREFERIP_SWITCH_MIN_SPEED_GAIN_PERCENT="20"
+PREFERIP_SWITCH_MIN_LATENCY_GAIN_MS="20"
+PREFERIP_STICKY_MIN_SPEED="0"
+PREFERIP_STICKY_MAX_LATENCY="999999"
+# 真实链路探活：用 curl --resolve 验证「优选IP + SNI/Host + WS path」能否到达 CF/回源链路。
+# 默认关闭；开启后会跳过探活失败 IP，并临时写入 bad-ip.txt。
+PREFERIP_PROBE_ENABLE="false"
+PREFERIP_PROBE_TIMEOUT="6"
+PREFERIP_PROBE_ACCEPT_CODES="200,204,301,302,400,401,403,404,426"
+PREFERIP_BAD_TTL_HOURS="24"
+
+# ── 状态 / 历史 / 备份 / 锁 ──
+PREFERIP_STATE_FILE=""
+PREFERIP_HISTORY_FILE=""
+PREFERIP_BAD_FILE=""
+PREFERIP_BACKUP_ENABLE="true"
+PREFERIP_BACKUP_KEEP="20"
+PREFERIP_BACKUP_DIR=""
+PREFERIP_LOCK_FILE=""

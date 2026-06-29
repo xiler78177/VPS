@@ -51,6 +51,29 @@ load_conf() {
         *) die "MISSING_COLO_POLICY 只能是 keep / abort / global" ;;
     esac
     KEEP_ON_EMPTY="${KEEP_ON_EMPTY:-true}"
+    # 优选结果分配/稳态切换（主要由 preferip-push.sh 使用）
+    PREFERIP_ASSIGN_MODE="${PREFERIP_ASSIGN_MODE:-round_robin}"
+    PREFERIP_ASSIGN_MODE="${PREFERIP_ASSIGN_MODE,,}"
+    case "$PREFERIP_ASSIGN_MODE" in
+        first|round_robin) ;;
+        *) die "PREFERIP_ASSIGN_MODE 只能是 first / round_robin" ;;
+    esac
+    PREFERIP_STICKY="${PREFERIP_STICKY:-true}"
+    PREFERIP_SWITCH_MIN_SPEED_GAIN_PERCENT="${PREFERIP_SWITCH_MIN_SPEED_GAIN_PERCENT:-20}"
+    PREFERIP_SWITCH_MIN_LATENCY_GAIN_MS="${PREFERIP_SWITCH_MIN_LATENCY_GAIN_MS:-20}"
+    PREFERIP_STICKY_MIN_SPEED="${PREFERIP_STICKY_MIN_SPEED:-0}"
+    PREFERIP_STICKY_MAX_LATENCY="${PREFERIP_STICKY_MAX_LATENCY:-999999}"
+    PREFERIP_PROBE_ENABLE="${PREFERIP_PROBE_ENABLE:-false}"
+    PREFERIP_PROBE_TIMEOUT="${PREFERIP_PROBE_TIMEOUT:-6}"
+    PREFERIP_PROBE_ACCEPT_CODES="${PREFERIP_PROBE_ACCEPT_CODES:-200,204,301,302,400,401,403,404,426}"
+    PREFERIP_BAD_TTL_HOURS="${PREFERIP_BAD_TTL_HOURS:-24}"
+    PREFERIP_BACKUP_ENABLE="${PREFERIP_BACKUP_ENABLE:-true}"
+    PREFERIP_BACKUP_KEEP="${PREFERIP_BACKUP_KEEP:-20}"
+    PREFERIP_STATE_FILE="${PREFERIP_STATE_FILE:-$CDN_PREFERIP_DIR/preferip.state.tsv}"
+    PREFERIP_HISTORY_FILE="${PREFERIP_HISTORY_FILE:-$CDN_PREFERIP_DIR/preferip.history.csv}"
+    PREFERIP_BAD_FILE="${PREFERIP_BAD_FILE:-$CDN_PREFERIP_DIR/bad-ip.txt}"
+    PREFERIP_BACKUP_DIR="${PREFERIP_BACKUP_DIR:-$CDN_PREFERIP_DIR/backup}"
+    PREFERIP_LOCK_FILE="${PREFERIP_LOCK_FILE:-$CDN_PREFERIP_DIR/preferip.lock}"
     # 公网 https 务必加密传输 secret
     [[ "$SUBSTORE_BASE" == https://* ]] || log "警告: SUBSTORE_BASE 非 https，secret 前缀会明文暴露在链路上"
 }
@@ -253,6 +276,40 @@ urlencode() {
         esac
     done
     printf '%s' "$out"
+}
+
+urldecode() {
+    local s="${1:-}"
+    s="${s//+/ }"
+    printf '%b' "${s//%/\\x}"
+}
+
+vless_query_string() {
+    local link="${1:-}" body after query
+    [[ "$link" == vless://* ]] || return 1
+    body="${link#vless://}"
+    body="${body%%#*}"
+    after="${body#*@}"
+    [[ "$after" == *\?* ]] || return 1
+    query="${after#*\?}"
+    printf '%s' "$query"
+}
+
+vless_query_param() {
+    local link="${1:-}" key="${2:-}" query pair k v
+    local -a _pairs
+    query="$(vless_query_string "$link")" || return 1
+    IFS='&' read -ra _pairs <<< "$query"
+    for pair in "${_pairs[@]}"; do
+        k="${pair%%=*}"
+        v=""
+        [[ "$pair" == *=* ]] && v="${pair#*=}"
+        if [[ "$k" == "$key" ]]; then
+            urldecode "$v"
+            return 0
+        fi
+    done
+    return 1
 }
 
 # 拼一条 CDN 客户端 vless 链接：server=优选IP，host/sni=真实域名。
