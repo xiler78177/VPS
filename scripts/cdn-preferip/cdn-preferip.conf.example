@@ -26,6 +26,8 @@ CFST_COLO_MODE="auto"
 # 旧格式「备注|vless链接」没有地区码时的默认地区码；留空则使用全局优选。
 # 示例: DEFAULT_CF_COLO="HKG"；多个候选可写 "NRT,KIX"
 DEFAULT_CF_COLO=""
+# 旧格式节点没有 IP 池字段时的默认 IP 版本；留空/auto=沿用 CFST_IP_FILE，或填 ipv4 / ipv6。
+DEFAULT_CF_IP_VERSION=""
 # 传给 CloudflareSpeedTest 的额外参数（按需调）：
 #   -dd 关闭下载测速只测延迟（更快但不测带宽）；-tl 平均延迟上限ms；-sl 下载速度下限MB/s
 CFST_EXTRA_ARGS="-dn 10 -tl 200"
@@ -39,9 +41,12 @@ CFST_ROUNDS="1"
 CFST_PICK_MODE="cfst"
 # CloudflareSpeedTest 可执行文件路径（留空=在 PATH 里找 CloudflareST / cfst）
 CFST_BIN=""
-# 测速用 IP 段文件（留空=用 CloudflareSpeedTest 自带 ip.txt）
+# 默认测速用 IP 段文件（留空=用 CloudflareSpeedTest 自带 ip.txt）。
 # IPv4: ip.txt；IPv6: ipv6.txt；XIU2/CloudflareSpeedTest 支持 IPv4+IPv6 混合文件。
 CFST_IP_FILE=""
+# 可选：显式指定 IPv4/IPv6 池。节点写 `...|ipv6|vless://...` 时会使用 CFST_IPV6_FILE。
+CFST_IPV4_FILE=""
+CFST_IPV6_FILE=""
 
 # ── 行为 ──
 # 优选结果为空时是否保留上次（true=不推空值，强烈建议 true）

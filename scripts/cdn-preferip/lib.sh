@@ -30,6 +30,10 @@ load_conf() {
     CFST_TOP_N="${CFST_TOP_N:-1}"
     [[ "$CFST_TOP_N" =~ ^[0-9]+$ && "$CFST_TOP_N" -ge 1 ]] || die "CFST_TOP_N 必须是 >=1 的整数"
     DEFAULT_CF_COLO="${DEFAULT_CF_COLO:-}"
+    DEFAULT_CF_IP_VERSION="${DEFAULT_CF_IP_VERSION:-}"
+    if [[ -n "$DEFAULT_CF_IP_VERSION" ]]; then
+        DEFAULT_CF_IP_VERSION="$(normalize_ip_version "$DEFAULT_CF_IP_VERSION")" || die "DEFAULT_CF_IP_VERSION 只能是 ipv4 / ipv6 / auto"
+    fi
     CFST_COLO_MODE="${CFST_COLO_MODE:-auto}"  # auto=nodes.txt 有地区码就按地区优选; off=全局优选
     CFST_COLO_MODE="${CFST_COLO_MODE,,}"
     case "$CFST_COLO_MODE" in
@@ -67,6 +71,32 @@ normalize_colo_key() {
     printf '%s' "$key"
 }
 
+normalize_ip_version() {
+    local v="${1:-}"
+    v="$(trim "$v")"
+    v="${v,,}"
+    case "$v" in
+        ""|auto|default) printf '' ;;
+        4|v4|ip4|ipv4) printf 'ipv4' ;;
+        6|v6|ip6|ipv6) printf 'ipv6' ;;
+        *) return 1 ;;
+    esac
+}
+
+split_colo_version() {
+    # 支持 HKG@ipv6 这种紧凑写法，也支持单独字段写 ipv6。
+    local raw="${1:-}" base ver
+    base="$raw"
+    ver=""
+    if [[ "$raw" == *@* ]]; then
+        base="${raw%@*}"
+        ver="${raw##*@}"
+    fi
+    base="$(normalize_colo_key "$base")" || return 1
+    ver="$(normalize_ip_version "$ver")" || return 1
+    printf '%s|%s' "$base" "$ver"
+}
+
 result_key_for_colo() {
     local colo="${1:-}" key=""
     if [[ -n "$colo" ]] && key=$(normalize_colo_key "$colo" 2>/dev/null); then
@@ -76,33 +106,85 @@ result_key_for_colo() {
     fi
 }
 
-NODE_NOTE=""; NODE_COLO=""; NODE_LINK=""
+result_key_for_node() {
+    local colo="${1:-}" ip_version="${2:-}" base ver
+    base="$(result_key_for_colo "$colo")"
+    ver="$(normalize_ip_version "$ip_version")" || return 1
+    if [[ -n "$ver" ]]; then
+        printf '%s@%s' "$base" "${ver^^}"
+    else
+        printf '%s' "$base"
+    fi
+}
+
+normalize_result_key() {
+    local raw="${1:-}" base ver
+    raw="$(trim "$raw")"
+    if [[ "$raw" == *@* ]]; then
+        base="${raw%@*}"
+        ver="${raw##*@}"
+        result_key_for_node "$base" "$ver"
+    else
+        result_key_for_node "$raw" ""
+    fi
+}
+
+result_key_colo() {
+    local key="${1:-}"
+    key="${key%@*}"
+    [[ "$key" == "GLOBAL" ]] && { printf 'GLOBAL'; return 0; }
+    normalize_colo_key "$key"
+}
+
+result_key_ip_version() {
+    local key="${1:-}"
+    if [[ "$key" == *@* ]]; then
+        normalize_ip_version "${key##*@}"
+    else
+        printf ''
+    fi
+}
+
+NODE_NOTE=""; NODE_COLO=""; NODE_IP_VERSION=""; NODE_LINK=""
 parse_node_line() {
-    # 兼容两种格式：
+    # 兼容三种格式：
     #   旧: 备注|vless链接
     #   新: 备注|CF地区码|vless链接       例如: 香港-01|HKG|vless://...
+    #   混合池: 备注|CF地区码|ipv6|vless链接 或 备注|HKG@ipv6|vless://...
     # 地区码可填多个逗号分隔候选，例如: 日本-01|NRT,KIX|vless://...
-    local raw="${1:-}" trimmed f1 f2 f3 rest
-    NODE_NOTE=""; NODE_COLO=""; NODE_LINK=""
+    local raw="${1:-}" trimmed f1 f2 f3 f4 rest cv
+    NODE_NOTE=""; NODE_COLO=""; NODE_IP_VERSION=""; NODE_LINK=""
     [[ -n "${raw//[[:space:]]/}" ]] || return 1
     trimmed="$(trim "$raw")"
     [[ "$trimmed" == \#* ]] && return 1
-    IFS='|' read -r f1 f2 f3 rest <<< "$raw"
-    f1="$(trim "$f1")"; f2="$(trim "$f2")"; f3="$(trim "$f3")"
+    IFS='|' read -r f1 f2 f3 f4 rest <<< "$raw"
+    f1="$(trim "$f1")"; f2="$(trim "$f2")"; f3="$(trim "$f3")"; f4="$(trim "$f4")"
     if [[ "$f2" == vless://* ]]; then
         NODE_NOTE="$f1"
         NODE_COLO="${DEFAULT_CF_COLO:-}"
+        NODE_IP_VERSION="${DEFAULT_CF_IP_VERSION:-}"
         NODE_LINK="$f2"
     elif [[ "$f3" == vless://* ]]; then
         NODE_NOTE="$f1"
         NODE_COLO="$f2"
+        NODE_IP_VERSION="${DEFAULT_CF_IP_VERSION:-}"
         NODE_LINK="$f3"
+    elif [[ "$f4" == vless://* ]]; then
+        NODE_NOTE="$f1"
+        NODE_COLO="$f2"
+        NODE_IP_VERSION="$f3"
+        NODE_LINK="$f4"
     else
         return 1
     fi
     [[ -n "$NODE_NOTE" && "$NODE_LINK" == vless://* ]] || return 1
     if [[ -n "$NODE_COLO" ]]; then
-        NODE_COLO="$(normalize_colo_key "$NODE_COLO")" || return 1
+        cv="$(split_colo_version "$NODE_COLO")" || return 1
+        NODE_COLO="${cv%%|*}"
+        [[ -z "$NODE_IP_VERSION" && "$cv" == *"|"* ]] && NODE_IP_VERSION="${cv#*|}"
+    fi
+    if [[ -n "$NODE_IP_VERSION" ]]; then
+        NODE_IP_VERSION="$(normalize_ip_version "$NODE_IP_VERSION")" || return 1
     fi
     return 0
 }

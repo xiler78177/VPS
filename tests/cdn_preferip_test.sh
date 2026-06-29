@@ -156,6 +156,92 @@ ck "ICN 缺结果时保留原 server" "grep -q '@old-kr.example:443' <<< \"\$con
 ck "ICN 缺结果时没有隐式回退 GLOBAL" "! grep -q '@8.8.8.8:443' <<< \"\$content\""
 
 echo ""
+echo "== cdn-preferip: 混合 IPv4/IPv6 池按节点分组 =="
+cat > "$TMP/cfst-mixed" <<'SH'
+#!/usr/bin/env bash
+out=""
+ipfile=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o) out="$2"; shift 2 ;;
+        -f) ipfile="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+if [[ "$ipfile" == *"ipv6.txt" ]]; then
+    cat > "$out" <<CSV
+IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码
+2606:4700::abcd,4,4,0.00,88.00,12.00,HKG
+CSV
+else
+    cat > "$out" <<CSV
+IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码
+1.1.1.1,4,4,0.00,80.00,20.00,HKG
+CSV
+fi
+SH
+chmod +x "$TMP/cfst-mixed"
+printf 'dummy\n' > "$TMP/ip.txt"
+printf 'dummy\n' > "$TMP/ipv6.txt"
+conf="$TMP/mixed.conf"; nodes="$TMP/mixed.nodes"; result="$TMP/mixed.result"
+write_base_conf "$conf" "$TMP/cfst-mixed"
+cat >> "$conf" <<EOF
+CFST_IP_FILE="$TMP/ip.txt"
+CFST_IPV6_FILE="$TMP/ipv6.txt"
+EOF
+cat > "$nodes" <<'EOF'
+HK-v4|HKG|vless://00000000-0000-0000-0000-000000000001@old-v4.example:443?type=ws&security=tls&host=hk.example&path=%2Fhk&sni=hk.example#old
+HK-v6|HKG|ipv6|vless://00000000-0000-0000-0000-000000000002@old-v6.example:443?type=ws&security=tls&host=hk6.example&path=%2Fhk6&sni=hk6.example#old
+EOF
+CDN_PREFERIP_CONF="$conf" RESULT_FILE="$result" NODES_FILE="$nodes" "$CDN_DIR/preferip-collect.sh" >/tmp/cdn-pref-mixed.out 2>/tmp/cdn-pref-mixed.err \
+    && pass "混合池 collect 成功" || fail "混合池 collect 失败"
+ck "IPv4 分组写入 HKG" "grep -qx 'HKG|1.1.1.1' '$result'"
+ck "IPv6 分组写入 HKG@IPV6" "grep -qx 'HKG@IPV6|2606:4700::abcd' '$result'"
+
+payload_mixed="$TMP/patch-payload-mixed.json"
+write_fake_curl "$fakebin" "$payload_mixed"
+PATH="$fakebin:$PATH" CDN_PREFERIP_CONF="$conf" RESULT_FILE="$result" NODES_FILE="$nodes" "$CDN_DIR/preferip-push.sh" >/tmp/cdn-pref-mixed-push.out 2>/tmp/cdn-pref-mixed-push.err \
+    && pass "混合池 push 成功" || fail "混合池 push 失败"
+content_mixed="$(jq -r '.content' "$payload_mixed")"
+ck "IPv4 节点使用 IPv4 优选 IP" "grep -q '@1.1.1.1:443' <<< \"\$content_mixed\""
+ck "IPv6 节点使用 IPv6 优选 IP 并加 []" "grep -q '@\\[2606:4700::abcd\\]:443' <<< \"\$content_mixed\""
+
+echo ""
+echo "== cdn-preferip: 多分组部分失败时 keep 可继续 =="
+cat > "$TMP/cfst-partial" <<'SH'
+#!/usr/bin/env bash
+out=""
+ipfile=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o) out="$2"; shift 2 ;;
+        -f) ipfile="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+if [[ "$ipfile" == *"ipv6.txt" ]]; then
+    : > "$out"
+else
+    cat > "$out" <<CSV
+IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码
+1.0.0.1,4,4,0.00,90.00,18.00,HKG
+CSV
+fi
+SH
+chmod +x "$TMP/cfst-partial"
+conf="$TMP/partial.conf"; nodes="$TMP/mixed.nodes"; result="$TMP/partial.result"
+write_base_conf "$conf" "$TMP/cfst-partial"
+cat >> "$conf" <<EOF
+CFST_IP_FILE="$TMP/ip.txt"
+CFST_IPV6_FILE="$TMP/ipv6.txt"
+MISSING_COLO_POLICY="keep"
+EOF
+CDN_PREFERIP_CONF="$conf" RESULT_FILE="$result" NODES_FILE="$nodes" "$CDN_DIR/preferip-collect.sh" >/tmp/cdn-pref-partial.out 2>/tmp/cdn-pref-partial.err \
+    && pass "部分分组失败时 collect 仍成功" || fail "部分分组失败时 collect 不应失败"
+ck "部分失败时仍写入成功分组" "grep -qx 'HKG|1.0.0.1' '$result'"
+ck "部分失败时不写空 IPv6 分组" "! grep -q 'HKG@IPV6' '$result'"
+
+echo ""
 echo "== cdn-preferip: IPv6 server 自动加 [] =="
 payload6="$TMP/patch-payload-v6.json"
 write_fake_curl "$fakebin" "$payload6"

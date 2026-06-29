@@ -22,6 +22,8 @@ NODES_FILE="${NODES_FILE:-$HERE/nodes.txt}"
 CFST_BIN="${CFST_BIN:-}"
 CFST_EXTRA_ARGS="${CFST_EXTRA_ARGS:-}"
 CFST_IP_FILE="${CFST_IP_FILE:-}"
+CFST_IPV4_FILE="${CFST_IPV4_FILE:-${CFST_IP_FILE:-}}"
+CFST_IPV6_FILE="${CFST_IPV6_FILE:-}"
 CFST_ROUNDS="${CFST_ROUNDS:-1}"
 CFST_PICK_MODE="${CFST_PICK_MODE:-cfst}"
 [[ "$CFST_ROUNDS" =~ ^[0-9]+$ && "$CFST_ROUNDS" -ge 1 ]] || die "CFST_ROUNDS 必须是 >=1 的整数"
@@ -39,8 +41,29 @@ fi
 [[ -n "$CFST_BIN" ]] || die "未找到 CloudflareSpeedTest。请安装并把二进制加入 PATH，或设 CFST_BIN=/path/to/cfst（项目: https://github.com/XIU2/CloudflareSpeedTest）"
 
 # 自定义 IP 段文件（-f）；留空则用 CloudflareSpeedTest 自带 ip.txt。
-ipfile_args=()
-[[ -n "$CFST_IP_FILE" ]] && { [[ -f "$CFST_IP_FILE" ]] || die "CFST_IP_FILE 不存在: $CFST_IP_FILE"; ipfile_args=(-f "$CFST_IP_FILE"); }
+# 可按节点使用 IPv4/IPv6 池：
+#   旧/默认节点 -> CFST_IP_FILE / CFST_IPV4_FILE
+#   节点标记 ipv6 -> CFST_IPV6_FILE，未配置时尝试与 CFST_IP_FILE 同目录的 ipv6.txt
+if [[ -z "$CFST_IPV6_FILE" && -n "$CFST_IP_FILE" ]]; then
+    guess_ipv6_file="$(dirname "$CFST_IP_FILE")/ipv6.txt"
+    [[ -f "$guess_ipv6_file" ]] && CFST_IPV6_FILE="$guess_ipv6_file"
+fi
+
+cfst_ipfile_for_version() {
+    local ip_version="${1:-}" file=""
+    case "$ip_version" in
+        ipv6)
+            file="$CFST_IPV6_FILE"
+            [[ -n "$file" ]] || die "节点要求 IPv6 优选，但未找到 CFST_IPV6_FILE；请设置 CFST_IPV6_FILE=/path/to/ipv6.txt"
+            ;;
+        ipv4) file="$CFST_IPV4_FILE" ;;
+        *) file="$CFST_IP_FILE" ;;
+    esac
+    if [[ -n "$file" ]]; then
+        [[ -f "$file" ]] || die "CFST IP 段文件不存在: $file"
+        printf '%s' "$file"
+    fi
+}
 
 tmp_files=()
 cleanup(){ rm -f "${tmp_files[@]}" 2>/dev/null || true; }
@@ -48,24 +71,34 @@ trap cleanup EXIT
 
 collect_one_group() {
     local key="$1" csv out rows ranked ip ips=() round ok=0
-    local -a sort_args=()
+    local colo ip_version ip_file label cfcolo_args=()
+    local -a sort_args=() ipfile_args=()
     rows="$(mktemp)"; ranked="$(mktemp)"
     tmp_files+=("$rows" "$ranked")
+    colo="$(result_key_colo "$key")" || return 1
+    ip_version="$(result_key_ip_version "$key")" || return 1
+    ip_file="$(cfst_ipfile_for_version "$ip_version")"
+    [[ -n "$ip_file" ]] && ipfile_args=(-f "$ip_file")
+    label="$key"
+    [[ -n "$ip_file" ]] && label="${label} file=${ip_file}"
+    if [[ "$colo" != "GLOBAL" ]]; then
+        cfcolo_args=(-httping -cfcolo "$colo")
+    fi
 
     for ((round=1; round<=CFST_ROUNDS; round++)); do
         csv="$(mktemp)"; out="$(mktemp)"
         tmp_files+=("$csv" "$out")
-        if [[ "$key" == "GLOBAL" ]]; then
-            log "开始全局优选（$CFST_BIN），轮次 ${round}/${CFST_ROUNDS}；输出 CSV → $csv"
+        if [[ "$colo" == "GLOBAL" ]]; then
+            log "开始全局优选 ${label}（$CFST_BIN），轮次 ${round}/${CFST_ROUNDS}；输出 CSV → $csv"
             # shellcheck disable=SC2086
             "$CFST_BIN" $CFST_EXTRA_ARGS "${ipfile_args[@]}" -o "$csv" >"$out" 2>&1 || {
                 log "CloudflareSpeedTest 全局优选失败，日志末尾:"; tail -n 15 "$out" >&2 || true; continue
             }
         else
-            log "开始按地区优选 ${key}（HTTPing + -cfcolo），轮次 ${round}/${CFST_ROUNDS}；输出 CSV → $csv"
+            log "开始按地区优选 ${label}（HTTPing + -cfcolo ${colo}），轮次 ${round}/${CFST_ROUNDS}；输出 CSV → $csv"
             # CloudflareSpeedTest 官方限制：-cfcolo 仅 HTTPing 模式可用。
             # shellcheck disable=SC2086
-            "$CFST_BIN" $CFST_EXTRA_ARGS "${ipfile_args[@]}" -httping -cfcolo "$key" -o "$csv" >"$out" 2>&1 || {
+            "$CFST_BIN" $CFST_EXTRA_ARGS "${ipfile_args[@]}" "${cfcolo_args[@]}" -o "$csv" >"$out" 2>&1 || {
                 log "CloudflareSpeedTest 地区 ${key} 优选失败，日志末尾:"; tail -n 15 "$out" >&2 || true; continue
             }
         fi
@@ -154,7 +187,7 @@ collect_group_or_fail() {
 if [[ "${CFST_COLO_MODE,,}" != "off" && -f "$NODES_FILE" ]]; then
     while IFS= read -r raw || [[ -n "$raw" ]]; do
         if parse_node_line "$raw"; then
-            add_group "$(result_key_for_colo "${NODE_COLO:-}")"
+            add_group "$(result_key_for_node "${NODE_COLO:-}" "${NODE_IP_VERSION:-}")"
         fi
     done < "$NODES_FILE"
 fi
@@ -172,17 +205,28 @@ if [[ ${#groups[@]} -eq 1 && "${groups[0]}" == "GLOBAL" ]]; then
     printf '%s\n' "${ips[@]}" > "$tmp_result"
 else
     printf '# cdn-preferip result v2: colo|ip\n' > "$tmp_result"
+    success_groups=0
     for key in "${groups[@]}"; do
         group_out="$(mktemp)"; tmp_files+=("$group_out")
-        collect_group_or_fail "$key" "$group_out" || {
+        if ! collect_group_or_fail "$key" "$group_out"; then
+            if [[ "$MISSING_COLO_POLICY" == "keep" ]]; then
+                log "分组 ${key} 无结果；MISSING_COLO_POLICY=keep：本次结果跳过该组，回写阶段将保留对应节点原 server。"
+                continue
+            fi
             [[ "${KEEP_ON_EMPTY}" == "true" ]] && log "保留旧结果文件 $RESULT_FILE，不写空。"
             exit 1
-        }
+        fi
+        success_groups=$((success_groups+1))
         mapfile -t ips < "$group_out"
         for ip in "${ips[@]}"; do
             printf '%s|%s\n' "$key" "$ip" >> "$tmp_result"
         done
     done
+    if [[ "$success_groups" -eq 0 ]]; then
+        log "所有分组均无有效结果。"
+        [[ "${KEEP_ON_EMPTY}" == "true" ]] && log "保留旧结果文件 $RESULT_FILE，不写空。"
+        exit 1
+    fi
 fi
 
 mv "$tmp_result" "$RESULT_FILE"

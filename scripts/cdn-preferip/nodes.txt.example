@@ -2,10 +2,12 @@
 # 复制本文件为 nodes.txt 后按格式填写(nodes.txt 不进 git，含你的真实节点)。
 #
 # 推荐格式:  区域备注|CF地区码|节点的 vless 链接
+# IPv6格式:  区域备注|CF地区码|ipv6|节点的 vless 链接
 # 兼容旧格式: 区域备注|节点的 vless 链接
 #   · 区域备注  = 你想要的节点名(客户端里就显示这个)，如  香港-example-1-CDN
 #   · CF地区码  = Cloudflare colo/IATA 码，用于按地区优选；如 HKG、ICN、NRT,KIX
 #                 多个候选用英文逗号分隔，脚本会传给 CloudflareSpeedTest 的 -cfcolo
+#   · IP池      = 可选，填 ipv6 时使用 conf 里的 CFST_IPV6_FILE；不填则走默认/IPv4 池
 #   · vless链接 = VPS 建 CDN 节点(Reality 菜单 10)时打印的那条链接，整条粘进来即可
 #                 (链接里的 server 填什么都行，会被当天优选 IP 覆盖)
 #   · 加机器 = 粘一行   删机器 = 删一行   行首 # 为注释、空行忽略
@@ -17,3 +19,4 @@
 香港-example-1-CDN|HKG|vless://你的UUID@你的cdn域名:443?encryption=none&security=tls&sni=你的cdn域名&fp=chrome&type=ws&host=你的cdn域名&path=%2F你的隐秘path#随便填会被覆盖
 韩国-example-2-CDN|ICN|vless://你的UUID@第二台cdn域名:443?encryption=none&security=tls&sni=第二台cdn域名&fp=chrome&type=ws&host=第二台cdn域名&path=%2F第二台path#随便填
 日本-example-3-CDN|NRT,KIX|vless://你的UUID@第三台cdn域名:443?encryption=none&security=tls&sni=第三台cdn域名&fp=chrome&type=ws&host=第三台cdn域名&path=%2F第三台path#随便填
+香港-ipv6-example-CDN|HKG|ipv6|vless://你的UUID@第四台cdn域名:443?encryption=none&security=tls&sni=第四台cdn域名&fp=chrome&type=ws&host=第四台cdn域名&path=%2F第四台path#随便填

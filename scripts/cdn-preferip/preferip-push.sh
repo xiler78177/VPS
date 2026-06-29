@@ -4,6 +4,7 @@
 # 多节点模式(推荐)：读 nodes.txt，每行可写：
 #   旧格式: 区域备注|vless链接
 #   新格式: 区域备注|CF地区码|vless链接    例如 香港-01|HKG|vless://...
+#   混合池: 区域备注|CF地区码|ipv6|vless链接 或 区域备注|HKG@ipv6|vless://...
 #   C 会按每个节点的 CF 地区码选择对应优选 IP；host/sni/uuid/path 全保留，一次性 PATCH 到专用订阅。
 # 单节点模式(旧/兼容)：若无 nodes.txt 但 conf 填了 CDN_UUID/DOMAIN/WS_PATH，则按单节点拼。
 #
@@ -37,7 +38,7 @@ while IFS= read -r raw || [[ -n "$raw" ]]; do
     if [[ "$raw" == *"|"* ]]; then
         key="${raw%%|*}"
         ip="${raw#*|}"
-        key="$(result_key_for_colo "$key")"
+        key="$(normalize_result_key "$key")"
         ip="$(trim "$ip")"
         is_ip_literal "$ip" || continue
         [[ -z "${best_by_key[$key]:-}" ]] && best_by_key[$key]="$ip"
@@ -65,7 +66,7 @@ if [[ -f "$NODES_FILE" ]]; then
             [[ -n "${raw//[[:space:]]/}" && "$(trim "$raw")" != \#* ]] && log "跳过无效行（需「备注|链接」或「备注|CF地区码|链接」）: $raw"
             continue
         fi
-        key="$(result_key_for_colo "${NODE_COLO:-}")"
+        key="$(result_key_for_node "${NODE_COLO:-}" "${NODE_IP_VERSION:-}")"
         [[ "$CFST_COLO_MODE" == "off" ]] && key="GLOBAL"
 
         best=""
@@ -109,7 +110,7 @@ else
     fi
     mapfile -t single_ips < <(
         if [[ -n "${DEFAULT_CF_COLO:-}" ]]; then
-            key="$(result_key_for_colo "$DEFAULT_CF_COLO")"
+            key="$(result_key_for_node "$DEFAULT_CF_COLO" "${DEFAULT_CF_IP_VERSION:-}")"
             [[ -n "${best_by_key[$key]:-}" ]] && printf '%s\n' "${best_by_key[$key]}"
         fi
         [[ -n "$global_best" ]] && printf '%s\n' "$global_best"
