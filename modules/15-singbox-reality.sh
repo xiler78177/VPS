@@ -982,14 +982,40 @@ reality_has_local_public_ipv4() {
         END { exit (found?0:1) }'
 }
 
+reality_ipv4_is_likely_warp_egress() {
+    local ip="${1:-}"
+    # Cloudflare WARP 常见 IPv4 出口段。若本机网卡没有公网 IPv4 且探测到这些出口，
+    # 不能把它写进 CF 回源 A 记录，否则 CF 会回源到 WARP 出口而不是本机。
+    case "$ip" in
+        104.28.*|104.29.*) return 0 ;;
+    esac
+    return 1
+}
+
+reality_has_warp_interface() {
+    command_exists ip || return 1
+    ip -o link show 2>/dev/null | grep -Eiq '(warp|wgcf|cloudflare)'
+}
+
+reality_should_clear_detected_ipv4() {
+    local ip="${1:-}"
+    [[ -n "$ip" ]] || return 1
+    reality_has_local_public_ipv4 && return 1
+    # 没有本地公网 IPv4 有两种常见情况：
+    # 1) IPv6-only + WARP：公网 IPv4 是 WARP 出口，必须清空；
+    # 2) OCI/云厂商 1:1 NAT：公网 IPv4 不绑在网卡上，但仍可入站回源，必须保留。
+    # 因此只在明确像 WARP 时清空；普通云 NAT IPv4 保留。
+    reality_ipv4_is_likely_warp_egress "$ip" && return 0
+    reality_has_warp_interface && return 0
+    return 1
+}
+
 reality_detect_ips() {
     REALITY_IPV4="$(get_public_ipv4 2>/dev/null || true)"
     REALITY_IPV6="$(get_public_ipv6 2>/dev/null || true)"
     [[ -n "$REALITY_IPV6" && "$REALITY_IPV6" != *:* ]] && REALITY_IPV6=""
-    # 防 WARP/NAT64 幽灵 IPv4:IPv6-only+WARP 机上 get_public_ipv4 会探到 WARP 出口 IP(如104.28.x),
-    # 但本机网卡并无真实公网 IPv4、CF 回源连不上;若据此误建 A 记录,CF 回源会优先走错 IPv4 超时20s。
-    # 故本机网卡确实没有全局公网 IPv4 时清空 REALITY_IPV4,只建 AAAA。
-    if [[ -n "$REALITY_IPV4" ]] && ! reality_has_local_public_ipv4; then
+    # 防 WARP/NAT64 幽灵 IPv4，同时兼容 OCI/云厂商 1:1 NAT 公网 IPv4 不绑定到客机网卡的场景。
+    if [[ -n "$REALITY_IPV4" ]] && reality_should_clear_detected_ipv4 "$REALITY_IPV4"; then
         REALITY_IPV4=""
     fi
 }

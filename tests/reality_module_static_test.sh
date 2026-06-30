@@ -88,6 +88,35 @@ port="$(REALITY_TEST_PORT_CANDIDATES="19999 20000 60000 60001" reality_random_po
 short_id="$(reality_generate_short_id)"
 assert_match '^[0-9a-f]{16}$' "$short_id" "short_id should be non-empty 8-byte hex"
 
+(
+    get_public_ipv4(){ echo "217.142.138.63"; }
+    get_public_ipv6(){ return 1; }
+    ip(){
+        case "$*" in
+            "-o -4 addr show scope global") echo "2: eth0    inet 10.0.0.111/24 brd 10.0.0.255 scope global eth0" ;;
+            "-o link show") echo "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500" ;;
+        esac
+    }
+    REALITY_IPV4=""; REALITY_IPV6=""
+    reality_detect_ips
+    [[ "$REALITY_IPV4" == "217.142.138.63" ]] || fail "cloud NAT public IPv4 should be kept even when not bound to local NIC"
+    [[ -z "$REALITY_IPV6" ]] || fail "cloud NAT fixture should not invent IPv6"
+)
+
+(
+    get_public_ipv4(){ echo "104.28.200.1"; }
+    get_public_ipv6(){ return 1; }
+    ip(){
+        case "$*" in
+            "-o -4 addr show scope global") echo "3: CloudflareWARP    inet 172.16.0.2/32 scope global CloudflareWARP" ;;
+            "-o link show") echo "3: CloudflareWARP: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1280" ;;
+        esac
+    }
+    REALITY_IPV4=""; REALITY_IPV6=""
+    reality_detect_ips
+    [[ -z "$REALITY_IPV4" ]] || fail "WARP IPv4 egress should be cleared when no local public IPv4 exists"
+)
+
 config="$(REALITY_LISTEN_HOST=0.0.0.0 reality_render_singbox_config '11111111-1111-4111-8111-111111111111' 'priv-key' '23456' 'www.example.com' 'a1b2c3d4e5f60708')"
 assert_contains '"log":{"disabled":true}' "$config" "config should disable sing-box logs"
 assert_contains '"type":"vless"' "$config" "config should use VLESS inbound"
