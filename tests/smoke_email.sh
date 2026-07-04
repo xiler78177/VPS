@@ -114,6 +114,7 @@ rc=$?
 
 echo ""
 echo "== Test 3b: email_run 保留失败命令退出码 =="
+# shellcheck disable=SC2218 # email_run is provided by the generated library sourced above.
 email_run "预期失败命令" bash -c 'exit 7' >/dev/null 2>&1
 rc=$?
 [[ $rc -eq 7 ]] && pass "email_run 返回真实失败码 7" || fail "email_run 返回码错误: $rc (应为 7)"
