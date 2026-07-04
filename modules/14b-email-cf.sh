@@ -134,19 +134,33 @@ _email_cf_dns_delete() {
 # 返回: 多行 record_id
 _email_cf_dns_find_ids() {
     local zid="$1" type="$2" name="$3"
-    local enc_type enc_name resp
+    local enc_type enc_name resp page=1 per_page=50 total_pages count
     enc_type=$(_email_cf_urlencode "$type")
     enc_name=$(_email_cf_urlencode "$name")
-    resp=$(_email_cf_api GET "zones/$zid/dns_records?type=$enc_type&name=$enc_name&per_page=50") || return 1
-    echo "$resp" | jq -r '.result[].id'
+    while true; do
+        resp=$(_email_cf_api GET "zones/$zid/dns_records?type=$enc_type&name=$enc_name&per_page=$per_page&page=$page") || return 1
+        echo "$resp" | jq -r '.result[].id'
+        total_pages=$(echo "$resp" | jq -r '.result_info.total_pages // empty' 2>/dev/null)
+        count=$(echo "$resp" | jq -r '.result | length' 2>/dev/null)
+        if [[ "$total_pages" =~ ^[0-9]+$ ]]; then
+            (( page >= total_pages )) && break
+        else
+            [[ "$count" =~ ^[0-9]+$ ]] || count=0
+            (( count < per_page )) && break
+        fi
+        page=$((page + 1))
+    done
 }
 
 # 删除 zone 下所有匹配 type+name 的记录（idempotent 清理）
 _email_cf_dns_purge() {
-    local zid="$1" type="$2" name="$3" id
+    local zid="$1" type="$2" name="$3" ids id failed=0
+    ids=$(_email_cf_dns_find_ids "$zid" "$type" "$name") || return 1
     while IFS= read -r id; do
-        [[ -n "$id" ]] && _email_cf_dns_delete "$zid" "$id" || true
-    done < <(_email_cf_dns_find_ids "$zid" "$type" "$name")
+        [[ -z "$id" ]] && continue
+        _email_cf_dns_delete "$zid" "$id" || failed=1
+    done <<< "$ids"
+    return "$failed"
 }
 
 # ── Pages ──
@@ -272,7 +286,7 @@ _email_cf_catch_all_to_worker() {
 _email_cf_catch_all_disable() {
     local zid="$1"
     local body='{"enabled":false,"matchers":[{"type":"all"}],"actions":[{"type":"drop"}]}'
-    _email_cf_api PUT "zones/$zid/email/routing/rules/catch_all" "$body" >/dev/null 2>&1 || true
+    _email_cf_api PUT "zones/$zid/email/routing/rules/catch_all" "$body" >/dev/null
 }
 
 # ── 高层封装：add-and-record ──

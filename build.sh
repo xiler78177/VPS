@@ -49,10 +49,17 @@ MODULES=(
 )
 
 mkdir -p "$(dirname "$OUTPUT")"
+OUTPUT_DIR="$(dirname "$OUTPUT")"
+OUTPUT_BASE="$(basename "$OUTPUT")"
+TMP_OUTPUT="$(mktemp "${OUTPUT_DIR}/.${OUTPUT_BASE}.tmp.XXXXXX")"
+cleanup_tmp_output() {
+    rm -f "$TMP_OUTPUT"
+}
+trap cleanup_tmp_output EXIT
 
 # 写入 shebang
-echo '#!/bin/bash' > "$OUTPUT"
-echo '' >> "$OUTPUT"
+echo '#!/bin/bash' > "$TMP_OUTPUT"
+echo '' >> "$TMP_OUTPUT"
 
 # 按顺序拼接各模块（跳过模块文件的注释头）
 for mod in "${MODULES[@]}"; do
@@ -66,11 +73,11 @@ for mod in "${MODULES[@]}"; do
     if [[ "$mod" == "15-singbox-reality.sh" ]]; then
         enhancement_path="$MODULES_DIR/enhancements/reality-sni-speedtest-interactive.sh"
         if [[ -f "$enhancement_path" ]]; then
-            echo "# ============================================================================" >> "$OUTPUT"
-            echo "# Reality SNI 自动测速增强模块（内联）" >> "$OUTPUT"
-            echo "# ============================================================================" >> "$OUTPUT"
-            tail -n +2 "$enhancement_path" | tr -d '\r' >> "$OUTPUT"
-            echo "" >> "$OUTPUT"
+            echo "# ============================================================================" >> "$TMP_OUTPUT"
+            echo "# Reality SNI 自动测速增强模块（内联）" >> "$TMP_OUTPUT"
+            echo "# ============================================================================" >> "$TMP_OUTPUT"
+            tail -n +2 "$enhancement_path" | tr -d '\r' >> "$TMP_OUTPUT"
+            echo "" >> "$TMP_OUTPUT"
         fi
     fi
 
@@ -78,21 +85,23 @@ for mod in "${MODULES[@]}"; do
     # 对于 15-singbox-reality.sh，仅删除显式 BUILD-OMIT 包裹的运行时 source 块；
     # 增强模块已内联，legacy SNI 函数保留为兜底且不会覆盖增强入口。
     if [[ "$mod" == "15-singbox-reality.sh" ]]; then
-        tail -n +2 "$mod_path" | tr -d '\r' | sed '/^# BEGIN BUILD-OMIT reality-sni-runtime-source$/,/^# END BUILD-OMIT reality-sni-runtime-source$/d' >> "$OUTPUT"
+        tail -n +2 "$mod_path" | tr -d '\r' | sed '/^# BEGIN BUILD-OMIT reality-sni-runtime-source$/,/^# END BUILD-OMIT reality-sni-runtime-source$/d' >> "$TMP_OUTPUT"
     else
-        tail -n +2 "$mod_path" | tr -d '\r' >> "$OUTPUT"
+        tail -n +2 "$mod_path" | tr -d '\r' >> "$TMP_OUTPUT"
     fi
 done
 
 # 末尾追加入口调用
-echo 'main "$@"' >> "$OUTPUT"
+echo 'main "$@"' >> "$TMP_OUTPUT"
 
 # 确保整个文件使用 LF 换行符（防止 Windows 环境污染）
 if command -v sed &>/dev/null; then
-    sed -i 's/\r$//' "$OUTPUT"
+    sed -i 's/\r$//' "$TMP_OUTPUT"
 fi
 
-chmod +x "$OUTPUT"
+chmod +x "$TMP_OUTPUT"
+mv -f "$TMP_OUTPUT" "$OUTPUT"
+trap - EXIT
 
 # 统计信息
 TOTAL_LINES=$(wc -l < "$OUTPUT")

@@ -1,8 +1,65 @@
 # modules/09c-web-domain.sh - 域名管理（添加/查看/删除 + 证书总览 + 续签/日志）
 
+_web_add_domain_clean_start() {
+    local domain="$1" cert_prefix="${CERT_PATH_PREFIX%/}" root_part
+    [[ -n "$domain" && -n "$cert_prefix" && "$cert_prefix" != "/" ]] || return 1
+    root_part="${domain#*.}"
+
+    local paths=(
+        "${CONFIG_DIR}/${domain}.conf"
+        "${cert_prefix}/${domain}"
+        "${CERT_HOOKS_DIR}/renew-${domain}.sh"
+        "/root/cert-renew-hook-${domain}.sh"
+        "/root/.cloudflare-${domain}.ini"
+        "${DDNS_CONFIG_DIR}/${domain}.conf"
+        "${DDNS_CONFIG_DIR}/origin.${domain}.conf"
+        "/etc/nginx/sites-available/${domain}.conf"
+        "/etc/nginx/sites-enabled/${domain}.conf"
+        "/etc/letsencrypt/live/${domain}"
+    )
+    if [[ "$root_part" != "$domain" ]]; then
+        paths+=("${DDNS_CONFIG_DIR}/origin.${root_part}.conf")
+    fi
+
+    local path
+    for path in "${paths[@]}"; do
+        [[ -e "$path" || -L "$path" ]] && return 1
+    done
+    if command_exists certbot && certbot certificates 2>/dev/null | grep -Fq -- "$domain"; then
+        return 1
+    fi
+    return 0
+}
+
+_web_add_domain_rollback() {
+    local domain="$1" clean_start="${2:-0}"
+    local zone_id="${3:-}" token="${4:-}" dns_snapshot="${5:-}" restore_dns="${6:-0}"
+    if [[ "$restore_dns" == "1" && -n "$zone_id" && -n "$token" && -n "$dns_snapshot" ]]; then
+        print_warn "安装失败，正在恢复 Cloudflare DNS 快照..."
+        if _cf_dns_restore_records "$zone_id" "$token" "$domain" "$dns_snapshot" A AAAA CNAME; then
+            print_success "Cloudflare DNS 已恢复到安装前状态"
+        else
+            print_warn "Cloudflare DNS 快照恢复失败，请人工核查 ${domain} 的 A/AAAA/CNAME 记录"
+        fi
+    fi
+
+    if [[ "$clean_start" != "1" ]]; then
+        print_warn "安装失败：检测到该域名安装前已有本地配置/证书，已跳过自动清理以避免误删旧配置"
+        print_info "请检查 ${CONFIG_DIR}/${domain}.conf、${CERT_PATH_PREFIX%/}/${domain}、续签 Hook 与 DDNS 配置是否需要手动清理"
+        return 0
+    fi
+
+    print_warn "安装失败，正在清理本次创建的本地半成品..."
+    _web_cleanup_domain "$domain" "quiet" || {
+        print_warn "半成品清理未完全成功，请稍后通过删除域名配置重试"
+        return 1
+    }
+    return 0
+}
+
 web_add_domain() {
     print_title "添加域名配置 (SSL + Nginx)"
-    web_env_check || { pause; return; }
+    web_env_check || { pause; return 1; }
 
     # 配置收集阶段
     echo -e "\n${C_CYAN}=== 收集配置信息 ===${C_RESET}\n"
@@ -13,7 +70,7 @@ web_add_domain() {
     echo -e "  ${C_GRAY}权限需要: Zone.DNS + Zone.SSL${C_RESET}"
     echo -e "  ${C_GRAY}创建: CF 后台 -> My Profile -> API Tokens -> Create Token${C_RESET}"
     if ! _cf_read_token "CF_API_TOKEN"; then
-        pause; return
+        pause; return 1
     fi
 
     # 2. 选择域名 (自动列出 Token 可管理的域名)
@@ -22,7 +79,7 @@ web_add_domain() {
     zones_json=$(_cf_list_zones "$CF_API_TOKEN" "status=active")
     if ! _cf_api_ok "$zones_json"; then
         print_error "获取域名列表失败: $(_cf_api_err "$zones_json")"
-        pause; return
+        pause; return 1
     fi
     while IFS='|' read -r zname zid; do
         [[ -z "$zname" ]] && continue
@@ -32,7 +89,7 @@ web_add_domain() {
 
     if [[ ${#zone_list[@]} -eq 0 ]]; then
         print_error "该 Token 无可管理的域名，请检查 Token 权限"
-        pause; return
+        pause; return 1
     fi
 
     echo -e "${C_CYAN}可用域名:${C_RESET}"
@@ -94,6 +151,8 @@ web_add_domain() {
             if validate_port "$NGINX_HTTPS_PORT"; then break; fi
             print_warn "端口无效"
         done
+        # Reality 443 共存：请求 443 时下沉到 web 内部端口，443 归 nginx stream 分流。
+        NGINX_HTTPS_PORT="$(_web_coexist_https_port "$NGINX_HTTPS_PORT")"
         read -e -r -p "后端协议 [1]http [2]https: " proto
         BACKEND_PROTOCOL=$([[ "$proto" == "2" ]] && echo "https" || echo "http")
         print_guide "后端服务地址"
@@ -199,25 +258,36 @@ web_add_domain() {
     #  执行阶段
     # ══════════════════════════════════════════════════════════════
     local step=1
+    local rollback_clean_start=0
+    local dns_snapshot="" dns_restore_needed=0
+    _web_add_domain_clean_start "$DOMAIN" && rollback_clean_start=1
 
     # ── DNS 解析 ──
     if [[ "$dns_mode" != "0" ]]; then
         echo -e "\n${C_CYAN}=== [${step}] DNS 解析 ===${C_RESET}"
+        dns_snapshot=$(_cf_dns_snapshot_records "$zone_id" "$CF_API_TOKEN" "$DOMAIN" A AAAA CNAME) || {
+            print_error "DNS 快照创建失败，已中止以避免后续失败无法恢复 Cloudflare 远端状态"
+            pause; return 1
+        }
+        dns_restore_needed=1
         case $dns_mode in
             1) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "A" "$ipv4" "$dns_proxied" ;;
             2) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "AAAA" "$ipv6" "$dns_proxied" ;;
-            3) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "A" "$ipv4" "$dns_proxied"
-               _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "AAAA" "$ipv6" "$dns_proxied" ;;
-        esac
+            3) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "A" "$ipv4" "$dns_proxied" \
+               && _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "AAAA" "$ipv6" "$dns_proxied" ;;
+        esac || {
+            print_error "DNS 记录配置失败"
+            _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"
+            pause; return 1
+        }
         ((step++))
     fi
 
     # ── SSL 证书 ──
     echo -e "\n${C_CYAN}=== [${step}] SSL 证书申请 ===${C_RESET}"
-    mkdir -p "${CERT_PATH_PREFIX}/${DOMAIN}"
+    mkdir -p "${CERT_PATH_PREFIX}/${DOMAIN}" || { print_error "证书目录创建失败"; _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
     local CLOUDFLARE_CREDENTIALS="/root/.cloudflare-${DOMAIN}.ini"
-    write_file_atomic "$CLOUDFLARE_CREDENTIALS" "dns_cloudflare_api_token = $CF_API_TOKEN"
-    chmod 600 "$CLOUDFLARE_CREDENTIALS"
+    write_private_file_atomic "$CLOUDFLARE_CREDENTIALS" "dns_cloudflare_api_token = $CF_API_TOKEN" || { print_error "Cloudflare 凭据写入失败"; _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
     print_info "正在申请证书 (DNS 验证，可能需要 1-2 分钟)..."
     if certbot certonly \
         --dns-cloudflare \
@@ -230,18 +300,19 @@ web_add_domain() {
         --non-interactive; then
         print_success "证书获取成功！"
         local cert_dir="${CERT_PATH_PREFIX}/${DOMAIN}"
-        cp -L "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "$cert_dir/fullchain.pem"
-        cp -L "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "$cert_dir/privkey.pem"
-        chmod 644 "$cert_dir/fullchain.pem"
-        chmod 600 "$cert_dir/privkey.pem"
+        copy_cert_pair_atomic "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "$cert_dir" || {
+            print_error "证书复制失败"
+            _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"
+            pause; return 1
+        }
         ((step++))
 
         # ── Nginx 反向代理 ──
         if [[ $do_nginx -eq 1 ]]; then
             echo -e "\n${C_CYAN}=== [${step}] Nginx 反向代理 ===${C_RESET}"
             _ensure_ssl_params
-            local redir_port=""
-            [[ "$NGINX_HTTPS_PORT" != "443" ]] && redir_port=":${NGINX_HTTPS_PORT}"
+            local redir_port
+            redir_port="$(_web_coexist_redir_suffix "$NGINX_HTTPS_PORT")"
             local nginx_conf="# Config for $DOMAIN
 # Generated by $SCRIPT_NAME $VERSION
 server {
@@ -269,28 +340,35 @@ $(_nginx_tls_http2_block "$NGINX_HTTPS_PORT")
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_buffering off;
     }
-}"
+            }"
             if ! _nginx_deploy_conf "$DOMAIN" "$nginx_conf"; then
-                pause; return
+                _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"
+                pause; return 1
             fi
             print_success "Nginx 配置已生效"
+            # 443 共存模式：把本站域名加入 stream SNI 白名单（未启用则 no-op）
+            declare -F reality_coexist_refresh >/dev/null && reality_coexist_refresh || true
             ((step++))
 
             # ── 防火墙 ──
             echo -e "\n${C_CYAN}=== [${step}] 防火墙 ===${C_RESET}"
-            if ufw_is_active; then
-                ufw allow "$NGINX_HTTP_PORT/tcp" comment "Nginx-HTTP" >/dev/null 2>&1 || true
-                ufw allow "$NGINX_HTTPS_PORT/tcp" comment "Nginx-HTTPS" >/dev/null 2>&1 || true
-                print_success "防火墙规则已更新"
+            _web_allow_public_tcp_port "$NGINX_HTTP_PORT" "Nginx-HTTP" "${NGINX_HTTP_PORT}/tcp" || { _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
+            # 443 共存：HTTPS 端口若已下沉为 web 内部端口，则它仅需 loopback 可达（对外走 443 stream），
+            # 不放行到公网，避免真站直连入口被旁路探测。
+            if declare -F _web_coexist_is_inner_port >/dev/null && _web_coexist_is_inner_port "$NGINX_HTTPS_PORT"; then
+                print_info "共存模式：${NGINX_HTTPS_PORT} 为内部端口，仅 loopback 可达，不放行到公网（对外由 443 提供）"
             else
-                print_info "UFW 未启用，跳过"
+                _web_allow_public_tcp_port "$NGINX_HTTPS_PORT" "Nginx-HTTPS" "${NGINX_HTTPS_PORT}/tcp" || { _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
+            fi
+            if command_exists ufw && ufw_is_active; then
+                print_success "防火墙规则已更新"
             fi
             ((step++))
         fi
 
         # ── 证书自动续签 ──
         echo -e "\n${C_CYAN}=== [${step}] 证书自动续签 ===${C_RESET}"
-        mkdir -p "$CERT_HOOKS_DIR"
+        mkdir -p "$CERT_HOOKS_DIR" || { print_error "续签 Hook 目录创建失败"; _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
         local DEPLOY_HOOK_SCRIPT="${CERT_HOOKS_DIR}/renew-${DOMAIN}.sh"
         local hook_content="#!/bin/bash
 # Auto-generated renewal hook for $DOMAIN
@@ -301,12 +379,10 @@ CERT_DIR=\"${cert_dir}\"
 LETSENCRYPT_LIVE=\"/etc/letsencrypt/live/\${DOMAIN}\"
 echo \"[\$(date)] Starting renewal hook for \$DOMAIN\" >> /var/log/cert-renew.log
 
+$(render_cert_pair_hook_helper)
+
 # Copy certificates
-if [[ -f \"\${LETSENCRYPT_LIVE}/fullchain.pem\" ]]; then
-    cp -L \"\${LETSENCRYPT_LIVE}/fullchain.pem\" \"\${CERT_DIR}/fullchain.pem\"
-    cp -L \"\${LETSENCRYPT_LIVE}/privkey.pem\" \"\${CERT_DIR}/privkey.pem\"
-    chmod 644 \"\${CERT_DIR}/fullchain.pem\"
-    chmod 600 \"\${CERT_DIR}/privkey.pem\"
+if copy_cert_pair_atomic \"\${LETSENCRYPT_LIVE}/fullchain.pem\" \"\${LETSENCRYPT_LIVE}/privkey.pem\" \"\${CERT_DIR}\"; then
     echo \"[\$(date)] Certificates copied successfully\" >> /var/log/cert-renew.log
 else
     echo \"[\$(date)] ERROR: Certificate files not found\" >> /var/log/cert-renew.log
@@ -330,11 +406,11 @@ echo \"[\$(date)] Nginx reloaded\" >> /var/log/cert-renew.log
 echo \"[\$(date)] Renewal hook completed for \$DOMAIN\" >> /var/log/cert-renew.log
 exit 0
 "
-        write_file_atomic "$DEPLOY_HOOK_SCRIPT" "$hook_content"
-        chmod +x "$DEPLOY_HOOK_SCRIPT"
+        write_file_atomic "$DEPLOY_HOOK_SCRIPT" "$hook_content" || { print_error "续签 Hook 写入失败"; _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
+        chmod +x "$DEPLOY_HOOK_SCRIPT" || { print_error "续签 Hook 授权失败"; _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
         local cron_tag="CertRenew_${DOMAIN}"
         local cron_minute=$(( $(echo "$DOMAIN" | cksum | cut -d' ' -f1) % 60 ))
-        cron_add_job "$cron_tag" "${cron_minute} 3 * * * certbot renew --quiet --cert-name '${DOMAIN}' --deploy-hook '${DEPLOY_HOOK_SCRIPT}' # ${cron_tag}"
+        cron_add_job "$cron_tag" "${cron_minute} 3 * * * certbot renew --quiet --cert-name '${DOMAIN}' --deploy-hook '${DEPLOY_HOOK_SCRIPT}' # ${cron_tag}" || { print_error "自动续签 cron 配置失败"; _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
         print_success "自动续签已配置 (每日 3:$(printf '%02d' $cron_minute) AM)"
 
         # 保存域名管理配置
@@ -353,7 +429,7 @@ NGINX_HTTPS_PORT=\"$NGINX_HTTPS_PORT\"
 LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
 "
         fi
-        write_file_atomic "${CONFIG_DIR}/${DOMAIN}.conf" "$config_content"
+        write_file_atomic "${CONFIG_DIR}/${DOMAIN}.conf" "$config_content" || { print_error "域名管理配置写入失败"; _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
         ((step++))
 
         # ── DDNS 动态解析 ──
@@ -362,8 +438,13 @@ LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
             local ddns_ipv4="false" ddns_ipv6="false"
             [[ "$dns_mode" == "1" || "$dns_mode" == "3" ]] && ddns_ipv4="true"
             [[ "$dns_mode" == "2" || "$dns_mode" == "3" ]] && ddns_ipv6="true"
-            ddns_setup "$DOMAIN" "$CF_API_TOKEN" "$zone_id" "$ddns_ipv4" "$ddns_ipv6" "$dns_proxied"
+            ddns_setup "$DOMAIN" "$CF_API_TOKEN" "$zone_id" "$ddns_ipv4" "$ddns_ipv6" "$dns_proxied" || {
+                print_error "DDNS 配置失败"
+                _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"
+                pause; return 1
+            }
         fi
+        dns_restore_needed=0
 
         # ══════════════════════════════════════════════════════════════
         #  完成报告
@@ -394,7 +475,12 @@ LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
         echo "1. 域名 DNS 是否正确解析到本机
 2. API Token 权限是否正确
 3. 网络连接是否正常"
-        rm -f "$CLOUDFLARE_CREDENTIALS"
+        if [[ "$rollback_clean_start" == "1" ]]; then
+            _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"
+        else
+            rm -f "$CLOUDFLARE_CREDENTIALS"
+        fi
+        pause; return 1
     fi
     pause
 }
@@ -544,7 +630,10 @@ web_delete_domain() {
     echo -e "${C_RESET}"
     if ! confirm "确认彻底删除吗?"; then return; fi
     print_info "正在执行清理..."
-    _web_cleanup_domain "$target_domain"
+    if ! _web_cleanup_domain "$target_domain"; then
+        print_error "域名清理失败。"
+        pause; return 1
+    fi
     log_action "Deleted domain config: $target_domain"
     pause
 }

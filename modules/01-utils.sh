@@ -120,6 +120,183 @@ write_file_atomic() {
     return 0
 }
 
+write_private_file_atomic() {
+    local filepath="$1" content="$2" tmpfile dir old_umask rc
+    dir="$(dirname "$filepath")"
+    mkdir -p "$dir" || return 1
+    old_umask=$(umask)
+    umask 077
+    tmpfile=$(mktemp "${dir}/.tmp.server-manage.private.XXXXXX")
+    rc=$?
+    umask "$old_umask"
+    [[ $rc -eq 0 ]] || return 1
+    _tmp_register "$tmpfile"
+    if ! printf "%s\n" "$content" > "$tmpfile"; then
+        rm -f -- "$tmpfile" 2>/dev/null || true
+        _tmp_unregister "$tmpfile"
+        return 1
+    fi
+    chmod 600 "$tmpfile" 2>/dev/null || true
+    chown root:root "$tmpfile" 2>/dev/null || true
+    if ! mv "$tmpfile" "$filepath"; then
+        rm -f -- "$tmpfile" 2>/dev/null || true
+        _tmp_unregister "$tmpfile"
+        return 1
+    fi
+    _tmp_unregister "$tmpfile"
+    return 0
+}
+
+copy_cert_pair_atomic() {
+    local src_fullchain="$1" src_privkey="$2" dest_dir="$3"
+    local dest_full dest_key full_tmp key_tmp old_umask rc bak_full="" bak_key=""
+    _copy_cert_pair_restore_local() {
+        local _dest_full="$1" _dest_key="$2" _bak_full="${3:-}" _bak_key="${4:-}" _full_tmp="${5:-}" _key_tmp="${6:-}"
+        rm -f -- "$_dest_full" "$_dest_key" "$_full_tmp" "$_key_tmp" 2>/dev/null || true
+        [[ -n "$_bak_full" && -f "$_bak_full" ]] && mv "$_bak_full" "$_dest_full" 2>/dev/null || true
+        [[ -n "$_bak_key" && -f "$_bak_key" ]] && mv "$_bak_key" "$_dest_key" 2>/dev/null || true
+    }
+    [[ -f "$src_fullchain" && -f "$src_privkey" && -n "$dest_dir" ]] || return 1
+    mkdir -p "$dest_dir" || return 1
+    dest_full="${dest_dir}/fullchain.pem"
+    dest_key="${dest_dir}/privkey.pem"
+    old_umask=$(umask)
+    umask 077
+    full_tmp=$(mktemp "${dest_dir}/.tmp.server-manage.fullchain.XXXXXX")
+    rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+        key_tmp=$(mktemp "${dest_dir}/.tmp.server-manage.privkey.XXXXXX")
+        rc=$?
+    fi
+    umask "$old_umask"
+    [[ "$rc" -eq 0 ]] || { rm -f -- "${full_tmp:-}" "${key_tmp:-}" 2>/dev/null || true; return 1; }
+    declare -F _tmp_register >/dev/null 2>&1 && _tmp_register "$full_tmp"
+    declare -F _tmp_register >/dev/null 2>&1 && _tmp_register "$key_tmp"
+    if ! cp -L "$src_fullchain" "$full_tmp" || ! cp -L "$src_privkey" "$key_tmp"; then
+        rm -f -- "$full_tmp" "$key_tmp" 2>/dev/null || true
+        declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$full_tmp"
+        declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$key_tmp"
+        return 1
+    fi
+    chmod 644 "$full_tmp" 2>/dev/null || true
+    chmod 600 "$key_tmp" 2>/dev/null || true
+    chown root:root "$full_tmp" "$key_tmp" 2>/dev/null || true
+    if [[ -e "$dest_full" ]]; then
+        bak_full=$(mktemp "${dest_dir}/.bak.server-manage.fullchain.XXXXXX") || {
+            rm -f -- "$full_tmp" "$key_tmp" 2>/dev/null || true
+            declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$full_tmp"
+            declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$key_tmp"
+            return 1
+        }
+        rm -f -- "$bak_full"
+        mv "$dest_full" "$bak_full" || {
+            rm -f -- "$full_tmp" "$key_tmp" "$bak_full" 2>/dev/null || true
+            declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$full_tmp"
+            declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$key_tmp"
+            return 1
+        }
+    fi
+    if [[ -e "$dest_key" ]]; then
+        bak_key=$(mktemp "${dest_dir}/.bak.server-manage.privkey.XXXXXX") || {
+            _copy_cert_pair_restore_local "$dest_full" "$dest_key" "$bak_full" "$bak_key" "$full_tmp" "$key_tmp"
+            declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$full_tmp"
+            declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$key_tmp"
+            return 1
+        }
+        rm -f -- "$bak_key"
+        mv "$dest_key" "$bak_key" || {
+            _copy_cert_pair_restore_local "$dest_full" "$dest_key" "$bak_full" "$bak_key" "$full_tmp" "$key_tmp"
+            declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$full_tmp"
+            declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$key_tmp"
+            return 1
+        }
+    fi
+    if ! mv "$full_tmp" "$dest_full"; then
+        _copy_cert_pair_restore_local "$dest_full" "$dest_key" "$bak_full" "$bak_key" "$full_tmp" "$key_tmp"
+        declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$full_tmp"
+        declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$key_tmp"
+        return 1
+    fi
+    declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$full_tmp"
+    if ! mv "$key_tmp" "$dest_key"; then
+        _copy_cert_pair_restore_local "$dest_full" "$dest_key" "$bak_full" "$bak_key" "" "$key_tmp"
+        declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$key_tmp"
+        return 1
+    fi
+    declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$key_tmp"
+    rm -f -- "$bak_full" "$bak_key" 2>/dev/null || true
+    return 0
+}
+
+render_cert_pair_hook_helper() {
+    cat <<'HOOK_CERT_PAIR_HELPER'
+copy_cert_pair_restore() {
+    local dest_full="$1" dest_key="$2" bak_full="${3:-}" bak_key="${4:-}" full_tmp="${5:-}" key_tmp="${6:-}"
+    rm -f -- "$dest_full" "$dest_key" "$full_tmp" "$key_tmp" 2>/dev/null || true
+    [[ -n "$bak_full" && -f "$bak_full" ]] && mv "$bak_full" "$dest_full" 2>/dev/null || true
+    [[ -n "$bak_key" && -f "$bak_key" ]] && mv "$bak_key" "$dest_key" 2>/dev/null || true
+}
+
+copy_cert_pair_atomic() {
+    local src_fullchain="$1" src_privkey="$2" dest_dir="$3"
+    local dest_full dest_key full_tmp key_tmp old_umask rc bak_full="" bak_key=""
+    [[ -f "$src_fullchain" && -f "$src_privkey" && -n "$dest_dir" ]] || return 1
+    mkdir -p "$dest_dir" || return 1
+    dest_full="${dest_dir}/fullchain.pem"
+    dest_key="${dest_dir}/privkey.pem"
+    old_umask=$(umask)
+    umask 077
+    full_tmp=$(mktemp "${dest_dir}/.tmp.server-manage.fullchain.XXXXXX")
+    rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+        key_tmp=$(mktemp "${dest_dir}/.tmp.server-manage.privkey.XXXXXX")
+        rc=$?
+    fi
+    umask "$old_umask"
+    [[ "$rc" -eq 0 ]] || { rm -f -- "${full_tmp:-}" "${key_tmp:-}" 2>/dev/null || true; return 1; }
+    if ! cp -L "$src_fullchain" "$full_tmp" || ! cp -L "$src_privkey" "$key_tmp"; then
+        rm -f -- "$full_tmp" "$key_tmp" 2>/dev/null || true
+        return 1
+    fi
+    chmod 644 "$full_tmp" 2>/dev/null || true
+    chmod 600 "$key_tmp" 2>/dev/null || true
+    chown root:root "$full_tmp" "$key_tmp" 2>/dev/null || true
+    if [[ -e "$dest_full" ]]; then
+        bak_full=$(mktemp "${dest_dir}/.bak.server-manage.fullchain.XXXXXX") || {
+            rm -f -- "$full_tmp" "$key_tmp" 2>/dev/null || true
+            return 1
+        }
+        rm -f -- "$bak_full"
+        mv "$dest_full" "$bak_full" || {
+            rm -f -- "$full_tmp" "$key_tmp" "$bak_full" 2>/dev/null || true
+            return 1
+        }
+    fi
+    if [[ -e "$dest_key" ]]; then
+        bak_key=$(mktemp "${dest_dir}/.bak.server-manage.privkey.XXXXXX") || {
+            copy_cert_pair_restore "$dest_full" "$dest_key" "$bak_full" "$bak_key" "$full_tmp" "$key_tmp"
+            return 1
+        }
+        rm -f -- "$bak_key"
+        mv "$dest_key" "$bak_key" || {
+            copy_cert_pair_restore "$dest_full" "$dest_key" "$bak_full" "$bak_key" "$full_tmp" "$key_tmp"
+            return 1
+        }
+    fi
+    if ! mv "$full_tmp" "$dest_full"; then
+        copy_cert_pair_restore "$dest_full" "$dest_key" "$bak_full" "$bak_key" "$full_tmp" "$key_tmp"
+        return 1
+    fi
+    if ! mv "$key_tmp" "$dest_key"; then
+        copy_cert_pair_restore "$dest_full" "$dest_key" "$bak_full" "$bak_key" "" "$key_tmp"
+        return 1
+    fi
+    rm -f -- "$bak_full" "$bak_key" 2>/dev/null || true
+    return 0
+}
+HOOK_CERT_PAIR_HELPER
+}
+
 handle_interrupt() {
     _cleanup_tmpfiles
     echo ""
@@ -263,6 +440,75 @@ _ssh_authorized_keys_available() {
     return 1
 }
 
+_ssh_authorized_keys_append() {
+    local ak="$1" key="$2" owner="${3:-}" dir tmp old_umask rc last_byte
+    [[ -n "$ak" && -n "$key" ]] || return 1
+    dir="$(dirname "$ak")"
+    mkdir -p "$dir" || return 1
+    if [[ -f "$ak" ]] && grep -Fxq -- "$key" "$ak" 2>/dev/null; then
+        return 0
+    fi
+    old_umask=$(umask)
+    umask 077
+    tmp=$(mktemp "${dir}/.tmp.server-manage.authorized-keys.XXXXXX")
+    rc=$?
+    umask "$old_umask"
+    [[ "$rc" -eq 0 ]] || return 1
+    _tmp_register "$tmp"
+    if [[ -f "$ak" ]]; then
+        cat "$ak" > "$tmp" || { rm -f "$tmp"; _tmp_unregister "$tmp"; return 1; }
+        if [[ -s "$tmp" ]]; then
+            last_byte=$(tail -c 1 "$tmp" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+            if [[ "$last_byte" != "0a" ]]; then
+                printf '\n' >> "$tmp" || { rm -f "$tmp"; _tmp_unregister "$tmp"; return 1; }
+            fi
+        fi
+    fi
+    printf '%s\n' "$key" >> "$tmp" || { rm -f "$tmp"; _tmp_unregister "$tmp"; return 1; }
+    chmod 600 "$tmp" 2>/dev/null || true
+    [[ -n "$owner" ]] && chown "$owner" "$tmp" 2>/dev/null || true
+    if ! mv "$tmp" "$ak"; then
+        rm -f "$tmp"
+        _tmp_unregister "$tmp"
+        return 1
+    fi
+    _tmp_unregister "$tmp"
+    chmod 600 "$ak" 2>/dev/null || true
+    [[ -n "$owner" ]] && chown "$owner" "$ak" 2>/dev/null || true
+    return 0
+}
+
+_ssh_authorized_keys_remove() {
+    local ak="$1" key="$2" owner="${3:-}" dir tmp old_umask rc grep_rc
+    [[ -n "$ak" && -n "$key" && -f "$ak" ]] || return 1
+    dir="$(dirname "$ak")"
+    old_umask=$(umask)
+    umask 077
+    tmp=$(mktemp "${dir}/.tmp.server-manage.authorized-keys.XXXXXX")
+    rc=$?
+    umask "$old_umask"
+    [[ "$rc" -eq 0 ]] || return 1
+    _tmp_register "$tmp"
+    grep -Fvx -- "$key" "$ak" > "$tmp"
+    grep_rc=$?
+    if [[ $grep_rc -gt 1 ]]; then
+        rm -f "$tmp"
+        _tmp_unregister "$tmp"
+        return 1
+    fi
+    chmod 600 "$tmp" 2>/dev/null || true
+    [[ -n "$owner" ]] && chown "$owner" "$tmp" 2>/dev/null || true
+    if ! mv "$tmp" "$ak"; then
+        rm -f "$tmp"
+        _tmp_unregister "$tmp"
+        return 1
+    fi
+    _tmp_unregister "$tmp"
+    chmod 600 "$ak" 2>/dev/null || true
+    [[ -n "$owner" ]] && chown "$owner" "$ak" 2>/dev/null || true
+    return 0
+}
+
 _ssh_non_root_sudo_available() {
     local passwd_file="${SSH_PASSWD_FILE:-/etc/passwd}"
     local group_file="${SSH_GROUP_FILE:-/etc/group}"
@@ -295,13 +541,13 @@ ufw_is_active() {
     LANG=C ufw status 2>/dev/null | grep -qi 'Status: active'
 }
 
-# 统一设置 sshd_config 的某个 directive：命中则替换，未命中则追加
-# 用法: _sshd_set_directive <Key> <Value> [file]
+# 统一设置 sshd_config 的某个 directive：命中则替换，未命中则插入到首个 Match 块之前
+# 用法: _sshd_set_directive <Key> <Value> [file] [skip_dropin_check]
 _sshd_set_directive() {
-    local key="$1" value="$2" file="${3:-$SSHD_CONFIG}"
+    local key="$1" value="$2" file="${3:-$SSHD_CONFIG}" skip_dropin_check="${4:-0}"
     [[ -f "$file" ]] || return 1
     # 检查 drop-in 是否已配置同名 directive（OpenSSH 默认 drop-in 优先生效）
-    if [[ -d /etc/ssh/sshd_config.d ]]; then
+    if [[ "$skip_dropin_check" != "1" && -d /etc/ssh/sshd_config.d ]]; then
         local overrides
         overrides=$(grep -lE "^[[:space:]]*${key}[[:space:]]+" /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true)
         if [[ -n "$overrides" ]]; then
@@ -476,6 +722,13 @@ validate_cidr() {
     fi
 }
 
+nft_addr_family_for_cidr() {
+    case "${1:-}" in
+        *:*) printf 'ip6' ;;
+        *)   printf 'ip' ;;
+    esac
+}
+
 validate_cidr_list() {
     local list="${1:-}" item
     [[ -n "$list" && "$list" != "null" ]] || return 0
@@ -605,28 +858,86 @@ validate_conf_file() {
 cron_remove_job() {
     local pattern="$1"
     local cron_tmp
-    cron_tmp=$(mktemp) || return 1
+    cron_tmp=$(_cron_tmp_create) || return 1
     crontab -l 2>/dev/null | grep -Fv -- "$pattern" > "$cron_tmp" || true
     if ! crontab "$cron_tmp" 2>/dev/null; then
         print_error "更新 crontab 失败"
-        rm -f "$cron_tmp"
+        _cron_tmp_cleanup "$cron_tmp"
         return 1
     fi
-    rm -f "$cron_tmp"
+    _cron_tmp_cleanup "$cron_tmp"
+}
+
+_cron_tmp_create() {
+    local tmp_dir tmp_file old_umask rc
+    old_umask=$(umask)
+    umask 077
+    tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/${SCRIPT_NAME:-server-manage}-cron.XXXXXX")
+    rc=$?
+    umask "$old_umask"
+    [[ "$rc" -eq 0 ]] || return 1
+    chmod 700 "$tmp_dir" 2>/dev/null || true
+    tmp_file="$tmp_dir/crontab"
+    : > "$tmp_file" || { rm -rf -- "$tmp_dir" 2>/dev/null || true; return 1; }
+    chmod 600 "$tmp_file" 2>/dev/null || true
+    printf '%s\n' "$tmp_file"
+}
+
+_cron_tmp_cleanup() {
+    local cron_tmp="${1:-}" tmp_dir base
+    [[ -n "$cron_tmp" ]] || return 0
+    tmp_dir="$(dirname "$cron_tmp")"
+    base="$(basename "$tmp_dir")"
+    case "$base" in
+        "${SCRIPT_NAME:-server-manage}-cron."*) rm -rf -- "$tmp_dir" 2>/dev/null || true ;;
+        *) rm -f -- "$cron_tmp" 2>/dev/null || true ;;
+    esac
+}
+
+cron_has_job_command() {
+    local command_path="$1"
+    crontab -l 2>/dev/null | awk -v cmd="$command_path" 'NF >= 6 && $6 == cmd { found=1 } END { exit(found ? 0 : 1) }'
+}
+
+cron_remove_job_command() {
+    local command_path="$1"
+    local cron_tmp
+    cron_tmp=$(_cron_tmp_create) || return 1
+    crontab -l 2>/dev/null | awk -v cmd="$command_path" '!(NF >= 6 && $6 == cmd)' > "$cron_tmp" || true
+    if ! crontab "$cron_tmp" 2>/dev/null; then
+        print_error "更新 crontab 失败"
+        _cron_tmp_cleanup "$cron_tmp"
+        return 1
+    fi
+    _cron_tmp_cleanup "$cron_tmp"
+}
+
+cron_add_job_command() {
+    local command_path="$1" line="$2"
+    local cron_tmp
+    cron_tmp=$(_cron_tmp_create) || return 1
+    crontab -l 2>/dev/null | awk -v cmd="$command_path" '!(NF >= 6 && $6 == cmd)' > "$cron_tmp" || true
+    echo "$line" >> "$cron_tmp"
+    if ! crontab "$cron_tmp" 2>/dev/null; then
+        print_error "更新 crontab 失败"
+        _cron_tmp_cleanup "$cron_tmp"
+        return 1
+    fi
+    _cron_tmp_cleanup "$cron_tmp"
 }
 
 cron_add_job() {
     local pattern="$1" line="$2"
     local cron_tmp
-    cron_tmp=$(mktemp) || return 1
+    cron_tmp=$(_cron_tmp_create) || return 1
     crontab -l 2>/dev/null | grep -Fv -- "$pattern" > "$cron_tmp" || true
     echo "$line" >> "$cron_tmp"
     if ! crontab "$cron_tmp" 2>/dev/null; then
         print_error "更新 crontab 失败"
-        rm -f "$cron_tmp"
+        _cron_tmp_cleanup "$cron_tmp"
         return 1
     fi
-    rm -f "$cron_tmp"
+    _cron_tmp_cleanup "$cron_tmp"
 }
 
 init_environment() {

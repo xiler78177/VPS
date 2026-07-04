@@ -9,6 +9,7 @@ readonly CERT_HOOKS_DIR="/root/cert-hooks"
 readonly WG_SHARED_DB_DIR="/etc/wireguard/db"
 readonly WG_SHARED_DB_FILE="${WG_SHARED_DB_DIR}/wg-data.json"
 readonly WG_SHARED_ROLE_FILE="/etc/wireguard/.role"
+readonly WG_SHARED_ROUTE_STATE_FILE="${WG_SHARED_DB_DIR}/managed-routes.state"
 readonly WG_DEFAULT_PORT=50000
 readonly WG_MTU_DIRECT=1420
 PLATFORM="debian"
@@ -93,6 +94,15 @@ REALITY_CDN_STATE_FILE="${REALITY_CONFIG_DIR}/cdn.conf"
 REALITY_CDN_LINK_FILE="${REALITY_CONFIG_DIR}/cdn-link.txt"
 REALITY_CDN_CLIENT_JSON="${REALITY_CONFIG_DIR}/cdn-client.json"
 REALITY_CDN_ORIGIN_PORT="${REALITY_CDN_ORIGIN_PORT:-8443}"
+# 443 共存模式（nginx stream + ssl_preread 分流）：443 由 nginx stream 独占，
+# 按 SNI 分流——真站域名(白名单) → REALITY_WEB_INNER_PORT；default(借用SNI/未知/无SNI)
+# → REALITY_COEXIST_INNER_PORT(sing-box reality 入站)。所有后端仅绑 127.0.0.1，外部不可见。
+# reality 内部端口选 18443，明确避开 CDN 回源用的 8443（CF 橙云支持端口，不可改）。
+REALITY_COEXIST_STATE_FILE="${REALITY_CONFIG_DIR}/coexist.conf"
+REALITY_COEXIST_INNER_PORT="${REALITY_COEXIST_INNER_PORT:-18443}"
+REALITY_WEB_INNER_PORT="${REALITY_WEB_INNER_PORT:-12443}"
+REALITY_STREAM_ENABLED_DIR="/etc/nginx/stream-enabled"
+REALITY_STREAM_CONF="${REALITY_STREAM_ENABLED_DIR}/reality-coexist.conf"
 REALITY_SINGBOX_CONFIG="/etc/sing-box/config.json"
 REALITY_REALM_CONFIG="/etc/realm/config.toml"
 REALITY_PORT_MIN=20000

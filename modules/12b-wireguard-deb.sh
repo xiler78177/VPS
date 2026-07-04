@@ -175,9 +175,8 @@ wg_deb_rebuild_conf() {
     [[ -z "$def_iface" || "$def_iface" == "null" ]] && def_iface=$(wg_deb_detect_default_iface)
     [[ -z "$def_iface" ]] && def_iface="eth0"
 
-    local old_umask _rc
-    old_umask=$(umask)
-    umask 077
+    local conf_content
+    conf_content=$(
     {
         echo "[Interface]"
         echo "PrivateKey = ${priv_key}"
@@ -214,20 +213,19 @@ wg_deb_rebuild_conf() {
             fi
             i=$((i + 1))
         done
-    } > "$WG_DEB_CONF"
-    _rc=$?
-    umask "$old_umask"
-    [[ $_rc -eq 0 ]] || return 1
-    chmod 600 "$WG_DEB_CONF"
+    }
+)
+    wg_write_private_file "$WG_DEB_CONF" "$conf_content"
 }
 
 wg_deb_regenerate_client_confs() {
     local pc=$(wg_deb_db_get '.peers | length')
     [[ "$pc" -eq 0 ]] && return
-    local spub sep sport sdns mask mtu
+    local spub sep sport endpoint sdns mask mtu
     spub=$(wg_deb_db_get '.server.public_key')
     sep=$(wg_deb_db_get '.server.endpoint')
     sport=$(wg_deb_db_get '.server.port')
+    endpoint=$(wg_shared_format_endpoint "$sep" "$sport")
     sdns=$(wg_deb_db_get '.server.dns')
     mask=$(echo "$(wg_deb_db_get '.server.subnet')" | cut -d'/' -f2)
     mtu=$(wg_deb_db_get '.server.mtu // empty')
@@ -246,31 +244,39 @@ MTU = ${mtu}"
 [Peer]
 PublicKey = ${spub}
 PresharedKey = $(wg_deb_db_get ".peers[$i].preshared_key")
-Endpoint = ${sep}:${sport}
+Endpoint = ${endpoint}
 AllowedIPs = $(wg_deb_db_get ".peers[$i].client_allowed_ips")
 PersistentKeepalive = 25"
-        write_file_atomic "${WG_DEB_CLIENT_DIR}/${name}.conf" "$conf_content"
-        chmod 600 "${WG_DEB_CLIENT_DIR}/${name}.conf"
+        wg_write_private_file "${WG_DEB_CLIENT_DIR}/${name}.conf" "$conf_content" || return 1
         i=$((i + 1))
     done
 }
 
 wg_deb_apply_conf() {
     wg_deb_rebuild_conf || return 1
-    wg_deb_regenerate_client_confs
+    wg_deb_regenerate_client_confs || return 1
     wg_deb_is_running || return 0
-    local tmp
-    tmp=$(mktemp "/tmp/${SCRIPT_NAME}-wg-deb-sync.XXXXXX") || return 1
+    local tmp_dir tmp
+    tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/${SCRIPT_NAME}-wg-deb-sync.XXXXXX") || return 1
+    chmod 700 "$tmp_dir" 2>/dev/null || true
+    tmp="${tmp_dir}/sync.conf"
     awk '
         /^\[Interface\]$/ { section="interface"; print; next }
         /^\[Peer\]$/ { section="peer"; print; next }
         section=="interface" && /^(PrivateKey|ListenPort|FwMark)[[:space:]]*=/ { print; next }
         section=="peer" && /^(PublicKey|PresharedKey|AllowedIPs|Endpoint|PersistentKeepalive)[[:space:]]*=/ { print; next }
-    ' "$WG_DEB_CONF" > "$tmp"
+    ' "$WG_DEB_CONF" > "$tmp" || { rm -rf "$tmp_dir"; return 1; }
+    chmod 600 "$tmp" 2>/dev/null || true
     if wg syncconf "$WG_DEB_INTERFACE" "$tmp" >/dev/null 2>&1; then
-        rm -f "$tmp"
+        rm -rf "$tmp_dir"
+        wg_deb_sync_peer_routes || return 1
         return 0
     fi
-    rm -f "$tmp"
+    rm -rf "$tmp_dir"
     return 1
+}
+
+wg_deb_sync_peer_routes() {
+    wg_deb_is_running || return 0
+    wg_shared_sync_gateway_routes wg_deb_db_get "$WG_DEB_INTERFACE"
 }

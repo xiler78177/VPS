@@ -31,6 +31,22 @@ _fail2ban_set_sshd_port() {
     mv "$tmpfile" "$jail_file"
 }
 
+_ssh_socket_dropin_path() {
+    local socket_unit="$1"
+    printf '/etc/systemd/system/%s.d/server-manage-port.conf' "$socket_unit"
+}
+
+_ssh_socket_dropin_rollback() {
+    local socket_dropin="${1:-}" socket_backup="${2:-}" socket_created="${3:-0}"
+    [[ -n "$socket_dropin" ]] || return 0
+    if [[ -n "$socket_backup" && -f "$socket_backup" ]]; then
+        mv "$socket_backup" "$socket_dropin" 2>/dev/null || true
+    elif [[ "$socket_created" -eq 1 ]]; then
+        rm -f "$socket_dropin" 2>/dev/null || true
+    fi
+    systemctl daemon-reload 2>/dev/null || true
+}
+
 ssh_change_port() {
     print_title "修改 SSH 端口"
     refresh_ssh_port
@@ -90,8 +106,9 @@ ssh_change_port() {
     cp "$target_conf" "$backup_file"
 
     if [[ -n "$socket_unit" ]]; then
-        local socket_dropin_dir="/etc/systemd/system/${socket_unit}.d"
-        socket_dropin="${socket_dropin_dir}/server-manage-port.conf"
+        socket_dropin=$(_ssh_socket_dropin_path "$socket_unit")
+        local socket_dropin_dir
+        socket_dropin_dir=$(dirname "$socket_dropin")
         mkdir -p "$socket_dropin_dir"
         if [[ -f "$socket_dropin" ]]; then
             socket_backup="${socket_dropin}.bak.$(date +%s)"
@@ -99,19 +116,50 @@ ssh_change_port() {
         else
             socket_created=1
         fi
-        cat > "$socket_dropin" <<EOF
+        local socket_tmp
+        socket_tmp=$(mktemp "${socket_dropin_dir}/.tmp.server-manage.ssh-socket.XXXXXX") || {
+            print_error "创建 SSH socket drop-in 临时文件失败，已回滚。"
+            mv "$backup_file" "$target_conf" 2>/dev/null || true
+            [[ -n "$socket_backup" ]] && rm -f "$socket_backup"
+            pause; return 1
+        }
+        _tmp_register "$socket_tmp"
+        if ! cat > "$socket_tmp" <<EOF
 [Socket]
 ListenStream=
 ListenStream=0.0.0.0:${port}
 ListenStream=[::]:${port}
 EOF
+        then
+            print_error "写入 SSH socket drop-in 失败，已回滚。"
+            rm -f "$socket_tmp" 2>/dev/null || true
+            _tmp_unregister "$socket_tmp"
+            mv "$backup_file" "$target_conf" 2>/dev/null || true
+            [[ -n "$socket_backup" ]] && rm -f "$socket_backup"
+            pause; return 1
+        fi
+        chmod 0644 "$socket_tmp" 2>/dev/null || true
+        if ! mv "$socket_tmp" "$socket_dropin"; then
+            print_error "安装 SSH socket drop-in 失败，已回滚。"
+            rm -f "$socket_tmp" 2>/dev/null || true
+            _tmp_unregister "$socket_tmp"
+            mv "$backup_file" "$target_conf" 2>/dev/null || true
+            [[ -n "$socket_backup" ]] && rm -f "$socket_backup"
+            pause; return 1
+        fi
+        _tmp_unregister "$socket_tmp"
         systemctl daemon-reload 2>/dev/null || true
     fi
 
     # 先放行新端口（防止改完连不上）
     local ufw_opened=0 firewall_opened_backends=""
     if ufw_is_active; then
-        ufw allow "$port/tcp" comment "SSH-New" >/dev/null
+        if ! ufw allow "$port/tcp" comment "SSH-New" >/dev/null; then
+            print_error "UFW 放行新 SSH 端口失败，已中止修改。"
+            [[ -n "$socket_unit" ]] && _ssh_socket_dropin_rollback "$socket_dropin" "$socket_backup" "$socket_created"
+            rm -f "$backup_file"
+            pause; return 1
+        fi
         ufw_opened=1
         print_success "UFW 已放行新端口 $port。"
     else
@@ -119,7 +167,9 @@ EOF
             if ! firewall_prepare_non_ufw_ssh_port "$port" "SSH-New"; then
                 print_error "无法确认本地防火墙已放行新 SSH 端口，拒绝继续修改以避免失联。"
                 print_info "请先手动放行 ${port}/tcp（云安全组 + 本机防火墙），再重试。"
-                pause; return
+                [[ -n "$socket_unit" ]] && _ssh_socket_dropin_rollback "$socket_dropin" "$socket_backup" "$socket_created"
+                rm -f "$backup_file"
+                pause; return 1
             fi
             firewall_opened_backends="$FIREWALL_SSH_OPEN_BACKENDS"
         else
@@ -130,21 +180,21 @@ EOF
         fi
     fi
 
-    # 写入端口配置
-    if grep -qE "^\s*#?\s*Port\s" "$target_conf"; then
-        sed -i -E "s|^\s*#?\s*Port\s+.*|Port ${port}|" "$target_conf"
-    else
-        printf '\n# server-manage: appended Port\nPort %s\n' "$port" >> "$target_conf"
+    # 写入端口配置。必须插入到首个 Match 块之前，否则只会作用于匹配块并导致 sshd -t 失败/配置无效。
+    if ! _sshd_set_directive "Port" "$port" "$target_conf" 1; then
+        print_error "写入 SSH 端口配置失败，已回滚。"
+        mv "$backup_file" "$target_conf" 2>/dev/null || true
+        [[ -n "$socket_unit" ]] && _ssh_socket_dropin_rollback "$socket_dropin" "$socket_backup" "$socket_created"
+        [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
+        [[ -n "$firewall_opened_backends" ]] && firewall_rollback_ssh_port "$port" "$firewall_opened_backends" "SSH-New"
+        pause; return
     fi
 
     # 校验配置语法
     if ! sshd -t 2>/dev/null; then
         print_error "sshd 配置校验失败！已回滚。"
         mv "$backup_file" "$target_conf"
-        if [[ -n "$socket_unit" ]]; then
-            if [[ -n "$socket_backup" ]]; then mv "$socket_backup" "$socket_dropin" 2>/dev/null || true; elif [[ $socket_created -eq 1 ]]; then rm -f "$socket_dropin"; fi
-            systemctl daemon-reload 2>/dev/null || true
-        fi
+        [[ -n "$socket_unit" ]] && _ssh_socket_dropin_rollback "$socket_dropin" "$socket_backup" "$socket_created"
         [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
         [[ -n "$firewall_opened_backends" ]] && firewall_rollback_ssh_port "$port" "$firewall_opened_backends" "SSH-New"
         pause; return
@@ -153,10 +203,7 @@ EOF
     if ! _restart_sshd; then
         print_error "重启失败！已回滚配置。"
         mv "$backup_file" "$target_conf" 2>/dev/null || true
-        if [[ -n "$socket_unit" ]]; then
-            if [[ -n "$socket_backup" ]]; then mv "$socket_backup" "$socket_dropin" 2>/dev/null || true; elif [[ $socket_created -eq 1 ]]; then rm -f "$socket_dropin"; fi
-            systemctl daemon-reload 2>/dev/null || true
-        fi
+        [[ -n "$socket_unit" ]] && _ssh_socket_dropin_rollback "$socket_dropin" "$socket_backup" "$socket_created"
         [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
         [[ -n "$firewall_opened_backends" ]] && firewall_rollback_ssh_port "$port" "$firewall_opened_backends" "SSH-New"
         _restart_sshd || true
@@ -174,10 +221,7 @@ EOF
     if [[ $listen_ok -ne 1 ]]; then
         print_error "重启后未检测到 SSH 在新端口 ${port}/tcp 监听，已回滚配置。"
         mv "$backup_file" "$target_conf" 2>/dev/null || true
-        if [[ -n "$socket_unit" ]]; then
-            if [[ -n "$socket_backup" ]]; then mv "$socket_backup" "$socket_dropin" 2>/dev/null || true; elif [[ $socket_created -eq 1 ]]; then rm -f "$socket_dropin"; fi
-            systemctl daemon-reload 2>/dev/null || true
-        fi
+        [[ -n "$socket_unit" ]] && _ssh_socket_dropin_rollback "$socket_dropin" "$socket_backup" "$socket_created"
         [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
         [[ -n "$firewall_opened_backends" ]] && firewall_rollback_ssh_port "$port" "$firewall_opened_backends" "SSH-New"
         _restart_sshd || true
@@ -248,9 +292,12 @@ ssh_keys() {
             print_warn "该公钥已存在，无需重复添加。"
             pause; return
         fi
-        echo "$key" >> "$dir/authorized_keys"
-        chmod 700 "$dir"; chmod 600 "$dir/authorized_keys"
-        chown -R "$user:$user" "$dir"
+        chmod 700 "$dir" 2>/dev/null || true
+        chown "$user:$user" "$dir" 2>/dev/null || true
+        _ssh_authorized_keys_append "$dir/authorized_keys" "$key" "$user:$user" || {
+            print_error "公钥写入失败"
+            pause; return
+        }
         print_success "公钥已添加。"
         log_action "SSH key added for user $user"
         ;;
@@ -306,22 +353,7 @@ ssh_keys() {
         if [[ "$didx" =~ ^[0-9]+$ ]] && [[ "$didx" -ge 1 && "$didx" -le ${#keys[@]} ]]; then
             local target_key="${keys[$((didx-1))]}"
             if confirm "确认删除第 ${didx} 个公钥?"; then
-                local tmp_ak grep_rc
-                tmp_ak=$(mktemp "$(dirname "$ak")/.tmp.server-manage.authorized-keys.XXXXXX") || { print_error "创建临时文件失败"; pause; return; }
-                _tmp_register "$tmp_ak"
-                grep -Fvx -- "$target_key" "$ak" > "$tmp_ak"
-                grep_rc=$?
-                if [[ $grep_rc -gt 1 ]]; then
-                    rm -f "$tmp_ak"
-                    _tmp_unregister "$tmp_ak"
-                    print_error "删除失败"
-                    pause; return
-                fi
-                cat "$tmp_ak" > "$ak" || { rm -f "$tmp_ak"; _tmp_unregister "$tmp_ak"; print_error "写入失败"; pause; return; }
-                rm -f "$tmp_ak"
-                _tmp_unregister "$tmp_ak"
-                chmod 600 "$ak"
-                chown "$user:$user" "$ak" 2>/dev/null || true
+                _ssh_authorized_keys_remove "$ak" "$target_key" "$user:$user" || { print_error "写入失败"; pause; return; }
                 print_success "已删除。"
                 log_action "SSH key deleted for user $user (index=$didx)"
             fi
@@ -363,9 +395,12 @@ ssh_keys() {
             if grep -qF "$pub_key" "$imp_dir/authorized_keys" 2>/dev/null; then
                 print_warn "该公钥已存在，无需重复添加。"
             else
-                echo "$pub_key" >> "$imp_dir/authorized_keys"
-                chmod 700 "$imp_dir"; chmod 600 "$imp_dir/authorized_keys"
-                chown -R "$imp_user:$imp_user" "$imp_dir"
+                chmod 700 "$imp_dir" 2>/dev/null || true
+                chown "$imp_user:$imp_user" "$imp_dir" 2>/dev/null || true
+                _ssh_authorized_keys_append "$imp_dir/authorized_keys" "$pub_key" "$imp_user:$imp_user" || {
+                    print_error "公钥导入失败"
+                    pause; return
+                }
                 print_success "公钥已导入 ${imp_user} 的 authorized_keys。"
                 log_action "SSH pubkey auto-imported for user $imp_user from $key_file"
             fi

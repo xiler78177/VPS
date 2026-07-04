@@ -13,6 +13,22 @@ assert_contains() {
     local needle="$1" haystack="$2" message="$3"
     grep -Fq -- "$needle" <<< "$haystack" || fail "$message"
 }
+assert_mode_600() {
+    local file="$1" message="$2" mode
+    case "$(uname -s 2>/dev/null || echo unknown)" in
+        MINGW*|MSYS*|CYGWIN*) return 0 ;;
+    esac
+    mode="$(stat -c '%a' "$file" 2>/dev/null || stat -f '%Lp' "$file" 2>/dev/null || true)"
+    [[ "$mode" == "600" ]] || fail "$message (mode=${mode:-unknown})"
+}
+assert_mode_644() {
+    local file="$1" message="$2" mode
+    case "$(uname -s 2>/dev/null || echo unknown)" in
+        MINGW*|MSYS*|CYGWIN*) return 0 ;;
+    esac
+    mode="$(stat -c '%a' "$file" 2>/dev/null || stat -f '%Lp' "$file" 2>/dev/null || true)"
+    [[ "$mode" == "644" ]] || fail "$message (mode=${mode:-unknown})"
+}
 
 source modules/00-constants.sh
 source modules/01-utils.sh
@@ -52,6 +68,12 @@ exit 0
 EOF_MOCK_SYSTEMCTL_OK
 chmod +x "$reality_test_tmp/bin/sing-box" "$reality_test_tmp/bin/systemctl"
 PATH="$reality_test_tmp/bin:$PATH"
+sha_file="$reality_test_tmp/sing-box-linux-amd64.tar.gz"
+printf '%s' 'payload' > "$sha_file"
+sha_hash="$(sha256sum "$sha_file" | awk '{print $1}')"
+printf '%s  sing-box-linux-amd64.tar.gz\n' "$sha_hash" > "$reality_test_tmp/checksums.txt"
+reality_verify_sha256_file "$sha_file" "$reality_test_tmp/checksums.txt" >/dev/null 2>&1 || \
+    fail "sha256 verification should default asset_name from file basename when third argument is omitted"
 if reality_apply_singbox_config '{"new":"bad"}' >/dev/null 2>&1; then
     fail "checked apply helper should fail when sing-box check fails"
 fi
@@ -70,11 +92,90 @@ if reality_apply_singbox_config '{"new":"restart-fail"}' >/dev/null 2>&1; then
 fi
 [[ "$(cat "$REALITY_SINGBOX_CONFIG")" == 'old-config' ]] || fail "failed restart should restore previous config"
 
+selftest_tmp="$reality_test_tmp/selftest-tmp"
+mkdir -p "$selftest_tmp"
+cat > "$reality_test_tmp/bin/sing-box" <<'EOF_MOCK_SELFTEST_SINGBOX'
+#!/usr/bin/env bash
+echo "mock sing-box exited" >&2
+exit 0
+EOF_MOCK_SELFTEST_SINGBOX
+cat > "$reality_test_tmp/bin/ss" <<'EOF_MOCK_SELFTEST_SS'
+#!/usr/bin/env bash
+echo "LISTEN 0 0 127.0.0.1:19090 0.0.0.0:*"
+EOF_MOCK_SELFTEST_SS
+cat > "$reality_test_tmp/bin/curl" <<'EOF_MOCK_SELFTEST_CURL'
+#!/usr/bin/env bash
+echo "mock curl failure" >&2
+exit 7
+EOF_MOCK_SELFTEST_CURL
+chmod +x "$reality_test_tmp/bin/sing-box" "$reality_test_tmp/bin/ss" "$reality_test_tmp/bin/curl"
+(
+    TMPDIR="$selftest_tmp"
+    REALITY_PORT=443
+    REALITY_UUID=11111111-1111-1111-1111-111111111111
+    REALITY_SNI=www.example.com
+    REALITY_PUBLIC_KEY=pubkey
+    REALITY_SHORT_ID=abcd
+    REALITY_FINGERPRINT=chrome
+    reality_load_state(){ return 0; }
+    if reality_local_client_self_test >/dev/null 2>&1; then
+        fail "Reality self-test should fail with mocked curl"
+    fi
+)
+if find "$selftest_tmp" -maxdepth 1 -name 'reality-client-test.*' -print -quit | grep -q .; then
+    fail "Reality self-test should clean private temp directory on failure"
+fi
+
 prompt_sni_body="$(declare -f reality_prompt_sni)"
 assert_contains 'reality_smart_sni_selection' "$prompt_sni_body" "sourcing Reality module should keep enhanced SNI prompt active"
 if grep -Fq 'REALITY SNI/handshake 目标' <<< "$prompt_sni_body"; then
     fail "enhanced SNI prompt should not be overwritten by legacy prompt when sourcing modules"
 fi
+
+prompt_marker="$reality_test_tmp/noninteractive-prompts.log"
+landing_args="$reality_test_tmp/noninteractive-landing.args"
+(
+    reality_prompt_cf_token(){ echo "cf-token" >> "$prompt_marker"; return 1; }
+    reality_prompt_landing_dns_mode(){ echo "dns-mode" >> "$prompt_marker"; return 1; }
+    reality_prompt_domain_with_zones(){ echo "domain" >> "$prompt_marker"; return 1; }
+    reality_prompt_node_name(){ echo "node-name" >> "$prompt_marker"; return 1; }
+    reality_prompt_sni(){ echo "sni" >> "$prompt_marker"; return 1; }
+    reality_prompt_port(){ echo "port" >> "$prompt_marker"; return 1; }
+    reality_prompt_split_ports(){ echo "split-ports" >> "$prompt_marker"; return 1; }
+    reality_install_landing(){ printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$@" > "$landing_args"; return 0; }
+    reality_install_relay(){ echo "relay" >> "$prompt_marker"; return 1; }
+    reality_install_wizard --landing --cf-token tok --dns-mode split \
+        --node-v4 v4.example.com --node-v6 v6.example.com \
+        --name node --name-v4 node-v4 --name-v6 node-v6 \
+        --sni www.example.com --port 443 --port-v6 443 >/dev/null 2>&1
+) || fail "non-interactive Reality landing CLI args should complete without prompts"
+[[ ! -s "$prompt_marker" ]] || fail "non-interactive Reality landing unexpectedly called prompt/install fallback: $(cat "$prompt_marker")"
+[[ "$(cat "$landing_args")" == "v4.example.com|www.example.com|443|tok|node|split|v4.example.com|v6.example.com|443|node-v4|node-v6" ]] \
+    || fail "non-interactive Reality landing passed wrong args: $(cat "$landing_args")"
+
+prompt_marker="$reality_test_tmp/noninteractive-both-prompts.log"
+landing_args="$reality_test_tmp/noninteractive-both-landing.args"
+relay_args="$reality_test_tmp/noninteractive-both-relay.args"
+(
+    confirm(){ echo "confirm" >> "$prompt_marker"; return 1; }
+    reality_prompt_cf_token(){ echo "cf-token" >> "$prompt_marker"; return 1; }
+    reality_prompt_landing_dns_mode(){ echo "dns-mode" >> "$prompt_marker"; return 1; }
+    reality_prompt_domain_with_zones(){ echo "domain" >> "$prompt_marker"; return 1; }
+    reality_prompt_node_name(){ echo "node-name" >> "$prompt_marker"; return 1; }
+    reality_prompt_sni(){ echo "sni" >> "$prompt_marker"; return 1; }
+    reality_prompt_port(){ echo "port" >> "$prompt_marker"; return 1; }
+    reality_install_landing(){ printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$@" > "$landing_args"; return 0; }
+    reality_install_relay(){ printf '%s|%s|%s|%s|%s|%s\n' "$@" > "$relay_args"; return 0; }
+    reality_load_state(){ return 1; }
+    reality_install_wizard --both --cf-token tok --dns-mode auto \
+        --node node.example.com --name combo --sni www.example.com --port 443 \
+        --relay-domain relay.example.com --relay-port 2443 >/dev/null 2>&1
+) || fail "non-interactive Reality both CLI args should complete without prompts"
+[[ ! -s "$prompt_marker" ]] || fail "non-interactive Reality both unexpectedly called prompt/confirm: $(cat "$prompt_marker")"
+[[ "$(cat "$landing_args")" == "node.example.com|www.example.com|443|tok|combo|auto|||||" ]] \
+    || fail "non-interactive Reality both landing args wrong: $(cat "$landing_args")"
+[[ "$(cat "$relay_args")" == "relay.example.com|2443|127.0.0.1|443|tok|combo" ]] \
+    || fail "non-interactive Reality both relay args wrong: $(cat "$relay_args")"
 
 candidate_count="$(grep -A80 '^REALITY_CANDIDATE_SNI=(' modules/15-singbox-reality.sh | sed -n '/^)/q;p' | grep -c '\"')"
 [[ "$candidate_count" -ge 20 ]] || fail "SNI candidate pool should contain at least 20 domains"
@@ -192,8 +293,43 @@ assert_contains '@v6.example.com:34567?' "$(cat "$REALITY_LINK_FILE_V6")" "split
 assert_contains '@v4.example.com:23456?' "$(cat "$REALITY_LINK_FILE")" "combined split link file should include IPv4 node"
 assert_contains '@v6.example.com:34567?' "$(cat "$REALITY_LINK_FILE")" "combined split link file should include IPv6 node"
 assert_contains '"server":"v6.example.com","server_port":34567' "$(cat "$REALITY_CLIENT_JSON_V6")" "split mode should write IPv6 client JSON"
+assert_mode_600 "$REALITY_LINK_FILE_V4" "split IPv4 link artifact should be private"
+assert_mode_600 "$REALITY_LINK_FILE_V6" "split IPv6 link artifact should be private"
+assert_mode_600 "$REALITY_LINK_FILE" "combined split link artifact should be private"
+assert_mode_600 "$REALITY_CLIENT_JSON_V4" "split IPv4 JSON artifact should be private"
+assert_mode_600 "$REALITY_CLIENT_JSON_V6" "split IPv6 JSON artifact should be private"
+assert_mode_600 "$REALITY_CLIENT_JSON" "combined split JSON artifact should be private"
 REALITY_DNS_MODE=""
 REALITY_PORT_V6=""
+
+REALITY_CDN_LINK_FILE="${REALITY_CONFIG_DIR}/cdn-link.txt"
+REALITY_CDN_CLIENT_JSON="${REALITY_CONFIG_DIR}/cdn-client.json"
+REALITY_CDN_DOMAIN="cdn.example.com"
+REALITY_CDN_UUID="22222222-2222-4222-8222-222222222222"
+REALITY_CDN_WS_PATH="/secretpath00"
+REALITY_CDN_INNER_PORT="58999"
+REALITY_CDN_PREFER_IP="1.2.3.4"
+REALITY_CDN_NODE_NAME="cdn-test"
+reality_cdn_write_client_artifacts
+assert_contains '@1.2.3.4:443?' "$(cat "$REALITY_CDN_LINK_FILE")" "CDN client link should use preferred IP"
+assert_contains '"transport":{"type":"ws","path":"/secretpath00"' "$(cat "$REALITY_CDN_CLIENT_JSON")" "CDN client JSON should include WS path"
+assert_mode_600 "$REALITY_CDN_LINK_FILE" "CDN link artifact should be private"
+assert_mode_600 "$REALITY_CDN_CLIENT_JSON" "CDN JSON artifact should be private"
+
+REALITY_RELAY_DIR="${REALITY_CONFIG_DIR}/relays"
+RLY_NAME="relay-test"
+RLY_LISTEN_PORT="25000"
+RLY_CONNECT_HOST="relay.example.com"
+RLY_UUID="33333333-3333-4333-8333-333333333333"
+RLY_SNI="www.example.com"
+RLY_PUBLIC_KEY="relay-pub-key"
+RLY_SHORT_ID="0011223344556677"
+RLY_FINGERPRINT="chrome"
+reality_relay_write_client_artifacts
+assert_contains '@relay.example.com:25000?' "$(cat "$REALITY_RELAY_DIR/relay-25000.link.txt")" "relay link artifact should use relay host and port"
+assert_contains '"server":"relay.example.com","server_port":25000' "$(cat "$REALITY_RELAY_DIR/relay-25000.client.json")" "relay JSON artifact should use relay host and port"
+assert_mode_600 "$REALITY_RELAY_DIR/relay-25000.link.txt" "relay link artifact should be private"
+assert_mode_600 "$REALITY_RELAY_DIR/relay-25000.client.json" "relay JSON artifact should be private"
 
 payload="$(reality_cf_dns_payload 'A' 'node.example.com' '203.0.113.10')"
 assert_contains '"proxied":false' "$payload" "Cloudflare node DNS payload must force grey-cloud"
@@ -217,6 +353,40 @@ realm_tmp="$(mktemp -d)"
 touch "$realm_tmp/realm-slim"
 realm_bin="$(reality_find_realm_binary "$realm_tmp")"
 [[ "$realm_bin" == "$realm_tmp/realm-slim" ]] || fail "Realm binary finder should accept realm-slim extracted binary, got: $realm_bin"
+
+sagernet_keyring="$reality_test_tmp/apt/keyrings/sagernet.asc"
+sagernet_source="$reality_test_tmp/apt/sources/sagernet.sources"
+REALITY_SAGERNET_KEYRING_FILE="$sagernet_keyring"
+REALITY_SAGERNET_SOURCE_FILE="$sagernet_source"
+_reality_write_sagernet_source || fail "SagerNet apt source helper should write to redirected candidate path"
+sagernet_source_body="$(cat "$sagernet_source")"
+assert_contains 'URIs: https://deb.sagernet.org/' "$sagernet_source_body" "SagerNet source should use official repo URI"
+assert_contains "Signed-By: $sagernet_keyring" "$sagernet_source_body" "SagerNet source should reference redirected keyring path"
+assert_mode_644 "$sagernet_source" "SagerNet source candidate should be public-readable"
+if ( REALITY_SAGERNET_KEYRING_FILE="relative/keyring.asc"; _reality_write_sagernet_source >/dev/null 2>&1 ); then
+    fail "SagerNet source helper should reject non-absolute keyring path"
+fi
+unset REALITY_SAGERNET_KEYRING_FILE REALITY_SAGERNET_SOURCE_FILE
+
+realm_service="$reality_test_tmp/systemd/realm.service"
+realm_config="$reality_test_tmp/realm/config.toml"
+orig_reality_realm_config="${REALITY_REALM_CONFIG:-}"
+mkdir -p "$(dirname "$realm_config")" "$reality_test_tmp/realm-bin"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$reality_test_tmp/realm-bin/realm"
+chmod +x "$reality_test_tmp/realm-bin/realm"
+printf 'log.level = "warn"\n' > "$realm_config"
+REALITY_REALM_SERVICE_FILE="$realm_service"
+REALITY_REALM_BIN="$reality_test_tmp/realm-bin/realm"
+REALITY_REALM_CONFIG="$realm_config"
+_reality_install_realm_service_unit || fail "Realm service helper should write to redirected candidate path"
+realm_service_body="$(cat "$realm_service")"
+assert_contains "ExecStart=$REALITY_REALM_BIN -c $realm_config" "$realm_service_body" "Realm service should use resolved binary and redirected config path"
+assert_mode_644 "$realm_service" "Realm service candidate should be public-readable"
+if ( REALITY_REALM_SERVICE_FILE="relative.service"; _reality_install_realm_service_unit >/dev/null 2>&1 ); then
+    fail "Realm service helper should reject non-absolute service path"
+fi
+unset REALITY_REALM_SERVICE_FILE REALITY_REALM_BIN
+REALITY_REALM_CONFIG="$orig_reality_realm_config"
 
 firewall_helper_body="$(awk '/^firewall_allow_tcp_port\(\)/,/^}/' modules/04-firewall.sh)"
 assert_contains 'ufw allow "${port}/tcp"' "$firewall_helper_body" "Reality firewall helper should add only the requested TCP port"
@@ -256,6 +426,9 @@ fi
 if grep -Fq '卸载 Reality/Realm 配置' <<< "$reality_menu_body"; then
     fail "Reality top-level menu should not expose uninstall entry"
 fi
+delete_body="$(awk '/^reality_delete_node_info\(\)/,/^reality_uninstall\(\)/' modules/15-singbox-reality.sh)"
+assert_contains 'systemctl disable --now sing-box' "$delete_body" "deleting Reality node info should stop the managed sing-box service"
+assert_contains 'rm -f "$REALITY_SINGBOX_CONFIG"' "$delete_body" "deleting Reality node info should remove the managed sing-box config after backup"
 
 zones_json='{"success":true,"result":[{"name":"example.com"},{"name":"gpt.xx.kg"}]}'
 zones="$(reality_cf_zone_names_from_json "$zones_json")"
@@ -271,14 +444,14 @@ resolved_public_a="$(reality_resolve_public_a 'node.example.com')"
 unset -f curl
 [[ "$resolved_public_a" == '203.0.113.10' ]] || fail "public DoH resolver should parse IPv4 from JSON with optional spacing"
 
-cf_token_out="$(printf 'secret-token\n' | reality_prompt_cf_token 2>/tmp/reality-token-prompt.err)"
+cf_token_out="$(printf 'secret-token\n' | reality_prompt_cf_token 2>"$reality_test_tmp/reality-token-prompt.err")"
 [[ "$cf_token_out" == 'secret-token' ]] || fail "Cloudflare token prompt should return only token on stdout"
 
 _cf_api() {
     printf '%s\n' '{"success":true,"result":[{"name":"example.com"},{"name":"gpt.xx.kg"}]}'
 }
 _cf_api_ok() { [[ "$(grep -o '"success":true' <<< "$1")" == '"success":true' ]]; }
-prompt_domain_out="$(printf '2\ntest\n' | reality_prompt_domain_with_zones '节点连接' 'secret-token' 2>/tmp/reality-domain-prompt.err)"
+prompt_domain_out="$(printf '2\ntest\n' | reality_prompt_domain_with_zones '节点连接' 'secret-token' 2>"$reality_test_tmp/reality-domain-prompt.err")"
 [[ "$prompt_domain_out" == 'test.gpt.xx.kg' ]] || fail "zone-aware domain prompt should return only joined full domain on stdout, got: $prompt_domain_out"
 
 prompts_text="$(grep -E '节点连接域名|SNI 域名|REALITY SNI|候选|Cloudflare 灰云|Cloudflare API Token|自动创建/更新|不是让你手动|只需要填写自定义前缀|实际连接|成品网站|校验 TLS|请选择一个 SNI' modules/15-singbox-reality.sh)"

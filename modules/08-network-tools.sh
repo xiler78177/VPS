@@ -2,6 +2,10 @@
 net_iperf3() {
     print_title "iPerf3 测速"
     install_package "iperf3"
+    if ! command_exists iperf3; then
+        print_error "iperf3 安装失败或命令不可用。"
+        pause; return 1
+    fi
     read -e -r -p "监听端口 [5201]: " port
     port=${port:-5201}
     if ! validate_port "$port"; then
@@ -11,10 +15,25 @@ net_iperf3() {
     local ufw_opened=0
         if ufw_is_active; then
         if ! ufw status 2>/dev/null | grep -q "$port/tcp"; then
-            ufw allow "$port/tcp" comment "iPerf3-Temp" >/dev/null
+            if ! ufw allow "$port/tcp" comment "iPerf3-Temp" >/dev/null; then
+                print_error "临时放行端口 $port 失败。"
+                pause; return 1
+            fi
             ufw_opened=1
             print_info "临时放行端口 $port"
         fi
+    fi
+    iperf3 -s -p "$port" &
+    local iperf_pid=$!
+    sleep 0.2
+    if ! jobs -pr | grep -qx "$iperf_pid"; then
+        wait "$iperf_pid" 2>/dev/null || true
+        if [[ $ufw_opened -eq 1 ]]; then
+            ufw delete allow "$port/tcp" >/dev/null 2>&1 || true
+            print_info "防火墙规则已移除。"
+        fi
+        print_error "iPerf3 服务启动失败。"
+        pause; return 1
     fi
     local ip4=$(get_public_ipv4)
     local ip6=$(get_public_ipv6 || echo "")
@@ -25,8 +44,6 @@ net_iperf3() {
     [[ -n "$ip6" && "$ip6" != "未检测到" ]] && echo -e "IPv6 Upload: ${C_YELLOW}iperf3 -6 -c $ip6 -p $port${C_RESET}"
     [[ -n "$ip6" && "$ip6" != "未检测到" ]] && echo -e "IPv6 Download: ${C_YELLOW}iperf3 -6 -c $ip6 -p $port -R${C_RESET}"
     echo -e "${C_RED}按 Ctrl+C 停止测试...${C_RESET}"
-    iperf3 -s -p "$port" &
-    local iperf_pid=$!
     local cleaned=0
 
     cleanup_iperf() {
@@ -50,6 +67,168 @@ net_iperf3() {
     cleanup_iperf
     log_action "iPerf3 test completed on port $port"
     pause
+}
+
+_net_resolved_conf_path() {
+    printf '%s' "/etc/systemd/resolved.conf"
+}
+
+_net_gai_conf_path() {
+    printf '%s' "/etc/gai.conf"
+}
+
+_net_openwrt_reload_network() {
+    /etc/init.d/network reload
+}
+
+_net_render_resolved_dns_conf() {
+    local conf_file="$1" dns="$2"
+    if [[ -f "$conf_file" ]]; then
+        awk -v dns="$dns" '
+            BEGIN { in_resolve=0; seen_resolve=0; inserted=0 }
+            /^[[:space:]]*\[Resolve\][[:space:]]*$/ {
+                print
+                if (!inserted) {
+                    print "DNS=" dns
+                    inserted=1
+                }
+                in_resolve=1
+                seen_resolve=1
+                next
+            }
+            /^[[:space:]]*\[/ {
+                in_resolve=0
+            }
+            in_resolve && /^[[:space:]]*DNS[[:space:]]*=/ {
+                next
+            }
+            { print }
+            END {
+                if (!seen_resolve) {
+                    print ""
+                    print "[Resolve]"
+                    print "DNS=" dns
+                }
+            }
+        ' "$conf_file"
+    else
+        printf '[Resolve]\nDNS=%s\n' "$dns"
+    fi
+}
+
+_net_apply_systemd_resolved_dns() {
+    local dns="$1" res_conf old_content had_file=0 new_content
+    res_conf="$(_net_resolved_conf_path)"
+    if [[ -f "$res_conf" ]]; then
+        old_content=$(cat "$res_conf")
+        had_file=1
+    else
+        old_content=""
+    fi
+    new_content="$(_net_render_resolved_dns_conf "$res_conf" "$dns")" || return 1
+    if ! write_file_atomic "$res_conf" "$new_content"; then
+        print_error "写入 $res_conf 失败"
+        return 1
+    fi
+    if systemctl restart systemd-resolved; then
+        return 0
+    fi
+    print_error "重启 systemd-resolved 失败，正在回滚 DNS 配置"
+    if [[ "$had_file" -eq 1 ]]; then
+        write_file_atomic "$res_conf" "$old_content" >/dev/null 2>&1 || true
+    else
+        rm -f "$res_conf" 2>/dev/null || true
+    fi
+    return 1
+}
+
+_net_render_gai_conf() {
+    local conf_file="$1" mode="${2:-ipv6}"
+    if [[ -f "$conf_file" ]]; then
+        awk '
+            /^# BEGIN server-manage ip-priority/ { in_block=1; next }
+            in_block {
+                if (/^# END server-manage ip-priority/) in_block=0
+                next
+            }
+            /^[[:space:]]*precedence[[:space:]]+::ffff:0:0\/96[[:space:]]+100([[:space:]]*(#.*)?)?$/ { next }
+            { print }
+        ' "$conf_file"
+    fi
+    if [[ "$mode" == "ipv4" ]]; then
+        printf '\n# BEGIN server-manage ip-priority\n'
+        printf 'precedence ::ffff:0:0/96  100\n'
+        printf '# END server-manage ip-priority\n'
+    fi
+}
+
+_net_apply_gai_priority() {
+    local mode="$1" gai_path new_content
+    gai_path="$(_net_gai_conf_path)"
+    mkdir -p "$(dirname "$gai_path")" || return 1
+    new_content="$(_net_render_gai_conf "$gai_path" "$mode")" || return 1
+    write_file_atomic "$gai_path" "$new_content"
+}
+
+_net_openwrt_restore_dns_snapshot() {
+    local iface="$1" had_dns="$2" dns_snapshot="$3" had_peerdns="$4" peerdns_snapshot="$5"
+    local rc=0
+    uci -q delete "network.${iface}.dns" 2>/dev/null || true
+    if [[ "$had_dns" == "true" && -n "$dns_snapshot" ]]; then
+        local ip
+        while IFS= read -r ip; do
+            [[ -n "$ip" ]] || continue
+            uci add_list "network.${iface}.dns=$ip" >/dev/null 2>&1 || rc=1
+        done <<< "$dns_snapshot"
+    fi
+    if [[ "$had_peerdns" == "true" ]]; then
+        uci set "network.${iface}.peerdns=${peerdns_snapshot}" >/dev/null 2>&1 || rc=1
+    else
+        uci -q delete "network.${iface}.peerdns" 2>/dev/null || true
+    fi
+    uci commit network >/dev/null 2>&1 || rc=1
+    _net_openwrt_reload_network >/dev/null 2>&1 || rc=1
+    return "$rc"
+}
+
+_net_openwrt_apply_dns() {
+    local iface="$1" dns="$2"
+    local had_dns=false dns_snapshot="" had_peerdns=false peerdns_snapshot="" ip
+    if dns_snapshot=$(uci -q get "network.${iface}.dns" 2>/dev/null); then
+        had_dns=true
+    fi
+    if peerdns_snapshot=$(uci -q get "network.${iface}.peerdns" 2>/dev/null); then
+        had_peerdns=true
+    fi
+
+    uci -q delete "network.${iface}.dns" 2>/dev/null || true
+    for ip in $dns; do
+        if ! uci add_list "network.${iface}.dns=$ip"; then
+            print_error "写入 OpenWrt DNS 失败: $ip"
+            _net_openwrt_restore_dns_snapshot "$iface" "$had_dns" "$dns_snapshot" "$had_peerdns" "$peerdns_snapshot" \
+                || print_error "恢复 OpenWrt DNS 配置失败，请手动检查 network 配置。"
+            return 1
+        fi
+    done
+    if ! uci set "network.${iface}.peerdns=0"; then
+        print_error "设置 OpenWrt peerdns 失败"
+        _net_openwrt_restore_dns_snapshot "$iface" "$had_dns" "$dns_snapshot" "$had_peerdns" "$peerdns_snapshot" \
+            || print_error "恢复 OpenWrt DNS 配置失败，请手动检查 network 配置。"
+        return 1
+    fi
+    if ! uci commit network; then
+        print_error "提交 OpenWrt network 配置失败"
+        _net_openwrt_restore_dns_snapshot "$iface" "$had_dns" "$dns_snapshot" "$had_peerdns" "$peerdns_snapshot" \
+            || print_error "恢复 OpenWrt DNS 配置失败，请手动检查 network 配置。"
+        return 1
+    fi
+    if ! _net_openwrt_reload_network 2>/dev/null; then
+        print_error "重载 OpenWrt network 失败，已恢复原 DNS 配置。"
+        _net_openwrt_restore_dns_snapshot "$iface" "$had_dns" "$dns_snapshot" "$had_peerdns" "$peerdns_snapshot" \
+            || print_error "恢复 OpenWrt DNS 配置失败，请手动检查 network 配置。"
+        return 1
+    fi
+    return 0
 }
 
 net_dns() {
@@ -121,20 +300,10 @@ net_dns() {
         dns_iface="$network_wan"
         uci -q get "network.${dns_iface}" >/dev/null 2>&1 || dns_iface="$network_lan"
         uci -q get "network.${dns_iface}" >/dev/null 2>&1 || { print_error "未找到 OpenWrt wan/lan 网络接口"; pause; return 1; }
-        uci delete "network.${dns_iface}.dns" 2>/dev/null || true
-        for ip in $dns; do
-            uci add_list "network.${dns_iface}.dns=$ip" || { print_error "写入 OpenWrt DNS 失败: $ip"; pause; return 1; }
-        done
-        uci set "network.${dns_iface}.peerdns=0" || { print_error "设置 OpenWrt peerdns 失败"; pause; return 1; }
-        uci commit network || { print_error "提交 OpenWrt network 配置失败"; pause; return 1; }
-        /etc/init.d/network reload 2>/dev/null || true
+        _net_openwrt_apply_dns "$dns_iface" "$dns" || { pause; return 1; }
         print_success "DNS 已通过 uci 修改 (接口: ${dns_iface}, 持久化)。"
     elif is_systemd && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        local res_conf="/etc/systemd/resolved.conf"
-        grep -q '^\[Resolve\]' "$res_conf" || echo -e "\n[Resolve]" >> "$res_conf"
-        sed -i '/^DNS=/d' "$res_conf"
-        sed -i '/^\[Resolve\]/a DNS='"$dns" "$res_conf"
-        systemctl restart systemd-resolved
+        _net_apply_systemd_resolved_dns "$dns" || { pause; return 1; }
         print_success "DNS 已修改。"
     else
         local resolv_content=""
@@ -230,18 +399,21 @@ menu_net() {
                 read -e -r -p "选: " p
                 case $p in
                     1)
-                        [[ ! -f /etc/gai.conf ]] && touch /etc/gai.conf
-                        sed -i '/^#\?precedence ::ffff:0:0\/96  100/d' /etc/gai.conf
-                        echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
-                        print_success "IPv4 优先。"
-                        log_action "IP priority changed: ipv4"
+                        if _net_apply_gai_priority ipv4; then
+                            print_success "IPv4 优先。"
+                            log_action "IP priority changed: ipv4"
+                        else
+                            print_error "写入 /etc/gai.conf 失败。"
+                        fi
                         pause
                         ;;
                     2)
-                        [[ ! -f /etc/gai.conf ]] && touch /etc/gai.conf
-                        sed -i '/^#\?precedence ::ffff:0:0\/96  100/d' /etc/gai.conf
-                        print_success "IPv6 优先。"
-                        log_action "IP priority changed: ipv6"
+                        if _net_apply_gai_priority ipv6; then
+                            print_success "IPv6 优先。"
+                            log_action "IP priority changed: ipv6"
+                        else
+                            print_error "写入 /etc/gai.conf 失败。"
+                        fi
                         pause
                         ;;
                     0|q|Q|"") ;;

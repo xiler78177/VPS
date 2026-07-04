@@ -1,23 +1,55 @@
 # modules/04-firewall.sh - UFW 防火墙管理
+_ufw_validate_current_ssh_ports() {
+    local _ssh_port found=0
+    for _ssh_port in $CURRENT_SSH_PORTS; do
+        found=1
+        validate_port "$_ssh_port" || {
+            print_error "无法确认当前 SSH 端口，拒绝操作 UFW"
+            return 1
+        }
+    done
+    if [[ "$found" -eq 0 ]]; then
+        print_error "无法确认当前 SSH 端口，拒绝操作 UFW"
+        return 1
+    fi
+    return 0
+}
+
+_ufw_apply_default_ssh_rules() {
+    local _ssh_port
+    _ufw_validate_current_ssh_ports || return 1
+    print_info "配置默认规则..."
+    if ! ufw default deny incoming >/dev/null; then
+        print_error "设置 UFW 默认入站拒绝失败。"
+        return 1
+    fi
+    if ! ufw default allow outgoing >/dev/null; then
+        print_error "设置 UFW 默认出站允许失败。"
+        return 1
+    fi
+    for _ssh_port in $CURRENT_SSH_PORTS; do
+        if ! ufw allow "$_ssh_port/tcp" comment "SSH-Access" >/dev/null; then
+            print_error "放行 SSH 端口 ${_ssh_port}/tcp 失败，拒绝继续启用 UFW。"
+            return 1
+        fi
+    done
+    return 0
+}
+
 ufw_setup() {
-    install_package "ufw"
+    install_package "ufw" || { print_error "UFW 安装失败。"; pause; return 1; }
+    _require_cmd ufw "UFW" || return
     if is_systemd && systemctl is-active --quiet firewalld 2>/dev/null; then
         print_warn "检测到 firewalld 正在运行，请先禁用它。"
-        return
+        pause; return 1
     fi
     refresh_ssh_port
-    local _ssh_port
-    for _ssh_port in $CURRENT_SSH_PORTS; do
-        validate_port "$_ssh_port" || { print_error "无法确认当前 SSH 端口，拒绝启用 UFW"; pause; return 1; }
-    done
-    print_info "配置默认规则..."
-    ufw default deny incoming >/dev/null
-    ufw default allow outgoing >/dev/null
-    for _ssh_port in $CURRENT_SSH_PORTS; do
-        ufw allow "$_ssh_port/tcp" comment "SSH-Access" >/dev/null
-    done
+    _ufw_apply_default_ssh_rules || { pause; return 1; }
     if confirm "启用 UFW 可能导致 SSH 断开(若端口配置错误)，确认启用?"; then
-        echo "y" | ufw enable
+        if ! echo "y" | ufw enable >/dev/null; then
+            print_error "UFW 启用失败。"
+            pause; return 1
+        fi
         print_success "UFW 已启用。"
         log_action "UFW enabled with SSH ports $CURRENT_SSH_PORTS"
     fi
@@ -60,18 +92,20 @@ ufw_safe_reset() {
     if confirm "这将重置所有规则！脚本会尝试保留当前 SSH 端口，确定吗？"; then
         print_info "正在重置..."
         refresh_ssh_port
-        local _ssh_port
-        for _ssh_port in $CURRENT_SSH_PORTS; do
-            validate_port "$_ssh_port" || { print_error "无法确认当前 SSH 端口，拒绝重置 UFW"; pause; return 1; }
-        done
-        echo "y" | ufw disable >/dev/null
-        echo "y" | ufw reset >/dev/null
-        ufw default deny incoming >/dev/null
-        ufw default allow outgoing >/dev/null
-        for _ssh_port in $CURRENT_SSH_PORTS; do
-            ufw allow "$_ssh_port/tcp" comment "SSH-Access" >/dev/null
-        done
-        echo "y" | ufw enable >/dev/null
+        _ufw_validate_current_ssh_ports || { pause; return 1; }
+        if ! echo "y" | ufw disable >/dev/null; then
+            print_error "UFW 禁用失败，已中止重置。"
+            pause; return 1
+        fi
+        if ! echo "y" | ufw reset >/dev/null; then
+            print_error "UFW 重置失败。"
+            pause; return 1
+        fi
+        _ufw_apply_default_ssh_rules || { pause; return 1; }
+        if ! echo "y" | ufw enable >/dev/null; then
+            print_error "UFW 重新启用失败，请手动检查当前防火墙状态。"
+            pause; return 1
+        fi
         print_success "重置完成。SSH 端口 ${CURRENT_SSH_PORTS} 已放行。"
         log_action "UFW reset completed"
     fi
@@ -113,6 +147,7 @@ ufw_add() {
 }
 
 FIREWALL_SSH_OPEN_BACKENDS=""
+FIREWALL_UDP_OPEN_BACKENDS=""
 
 _firewall_iptables_input_restrictive() {
     local bin="$1"
@@ -155,6 +190,39 @@ _firewall_iptables_delete_tcp_accept() {
     "$bin" -D INPUT -p tcp -m state --state NEW -m tcp --dport "$port" \
         -m comment --comment "$comment" -j ACCEPT 2>/dev/null && return 0
     "$bin" -D INPUT -p tcp -m tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+}
+
+_firewall_iptables_has_udp_accept() {
+    local bin="$1" port="$2"
+    validate_port "$port" || return 1
+    command_exists "$bin" || return 1
+    "$bin" -S INPUT 2>/dev/null | awk -v p="$port" '
+        $1=="-A" && $2=="INPUT" &&
+        $0 ~ / -j ACCEPT( |$)/ &&
+        $0 ~ /(^| )-p udp( |$)/ &&
+        $0 ~ ("(^| )--dport " p "($| )") { found=1 }
+        END { exit found ? 0 : 1 }
+    '
+}
+
+_firewall_iptables_insert_udp_accept() {
+    local bin="$1" port="$2" comment="${3:-server-manage UDP}"
+    validate_port "$port" || return 1
+    command_exists "$bin" || return 1
+    _firewall_iptables_has_udp_accept "$bin" "$port" && return 0
+
+    "$bin" -I INPUT 1 -p udp -m udp --dport "$port" \
+        -m comment --comment "$comment" -j ACCEPT 2>/dev/null && return 0
+    "$bin" -I INPUT 1 -p udp -m udp --dport "$port" -j ACCEPT
+}
+
+_firewall_iptables_delete_udp_accept() {
+    local bin="$1" port="$2" comment="${3:-server-manage UDP}"
+    validate_port "$port" || return 1
+    command_exists "$bin" || return 0
+    "$bin" -D INPUT -p udp -m udp --dport "$port" \
+        -m comment --comment "$comment" -j ACCEPT 2>/dev/null && return 0
+    "$bin" -D INPUT -p udp -m udp --dport "$port" -j ACCEPT 2>/dev/null || true
 }
 
 _firewall_iptables_save_rules() {
@@ -286,6 +354,84 @@ firewall_rollback_ssh_port() {
     done
 }
 
+# firewall_prepare_non_ufw_udp_port <port> [comment]
+# UFW 未启用/不存在时，为必须可入站的 UDP 服务处理常见本机防火墙。
+# 返回值同 firewall_prepare_non_ufw_ssh_port。
+firewall_prepare_non_ufw_udp_port() {
+    local port="$1" comment="${2:-Managed-UDP}"
+    FIREWALL_UDP_OPEN_BACKENDS=""
+    validate_port "$port" || { print_error "端口无效: $port"; return 1; }
+    [[ "$PLATFORM" == "openwrt" ]] && return 0
+
+    if is_systemd && systemctl is-active --quiet firewalld 2>/dev/null; then
+        print_warn "检测到 firewalld 正在运行；UDP 端口 ${port} 必须同步放行。"
+        if ! command_exists firewall-cmd; then
+            print_error "firewalld 活跃但 firewall-cmd 不可用，拒绝继续。"
+            return 1
+        fi
+        if ! confirm "是否通过 firewalld 放行 ${port}/udp（运行时 + permanent）？"; then
+            return 2
+        fi
+        firewall-cmd --add-port="${port}/udp" >/dev/null || return 1
+        firewall-cmd --permanent --add-port="${port}/udp" >/dev/null 2>&1 || \
+            print_warn "firewalld permanent 规则写入失败；本次运行时已放行，但重启后可能丢失。"
+        FIREWALL_UDP_OPEN_BACKENDS+=" firewalld"
+        print_success "firewalld 已放行 ${port}/udp。"
+        return 0
+    fi
+
+    local restrictive=0 changed=0 backend
+    for backend in iptables ip6tables; do
+        command_exists "$backend" || continue
+        _firewall_iptables_input_restrictive "$backend" || continue
+        restrictive=1
+        if _firewall_iptables_has_udp_accept "$backend" "$port"; then
+            print_info "${backend} 已存在 ${port}/udp 放行规则。"
+            continue
+        fi
+        print_warn "检测到 ${backend} INPUT 链存在 DROP/REJECT，且未放行 ${port}/udp。"
+        if ! confirm "是否自动插入 ${backend} 放行规则并尽量持久化？"; then
+            [[ -n "$FIREWALL_UDP_OPEN_BACKENDS" ]] && firewall_rollback_udp_port "$port" "$FIREWALL_UDP_OPEN_BACKENDS" "$comment"
+            return 2
+        fi
+        if ! _firewall_iptables_insert_udp_accept "$backend" "$port" "$comment"; then
+            print_error "${backend} 插入 ${port}/udp 放行规则失败。"
+            [[ -n "$FIREWALL_UDP_OPEN_BACKENDS" ]] && firewall_rollback_udp_port "$port" "$FIREWALL_UDP_OPEN_BACKENDS" "$comment"
+            return 1
+        fi
+        FIREWALL_UDP_OPEN_BACKENDS+=" ${backend}"
+        changed=1
+        print_success "${backend} 已放行 ${port}/udp。"
+        _firewall_save_after_iptables_change "$backend"
+    done
+
+    if [[ $restrictive -eq 0 ]]; then
+        print_info "未检测到 UFW 以外的本地 INPUT DROP/REJECT；仍请确认云安全组已放行 ${port}/udp。"
+    elif [[ $changed -eq 0 ]]; then
+        print_info "检测到本地防火墙限制，但 ${port}/udp 已有放行规则。"
+    fi
+    return 0
+}
+
+firewall_rollback_udp_port() {
+    local port="$1" backends="${2:-}" comment="${3:-Managed-UDP}" backend
+    validate_port "$port" || return 0
+    for backend in $backends; do
+        case "$backend" in
+            iptables|ip6tables)
+                _firewall_iptables_delete_udp_accept "$backend" "$port" "$comment"
+                _firewall_save_after_iptables_change "$backend"
+                ;;
+            firewalld)
+                if command_exists firewall-cmd; then
+                    firewall-cmd --remove-port="${port}/udp" >/dev/null 2>&1 || true
+                    firewall-cmd --permanent --remove-port="${port}/udp" >/dev/null 2>&1 || true
+                fi
+                ;;
+        esac
+    done
+}
+
 # firewall_allow_tcp_port <port> [comment]
 # 返回值:
 #   0 = 已成功放行
@@ -327,6 +473,41 @@ firewall_allow_tcp_port() {
     return 1
 }
 
+# firewall_allow_udp_port <port> [comment]
+# 返回值同 firewall_allow_tcp_port；业务模块只追加规则，不自动启用/重置 UFW。
+firewall_allow_udp_port() {
+    local port="$1" comment="${2:-Managed-UDP}"
+    validate_port "$port" || { print_error "端口无效: $port"; return 1; }
+    if [[ "$PLATFORM" == "openwrt" ]]; then
+        print_warn "OpenWrt 防火墙请在 LuCI/fw4 中放行 ${port}/udp"
+        return 0
+    fi
+
+    if ! command_exists ufw; then
+        print_warn "未检测到 UFW — 本脚本不会自动安装。"
+        print_info "如需本地防火墙，请进入【防火墙管理】菜单完成 UFW 安装与启用；"
+        print_info "或在云厂商安全组放行 ${port}/udp。"
+        log_action "UFW absent during firewall_allow_udp_port port=${port}" "INFO"
+        return 2
+    fi
+
+    if ! ufw_is_active; then
+        print_warn "UFW 已安装但未启用 — 本脚本不会在业务流程里自动启用 UFW。"
+        print_info "如需本地防火墙保护，请进入【防火墙管理】→ 安装并启用 UFW；"
+        print_info "或在云厂商安全组放行 ${port}/udp。"
+        log_action "UFW inactive during firewall_allow_udp_port port=${port}" "INFO"
+        return 2
+    fi
+
+    # UFW 已启用 — 仅追加规则
+    if ufw allow "${port}/udp" comment "$comment" >/dev/null 2>&1; then
+        log_action "UFW allowed ${port}/udp comment=${comment}"
+        return 0
+    fi
+    print_error "UFW 添加规则失败: ${port}/udp"
+    return 1
+}
+
 firewall_apply_reality_port() {
     local port="$1"
     firewall_allow_tcp_port "$port" "SingBox-Reality"
@@ -357,8 +538,123 @@ _geoip_country_name() {
 }
 
 _geoip_load_conf() {
+    local line key value mode="" countries="" last_update="" cc
     GEOIP_MODE="" GEOIP_COUNTRIES="" GEOIP_LAST_UPDATE=""
-    [[ -f "$GEOIP_CONF" ]] && validate_conf_file "$GEOIP_CONF" && source "$GEOIP_CONF"
+    [[ -f "$GEOIP_CONF" ]] || return 1
+    validate_conf_file "$GEOIP_CONF" || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        [[ -z "${line// }" || "$line" =~ ^[[:space:]]*# ]] && continue
+        key="${line%%=*}"
+        key="${key//[[:space:]]/}"
+        value="${line#*=}"
+        case "$key" in
+            GEOIP_MODE|GEOIP_COUNTRIES|GEOIP_LAST_UPDATE) ;;
+            *) return 1 ;;
+        esac
+        if [[ "$value" =~ ^\"(.*)\"$ ]]; then
+            value="${BASH_REMATCH[1]}"
+        elif [[ "$value" =~ ^\'([^\']*)\'$ ]]; then
+            value="${BASH_REMATCH[1]}"
+        fi
+        case "$key" in
+            GEOIP_MODE) mode="$value" ;;
+            GEOIP_COUNTRIES) countries="$value" ;;
+            GEOIP_LAST_UPDATE) last_update="$value" ;;
+        esac
+    done < "$GEOIP_CONF"
+    [[ -z "$mode" || "$mode" =~ ^(whitelist|blacklist)$ ]] || return 1
+    for cc in $countries; do
+        [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || return 1
+    done
+    GEOIP_MODE="$mode"
+    GEOIP_COUNTRIES="$countries"
+    GEOIP_LAST_UPDATE="$last_update"
+    return 0
+}
+
+_geoip_service_file_path() {
+    printf '%s' "${GEOIP_SERVICE_FILE:-/etc/systemd/system/geoip-firewall.service}"
+}
+
+_geoip_apply_script_path() {
+    printf '%s' "${GEOIP_APPLY_SCRIPT:-/usr/local/bin/geoip-apply.sh}"
+}
+
+_geoip_update_script_path() {
+    printf '%s' "${GEOIP_UPDATE_SCRIPT:-/usr/local/bin/geoip-update.sh}"
+}
+
+_geoip_render_conf() {
+    local mode="$1" countries="$2" last_update="$3" cc
+    [[ "$mode" =~ ^(whitelist|blacklist)$ ]] || return 1
+    [[ "$last_update" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+    for cc in $countries; do
+        [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || return 1
+    done
+    printf 'GEOIP_MODE="%s"\n' "$mode"
+    printf 'GEOIP_COUNTRIES="%s"\n' "$countries"
+    printf 'GEOIP_LAST_UPDATE="%s"\n' "$last_update"
+}
+
+_geoip_write_conf() {
+    local mode="$1" countries="$2" last_update="$3" content
+    content="$(_geoip_render_conf "$mode" "$countries" "$last_update")" || return 1
+    write_private_file_atomic "$GEOIP_CONF" "$content"
+}
+
+_geoip_render_conf_last_update() {
+    local conf_file="$1" last_update="$2"
+    [[ "$last_update" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+    if [[ -f "$conf_file" ]]; then
+        awk -v last_update="$last_update" '
+            BEGIN { done=0 }
+            /^[[:space:]]*GEOIP_LAST_UPDATE[[:space:]]*=/ {
+                if (!done) print "GEOIP_LAST_UPDATE=\"" last_update "\""
+                done=1
+                next
+            }
+            { print }
+            END {
+                if (!done) print "GEOIP_LAST_UPDATE=\"" last_update "\""
+            }
+        ' "$conf_file"
+    else
+        printf 'GEOIP_LAST_UPDATE="%s"\n' "$last_update"
+    fi
+}
+
+_geoip_update_last_update() {
+    local conf_file="$1" last_update="${2:-$(date +%Y-%m-%d)}" content
+    validate_conf_file "$conf_file" || return 1
+    content="$(_geoip_render_conf_last_update "$conf_file" "$last_update")" || return 1
+    write_private_file_atomic "$conf_file" "$content"
+}
+
+_geoip_render_service_unit() {
+    local apply_script="${1:-/usr/local/bin/geoip-apply.sh}"
+    cat <<SVC_EOF
+[Unit]
+Description=GeoIP Firewall Rules
+After=network.target
+Before=ufw.service
+
+[Service]
+Type=oneshot
+ExecStart=${apply_script}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SVC_EOF
+}
+
+_geoip_install_service_unit() {
+    local service_file content
+    service_file="$(_geoip_service_file_path)"
+    content="$(_geoip_render_service_unit "$(_geoip_apply_script_path)")" || return 1
+    write_file_atomic "$service_file" "$content" || return 1
+    chmod 644 "$service_file" 2>/dev/null || true
 }
 
 _geoip_download() {
@@ -415,7 +711,7 @@ _geoip_apply() {
     local tmp_set="${set_name}_tmp"
     local set6_name="geoip_${mode}6"
     local tmp6_set="${set6_name}_tmp"
-    local total_entries=0 total6_entries=0
+    local total_entries=0 total6_entries=0 use_ip6tables=0 swapped4=0
     for cc in $countries; do
         local f="${GEOIP_DATA_DIR}/${cc,,}.zone"
         if [[ -f "$f" ]]; then
@@ -438,6 +734,7 @@ _geoip_apply() {
         print_error "检测到 IPv6 栈但缺少 ip6tables，拒绝应用 GeoIP 以避免 IPv6 绕过。"
         return 1
     fi
+    command_exists ip6tables && use_ip6tables=1
     # Bulk load into temp set
     ipset create "$tmp_set" hash:net maxelem 131072 2>/dev/null || ipset flush "$tmp_set" || return 1
     for cc in $countries; do
@@ -449,29 +746,44 @@ _geoip_apply() {
             return 1
         fi
     done
-    # Atomic swap
-    ipset create "$set_name" hash:net maxelem 131072 2>/dev/null || true
-    if ! ipset swap "$tmp_set" "$set_name"; then
-        print_error "GeoIP ipset swap 失败，保留旧集合。"
-        ipset destroy "$tmp_set" 2>/dev/null || true
-        return 1
-    fi
-    ipset destroy "$tmp_set" 2>/dev/null || true
-    if command_exists ip6tables; then
-        ipset create "$tmp6_set" hash:net family inet6 maxelem 131072 2>/dev/null || ipset flush "$tmp6_set" || return 1
+
+    if [[ "$use_ip6tables" -eq 1 ]]; then
+        if ! ipset create "$tmp6_set" hash:net family inet6 maxelem 131072 2>/dev/null && ! ipset flush "$tmp6_set"; then
+            ipset destroy "$tmp_set" 2>/dev/null || true
+            return 1
+        fi
         for cc in $countries; do
             local f6="${GEOIP_DATA_DIR}/${cc,,}.zone6"
             [[ -f "$f6" ]] || continue
             if ! sed -e '/^#/d' -e '/^$/d' -e '/:/!d' -e "s/^/add ${tmp6_set} /" "$f6" | ipset restore -exist 2>/dev/null; then
                 print_error "GeoIP 写入 IPv6 ipset 失败: ${cc}"
                 ipset destroy "$tmp6_set" 2>/dev/null || true
+                ipset destroy "$tmp_set" 2>/dev/null || true
                 return 1
             fi
         done
+    fi
+
+    # Swap only after both families have been populated. If IPv6 swap fails after
+    # IPv4 has moved, swap IPv4 back so an update failure does not half-commit.
+    ipset create "$set_name" hash:net maxelem 131072 2>/dev/null || true
+    if ! ipset swap "$tmp_set" "$set_name"; then
+        print_error "GeoIP ipset swap 失败，保留旧集合。"
+        ipset destroy "$tmp_set" 2>/dev/null || true
+        [[ "$use_ip6tables" -eq 1 ]] && ipset destroy "$tmp6_set" 2>/dev/null || true
+        return 1
+    fi
+    swapped4=1
+    if [[ "$use_ip6tables" -eq 1 ]]; then
         ipset create "$set6_name" hash:net family inet6 maxelem 131072 2>/dev/null || true
         if ! ipset swap "$tmp6_set" "$set6_name"; then
             print_error "GeoIP IPv6 ipset swap 失败，保留旧集合。"
+            if [[ "$swapped4" -eq 1 ]]; then
+                ipset swap "$tmp_set" "$set_name" 2>/dev/null || \
+                    print_warn "GeoIP IPv4 集合回滚失败，请手动检查 ipset: ${set_name}/${tmp_set}"
+            fi
             ipset destroy "$tmp6_set" 2>/dev/null || true
+            ipset destroy "$tmp_set" 2>/dev/null || true
             return 1
         fi
         ipset destroy "$tmp6_set" 2>/dev/null || true
@@ -479,6 +791,7 @@ _geoip_apply() {
             print_warn "GeoIP IPv6 数据为空；白名单模式将默认拦截公网 IPv6。"
         fi
     fi
+    ipset destroy "$tmp_set" 2>/dev/null || true
     # Build iptables chain
     iptables -N "$GEOIP_CHAIN" 2>/dev/null || iptables -F "$GEOIP_CHAIN" || return 1
     iptables -A "$GEOIP_CHAIN" -i lo -j RETURN || return 1
@@ -526,8 +839,11 @@ _geoip_clear() {
 }
 
 _geoip_install_persistence() {
+    local apply_script update_script apply_content update_content
+    apply_script="$(_geoip_apply_script_path)"
+    update_script="$(_geoip_update_script_path)"
     # Apply script (runs on boot)
-    cat > /usr/local/bin/geoip-apply.sh << 'APPLY_EOF'
+    apply_content="$(cat << 'APPLY_EOF'
 #!/bin/bash
 CONF="/etc/server-manage/geoip.conf"
 DATA="/etc/server-manage/geoip-data"
@@ -563,6 +879,8 @@ set6_name="geoip_${GEOIP_MODE}6"
 tmp6_set="${set6_name}_tmp"
 total_entries=0
 total6_entries=0
+use_ip6tables=0
+swapped4=0
 for cc in $GEOIP_COUNTRIES; do
     [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || continue
     f="${DATA}/${cc,,}.zone"
@@ -576,6 +894,7 @@ for cc in $GEOIP_COUNTRIES; do
 done
 [ "$total_entries" -gt 0 ] || exit 1
 [ -e /proc/net/if_inet6 ] && ! command -v ip6tables >/dev/null 2>&1 && exit 1
+command -v ip6tables >/dev/null 2>&1 && use_ip6tables=1
 ipset create "$tmp_set" hash:net maxelem 131072 2>/dev/null || ipset flush "$tmp_set" || exit 1
 for cc in $GEOIP_COUNTRIES; do
     [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || continue
@@ -583,21 +902,32 @@ for cc in $GEOIP_COUNTRIES; do
     [ -f "$f" ] || continue
     sed -e '/^#/d' -e '/^$/d' -e '/^[^0-9]/d' -e "s/^/add ${tmp_set} /" "$f" | ipset restore -exist 2>/dev/null || { ipset destroy "$tmp_set" 2>/dev/null || true; exit 1; }
 done
-ipset create "$set_name" hash:net maxelem 131072 2>/dev/null || true
-ipset swap "$tmp_set" "$set_name" || { ipset destroy "$tmp_set" 2>/dev/null || true; exit 1; }
-ipset destroy "$tmp_set" 2>/dev/null || true
-if command -v ip6tables >/dev/null 2>&1; then
-    ipset create "$tmp6_set" hash:net family inet6 maxelem 131072 2>/dev/null || ipset flush "$tmp6_set" || exit 1
+if [ "$use_ip6tables" -eq 1 ]; then
+    if ! ipset create "$tmp6_set" hash:net family inet6 maxelem 131072 2>/dev/null && ! ipset flush "$tmp6_set"; then
+        ipset destroy "$tmp_set" 2>/dev/null || true
+        exit 1
+    fi
     for cc in $GEOIP_COUNTRIES; do
         [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || continue
         f6="${DATA}/${cc,,}.zone6"
         [ -f "$f6" ] || continue
-        sed -e '/^#/d' -e '/^$/d' -e '/:/!d' -e "s/^/add ${tmp6_set} /" "$f6" | ipset restore -exist 2>/dev/null || { ipset destroy "$tmp6_set" 2>/dev/null || true; exit 1; }
+        sed -e '/^#/d' -e '/^$/d' -e '/:/!d' -e "s/^/add ${tmp6_set} /" "$f6" | ipset restore -exist 2>/dev/null || { ipset destroy "$tmp6_set" 2>/dev/null || true; ipset destroy "$tmp_set" 2>/dev/null || true; exit 1; }
     done
+fi
+ipset create "$set_name" hash:net maxelem 131072 2>/dev/null || true
+ipset swap "$tmp_set" "$set_name" || { ipset destroy "$tmp_set" 2>/dev/null || true; [ "$use_ip6tables" -eq 1 ] && ipset destroy "$tmp6_set" 2>/dev/null || true; exit 1; }
+swapped4=1
+if [ "$use_ip6tables" -eq 1 ]; then
     ipset create "$set6_name" hash:net family inet6 maxelem 131072 2>/dev/null || true
-    ipset swap "$tmp6_set" "$set6_name" || { ipset destroy "$tmp6_set" 2>/dev/null || true; exit 1; }
+    if ! ipset swap "$tmp6_set" "$set6_name"; then
+        [ "$swapped4" -eq 1 ] && ipset swap "$tmp_set" "$set_name" 2>/dev/null || true
+        ipset destroy "$tmp6_set" 2>/dev/null || true
+        ipset destroy "$tmp_set" 2>/dev/null || true
+        exit 1
+    fi
     ipset destroy "$tmp6_set" 2>/dev/null || true
 fi
+ipset destroy "$tmp_set" 2>/dev/null || true
 iptables -N "$CHAIN" 2>/dev/null || iptables -F "$CHAIN" || exit 1
 iptables -A "$CHAIN" -i lo -j RETURN || exit 1
 iptables -A "$CHAIN" -s 127.0.0.0/8 -j RETURN || exit 1
@@ -628,9 +958,11 @@ if command -v ip6tables >/dev/null 2>&1; then
     ip6tables -C INPUT -j "$CHAIN6" 2>/dev/null || ip6tables -I INPUT 1 -j "$CHAIN6" || exit 1
 fi
 APPLY_EOF
-    chmod 700 /usr/local/bin/geoip-apply.sh
+)"
+    write_file_atomic "$apply_script" "$apply_content" || return 1
+    chmod 700 "$apply_script"
     # Update script (cron weekly)
-    cat > /usr/local/bin/geoip-update.sh << 'UPDATE_EOF'
+    update_content="$(cat << 'UPDATE_EOF'
 #!/bin/bash
 CONF="/etc/server-manage/geoip.conf"
 DATA="/etc/server-manage/geoip-data"
@@ -685,30 +1017,44 @@ for cc in $GEOIP_COUNTRIES; do
     fi
 done
 /usr/local/bin/geoip-apply.sh || exit 1
-sed -i "s/^GEOIP_LAST_UPDATE=.*/GEOIP_LAST_UPDATE=\"$(date +%Y-%m-%d)\"/" "$CONF"
+update_last_update() {
+    last_update="$(date +%Y-%m-%d)"
+    [[ "$last_update" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || exit 1
+    dir="$(dirname "$CONF")"
+    tmp="$(mktemp "${dir}/.tmp.server-manage.geoip.XXXXXX")" || exit 1
+    if awk -v last_update="$last_update" '
+        BEGIN { done=0 }
+        /^[[:space:]]*GEOIP_LAST_UPDATE[[:space:]]*=/ {
+            if (!done) print "GEOIP_LAST_UPDATE=\"" last_update "\""
+            done=1
+            next
+        }
+        { print }
+        END {
+            if (!done) print "GEOIP_LAST_UPDATE=\"" last_update "\""
+        }
+    ' "$CONF" > "$tmp"; then
+        chmod 600 "$tmp" 2>/dev/null || true
+        chown root:root "$tmp" 2>/dev/null || true
+        mv "$tmp" "$CONF" || { rm -f "$tmp"; exit 1; }
+    else
+        rm -f "$tmp"
+        exit 1
+    fi
+}
+update_last_update
 UPDATE_EOF
-    chmod 700 /usr/local/bin/geoip-update.sh
+)"
+    write_file_atomic "$update_script" "$update_content" || return 1
+    chmod 700 "$update_script"
     # Systemd boot service
     if is_systemd; then
-        cat > /etc/systemd/system/geoip-firewall.service << 'SVC_EOF'
-[Unit]
-Description=GeoIP Firewall Rules
-After=network.target
-Before=ufw.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/geoip-apply.sh
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-SVC_EOF
-        systemctl daemon-reload
-        systemctl enable geoip-firewall >/dev/null 2>&1
+        _geoip_install_service_unit || return 1
+        systemctl daemon-reload || return 1
+        systemctl enable geoip-firewall >/dev/null 2>&1 || return 1
     fi
     # Weekly cron (Sunday 04:00)
-    cron_add_job "geoip-update.sh" "0 4 * * 0 /usr/local/bin/geoip-update.sh >/dev/null 2>&1"
+    cron_add_job "$(basename "$update_script")" "0 4 * * 0 ${update_script} >/dev/null 2>&1"
 }
 
 geoip_setup() {
@@ -790,20 +1136,29 @@ geoip_setup() {
         local f="${GEOIP_DATA_DIR}/${cc,,}.zone"
         [[ -f "$f" ]] && total=$((total + $(grep -c '^[0-9]' "$f" 2>/dev/null)))
     done
-    mkdir -p "$GEOIP_CONF_DIR"
-    cat > "$GEOIP_CONF" << EOF
-GEOIP_MODE="$mode"
-GEOIP_COUNTRIES="$countries"
-GEOIP_LAST_UPDATE="$(date +%Y-%m-%d)"
-EOF
-    chmod 600 "$GEOIP_CONF"
-    _geoip_install_persistence
-    print_success "GeoIP 规则已生效！"
+    if ! _geoip_write_conf "$mode" "$countries" "$(date +%Y-%m-%d)"; then
+        print_error "GeoIP 配置写入失败，未安装持久化任务。"
+        pause; return 1
+    fi
+    local persistence_ok=1
+    if ! _geoip_install_persistence; then
+        persistence_ok=0
+        print_warn "GeoIP 当前规则已生效，但持久化/自动更新任务安装失败。"
+        print_warn "请检查文件权限、crontab 或 systemd 状态；重启后规则可能不会自动恢复。"
+    fi
+    print_success "GeoIP 当前规则已生效！"
     echo "  模式: $([[ "$mode" == "whitelist" ]] && echo "白名单" || echo "黑名单")"
     echo "  国家: $countries"
     echo "  IP段: ${total} 条"
-    echo "  自动更新: 每周日 04:00"
-    log_action "GeoIP configured: mode=$mode countries=$countries entries=$total"
+    if [[ "$persistence_ok" -eq 1 ]]; then
+        echo "  自动更新: 每周日 04:00"
+        log_action "GeoIP configured: mode=$mode countries=$countries entries=$total"
+    else
+        echo "  自动更新: 未安装成功"
+        log_action "GeoIP configured without persistence: mode=$mode countries=$countries entries=$total"
+        pause
+        return 1
+    fi
     pause
 }
 
@@ -857,7 +1212,10 @@ geoip_update() {
             print_error "GeoIP 规则重新加载失败，已保留旧规则"
             pause; return 1
         fi
-        sed -i "s/^GEOIP_LAST_UPDATE=.*/GEOIP_LAST_UPDATE=\"$(date +%Y-%m-%d)\"/" "$GEOIP_CONF"
+        if ! _geoip_update_last_update "$GEOIP_CONF"; then
+            print_error "GeoIP 更新时间写入失败"
+            pause; return 1
+        fi
         print_success "更新完成"
         log_action "GeoIP data updated: $GEOIP_COUNTRIES"
     else
@@ -876,11 +1234,11 @@ geoip_disable() {
     _geoip_clear
     rm -f "$GEOIP_CONF"
     rm -rf "$GEOIP_DATA_DIR"
-    rm -f /usr/local/bin/geoip-apply.sh /usr/local/bin/geoip-update.sh
-    cron_remove_job "geoip-update.sh"
+    rm -f "$(_geoip_apply_script_path)" "$(_geoip_update_script_path)"
+    cron_remove_job "$(basename "$(_geoip_update_script_path)")"
     if is_systemd; then
         systemctl disable geoip-firewall 2>/dev/null || true
-        rm -f /etc/systemd/system/geoip-firewall.service
+        rm -f "$(_geoip_service_file_path)"
         systemctl daemon-reload
     fi
     print_success "GeoIP 已禁用，所有规则已清除。"

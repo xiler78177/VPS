@@ -1,5 +1,13 @@
 #!/bin/bash
 # 集成示例：如何将 reality-sni-speedtest-enhancement.sh 整合到 15-singbox-reality.sh
+#
+# This file is documentation with syntax-checked shell snippets. It must be
+# inert when executed or sourced, because later examples include /etc writes.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    echo "integration-example.sh is a documentation example; read it, do not execute it."
+    exit 0
+fi
+return 0
 
 # ============================================================================
 # 方案 1：完全替换（推荐）

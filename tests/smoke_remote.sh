@@ -3,17 +3,22 @@
 set -u
 
 BUILT="/tmp/v4-built.sh"
-LIB="/tmp/v4-lib.sh"
-WORK="/tmp/vps-smoke"
+WORK=$(mktemp -d)
+LIB="$WORK/v4-lib.sh"
+PWNED_MARKER="$WORK/PWNED_BY_SSH_EVAL"
 PASS=0; FAIL=0
+
+cleanup() {
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
 
 pass() { echo "  [PASS] $1"; PASS=$((PASS+1)); }
 fail() { echo "  [FAIL] $1"; FAIL=$((FAIL+1)); }
 
 # 把构建产物末行 main "$@" 去掉，得到纯函数库
+mkdir -p "$WORK"
 head -n -1 "$BUILT" > "$LIB"
-
-rm -rf "$WORK"; mkdir -p "$WORK"
 export CONFIG_FILE="$WORK/none.conf"   # 防止 01-utils.sh 末尾真去读 /etc/server-manage.conf
 
 # init_environment 会装包，绕过：临时把 install_package / auto_deps 变 noop
@@ -95,24 +100,24 @@ validate_conf_file "$WORK/t9_badline.conf" 2>/dev/null && fail "应拒绝非 KEY
 
 echo ""
 echo "== Test 2: SSH 数组调用防注入 =="
-rm -f /tmp/PWNED_BY_SSH_EVAL
+rm -f "$PWNED_MARKER"
 # 直接调用 ssh_keys 选项 4 不方便，单独验证：用同样的数组写法跑一次
 # 模拟旧 eval 行为应被注入，新数组写法不会
 KEYFILE="$WORK/idtest"
-EVIL='"; touch /tmp/PWNED_BY_SSH_EVAL; "'
+EVIL="\"; touch $PWNED_MARKER; \""
 
 # 新写法（与 06-ssh.sh 当前实现一致）
 args=(ssh-keygen -t ed25519 -f "$KEYFILE" -N "" -C "$EVIL" -q)
 "${args[@]}" 2>/dev/null
 
-if [[ -f /tmp/PWNED_BY_SSH_EVAL ]]; then
+if [[ -f "$PWNED_MARKER" ]]; then
     fail "注入成功 — 数组调用没保护住"
-    rm -f /tmp/PWNED_BY_SSH_EVAL
+    rm -f "$PWNED_MARKER"
 else
     pass "数组调用未被注入"
 fi
 # 验证生成的 key 确实带了恶意备注做字面量
-if grep -qF '"; touch /tmp/PWNED_BY_SSH_EVAL; "' "$KEYFILE.pub" 2>/dev/null; then
+if grep -qF "$EVIL" "$KEYFILE.pub" 2>/dev/null; then
     pass "恶意备注作为字面量写入公钥"
 else
     fail "公钥中未保留字面量备注"
@@ -122,33 +127,32 @@ rm -f "$KEYFILE" "$KEYFILE.pub"
 echo ""
 echo "== Test 3: firewall_apply_reality_port (UFW active) =="
 TESTPORT=64999
-if [[ $NON_ROOT -eq 1 ]]; then
-    PLATFORM="debian"
-    MOCK_UFW_RULES="$WORK/ufw.rules"
-    : > "$MOCK_UFW_RULES"
-    ufw() {
-        case "${1:-}" in
-            status)
-                echo "Status: active"
-                cat "$MOCK_UFW_RULES" 2>/dev/null
-                ;;
-            allow)
-                printf '%s ALLOW Anywhere\n' "${2:-}" >> "$MOCK_UFW_RULES"
-                ;;
-            delete)
-                if [[ "${2:-}" == "allow" ]]; then
-                    grep -vE "^${3:-}[[:space:]]" "$MOCK_UFW_RULES" > "${MOCK_UFW_RULES}.tmp" 2>/dev/null || true
-                    mv "${MOCK_UFW_RULES}.tmp" "$MOCK_UFW_RULES"
-                fi
-                ;;
-            *) return 0 ;;
-        esac
-    }
-fi
+# shellcheck disable=SC2034  # read dynamically by sourced helpers
+PLATFORM="debian"
+MOCK_UFW_RULES="$WORK/ufw.rules"
+: > "$MOCK_UFW_RULES"
+ufw() {
+    case "${1:-}" in
+        status)
+            echo "Status: active"
+            cat "$MOCK_UFW_RULES" 2>/dev/null
+            ;;
+        allow)
+            printf '%s ALLOW Anywhere\n' "${2:-}" >> "$MOCK_UFW_RULES"
+            ;;
+        delete)
+            if [[ "${2:-}" == "allow" ]]; then
+                grep -vE "^${3:-}[[:space:]]" "$MOCK_UFW_RULES" > "${MOCK_UFW_RULES}.tmp" 2>/dev/null || true
+                mv "${MOCK_UFW_RULES}.tmp" "$MOCK_UFW_RULES"
+            fi
+            ;;
+        *) return 0 ;;
+    esac
+}
 # 确保起始无该规则
-ufw delete allow ${TESTPORT}/tcp >/dev/null 2>&1
+ufw delete allow "${TESTPORT}/tcp" >/dev/null 2>&1
 
-firewall_apply_reality_port $TESTPORT
+firewall_apply_reality_port "$TESTPORT"
 rc=$?
 echo "  返回码: $rc (期望 0)"
 if [[ $rc -eq 0 ]] && ufw status 2>/dev/null | grep -qE "^${TESTPORT}/tcp\s+ALLOW"; then
@@ -157,7 +161,7 @@ else
     fail "UFW active 路径未生效"
 fi
 # 还原
-ufw delete allow ${TESTPORT}/tcp >/dev/null 2>&1
+ufw delete allow "${TESTPORT}/tcp" >/dev/null 2>&1
 if ! ufw status 2>/dev/null | grep -qE "^${TESTPORT}/tcp\s+ALLOW"; then
     pass "测试端口已清理"
 else
@@ -184,6 +188,4 @@ fi
 echo ""
 echo "== 结果 =="
 echo "  PASS=$PASS  FAIL=$FAIL"
-# 清理
-rm -rf "$WORK" "$LIB"
 exit $FAIL

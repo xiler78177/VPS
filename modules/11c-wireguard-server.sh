@@ -1,4 +1,303 @@
 # modules/11c-wireguard-server.sh - WireGuard server install/control/uninstall (OpenWrt)
+_wg_openwrt_rc_local_path() {
+    printf '%s' "${WG_OPENWRT_RC_LOCAL_FILE:-/etc/rc.local}"
+}
+
+_wg_openwrt_delete_allow_port_rules() {
+    local h
+    for h in $(nft -a list chain inet fw4 input_wan 2>/dev/null | grep 'wg_allow_port' | awk '{print $NF}'); do
+        nft delete rule inet fw4 input_wan handle "$h" 2>/dev/null || true
+    done
+}
+
+_wg_openwrt_delete_allow_port_rules_matching() {
+    local want="${1:-}" mode="${2:-match}" h
+    validate_port "$want" || return 1
+    for h in $(nft -a list chain inet fw4 input_wan 2>/dev/null | awk -v want="$want" -v mode="$mode" '
+        /wg_allow_port/ {
+            dport = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i == "dport") dport = $(i + 1)
+            }
+            if ((mode == "match" && dport == want) || (mode == "except" && dport != want)) print $NF
+        }
+    '); do
+        nft delete rule inet fw4 input_wan handle "$h" 2>/dev/null || true
+    done
+}
+
+_wg_openwrt_list_wireguard_ifaces() {
+    ip link show type wireguard 2>/dev/null | awk '
+        /^[0-9]+:/ {
+            name=$0
+            sub(/^[0-9]+:[[:space:]]*/, "", name)
+            sub(/:.*/, "", name)
+            sub(/@.*/, "", name)
+            current=name
+            next
+        }
+        /link\/none/ && current != "" {
+            print current
+            current=""
+        }
+    '
+}
+
+_wg_openwrt_allow_port_handles() {
+    local want="${1:-}"
+    validate_port "$want" || return 1
+    nft -a list chain inet fw4 input_wan 2>/dev/null | awk -v want="$want" '
+        /wg_allow_port/ {
+            dport = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i == "dport") dport = $(i + 1)
+            }
+            if (dport == want) print $NF
+        }
+    '
+}
+
+_wg_openwrt_persist_allow_port() {
+    local port="${1:-}"
+    validate_port "$port" || { print_error "WireGuard UDP 端口无效: $port"; return 1; }
+    local snapshot_dir snapshot
+    snapshot_dir=$(mktemp -d "${TMPDIR:-/tmp}/${SCRIPT_NAME}-wg-fw.XXXXXX") || {
+        print_error "创建 OpenWrt firewall UCI 快照目录失败"
+        return 1
+    }
+    chmod 700 "$snapshot_dir" 2>/dev/null || true
+    snapshot="${snapshot_dir}/firewall.uci"
+    if ! uci export firewall > "$snapshot" 2>/dev/null; then
+        rm -rf "$snapshot_dir" 2>/dev/null || true
+        print_error "备份 OpenWrt firewall UCI 配置失败"
+        return 1
+    fi
+    if ! _wg_openwrt_write_allow_port_uci "$port"; then
+        print_error "OpenWrt 防火墙持久化放行 ${port}/udp 失败"
+        _wg_openwrt_restore_uci_package firewall "$snapshot" || true
+        rm -rf "$snapshot_dir" 2>/dev/null || true
+        return 1
+    fi
+    rm -rf "$snapshot_dir" 2>/dev/null || true
+}
+
+_wg_openwrt_write_allow_port_uci() {
+    local port="${1:-}"
+    validate_port "$port" || return 1
+    uci set firewall.wg_allow_port=rule || return 1
+    uci set firewall.wg_allow_port.name='Allow-WG-UDP' || return 1
+    uci set firewall.wg_allow_port.src='wan' || return 1
+    uci set firewall.wg_allow_port.dest_port="$port" || return 1
+    uci set firewall.wg_allow_port.proto='udp' || return 1
+    uci set firewall.wg_allow_port.target='ACCEPT' || return 1
+    uci commit firewall || return 1
+}
+
+_wg_openwrt_write_allow_port_rc_local() {
+    local port="${1:-}" rc_block rc_file
+    validate_port "$port" || return 1
+    rc_file="$(_wg_openwrt_rc_local_path)"
+    _wg_rc_local_cleanup_managed_entries allow-port "$rc_file" || return 1
+    rc_block="# BEGIN server-manage wireguard allow-port\nnft insert rule inet fw4 input_wan udp dport ${port} counter accept comment \\\"wg_allow_port\\\" 2>/dev/null || true # wg_allow_port\n# END server-manage wireguard allow-port"
+    _wg_rc_local_insert_block "$rc_block" "$rc_file"
+}
+
+_wg_openwrt_apply_allow_port() {
+    local port="${1:-}" before_handles after_handles h
+    validate_port "$port" || { print_error "WireGuard UDP 端口无效: $port"; return 1; }
+    if ! nft list chain inet fw4 input_wan >/dev/null 2>&1; then
+        print_error "OpenWrt fw4 input_wan 链不存在，无法实时放行 ${port}/udp"
+        return 1
+    fi
+    before_handles=$(_wg_openwrt_allow_port_handles "$port" 2>/dev/null || true)
+    if ! nft insert rule inet fw4 input_wan udp dport "$port" counter accept comment "wg_allow_port" 2>/dev/null; then
+        print_error "OpenWrt nft 实时放行 ${port}/udp 失败"
+        return 1
+    fi
+    if ! _wg_openwrt_persist_allow_port "$port"; then
+        after_handles=$(_wg_openwrt_allow_port_handles "$port" 2>/dev/null || true)
+        for h in $after_handles; do
+            printf '%s\n' "$before_handles" | grep -Fxq -- "$h" || nft delete rule inet fw4 input_wan handle "$h" 2>/dev/null || true
+        done
+        return 1
+    fi
+    for h in $before_handles; do
+        nft delete rule inet fw4 input_wan handle "$h" 2>/dev/null || true
+    done
+    _wg_openwrt_delete_allow_port_rules_matching "$port" except
+    _wg_openwrt_write_allow_port_rc_local "$port" || print_warn "写入 /etc/rc.local 端口放行规则失败"
+    return 0
+}
+
+_wg_openwrt_rollback_server_modify() {
+    local old_port="${1:-}" old_dns="${2:-}" old_ep="${3:-}" old_lan="${4:-}" port_firewall_changed="${5:-false}"
+    validate_port "$old_port" || return 1
+    if [[ "$port_firewall_changed" == "true" ]]; then
+        _wg_openwrt_apply_allow_port "$old_port" >/dev/null 2>&1 || print_warn "回滚 OpenWrt 防火墙端口到 ${old_port}/udp 失败，请手动检查"
+    fi
+    if ! wg_db_set --argjson p "$old_port" \
+                  --arg d "$old_dns" \
+                  --arg e "$old_ep" \
+                  --arg l "${old_lan:-}" \
+                  '.server.port = $p | .server.dns = $d | .server.endpoint = $e | .server.server_lan_subnet = $l' >/dev/null 2>&1; then
+        print_warn "回滚 WireGuard 服务端数据库失败，请手动检查"
+        return 1
+    fi
+    _wg_update_peer_routes >/dev/null 2>&1 || true
+    wg_rebuild_uci_conf >/dev/null 2>&1 || true
+    wg_rebuild_conf >/dev/null 2>&1 || true
+    wg_regenerate_client_confs >/dev/null 2>&1 || true
+}
+
+_wg_openwrt_configure_server_uci() {
+    local server_privkey="${1:-}" server_ip="${2:-}" wg_mask="${3:-}" wg_port="${4:-}" mtu="${5:-}"
+    local snapshot_dir network_snapshot firewall_snapshot
+    snapshot_dir=$(mktemp -d "${TMPDIR:-/tmp}/${SCRIPT_NAME}-wg-server-uci.XXXXXX") || {
+        print_error "创建 OpenWrt UCI 配置快照目录失败"
+        return 1
+    }
+    chmod 700 "$snapshot_dir" 2>/dev/null || true
+    network_snapshot="${snapshot_dir}/network.uci"
+    firewall_snapshot="${snapshot_dir}/firewall.uci"
+    if ! uci export network > "$network_snapshot" 2>/dev/null; then
+        rm -rf "$snapshot_dir" 2>/dev/null || true
+        print_error "备份 OpenWrt network UCI 配置失败"
+        return 1
+    fi
+    if ! uci export firewall > "$firewall_snapshot" 2>/dev/null; then
+        rm -rf "$snapshot_dir" 2>/dev/null || true
+        print_error "备份 OpenWrt firewall UCI 配置失败"
+        return 1
+    fi
+    if ! _wg_openwrt_write_server_uci "$server_privkey" "$server_ip" "$wg_mask" "$wg_port" "$mtu"; then
+        print_error "OpenWrt 网络/防火墙 UCI 配置提交失败"
+        _wg_openwrt_restore_uci_package network "$network_snapshot" || true
+        _wg_openwrt_restore_uci_package firewall "$firewall_snapshot" || true
+        rm -rf "$snapshot_dir" 2>/dev/null || true
+        return 1
+    fi
+    rm -rf "$snapshot_dir" 2>/dev/null || true
+}
+
+_wg_openwrt_write_server_uci() {
+    local server_privkey="${1:-}" server_ip="${2:-}" wg_mask="${3:-}" wg_port="${4:-}" mtu="${5:-}"
+    uci set network.wg0=interface || return 1
+    uci set network.wg0.proto='wireguard' || return 1
+    uci set network.wg0.private_key="$server_privkey" || return 1
+    uci -q delete network.wg0.addresses 2>/dev/null || true
+    uci add_list network.wg0.addresses="${server_ip}/${wg_mask}" || return 1
+    uci set network.wg0.listen_port="$wg_port" || return 1
+    uci set network.wg0.mtu="$mtu" || return 1
+    uci set network.wg0.route_allowed_ips='1' || return 1
+
+    uci set firewall.wg_zone=zone || return 1
+    uci set firewall.wg_zone.name='wg' || return 1
+    uci set firewall.wg_zone.input='ACCEPT' || return 1
+    uci set firewall.wg_zone.output='ACCEPT' || return 1
+    uci set firewall.wg_zone.forward='ACCEPT' || return 1
+    uci set firewall.wg_zone.masq='1' || return 1
+    uci -q delete firewall.wg_zone.network 2>/dev/null || true
+    uci add_list firewall.wg_zone.network='wg0' || return 1
+    uci set firewall.wg_fwd_lan=forwarding || return 1
+    uci set firewall.wg_fwd_lan.src='lan' || return 1
+    uci set firewall.wg_fwd_lan.dest='wg' || return 1
+    uci set firewall.wg_fwd_wg=forwarding || return 1
+    uci set firewall.wg_fwd_wg.src='wg' || return 1
+    uci set firewall.wg_fwd_wg.dest='lan' || return 1
+
+    uci commit network || return 1
+    uci commit firewall || return 1
+}
+
+_wg_openwrt_snapshot_file() {
+    local src="${1:-}" dst="${2:-}" marker="${3:-}"
+    [[ -n "$src" && -n "$dst" && -n "$marker" ]] || return 1
+    [[ -e "$src" ]] || return 0
+    mkdir -p "$(dirname "$dst")" || return 1
+    cp -p "$src" "$dst" || return 1
+    : > "$marker"
+}
+
+_wg_openwrt_restore_snapshot_file() {
+    local dst="${1:-}" snap="${2:-}" marker="${3:-}"
+    [[ -n "$dst" && -n "$snap" && -n "$marker" ]] || return 0
+    if [[ -f "$marker" ]]; then
+        mkdir -p "$(dirname "$dst")" 2>/dev/null || true
+        cp -p "$snap" "$dst" 2>/dev/null || print_warn "恢复 $dst 失败，请手动检查。"
+    else
+        rm -f "$dst" 2>/dev/null || print_warn "删除新建文件 $dst 失败，请手动检查。"
+    fi
+}
+
+_wg_openwrt_snapshot_server_install() {
+    local snapshot_dir="${1:-}" rc_file sysctl_conf
+    [[ -n "$snapshot_dir" ]] || return 1
+    mkdir -p "$snapshot_dir" || return 1
+    if ! uci export network > "${snapshot_dir}/network.uci" 2>/dev/null; then
+        print_error "备份 OpenWrt network UCI 配置失败"
+        return 1
+    fi
+    if ! uci export firewall > "${snapshot_dir}/firewall.uci" 2>/dev/null; then
+        print_error "备份 OpenWrt firewall UCI 配置失败"
+        return 1
+    fi
+    rc_file="$(_wg_openwrt_rc_local_path)"
+    _wg_openwrt_snapshot_file "$WG_DB_FILE" "${snapshot_dir}/db" "${snapshot_dir}/db.exists" || return 1
+    _wg_openwrt_snapshot_file "$WG_ROLE_FILE" "${snapshot_dir}/role" "${snapshot_dir}/role.exists" || return 1
+    _wg_openwrt_snapshot_file "$WG_CONF" "${snapshot_dir}/conf" "${snapshot_dir}/conf.exists" || return 1
+    _wg_openwrt_snapshot_file "$WG_SHARED_ROUTE_STATE_FILE" "${snapshot_dir}/routes" "${snapshot_dir}/routes.exists" || return 1
+    _wg_openwrt_snapshot_file "$rc_file" "${snapshot_dir}/rc.local" "${snapshot_dir}/rc.local.exists" || return 1
+    sysctl_conf="$(_sysctl_conf_path)"
+    _wg_openwrt_snapshot_file "$sysctl_conf" "${snapshot_dir}/sysctl.conf" "${snapshot_dir}/sysctl.exists" || return 1
+    sysctl -n net.ipv4.ip_forward > "${snapshot_dir}/ip_forward.runtime" 2>/dev/null || true
+}
+
+_wg_openwrt_restore_uci_package() {
+    local pkg="${1:-}" snapshot="${2:-}"
+    [[ -n "$pkg" && -s "$snapshot" ]] || return 0
+    uci revert "$pkg" >/dev/null 2>&1 || true
+    if ! uci import "$pkg" < "$snapshot" >/dev/null 2>&1; then
+        print_warn "恢复 OpenWrt ${pkg} UCI 配置失败，请手动检查。"
+        return 1
+    fi
+    if ! uci commit "$pkg" >/dev/null 2>&1; then
+        print_warn "提交恢复后的 OpenWrt ${pkg} UCI 配置失败，请手动检查。"
+        return 1
+    fi
+}
+
+_wg_openwrt_rollback_server_install() {
+    local snapshot_dir="${1:-}" rollback_forward="${2:-false}" rc_file sysctl_conf ip_forward_runtime
+    [[ -n "$snapshot_dir" ]] || return 0
+    ifdown wg0 2>/dev/null || true
+    wg_mihomo_bypass_clean >/dev/null 2>&1 || true
+    _wg_openwrt_delete_allow_port_rules >/dev/null 2>&1 || true
+    rc_file="$(_wg_openwrt_rc_local_path)"
+    _wg_rc_local_cleanup_managed_entries all "$rc_file" >/dev/null 2>&1 || true
+
+    _wg_openwrt_restore_uci_package network "${snapshot_dir}/network.uci" || true
+    _wg_openwrt_restore_uci_package firewall "${snapshot_dir}/firewall.uci" || true
+    /etc/init.d/network reload >/dev/null 2>&1 || true
+    /etc/init.d/firewall reload >/dev/null 2>&1 || true
+
+    _wg_openwrt_restore_snapshot_file "$WG_DB_FILE" "${snapshot_dir}/db" "${snapshot_dir}/db.exists"
+    _wg_openwrt_restore_snapshot_file "$WG_ROLE_FILE" "${snapshot_dir}/role" "${snapshot_dir}/role.exists"
+    _wg_openwrt_restore_snapshot_file "$WG_CONF" "${snapshot_dir}/conf" "${snapshot_dir}/conf.exists"
+    _wg_openwrt_restore_snapshot_file "$WG_SHARED_ROUTE_STATE_FILE" "${snapshot_dir}/routes" "${snapshot_dir}/routes.exists"
+    _wg_openwrt_restore_snapshot_file "$rc_file" "${snapshot_dir}/rc.local" "${snapshot_dir}/rc.local.exists"
+    if [[ "$rollback_forward" == "true" ]]; then
+        sysctl_conf="$(_sysctl_conf_path)"
+        _wg_openwrt_restore_snapshot_file "$sysctl_conf" "${snapshot_dir}/sysctl.conf" "${snapshot_dir}/sysctl.exists"
+        ip_forward_runtime=$(cat "${snapshot_dir}/ip_forward.runtime" 2>/dev/null || true)
+        if [[ "$ip_forward_runtime" =~ ^[01]$ ]]; then
+            sysctl -w "net.ipv4.ip_forward=${ip_forward_runtime}" >/dev/null 2>&1 || true
+        elif [[ -f "$sysctl_conf" ]]; then
+            sysctl -p "$sysctl_conf" >/dev/null 2>&1 || true
+        fi
+    fi
+    rmdir "$(dirname "$WG_CONF")" 2>/dev/null || true
+}
+
 wg_server_install() {
     print_title "安装 WireGuard 服务端"
     if wg_is_installed && [[ "$(wg_get_role)" == "server" ]]; then
@@ -19,19 +318,32 @@ wg_server_install() {
     print_info "[2/7] 安装软件包..."
     wg_install_packages || { pause; return 1; }
 
+    local wg_install_snapshot_dir=""
+    local wg_forward_changed=false
+    wg_install_snapshot_dir=$(mktemp -d "${TMPDIR:-/tmp}/${SCRIPT_NAME}-wg-openwrt-install.XXXXXX") || {
+        print_error "创建 OpenWrt 安装回滚快照目录失败"
+        pause; return 1
+    }
+    if ! _wg_openwrt_snapshot_server_install "$wg_install_snapshot_dir"; then
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
+
     # ── [3/7] 配置 IP 转发 ──
     print_info "[3/7] 配置 IP 转发..."
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
-    if ! grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null; then
-        sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf 2>/dev/null
-        echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+    if ! _sysctl_enable_wireguard_forward; then
+        print_error "IP 转发配置失败"
+        _wg_openwrt_rollback_server_install "$wg_install_snapshot_dir" "$wg_forward_changed"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
     fi
+    wg_forward_changed=true
     print_success "IP 转发已开启"
 
     # ── [4/7] 配置服务端参数 ──
     print_info "[4/7] 配置服务端参数..."
 
-    local wg_port listen_addr mtu wg_dns wg_endpoint
+    local wg_port listen_addr mtu wg_dns wg_endpoint=""
     local wg_subnet="10.66.66.0/24"
     listen_addr="0.0.0.0"
     mtu=$WG_MTU_DIRECT
@@ -67,7 +379,7 @@ wg_server_install() {
     # 服务端 LAN 子网 (自动检测 br-lan)
     local server_lan_subnet=""
     local br_lan_addr
-    br_lan_addr=$(ip -4 addr show br-lan 2>/dev/null | grep -oP 'inet \K[0-9.]+/[0-9]+' | head -1)
+    br_lan_addr=$(ip -4 addr show br-lan 2>/dev/null | awk '/^[[:space:]]*inet[[:space:]]/ { print $2; exit }')
     if [[ -n "$br_lan_addr" ]]; then
         # 从 br-lan 地址推算网段 (如 10.10.100.1/24 → 10.10.100.0/24)
         local lan_ip lan_mask lan_prefix
@@ -118,12 +430,24 @@ wg_server_install() {
             done
         fi
     fi
+    if ! wg_endpoint=$(wg_shared_normalize_endpoint_host "$wg_endpoint"); then
+        print_error "公网端点无效，仅支持 IP 或域名"
+        _wg_openwrt_rollback_server_install "$wg_install_snapshot_dir" "$wg_forward_changed"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
 
     # ── [5/7] 生成密钥 ──
     print_info "[5/7] 生成服务端密钥..."
     local server_privkey server_pubkey
     server_privkey=$(wg genkey)
     server_pubkey=$(echo "$server_privkey" | wg pubkey)
+    if [[ -z "$server_privkey" || -z "$server_pubkey" ]]; then
+        print_error "WireGuard 服务端密钥生成失败"
+        _wg_openwrt_rollback_server_install "$wg_install_snapshot_dir" "$wg_forward_changed"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
     print_success "密钥已生成"
 
     # 服务器名称
@@ -135,20 +459,41 @@ wg_server_install() {
 
     # ── [6/7] 写入数据库 + 配置 OpenWrt 网络和防火墙 ──
     print_info "[6/7] 写入配置..."
-    wg_db_init
-    wg_set_role "server"
-    wg_db_set --arg sname "$server_name" \
-              --arg pk "$server_privkey" \
-              --arg pub "$server_pubkey" \
-              --arg ip "$server_ip" \
-              --arg sub "$wg_subnet" \
-              --arg port "$wg_port" \
-              --arg dns "$wg_dns" \
-              --arg ep "$wg_endpoint" \
-              --arg laddr "$listen_addr" \
-              --argjson mtu "$mtu" \
-              --arg ddns "${ddns_domain:-}" \
-              --arg lan "${server_lan_subnet:-}" \
+    # 配置 uci 网络接口
+    print_info "配置 OpenWrt 网络接口..."
+    local wg_mask
+    wg_mask=$(echo "$wg_subnet" | cut -d'/' -f2)
+    if ! _wg_openwrt_configure_server_uci "$server_privkey" "$server_ip" "$wg_mask" "$wg_port" "$mtu"; then
+        _wg_openwrt_rollback_server_install "$wg_install_snapshot_dir" "$wg_forward_changed"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
+
+    print_info "配置 OpenWrt 防火墙端口..."
+    if ! _wg_openwrt_apply_allow_port "$wg_port"; then
+        _wg_openwrt_rollback_server_install "$wg_install_snapshot_dir" "$wg_forward_changed"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
+
+    if ! wg_db_init; then
+        print_error "WireGuard 数据库初始化失败"
+        _wg_openwrt_rollback_server_install "$wg_install_snapshot_dir" "$wg_forward_changed"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
+    if ! wg_db_set --arg sname "$server_name" \
+                   --arg pk "$server_privkey" \
+                   --arg pub "$server_pubkey" \
+                   --arg ip "$server_ip" \
+                   --arg sub "$wg_subnet" \
+                   --arg port "$wg_port" \
+                   --arg dns "$wg_dns" \
+                   --arg ep "$wg_endpoint" \
+                   --arg laddr "$listen_addr" \
+                   --argjson mtu "$mtu" \
+                   --arg ddns "${ddns_domain:-}" \
+                   --arg lan "${server_lan_subnet:-}" \
     '.server = {
         name: $sname,
         private_key: $pk,
@@ -162,69 +507,54 @@ wg_server_install() {
         mtu: $mtu,
         ddns_domain: $ddns,
         server_lan_subnet: $lan
-    } | .schema_version = 2'
-
-    # 配置 uci 网络接口
-    print_info "配置 OpenWrt 网络接口..."
-    local wg_mask
-    wg_mask=$(echo "$wg_subnet" | cut -d'/' -f2)
-    uci set network.wg0=interface
-    uci set network.wg0.proto='wireguard'
-    uci set network.wg0.private_key="$server_privkey"
-    uci -q delete network.wg0.addresses 2>/dev/null
-    uci add_list network.wg0.addresses="${server_ip}/${wg_mask}"
-    uci set network.wg0.listen_port="$wg_port"
-    uci set network.wg0.mtu="$mtu"
-    uci set network.wg0.route_allowed_ips='1'
-
-    # 配置 uci 防火墙 zone + forwarding
-    print_info "配置 OpenWrt 防火墙..."
-    uci set firewall.wg_zone=zone
-    uci set firewall.wg_zone.name='wg'
-    uci set firewall.wg_zone.input='ACCEPT'
-    uci set firewall.wg_zone.output='ACCEPT'
-    uci set firewall.wg_zone.forward='ACCEPT'
-    uci set firewall.wg_zone.masq='1'
-    uci -q delete firewall.wg_zone.network 2>/dev/null
-    uci add_list firewall.wg_zone.network='wg0'
-    uci set firewall.wg_fwd_lan=forwarding
-    uci set firewall.wg_fwd_lan.src='lan'
-    uci set firewall.wg_fwd_lan.dest='wg'
-    uci set firewall.wg_fwd_wg=forwarding
-    uci set firewall.wg_fwd_wg.src='wg'
-    uci set firewall.wg_fwd_wg.dest='lan'
-
-    uci commit network
-    uci commit firewall
-
-    # nft 实时放行 WG UDP 端口 (不重启防火墙)
-    nft insert rule inet fw4 input_wan udp dport "$wg_port" counter accept comment \"wg_allow_port\" 2>/dev/null || true
-    # uci 持久化防火墙端口放行规则
-    uci set firewall.wg_allow_port=rule
-    uci set firewall.wg_allow_port.name='Allow-WG-UDP'
-    uci set firewall.wg_allow_port.src='wan'
-    uci set firewall.wg_allow_port.dest_port="$wg_port"
-    uci set firewall.wg_allow_port.proto='udp'
-    uci set firewall.wg_allow_port.target='ACCEPT'
-    uci commit firewall
+    } | .schema_version = 2'; then
+        print_error "WireGuard 数据库写入失败"
+        _wg_openwrt_rollback_server_install "$wg_install_snapshot_dir" "$wg_forward_changed"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
+    if ! wg_set_role "server"; then
+        print_error "WireGuard 角色写入失败"
+        _wg_openwrt_rollback_server_install "$wg_install_snapshot_dir" "$wg_forward_changed"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
 
     # 生成只读快照 wg0.conf
-    wg_rebuild_conf
+    if ! wg_rebuild_conf; then
+        print_error "生成 WireGuard 配置快照失败"
+        _wg_openwrt_rollback_server_install "$wg_install_snapshot_dir" "$wg_forward_changed"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
 
     # ── [7/7] Mihomo bypass + 启动 ──
     print_info "[7/7] 配置 Mihomo bypass 并启动..."
-    wg_setup_mihomo_bypass "$wg_subnet"
-    ifup wg0 2>/dev/null
+    if ! wg_setup_mihomo_bypass "$wg_subnet"; then
+        print_error "Mihomo bypass 配置失败"
+        _wg_openwrt_rollback_server_install "$wg_install_snapshot_dir" "$wg_forward_changed"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
+    if ! ifup wg0 2>/dev/null; then
+        print_error "启动 wg0 失败"
+        _wg_openwrt_rollback_server_install "$wg_install_snapshot_dir" "$wg_forward_changed"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
     sleep 2
     wg_sync_peer_routes
 
     # ── 安装结果展示 ──
     draw_line
-    if wg_is_running; then
-        print_success "WireGuard 服务端安装并启动成功！"
-    else
-        print_warn "WireGuard 已安装，但启动可能失败，请检查日志"
+    if ! wg_is_running; then
+        print_error "wg0 未运行，请检查 logread | grep netifd"
+        _wg_openwrt_rollback_server_install "$wg_install_snapshot_dir" "$wg_forward_changed"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
     fi
+    rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+    print_success "WireGuard 服务端安装并启动成功！"
     echo -e "  角色:       ${C_GREEN}服务端 (Server)${C_RESET}"
     echo -e "  监听地址:   ${C_GREEN}${listen_addr}:${wg_port}/udp${C_RESET}"
     echo -e "  MTU:        ${C_GREEN}${mtu}${C_RESET}"
@@ -259,14 +589,14 @@ wg_modify_server() {
     echo -e "  当前 DNS:   ${C_GREEN}${cur_dns}${C_RESET}"
     echo -e "  当前端点:   ${C_GREEN}${cur_ep}${C_RESET}"
     [[ -n "$cur_lan" && "$cur_lan" != "null" ]] && echo -e "  当前 LAN:   ${C_GREEN}${cur_lan}${C_RESET}"
-    local changed=false lan_changed=false
+    local changed=false lan_changed=false port_changed=false port_firewall_changed=false
 
     read -e -r -p "新监听端口 [${cur_port}]: " new_port
     new_port=${new_port:-$cur_port}
     if [[ "$new_port" != "$cur_port" ]]; then
         if validate_port "$new_port"; then
-            wg_db_set --argjson p "$new_port" '.server.port = $p'
             changed=true
+            port_changed=true
             print_info "端口将更改为 ${new_port}"
         else
             print_warn "端口无效，保持原值"
@@ -277,7 +607,6 @@ wg_modify_server() {
     read -e -r -p "新客户端 DNS [${cur_dns}]: " new_dns
     new_dns=${new_dns:-$cur_dns}
     if [[ "$new_dns" != "$cur_dns" ]]; then
-        wg_db_set --arg d "$new_dns" '.server.dns = $d'
         changed=true
         print_info "DNS 将更改为 ${new_dns}"
     fi
@@ -285,9 +614,13 @@ wg_modify_server() {
     read -e -r -p "新公网端点 [${cur_ep}]: " new_ep
     new_ep=${new_ep:-$cur_ep}
     if [[ "$new_ep" != "$cur_ep" ]]; then
-        wg_db_set --arg e "$new_ep" '.server.endpoint = $e'
-        changed=true
-        print_info "端点将更改为 ${new_ep}"
+        if ! new_ep=$(wg_shared_normalize_endpoint_host "$new_ep"); then
+            print_warn "端点无效，保持原值"
+            new_ep="$cur_ep"
+        else
+            changed=true
+            print_info "端点将更改为 ${new_ep}"
+        fi
     fi
 
     read -e -r -p "新服务端 LAN 子网 [${cur_lan:-无}]: " new_lan
@@ -297,7 +630,6 @@ wg_modify_server() {
             print_warn "LAN 子网格式无效，保持原值"
             new_lan="$cur_lan"
         else
-            wg_db_set --arg l "$new_lan" '.server.server_lan_subnet = $l'
             changed=true
             lan_changed=true
             print_info "LAN 子网将更改为 ${new_lan}"
@@ -306,43 +638,58 @@ wg_modify_server() {
 
     if [[ "$changed" != "true" ]]; then
         print_info "未做任何更改"
-        pause; return
+        pause; return 0
+    fi
+
+    if [[ "$port_changed" == "true" ]]; then
+        if ! _wg_openwrt_apply_allow_port "$new_port"; then
+            print_error "新 WireGuard UDP 端口未放行，已取消修改"
+            pause; return 1
+        fi
+        port_firewall_changed=true
+    fi
+
+    if ! wg_db_set --argjson p "$new_port" \
+                  --arg d "$new_dns" \
+                  --arg e "$new_ep" \
+                  --arg l "${new_lan:-}" \
+                  '.server.port = $p | .server.dns = $d | .server.endpoint = $e | .server.server_lan_subnet = $l'; then
+        print_error "WireGuard 数据库写入失败，正在回滚"
+        _wg_openwrt_rollback_server_modify "$cur_port" "$cur_dns" "$cur_ep" "$cur_lan" "$port_firewall_changed"
+        pause; return 1
     fi
 
     if [[ "$lan_changed" == "true" ]]; then
-        _wg_update_peer_routes
-        wg_mihomo_bypass_rebuild 2>/dev/null || true
+        if ! _wg_update_peer_routes; then
+            print_error "更新 peer 路由失败，正在回滚"
+            _wg_openwrt_rollback_server_modify "$cur_port" "$cur_dns" "$cur_ep" "$cur_lan" "$port_firewall_changed"
+            pause; return 1
+        fi
     fi
 
-    wg_rebuild_uci_conf
-    wg_rebuild_conf
-    wg_regenerate_client_confs
-
-    # 端口变更: 更新 nft 防火墙规则 + uci 持久化
-    if [[ "$new_port" != "$cur_port" ]]; then
-        # 删除旧端口 nft 规则
-        local h
-        for h in $(nft -a list chain inet fw4 input_wan 2>/dev/null | grep 'wg_allow_port' | awk '{print $NF}'); do
-            nft delete rule inet fw4 input_wan handle "$h" 2>/dev/null || true
-        done
-        # 添加新端口 nft 规则
-        nft insert rule inet fw4 input_wan udp dport "$new_port" counter accept comment \"wg_allow_port\" 2>/dev/null || true
-        # 更新 uci 持久化
-        uci set firewall.wg_allow_port.dest_port="$new_port"
-        uci commit firewall
-        # 更新 /etc/rc.local
-        sed -i '/wg_allow_port/d' /etc/rc.local 2>/dev/null || true
-        if grep -q "^exit 0" /etc/rc.local 2>/dev/null; then
-            sed -i "/^exit 0/i nft insert rule inet fw4 input_wan udp dport $new_port counter accept comment \\\"wg_allow_port\\\" 2>/dev/null || true" \
-                /etc/rc.local 2>/dev/null || true
-        else
-            echo "nft insert rule inet fw4 input_wan udp dport $new_port counter accept comment \"wg_allow_port\" 2>/dev/null || true" >> /etc/rc.local
-        fi
+    if ! wg_rebuild_uci_conf; then
+        print_error "重建 OpenWrt WireGuard UCI 配置失败，正在回滚"
+        _wg_openwrt_rollback_server_modify "$cur_port" "$cur_dns" "$cur_ep" "$cur_lan" "$port_firewall_changed"
+        pause; return 1
+    fi
+    if ! wg_rebuild_conf; then
+        print_error "生成 WireGuard 配置快照失败，正在回滚"
+        _wg_openwrt_rollback_server_modify "$cur_port" "$cur_dns" "$cur_ep" "$cur_lan" "$port_firewall_changed"
+        pause; return 1
+    fi
+    if ! wg_regenerate_client_confs; then
+        print_error "重生成客户端配置失败，正在回滚"
+        _wg_openwrt_rollback_server_modify "$cur_port" "$cur_dns" "$cur_ep" "$cur_lan" "$port_firewall_changed"
+        pause; return 1
     fi
 
     # LAN 子网或端口变更都需要重建 bypass (因为 bypass 包含所有子网)
     if [[ "$new_port" != "$cur_port" || "${new_lan:-}" != "${cur_lan:-}" ]]; then
-        wg_mihomo_bypass_rebuild
+        if ! wg_mihomo_bypass_rebuild; then
+            print_error "重建 Mihomo bypass/端口规则失败，正在回滚"
+            _wg_openwrt_rollback_server_modify "$cur_port" "$cur_dns" "$cur_ep" "$cur_lan" "$port_firewall_changed"
+            pause; return 1
+        fi
     fi
 
     print_success "服务端配置已更新"
@@ -481,9 +828,11 @@ wg_start() {
         wg_sync_peer_routes
         print_success "WireGuard 已启动"
         log_action "WireGuard started"
+        return 0
     else
         print_error "启动失败，请检查 logread | grep netifd"
         log_action "WireGuard start failed"
+        return 1
     fi
 }
 
@@ -498,8 +847,11 @@ wg_stop() {
     if ! wg_is_running; then
         print_success "WireGuard 已停止"
         log_action "WireGuard stopped"
+        return 0
     else
         print_error "停止失败"
+        log_action "WireGuard stop failed"
+        return 1
     fi
 }
 
@@ -514,23 +866,64 @@ wg_restart() {
         wg_sync_peer_routes
         print_success "WireGuard 已重启"
         log_action "WireGuard restarted"
+        return 0
     else
         print_error "重启失败"
         log_action "WireGuard restart failed"
+        return 1
     fi
 }
 
 # ── Mihomo bypass 函数 ──
 
+_wg_rc_local_cleanup_managed_entries() {
+    local kind="${1:-all}" rc_file="${2:-/etc/rc.local}" tmp_out rc_dir
+    case "$kind" in all|bypass|allow-port) ;; *) return 1 ;; esac
+    [[ -f "$rc_file" ]] || return 0
+    rc_dir="$(dirname "$rc_file")"
+    tmp_out=$(mktemp "${rc_dir}/.${SCRIPT_NAME}-wg-rc-clean.XXXXXX") || return 1
+    if awk -v kind="$kind" '
+        function marker_matches(line) {
+            if (kind == "all") return 1
+            return index(line, " " kind) > 0
+        }
+        /^# BEGIN server-manage wireguard / {
+            if (marker_matches($0)) { skip=1; next }
+        }
+        /^# END server-manage wireguard / {
+            if (skip) { skip=0; next }
+        }
+        skip { next }
+        kind != "allow-port" && /^# WireGuard bypass Mihomo/ { next }
+        kind != "allow-port" && /# wg_bypass[[:space:]]*$/ { next }
+        kind != "allow-port" && /# wg_peer_route[[:space:]]*$/ { next }
+        kind != "allow-port" && /# wg_ep_resolve[[:space:]]*$/ { next }
+        kind != "bypass" && /# wg_allow_port[[:space:]]*$/ { next }
+        kind != "bypass" && /nft insert rule inet fw4 input_wan udp dport .*comment .*wg_allow_port/ { next }
+        { print }
+    ' "$rc_file" > "$tmp_out"; then
+        chmod +x "$tmp_out" 2>/dev/null || true
+        mv "$tmp_out" "$rc_file" || { rm -f "$tmp_out"; return 1; }
+        chmod +x "$rc_file" 2>/dev/null || true
+        rm -f "$tmp_out"
+        return 0
+    fi
+    rm -f "$tmp_out"
+    return 1
+}
+
 _wg_rc_local_insert_block() {
     local rc_block="${1:-}" rc_file="${2:-/etc/rc.local}"
     [[ -n "$rc_block" ]] || return 1
-    local tmp_block tmp_out
-    tmp_block=$(mktemp "/tmp/${SCRIPT_NAME}-wg-rc-block.XXXXXX") || return 1
-    tmp_out=$(mktemp "/tmp/${SCRIPT_NAME}-wg-rc-local.XXXXXX") || { rm -f "$tmp_block"; return 1; }
+    local tmp_block tmp_out rc_dir
+    rc_dir="$(dirname "$rc_file")"
+    tmp_block=$(mktemp "${rc_dir}/.${SCRIPT_NAME}-wg-rc-block.XXXXXX") || return 1
+    tmp_out=$(mktemp "${rc_dir}/.${SCRIPT_NAME}-wg-rc-local.XXXXXX") || { rm -f "$tmp_block"; return 1; }
     if [[ ! -f "$rc_file" ]]; then
-        printf '#!/bin/sh\nexit 0\n' > "$rc_file" 2>/dev/null || { rm -f "$tmp_block" "$tmp_out"; return 1; }
-        chmod +x "$rc_file" 2>/dev/null || true
+        printf '#!/bin/sh\nexit 0\n' > "$tmp_out" 2>/dev/null || { rm -f "$tmp_block" "$tmp_out"; return 1; }
+        chmod 755 "$tmp_out" 2>/dev/null || true
+        mv "$tmp_out" "$rc_file" || { rm -f "$tmp_block" "$tmp_out"; return 1; }
+        tmp_out=$(mktemp "${rc_dir}/.${SCRIPT_NAME}-wg-rc-local.XXXXXX") || { rm -f "$tmp_block"; return 1; }
     fi
     printf '%b\n' "$rc_block" > "$tmp_block"
     if awk '
@@ -539,7 +932,8 @@ _wg_rc_local_insert_block() {
         { print }
         END { if (!inserted) printf "%s", block }
     ' "$tmp_block" "$rc_file" > "$tmp_out"; then
-        cat "$tmp_out" > "$rc_file"
+        chmod +x "$tmp_out" 2>/dev/null || true
+        mv "$tmp_out" "$rc_file" || { rm -f "$tmp_block" "$tmp_out"; return 1; }
         chmod +x "$rc_file" 2>/dev/null || true
         rm -f "$tmp_block" "$tmp_out"
         return 0
@@ -587,16 +981,18 @@ wg_setup_mihomo_bypass() {
     # wg0 接口流量跳过 Mihomo tproxy
     nft insert rule inet fw4 mangle_prerouting iifname \"wg0\" counter return comment \"wg_bypass_iface\" 2>/dev/null || true
     # 所有 VPN 相关子网跳过 Mihomo
-    local cidr
+    local cidr nft_family
     for cidr in "${unique_subnets[@]}"; do
-        nft insert rule inet fw4 mangle_prerouting ip daddr "$cidr" counter return comment \"wg_bypass_subnet\" 2>/dev/null || true
+        nft_family=$(nft_addr_family_for_cidr "$cidr")
+        nft insert rule inet fw4 mangle_prerouting "$nft_family" daddr "$cidr" counter return comment \"wg_bypass_subnet\" 2>/dev/null || true
     done
 
     # 持久化到 /etc/rc.local
-    sed -i '/wg_bypass/d; /WireGuard bypass/d; /wg_peer_route/d' /etc/rc.local 2>/dev/null || true
-    local rc_block="# WireGuard bypass Mihomo\nnft insert rule inet fw4 mangle_prerouting iifname \\\"wg0\\\" counter return comment \\\"wg_bypass_iface\\\" 2>/dev/null || true"
+    _wg_rc_local_cleanup_managed_entries bypass || print_warn "清理 /etc/rc.local 旧 bypass 规则失败"
+    local rc_block="# BEGIN server-manage wireguard bypass\n# WireGuard bypass Mihomo\nnft insert rule inet fw4 mangle_prerouting iifname \\\"wg0\\\" counter return comment \\\"wg_bypass_iface\\\" 2>/dev/null || true # wg_bypass"
     for cidr in "${unique_subnets[@]}"; do
-        rc_block="${rc_block}\nnft insert rule inet fw4 mangle_prerouting ip daddr \\\"${cidr}\\\" counter return comment \\\"wg_bypass_subnet\\\" 2>/dev/null || true"
+        nft_family=$(nft_addr_family_for_cidr "$cidr")
+        rc_block="${rc_block}\nnft insert rule inet fw4 mangle_prerouting ${nft_family} daddr \\\"${cidr}\\\" counter return comment \\\"wg_bypass_subnet\\\" 2>/dev/null || true"
     done
     # 网关 peer LAN 路由持久化 (proto-wireguard 不一定自动创建)
     local pc=$(wg_db_get '.peers | length' 2>/dev/null) pi=0
@@ -614,6 +1010,7 @@ wg_setup_mihomo_bypass() {
         fi
         pi=$((pi + 1))
     done
+    rc_block="${rc_block}\n# END server-manage wireguard bypass"
     _wg_rc_local_insert_block "$rc_block" || print_warn "写入 /etc/rc.local 持久化规则失败"
 
     print_success "Mihomo bypass 规则已配置 (${#unique_subnets[@]} 个子网)"
@@ -673,12 +1070,8 @@ wg_mihomo_bypass_clean() {
     for h in $(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print $NF}'); do
         nft delete rule inet fw4 mangle_prerouting handle "$h" 2>/dev/null || true
     done
-    # 清理 wg_allow_port
-    for h in $(nft -a list chain inet fw4 input_wan 2>/dev/null | grep 'wg_allow_port' | awk '{print $NF}'); do
-        nft delete rule inet fw4 input_wan handle "$h" 2>/dev/null || true
-    done
     # 清理 /etc/rc.local 中的持久化条目
-    sed -i '/wg_bypass/d; /wg_allow_port/d; /wg_peer_route/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null || true
+    _wg_rc_local_cleanup_managed_entries bypass || true
 }
 
 wg_mihomo_bypass_rebuild() {
@@ -687,31 +1080,13 @@ wg_mihomo_bypass_rebuild() {
     wg_port=$(wg_db_get '.server.port')
     [[ -z "$wg_subnet" || "$wg_subnet" == "null" ]] && return 1
 
-    wg_setup_mihomo_bypass "$wg_subnet"
+    wg_setup_mihomo_bypass "$wg_subnet" || return 1
 
     # 重建端口放行规则
     if [[ -n "$wg_port" && "$wg_port" != "null" ]]; then
-        # 先清理旧的 nft 规则
-        local h
-        for h in $(nft -a list chain inet fw4 input_wan 2>/dev/null | grep 'wg_allow_port' | awk '{print $NF}'); do
-            nft delete rule inet fw4 input_wan handle "$h" 2>/dev/null || true
-        done
-        nft insert rule inet fw4 input_wan udp dport "$wg_port" counter accept comment \"wg_allow_port\" 2>/dev/null || true
-        # 持久化到 /etc/rc.local
-        sed -i '/wg_allow_port/d' /etc/rc.local 2>/dev/null || true
-        local rc_block="nft insert rule inet fw4 input_wan udp dport ${wg_port} counter accept comment \\\"wg_allow_port\\\" 2>/dev/null || true"
-        _wg_rc_local_insert_block "$rc_block" || print_warn "写入 /etc/rc.local 端口放行规则失败"
-        # uci 持久化防火墙规则
-        if ! uci -q get firewall.wg_allow_port &>/dev/null; then
-            uci set firewall.wg_allow_port=rule
-            uci set firewall.wg_allow_port.name='Allow-WG-UDP'
-            uci set firewall.wg_allow_port.src='wan'
-            uci set firewall.wg_allow_port.dest_port="$wg_port"
-            uci set firewall.wg_allow_port.proto='udp'
-            uci set firewall.wg_allow_port.target='ACCEPT'
-            uci commit firewall
-        fi
+        _wg_openwrt_apply_allow_port "$wg_port" || return 1
     fi
+    return 0
 }
 
 # ── 卸载 ──
@@ -737,10 +1112,7 @@ wg_uninstall() {
     ifdown wg0 2>/dev/null || true
     ifdown wg_mesh 2>/dev/null || true
     local _wg_ifaces
-    _wg_ifaces=$(ip -o link show type wireguard 2>/dev/null | awk -F': ' '{print $2}' | tr -d ' ')
-    if [[ -z "$_wg_ifaces" ]]; then
-        _wg_ifaces=$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^wg[0-9_-]|^wg_' | tr -d ' ')
-    fi
+    _wg_ifaces=$(_wg_openwrt_list_wireguard_ifaces | tr '\n' ' ')
     for _must in "$WG_INTERFACE" wg_mesh wg-mesh; do
         if ip link show "$_must" &>/dev/null && ! echo "$_wg_ifaces" | grep -qw "$_must"; then
             _wg_ifaces="${_wg_ifaces:+$_wg_ifaces $_must}"
@@ -781,18 +1153,26 @@ wg_uninstall() {
         fi
         _fwi=$((_fwi + 1))
     done
-    uci commit network 2>/dev/null || true
-    uci commit firewall 2>/dev/null || true
+    if ! uci commit network; then
+        print_error "提交 OpenWrt network 清理失败，已中止卸载。请修复 UCI 后重试，避免本地状态先被删除。"
+        pause; return 1
+    fi
+    if ! uci commit firewall; then
+        print_error "提交 OpenWrt firewall 清理失败，已中止卸载。请修复 UCI 后重试，避免本地状态先被删除。"
+        pause; return 1
+    fi
 
     print_info "[3/6] 清理 Mihomo bypass 和 nft 规则..."
     wg_mihomo_bypass_clean
     # 旧版 prio 100 策略路由没有可验证标记，不能粗暴删除第三方规则。
 
     print_info "[4/6] 清理看门狗和定时任务..."
-    if crontab -l 2>/dev/null | grep -q "wg-watchdog.sh"; then
-        cron_remove_job "wg-watchdog.sh"
-    fi
-    rm -f /usr/bin/wg-watchdog.sh /usr/local/bin/wg-watchdog.sh /var/log/wg-watchdog.log 2>/dev/null || true
+    cron_remove_job_command "/usr/bin/wg-watchdog.sh" 2>/dev/null || true
+    cron_remove_job_command "/usr/local/bin/wg-watchdog.sh" 2>/dev/null || true
+    rm -f /usr/bin/wg-watchdog.sh /usr/local/bin/wg-watchdog.sh \
+          /var/log/wg-watchdog.log /var/run/server-manage/wg-watchdog.log \
+          /var/run/server-manage/.wg-watchdog-log.* \
+          /tmp/wg-watchdog.log /tmp/wg-watchdog.log.tmp 2>/dev/null || true
 
     print_info "[5/6] 删除配置文件..."
     rm -f "$WG_CONF" 2>/dev/null || true
@@ -812,8 +1192,7 @@ wg_uninstall() {
 
     if [[ "$role" == "server" ]]; then
         if confirm "是否恢复 IP 转发设置? (如果其他服务需要转发请选 N)"; then
-            sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf 2>/dev/null || true
-            sysctl -w net.ipv4.ip_forward=0 >/dev/null 2>&1 || true
+            _sysctl_disable_wireguard_forward || print_warn "恢复 IP 转发设置失败，请手动检查 /etc/sysctl.conf"
         fi
     fi
 
@@ -830,9 +1209,26 @@ wg_openwrt_clean_cmd() {
     draw_line
     cat << 'CLEANEOF'
 # === 停止所有 WireGuard 接口 ===
+die() { echo "[!] $*" >&2; exit 1; }
+list_wg_ifaces() {
+    ip link show type wireguard 2>/dev/null | awk '
+        /^[0-9]+:/ {
+            name=$0
+            sub(/^[0-9]+:[[:space:]]*/, "", name)
+            sub(/:.*/, "", name)
+            sub(/@.*/, "", name)
+            current=name
+            next
+        }
+        /link\/none/ && current != "" {
+            print current
+            current=""
+        }
+    '
+}
 ifdown wg0 2>/dev/null; true
 ifdown wg_mesh 2>/dev/null; true
-for iface in $(ip -o link show type wireguard 2>/dev/null | awk -F': ' '{print $2}'); do
+for iface in $(list_wg_ifaces); do
     ip link set "$iface" down 2>/dev/null; true
     ip link delete "$iface" 2>/dev/null; true
     echo "[+] 已删除接口: $iface"
@@ -847,7 +1243,7 @@ done
 
 # === 清理看门狗 ===
 rm -f /usr/bin/wg-watchdog.sh 2>/dev/null; true
-(crontab -l 2>/dev/null | grep -v wg-watchdog) | crontab - 2>/dev/null; true
+(crontab -l 2>/dev/null | awk '$6 != "/usr/bin/wg-watchdog.sh"') | crontab - 2>/dev/null; true
 /etc/init.d/cron restart 2>/dev/null; true
 echo '[+] 看门狗已清理'
 
@@ -899,11 +1295,31 @@ done
 for h in $(nft -a list chain inet fw4 input_wan 2>/dev/null | grep 'wg_allow_port' | awk '{print $NF}'); do
     nft delete rule inet fw4 input_wan handle "$h" 2>/dev/null; true
 done
-sed -i '/wg_bypass/d; /wg_allow_port/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null; true
+if [ -f /etc/rc.local ]; then
+    WG_RC_TMP="$(mktemp /etc/.rc.local.clean.XXXXXX 2>/dev/null)" || { echo '[!] 创建 rc.local 清理临时文件失败' >&2; exit 1; }
+    if awk '
+        /^# BEGIN server-manage wireguard / { skip=1; next }
+        /^# END server-manage wireguard / { skip=0; next }
+        skip { next }
+        /^# WireGuard bypass Mihomo/ { next }
+        /# wg_bypass[[:space:]]*$/ { next }
+        /# wg_peer_route[[:space:]]*$/ { next }
+        /# wg_ep_resolve[[:space:]]*$/ { next }
+        /# wg_allow_port[[:space:]]*$/ { next }
+        /nft insert rule inet fw4 input_wan udp dport .*comment .*wg_allow_port/ { next }
+        { print }
+    ' /etc/rc.local > "$WG_RC_TMP"; then
+        chmod +x "$WG_RC_TMP" 2>/dev/null && mv "$WG_RC_TMP" /etc/rc.local || { rm -f "$WG_RC_TMP"; die "安装清理后的 /etc/rc.local 失败"; }
+    else
+        rm -f "$WG_RC_TMP"
+        die "生成清理后的 /etc/rc.local 失败"
+    fi
+    rm -f "$WG_RC_TMP"
+fi
 
 # === 提交配置 ===
-uci commit network
-uci commit firewall
+uci commit network || die "提交 network 清理失败"
+uci commit firewall || die "提交 firewall 清理失败"
 
 # === 最终验证 ===
 echo ''

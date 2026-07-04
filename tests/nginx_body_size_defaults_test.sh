@@ -35,4 +35,13 @@ grep -q '_nginx_tls_http2_block "$HTTPS_PORT"' modules/09d-web-proxy.sh || \
 grep -q '_nginx_tls_http2_block "$https_port"' modules/09e-web-home-expose.sh || \
     fail "web_home_expose should use version-aware HTTP/2 listen helper"
 
+grep -q '_web_coexist_https_port "$https_port"' modules/09e-web-home-expose.sh || \
+    fail "web_home_expose should map requested 443 to the coexist web inner port"
+
+grep -q '_web_coexist_redir_suffix "$https_port"' modules/09e-web-home-expose.sh || \
+    fail "web_home_expose should use coexist-aware HTTPS redirect suffix"
+
+grep -q 'origin_rule_needed' modules/09e-web-home-expose.sh || \
+    fail "web_home_expose should skip CF Origin Rule for coexist inner ports"
+
 echo "nginx_body_size_defaults_test: PASS"

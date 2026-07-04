@@ -2,13 +2,26 @@
 # 远程冒烟测试：email 模块（不触发任何 CF API 调用，不实际部署）
 set -u
 
-BUILT="/tmp/v4-built.sh"
-LIB="/tmp/v4-lib.sh"
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+BUILT="${BUILT:-$ROOT/dist/v4-built.sh}"
 TMP_EMAIL_ROOT=$(mktemp -d)
+EMAIL_TEST_OUT_DIR="$TMP_EMAIL_ROOT/out"
+LIB="$TMP_EMAIL_ROOT/v4-lib.sh"
 PASS=0; FAIL=0
+mkdir -p "$EMAIL_TEST_OUT_DIR"
+export EMAIL_TEST_OUT_DIR
+trap 'rm -rf "$TMP_EMAIL_ROOT"' EXIT
 
 pass() { echo "  [PASS] $1"; PASS=$((PASS+1)); }
 fail() { echo "  [FAIL] $1"; FAIL=$((FAIL+1)); }
+mode_is_600() {
+    local file="$1" mode
+    case "$(uname -s 2>/dev/null || echo unknown)" in
+        MINGW*|MSYS*|CYGWIN*) return 0 ;;
+    esac
+    mode="$(stat -c '%a' "$file" 2>/dev/null || stat -f '%Lp' "$file" 2>/dev/null || true)"
+    [[ "$mode" == "600" ]]
+}
 
 head -n -1 "$BUILT" > "$LIB"
 cat >> "$LIB" <<'STUB'
@@ -65,14 +78,15 @@ email_state_write && pass "state 写入成功" || fail "state 写入失败"
 # 校验写出的文件不会触发命令替换（用新 validate_conf_file）
 validate_conf_file "$EMAIL_STATE_FILE" 2>/dev/null && pass "写出文件通过 validate_conf_file" || fail "写出文件未通过校验"
 
-# 测危险字符是否被触发（如果 quote 失败，rm -rf / 会被执行；用 -d /test_marker_dir 检查）
-touch /tmp/email_test_marker_$$
+# 测危险字符是否被触发（如果 quote 失败，marker 会被删除）
+EMAIL_TEST_MARKER="$TMP_EMAIL_ROOT/email_test_marker_$$"
+touch "$EMAIL_TEST_MARKER"
 ZONE_BEFORE="$EMAIL_ZONE_ID"
 unset EMAIL_INSTALLED EMAIL_ZONE_ID
 email_state_load && pass "state 重新加载成功" || fail "state 重新加载失败"
-if [[ -f /tmp/email_test_marker_$$ ]]; then
+if [[ -f "$EMAIL_TEST_MARKER" ]]; then
     pass "危险字符未触发命令执行 (marker 仍在)"
-    rm -f /tmp/email_test_marker_$$
+    rm -f "$EMAIL_TEST_MARKER"
 else
     fail "marker 消失 — 危险字符可能触发了命令"
 fi
@@ -183,7 +197,7 @@ EMAIL_CATCH_ALL_ENABLED=0
 email_state_write || exit 11
 CF_API_TOKEN='token-e1'
 CF_ACCOUNT_ID='acct-e1'
-printf '%s\n' "$EMAIL_DOMAIN" | email_uninstall >/tmp/email-e1.out 2>&1 || true
+printf '%s\n' "$EMAIL_DOMAIN" | email_uninstall >"$EMAIL_TEST_OUT_DIR/email-e1.out" 2>&1 || true
 [[ -f "$EMAIL_STATE_FILE" ]] || exit 1
 [[ -d "$EMAIL_INSTALL_DIR" ]] || exit 2
 [[ -f "$EMAIL_ADMIN_FILE" ]] || exit 3
@@ -253,7 +267,7 @@ EMAIL_PATCHES_APPLIED=''
 email_state_write || exit 11
 CF_API_TOKEN='token-e6'
 CF_ACCOUNT_ID='acct-e6'
-email_manage_upgrade >/tmp/email-e6.out 2>&1 || true
+email_manage_upgrade >"$EMAIL_TEST_OUT_DIR/email-e6.out" 2>&1 || true
 grep -q 'EMAIL_PATCHES_APPLIED="001-patch.sql"' "$EMAIL_STATE_FILE" || exit 1
 rm -rf "$mock_bin"
 exit 0
@@ -278,7 +292,7 @@ set -u
 source "$1" >/dev/null 2>&1 || exit 10
 _email_cf_worker_exists() { return 2; }
 EMAIL_WORKER_NAME=""
-if _email_deploy_pick_worker_name </dev/null >/tmp/email-p1.out 2>&1; then
+if _email_deploy_pick_worker_name </dev/null >"$EMAIL_TEST_OUT_DIR/email-p1.out" 2>&1; then
     exit 1
 fi
 [[ -z "$EMAIL_WORKER_NAME" ]] || exit 2
@@ -319,12 +333,71 @@ fi
 echo "$env_body" | grep -q 'bash -o pipefail' \
     && pass "E3: NodeSource 安装开启 pipefail" \
     || fail "E3: NodeSource 安装未开启 pipefail"
+if echo "$env_body" | grep -q 'mktemp -d "\${TMPDIR:-/tmp}/server-manage-email-node.XXXXXX"' \
+   && echo "$env_body" | grep -q 'chmod 700 "\$tmp_dir"' \
+   && echo "$env_body" | grep -q 'chmod 600 "\$tmp"' \
+   && echo "$env_body" | grep -q 'rm -rf "\$tmp_dir"' \
+   && ! echo "$env_body" | grep -q 'tmp=$(mktemp)'; then
+    pass "E3: NodeSource 安装脚本使用私有临时目录并清理"
+else
+    fail "E3: NodeSource 安装脚本仍可能落公共临时文件"
+fi
 
 # E4: 首次 Worker deploy 前 wrangler.toml 已包含 ADMIN_PASSWORDS 普通变量兜底，secret 写入失败也不会出现无密码窗口。
 render_body=$(awk '/^_email_deploy_render_toml\(\)/,/^}/' "$BUILT")
+min_render_body=$(awk '/^_email_render_min_toml\(\)/,/^}/' "$BUILT")
 echo "$render_body" | grep -q 'ADMIN_PASSWORDS = ' \
     && pass "E4: Worker 首次部署配置含 ADMIN_PASSWORDS 兜底变量" \
     || fail "E4: Worker 首次部署前未配置 ADMIN_PASSWORDS"
+if declare -F _email_write_private_file >/dev/null \
+   && echo "$min_render_body" | grep -q '_email_write_private_file "\$EMAIL_INSTALL_DIR/worker/wrangler.toml"' \
+   && echo "$render_body" | grep -q '_email_write_private_file "\$EMAIL_INSTALL_DIR/worker/wrangler.toml"' \
+   && ! echo "$min_render_body$render_body" | grep -q 'cat > "\$EMAIL_INSTALL_DIR/worker/wrangler.toml"'; then
+    pass "E4: wrangler.toml 渲染走私有原子写入"
+else
+    fail "E4: wrangler.toml 渲染仍可能先宽权限写入再 chmod"
+fi
+tmp_email_script=$(mktemp)
+cat > "$tmp_email_script" <<'EMAIL_E4_PERM_TEST'
+#!/bin/bash
+set -u
+source "$1" >/dev/null 2>&1 || exit 10
+if [[ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]]; then
+    PLATFORM="openwrt"
+    chown() { return 0; }
+fi
+jq() { printf '%s\n' '["admin-pass"]'; }
+mode_is_600() {
+    local file="$1" mode
+    case "$(uname -s 2>/dev/null || echo unknown)" in
+        MINGW*|MSYS*|CYGWIN*) return 0 ;;
+    esac
+    mode="$(stat -c '%a' "$file" 2>/dev/null || stat -f '%Lp' "$file" 2>/dev/null || true)"
+    [[ "$mode" == "600" ]]
+}
+mkdir -p "$EMAIL_INSTALL_DIR/worker"
+umask 022
+EMAIL_WORKER_NAME="worker-e4"
+EMAIL_D1_NAME="d1-e4"
+EMAIL_D1_ID="d1-id-e4"
+_email_render_min_toml || exit 11
+mode_is_600 "$EMAIL_INSTALL_DIR/worker/wrangler.toml" || exit 12
+EMAIL_DOMAIN="example.com"
+EMAIL_API_DOMAIN="api.example.com"
+EMAIL_ADDRESS_PREFIX="prefix"
+EMAIL_ADMIN_PASSWORD="admin-pass"
+EMAIL_JWT_SECRET="jwt-e4"
+_email_deploy_render_toml >/dev/null || exit 13
+mode_is_600 "$EMAIL_INSTALL_DIR/worker/wrangler.toml" || exit 14
+grep -Fxq 'JWT_SECRET = "jwt-e4"' "$EMAIL_INSTALL_DIR/worker/wrangler.toml" || exit 15
+grep -Fxq 'ADMIN_PASSWORDS = ["admin-pass"]' "$EMAIL_INSTALL_DIR/worker/wrangler.toml" || exit 16
+EMAIL_E4_PERM_TEST
+if bash "$tmp_email_script" "$LIB"; then
+    pass "E4: wrangler.toml 在宽 umask 下仍以 0600 写出"
+else
+    fail "E4: wrangler.toml 私有权限写入实测失败"
+fi
+rm -f "$tmp_email_script"
 
 # E5: pages service binding 不能长期 dirty git tracked wrangler.toml；patch 后必须恢复，且 helper 不应再用 sed -i 原地改。
 patch_body=$(awk '/^_email_patch_pages_service_binding\(\)/,/^}/' "$BUILT")
@@ -333,6 +406,13 @@ if echo "$patch_body" | grep -q 'sed -i'; then
     fail "E5: pages service binding 仍用 sed -i 原地修改 tracked wrangler.toml"
 else
     pass "E5: pages service binding 不再用 sed -i 原地修改"
+fi
+if echo "$patch_body" | grep -q '/tmp/server-manage-pages-wrangler'; then
+    fail "E5: pages/wrangler.toml 备份仍落公共 /tmp"
+elif echo "$patch_body" | grep -q 'mktemp "\${pages_dir}/.wrangler.toml.bak.XXXXXX"'; then
+    pass "E5: pages/wrangler.toml 备份落 pages 同目录"
+else
+    fail "E5: pages/wrangler.toml 备份缺少同目录 mktemp"
 fi
 grep -q '^_email_restore_pages_service_binding()' "$BUILT" \
     && echo "$restore_body" | grep -q 'mv .*wrangler.toml' \
@@ -346,6 +426,37 @@ echo "$pages_body" | grep -q '_email_restore_pages_service_binding' \
     && echo "$redeploy_body" | grep -q '_email_restore_pages_service_binding' \
     && pass "E5: 部署/升级/重部署后恢复 pages/wrangler.toml" \
     || fail "E5: 存在部署路径未恢复 pages/wrangler.toml"
+tmp_email_script=$(mktemp)
+cat > "$tmp_email_script" <<'EMAIL_E5_PATCH_TEST'
+#!/bin/bash
+set -u
+source "$1" >/dev/null 2>&1 || exit 10
+chown() { return 0; }
+EMAIL_WORKER_NAME="custom-worker"
+mkdir -p "$EMAIL_INSTALL_DIR/pages"
+cat > "$EMAIL_INSTALL_DIR/pages/wrangler.toml" <<'EOF'
+name = "pages-app"
+[[services]]
+binding = "TEMP_EMAIL"
+service = "cloudflare_temp_email"
+EOF
+_email_patch_pages_service_binding "$EMAIL_INSTALL_DIR/pages" || exit 11
+backup="${EMAIL_PAGES_TOML_BACKUP:-}"
+target="${EMAIL_PAGES_TOML_BACKUP_TARGET:-}"
+[[ "$backup" == "$EMAIL_INSTALL_DIR/pages"/.wrangler.toml.bak.* ]] || exit 12
+[[ "$target" == "$EMAIL_INSTALL_DIR/pages/wrangler.toml" ]] || exit 13
+grep -Fxq 'service = "custom-worker"' "$target" || exit 14
+_email_restore_pages_service_binding || exit 15
+grep -Fxq 'service = "cloudflare_temp_email"' "$target" || exit 16
+find "$EMAIL_INSTALL_DIR/pages" -maxdepth 1 -name '.wrangler.toml.bak.*' -print -quit | grep -q . && exit 17
+exit 0
+EMAIL_E5_PATCH_TEST
+if bash "$tmp_email_script" "$LIB" "$TMP_EMAIL_ROOT"; then
+    pass "E5: pages/wrangler.toml patch/restore 使用同目录备份且无残留"
+else
+    fail "E5: pages/wrangler.toml patch/restore 同目录备份实测失败"
+fi
+rm -f "$tmp_email_script"
 
 # E7: 已安装状态再次进入部署必须 fail-closed，不能生成新随机 D1/Pages 丢弃旧资源 ID。
 tmp_email_script=$(mktemp)
@@ -369,7 +480,7 @@ EMAIL_D1_ID='old-d1-id'
 EMAIL_PAGES_PROJECT='old-pages'
 EMAIL_WORKER_NAME='old-worker'
 email_state_write || exit 11
-email_deploy >/tmp/email-e7.out 2>&1 || true
+email_deploy >"$EMAIL_TEST_OUT_DIR/email-e7.out" 2>&1 || true
 [[ ! -f "$EMAIL_STATE_DIR/should-not-run" ]] || exit 1
 grep -q 'EMAIL_D1_NAME="old-d1"' "$EMAIL_STATE_FILE" || exit 2
 grep -q 'EMAIL_PAGES_PROJECT="old-pages"' "$EMAIL_STATE_FILE" || exit 3
@@ -402,6 +513,144 @@ else
     fail "L1: ADMIN_PASSWORDS 普通变量写入会破坏反斜杠"
     sed 's/^/    /' "$EMAIL_INSTALL_DIR/worker/wrangler.toml" 2>/dev/null || true
 fi
+if find "$EMAIL_INSTALL_DIR/worker" -maxdepth 1 -name 'wrangler.toml.tmp' -print -quit | grep -q .; then
+    fail "L1b: ADMIN_PASSWORDS fallback 留下可预测 wrangler.toml.tmp"
+else
+    pass "L1b: ADMIN_PASSWORDS fallback 不留下可预测临时文件"
+fi
+
+# L6: 首次部署 Resend/Email DNS 失败必须 fail-closed，不能把半成品标成已启用/已成功。
+tmp_email_script=$(mktemp)
+cat > "$tmp_email_script" <<'EMAIL_L6_TEST'
+#!/bin/bash
+set -u
+source "$1" >/dev/null 2>&1 || exit 10
+if [[ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]]; then
+    PLATFORM="openwrt"
+    chown() { return 0; }
+fi
+jq() { printf '["admin-pass"]\n'; }
+print_info() { :; }
+print_success() { :; }
+print_warn() { :; }
+print_error() { :; }
+email_log() { :; }
+log_action() { :; }
+email_save_admin_password() { :; }
+
+log="$2"
+_email_state_reset_vars
+EMAIL_DOMAIN="example.com"
+EMAIL_ZONE_ID="zone-test"
+EMAIL_WORKER_NAME="worker-test"
+EMAIL_ADMIN_PASSWORD="admin-pass"
+EMAIL_RESEND_ENABLED=1
+EMAIL_RESEND_SEND_DOMAIN="send.example.com"
+EMAIL_RESEND_TOKEN="resend-token"
+_email_cf_worker_secret_put() {
+    printf 'secret|%s|%s|%s\n' "$1" "$2" "$3" >> "$log"
+    [[ "$2" != "RESEND_TOKEN" ]]
+}
+if _email_deploy_secrets >/dev/null 2>&1; then exit 1; fi
+grep -Fxq 'EMAIL_RESEND_ENABLED=0' "$EMAIL_STATE_FILE" || exit 2
+grep -Fxq 'EMAIL_RESEND_SEND_DOMAIN=""' "$EMAIL_STATE_FILE" || exit 3
+grep -Fxq 'secret|worker-test|RESEND_TOKEN|resend-token' "$log" || exit 4
+
+: > "$log"
+_email_state_reset_vars
+EMAIL_DOMAIN="example.com"
+EMAIL_ZONE_ID="zone-test"
+EMAIL_FRONTEND_PREFIX="mail"
+EMAIL_FRONTEND_DOMAIN="mail.example.com"
+EMAIL_PAGES_DOMAIN="pages.example.dev"
+EMAIL_RESEND_ENABLED=0
+_email_cf_dns_purge() {
+    printf 'purge|%s|%s\n' "$2" "$3" >> "$log"
+    [[ "$2|$3" != "MX|example.com" ]]
+}
+_email_cf_dns_create_record_into() {
+    printf 'create|%s|%s|%s\n' "$1" "$3" "$4" >> "$log"
+    printf -v "$1" '%s-id' "$3"
+    return 0
+}
+if _email_deploy_dns >/dev/null 2>&1; then exit 5; fi
+grep -Fxq 'purge|MX|example.com' "$log" || exit 6
+if grep -Fq 'create|EMAIL_DNS_MX' "$log"; then exit 7; fi
+
+: > "$log"
+_email_state_reset_vars
+EMAIL_DOMAIN="example.com"
+EMAIL_ZONE_ID="zone-test"
+EMAIL_FRONTEND_PREFIX="mail"
+EMAIL_FRONTEND_DOMAIN="mail.example.com"
+EMAIL_PAGES_DOMAIN="pages.example.dev"
+EMAIL_RESEND_ENABLED=1
+EMAIL_RESEND_SEND_DOMAIN="send.example.com"
+EMAIL_RESEND_DKIM="dkim-value"
+_email_cf_dns_purge() {
+    printf 'purge|%s|%s\n' "$2" "$3" >> "$log"
+    return 0
+}
+_email_cf_dns_create_record_into() {
+    printf 'create|%s|%s|%s\n' "$1" "$3" "$4" >> "$log"
+    printf -v "$1" '%s-id' "$3"
+    [[ "$1" != "EMAIL_DNS_SPF_ID" ]]
+}
+if _email_deploy_dns >/dev/null 2>&1; then exit 8; fi
+grep -Fxq 'EMAIL_RESEND_ENABLED=0' "$EMAIL_STATE_FILE" || exit 9
+grep -Fxq 'EMAIL_RESEND_SEND_DOMAIN=""' "$EMAIL_STATE_FILE" || exit 11
+grep -Fq 'EMAIL_DNS_DKIM_ID=' "$EMAIL_STATE_FILE" || exit 12
+grep -Fxq 'create|EMAIL_DNS_SPF_ID|TXT|send.example.com' "$log" || exit 13
+exit 0
+EMAIL_L6_TEST
+email_l6_log="$TMP_EMAIL_ROOT/email-l6.log"
+if bash "$tmp_email_script" "$LIB" "$email_l6_log"; then
+    pass "L6: 首次部署 Resend/DNS 失败 fail-closed 并落 partial state"
+else
+    fail "L6: 首次部署 Resend/DNS 失败仍可能标记成功"
+    sed 's/^/    /' "$email_l6_log" 2>/dev/null || true
+fi
+rm -f "$tmp_email_script" "$email_l6_log"
+
+# L7: Pages 自定义域名绑定失败必须 fail-closed，不能继续把部署标记为完成。
+tmp_email_script=$(mktemp)
+cat > "$tmp_email_script" <<'EMAIL_L7_TEST'
+#!/bin/bash
+set -u
+source "$1" >/dev/null 2>&1 || exit 10
+if [[ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]]; then
+    PLATFORM="openwrt"
+    chown() { return 0; }
+fi
+print_success() { :; }
+print_warn() { :; }
+print_error() { :; }
+print_info() { :; }
+email_run() { return 0; }
+_email_patch_pages_service_binding() { return 0; }
+_email_restore_pages_service_binding() { :; }
+_email_cf_pages_project_create() { return 0; }
+_email_wrangler() { return 0; }
+_email_cf_pages_get_subdomain() { printf 'pages-mock.pages.dev\n'; }
+_email_cf_pages_attach_domain() { return 1; }
+mkdir -p "$EMAIL_INSTALL_DIR/pages"
+_email_state_reset_vars
+EMAIL_DOMAIN="example.com"
+EMAIL_FRONTEND_DOMAIN="mail.example.com"
+EMAIL_PAGES_PROJECT="pages-mock"
+EMAIL_WORKER_NAME="worker-mock"
+if _email_deploy_pages >/dev/null 2>&1; then exit 1; fi
+grep -Fxq 'EMAIL_INSTALLED=0' "$EMAIL_STATE_FILE" || exit 2
+grep -Fxq 'EMAIL_PAGES_PROJECT="pages-mock"' "$EMAIL_STATE_FILE" || exit 3
+grep -Fxq 'EMAIL_PAGES_DOMAIN="pages-mock.pages.dev"' "$EMAIL_STATE_FILE" || exit 4
+exit 0
+EMAIL_L7_TEST
+if bash "$tmp_email_script" "$LIB"; then
+    pass "L7: Pages 自定义域名绑定失败 fail-closed 并落 partial state"
+else
+    fail "L7: Pages 自定义域名绑定失败仍可能继续部署"
+fi
+rm -f "$tmp_email_script"
 
 # L2: DOMAINS 解析失败不能 fallback 成仅主域名后继续覆盖部署。
 cat > "$EMAIL_INSTALL_DIR/worker/wrangler.toml" <<'TOML'
@@ -414,13 +663,39 @@ EMAIL_API_DOMAIN='api.primary.example.com'
 _email_manage_prepare() { return 0; }
 pause() { :; }
 before_domains=$(cat "$EMAIL_INSTALL_DIR/worker/wrangler.toml")
-printf '1\nnew.example.com\n' | email_manage_domains >/tmp/email-domains-invalid.out 2>&1 || true
+printf '1\nnew.example.com\n' | email_manage_domains >"$EMAIL_TEST_OUT_DIR/email-domains-invalid.out" 2>&1 || true
 after_domains=$(cat "$EMAIL_INSTALL_DIR/worker/wrangler.toml")
 if [[ "$after_domains" == "$before_domains" ]] \
-   && grep -qi 'DOMAINS' /tmp/email-domains-invalid.out; then
+   && grep -qi 'DOMAINS' "$EMAIL_TEST_OUT_DIR/email-domains-invalid.out"; then
     pass "L2: DOMAINS 解析失败时拒绝覆盖而非静默重置"
 else
     fail "L2: DOMAINS 解析失败仍可能静默重置/覆盖"
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "  [SKIP] L4: 缺少 jq，跳过 DOMAINS 部署失败回滚实测"
+else
+cat > "$EMAIL_INSTALL_DIR/worker/wrangler.toml" <<'TOML'
+[vars]
+DOMAINS = ["primary.example.com"]
+DEFAULT_DOMAINS = ["primary.example.com"]
+TOML
+    before_domains=$(cat "$EMAIL_INSTALL_DIR/worker/wrangler.toml")
+    email_run() {
+        case "$1" in
+            "重新部署 Worker") return 31 ;;
+            *) return 0 ;;
+        esac
+    }
+    printf '1\nnew.example.com\n' | email_manage_domains >"$EMAIL_TEST_OUT_DIR/email-domains-deploy-fail.out" 2>&1 || true
+    after_domains=$(cat "$EMAIL_INSTALL_DIR/worker/wrangler.toml")
+    if [[ "$after_domains" == "$before_domains" ]] \
+       && grep -q 'wrangler.toml 已恢复' "$EMAIL_TEST_OUT_DIR/email-domains-deploy-fail.out"; then
+        pass "L4: DOMAINS Worker 部署失败时恢复 wrangler.toml"
+    else
+        fail "L4: DOMAINS 部署失败后未恢复 wrangler.toml"
+        sed 's/^/    /' "$EMAIL_INSTALL_DIR/worker/wrangler.toml" 2>/dev/null || true
+    fi
 fi
 
 manage_body=$(awk '/^email_manage_resend\(\)/,/^email_manage_upgrade\(\)/' "$BUILT")

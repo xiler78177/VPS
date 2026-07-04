@@ -53,9 +53,9 @@ candidate_count() {
 }
 
 entry_ip() { local e="$1"; printf '%s' "${e%%|*}"; }
-entry_lat() { local e="$1" a b c d; IFS='|' read -r a b c d <<< "$e"; printf '%s' "$b"; }
-entry_speed() { local e="$1" a b c d; IFS='|' read -r a b c d <<< "$e"; printf '%s' "$c"; }
-entry_count() { local e="$1" a b c d; IFS='|' read -r a b c d <<< "$e"; printf '%s' "$d"; }
+entry_lat() { local e="$1" _ip b c d; IFS='|' read -r _ip b c d <<< "$e"; printf '%s' "$b"; }
+entry_speed() { local e="$1" _ip b c d; IFS='|' read -r _ip b c d <<< "$e"; printf '%s' "$c"; }
+entry_count() { local e="$1" _ip b c d; IFS='|' read -r _ip b c d <<< "$e"; printf '%s' "$d"; }
 
 first_ip_for_key() {
     local key="$1" e
@@ -97,16 +97,12 @@ group_keys="${!candidates_by_key[*]}"
 log "已读取优选结果：全局=${global_best:-无}，地区分组=${group_keys}"
 
 # 2) 读取状态/黑名单工具
-declare -A state_key=() state_ip=() state_lat=() state_speed=() state_count=() state_ts=()
+declare -A state_ip=()
 if [[ -s "${PREFERIP_STATE_FILE:-}" ]]; then
     while IFS=$'\t' read -r note key ip lat speed count ts _rest || [[ -n "${note:-}" ]]; do
         [[ -z "${note//[[:space:]]/}" || "$note" == \#* ]] && continue
-        state_key["$note"]="$key"
+        : "$key" "$lat" "$speed" "$count" "$ts"
         state_ip["$note"]="$ip"
-        state_lat["$note"]="$lat"
-        state_speed["$note"]="$speed"
-        state_count["$note"]="$count"
-        state_ts["$note"]="$ts"
     done < "$PREFERIP_STATE_FILE"
 fi
 
@@ -346,8 +342,9 @@ planned_dns_family_for_node() {
 }
 
 add_dns_family_plan() {
-    local domain="$1" family="$2" cur="${dns_domain_family_plan[$domain]:-}"
+    local domain="$1" family="$2" cur
     [[ -n "$domain" && -n "$family" ]] || return 0
+    cur="${dns_domain_family_plan[$domain]:-}"
     [[ " $cur " == *" $family "* ]] && return 0
     dns_domain_family_plan["$domain"]="${cur:+$cur }$family"
 }
@@ -510,23 +507,16 @@ fi
 
 # 3) 写出本地渲染文件（供客户端/其他自动化拉取）
 rendered_file="${PREFERIP_OUTPUT_FILE:-$HERE/preferip.rendered.txt}"
-mkdir -p "$(dirname "$rendered_file")" 2>/dev/null || true
-render_tmp="$(mktemp)"
 {
     printf '# generated: %s\n' "$(date '+%F %T')"
     printf '%s' "$content"
-} > "$render_tmp"
-mv "$render_tmp" "$rendered_file"
-chmod 600 "$rendered_file" 2>/dev/null || true
+} | preferip_atomic_write "$rendered_file" 600 || die "写入本地节点文件失败: $rendered_file"
 log "已生成本地节点文件 → $rendered_file"
 
 if [[ -n "${PREFERIP_STATE_FILE:-}" ]]; then
-    mkdir -p "$(dirname "$PREFERIP_STATE_FILE")" 2>/dev/null || true
-    state_tmp="$(mktemp)"
     {
         printf '# note\tkey\tserver\tavg_latency_ms\tavg_speed_mbps\trounds_hit\tupdated_at_epoch\n'
         printf '%s' "$state_payload"
-    } > "$state_tmp"
-    mv "$state_tmp" "$PREFERIP_STATE_FILE"
+    } | preferip_atomic_write "$PREFERIP_STATE_FILE" 600 || die "写入 preferip state 失败: $PREFERIP_STATE_FILE"
 fi
 log "完成：已更新 ${n} 个 CDN 节点。客户端获取本地节点文件或入口 DNS 即生效。"

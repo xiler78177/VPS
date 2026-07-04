@@ -10,6 +10,7 @@ readonly CERT_HOOKS_DIR="/root/cert-hooks"
 readonly WG_SHARED_DB_DIR="/etc/wireguard/db"
 readonly WG_SHARED_DB_FILE="${WG_SHARED_DB_DIR}/wg-data.json"
 readonly WG_SHARED_ROLE_FILE="/etc/wireguard/.role"
+readonly WG_SHARED_ROUTE_STATE_FILE="${WG_SHARED_DB_DIR}/managed-routes.state"
 readonly WG_DEFAULT_PORT=50000
 readonly WG_MTU_DIRECT=1420
 PLATFORM="debian"
@@ -94,6 +95,15 @@ REALITY_CDN_STATE_FILE="${REALITY_CONFIG_DIR}/cdn.conf"
 REALITY_CDN_LINK_FILE="${REALITY_CONFIG_DIR}/cdn-link.txt"
 REALITY_CDN_CLIENT_JSON="${REALITY_CONFIG_DIR}/cdn-client.json"
 REALITY_CDN_ORIGIN_PORT="${REALITY_CDN_ORIGIN_PORT:-8443}"
+# 443 共存模式（nginx stream + ssl_preread 分流）：443 由 nginx stream 独占，
+# 按 SNI 分流——真站域名(白名单) → REALITY_WEB_INNER_PORT；default(借用SNI/未知/无SNI)
+# → REALITY_COEXIST_INNER_PORT(sing-box reality 入站)。所有后端仅绑 127.0.0.1，外部不可见。
+# reality 内部端口选 18443，明确避开 CDN 回源用的 8443（CF 橙云支持端口，不可改）。
+REALITY_COEXIST_STATE_FILE="${REALITY_CONFIG_DIR}/coexist.conf"
+REALITY_COEXIST_INNER_PORT="${REALITY_COEXIST_INNER_PORT:-18443}"
+REALITY_WEB_INNER_PORT="${REALITY_WEB_INNER_PORT:-12443}"
+REALITY_STREAM_ENABLED_DIR="/etc/nginx/stream-enabled"
+REALITY_STREAM_CONF="${REALITY_STREAM_ENABLED_DIR}/reality-coexist.conf"
 REALITY_SINGBOX_CONFIG="/etc/sing-box/config.json"
 REALITY_REALM_CONFIG="/etc/realm/config.toml"
 REALITY_PORT_MIN=20000
@@ -217,6 +227,183 @@ write_file_atomic() {
     fi
     _tmp_unregister "$tmpfile"
     return 0
+}
+
+write_private_file_atomic() {
+    local filepath="$1" content="$2" tmpfile dir old_umask rc
+    dir="$(dirname "$filepath")"
+    mkdir -p "$dir" || return 1
+    old_umask=$(umask)
+    umask 077
+    tmpfile=$(mktemp "${dir}/.tmp.server-manage.private.XXXXXX")
+    rc=$?
+    umask "$old_umask"
+    [[ $rc -eq 0 ]] || return 1
+    _tmp_register "$tmpfile"
+    if ! printf "%s\n" "$content" > "$tmpfile"; then
+        rm -f -- "$tmpfile" 2>/dev/null || true
+        _tmp_unregister "$tmpfile"
+        return 1
+    fi
+    chmod 600 "$tmpfile" 2>/dev/null || true
+    chown root:root "$tmpfile" 2>/dev/null || true
+    if ! mv "$tmpfile" "$filepath"; then
+        rm -f -- "$tmpfile" 2>/dev/null || true
+        _tmp_unregister "$tmpfile"
+        return 1
+    fi
+    _tmp_unregister "$tmpfile"
+    return 0
+}
+
+copy_cert_pair_atomic() {
+    local src_fullchain="$1" src_privkey="$2" dest_dir="$3"
+    local dest_full dest_key full_tmp key_tmp old_umask rc bak_full="" bak_key=""
+    _copy_cert_pair_restore_local() {
+        local _dest_full="$1" _dest_key="$2" _bak_full="${3:-}" _bak_key="${4:-}" _full_tmp="${5:-}" _key_tmp="${6:-}"
+        rm -f -- "$_dest_full" "$_dest_key" "$_full_tmp" "$_key_tmp" 2>/dev/null || true
+        [[ -n "$_bak_full" && -f "$_bak_full" ]] && mv "$_bak_full" "$_dest_full" 2>/dev/null || true
+        [[ -n "$_bak_key" && -f "$_bak_key" ]] && mv "$_bak_key" "$_dest_key" 2>/dev/null || true
+    }
+    [[ -f "$src_fullchain" && -f "$src_privkey" && -n "$dest_dir" ]] || return 1
+    mkdir -p "$dest_dir" || return 1
+    dest_full="${dest_dir}/fullchain.pem"
+    dest_key="${dest_dir}/privkey.pem"
+    old_umask=$(umask)
+    umask 077
+    full_tmp=$(mktemp "${dest_dir}/.tmp.server-manage.fullchain.XXXXXX")
+    rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+        key_tmp=$(mktemp "${dest_dir}/.tmp.server-manage.privkey.XXXXXX")
+        rc=$?
+    fi
+    umask "$old_umask"
+    [[ "$rc" -eq 0 ]] || { rm -f -- "${full_tmp:-}" "${key_tmp:-}" 2>/dev/null || true; return 1; }
+    declare -F _tmp_register >/dev/null 2>&1 && _tmp_register "$full_tmp"
+    declare -F _tmp_register >/dev/null 2>&1 && _tmp_register "$key_tmp"
+    if ! cp -L "$src_fullchain" "$full_tmp" || ! cp -L "$src_privkey" "$key_tmp"; then
+        rm -f -- "$full_tmp" "$key_tmp" 2>/dev/null || true
+        declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$full_tmp"
+        declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$key_tmp"
+        return 1
+    fi
+    chmod 644 "$full_tmp" 2>/dev/null || true
+    chmod 600 "$key_tmp" 2>/dev/null || true
+    chown root:root "$full_tmp" "$key_tmp" 2>/dev/null || true
+    if [[ -e "$dest_full" ]]; then
+        bak_full=$(mktemp "${dest_dir}/.bak.server-manage.fullchain.XXXXXX") || {
+            rm -f -- "$full_tmp" "$key_tmp" 2>/dev/null || true
+            declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$full_tmp"
+            declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$key_tmp"
+            return 1
+        }
+        rm -f -- "$bak_full"
+        mv "$dest_full" "$bak_full" || {
+            rm -f -- "$full_tmp" "$key_tmp" "$bak_full" 2>/dev/null || true
+            declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$full_tmp"
+            declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$key_tmp"
+            return 1
+        }
+    fi
+    if [[ -e "$dest_key" ]]; then
+        bak_key=$(mktemp "${dest_dir}/.bak.server-manage.privkey.XXXXXX") || {
+            _copy_cert_pair_restore_local "$dest_full" "$dest_key" "$bak_full" "$bak_key" "$full_tmp" "$key_tmp"
+            declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$full_tmp"
+            declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$key_tmp"
+            return 1
+        }
+        rm -f -- "$bak_key"
+        mv "$dest_key" "$bak_key" || {
+            _copy_cert_pair_restore_local "$dest_full" "$dest_key" "$bak_full" "$bak_key" "$full_tmp" "$key_tmp"
+            declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$full_tmp"
+            declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$key_tmp"
+            return 1
+        }
+    fi
+    if ! mv "$full_tmp" "$dest_full"; then
+        _copy_cert_pair_restore_local "$dest_full" "$dest_key" "$bak_full" "$bak_key" "$full_tmp" "$key_tmp"
+        declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$full_tmp"
+        declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$key_tmp"
+        return 1
+    fi
+    declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$full_tmp"
+    if ! mv "$key_tmp" "$dest_key"; then
+        _copy_cert_pair_restore_local "$dest_full" "$dest_key" "$bak_full" "$bak_key" "" "$key_tmp"
+        declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$key_tmp"
+        return 1
+    fi
+    declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$key_tmp"
+    rm -f -- "$bak_full" "$bak_key" 2>/dev/null || true
+    return 0
+}
+
+render_cert_pair_hook_helper() {
+    cat <<'HOOK_CERT_PAIR_HELPER'
+copy_cert_pair_restore() {
+    local dest_full="$1" dest_key="$2" bak_full="${3:-}" bak_key="${4:-}" full_tmp="${5:-}" key_tmp="${6:-}"
+    rm -f -- "$dest_full" "$dest_key" "$full_tmp" "$key_tmp" 2>/dev/null || true
+    [[ -n "$bak_full" && -f "$bak_full" ]] && mv "$bak_full" "$dest_full" 2>/dev/null || true
+    [[ -n "$bak_key" && -f "$bak_key" ]] && mv "$bak_key" "$dest_key" 2>/dev/null || true
+}
+
+copy_cert_pair_atomic() {
+    local src_fullchain="$1" src_privkey="$2" dest_dir="$3"
+    local dest_full dest_key full_tmp key_tmp old_umask rc bak_full="" bak_key=""
+    [[ -f "$src_fullchain" && -f "$src_privkey" && -n "$dest_dir" ]] || return 1
+    mkdir -p "$dest_dir" || return 1
+    dest_full="${dest_dir}/fullchain.pem"
+    dest_key="${dest_dir}/privkey.pem"
+    old_umask=$(umask)
+    umask 077
+    full_tmp=$(mktemp "${dest_dir}/.tmp.server-manage.fullchain.XXXXXX")
+    rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+        key_tmp=$(mktemp "${dest_dir}/.tmp.server-manage.privkey.XXXXXX")
+        rc=$?
+    fi
+    umask "$old_umask"
+    [[ "$rc" -eq 0 ]] || { rm -f -- "${full_tmp:-}" "${key_tmp:-}" 2>/dev/null || true; return 1; }
+    if ! cp -L "$src_fullchain" "$full_tmp" || ! cp -L "$src_privkey" "$key_tmp"; then
+        rm -f -- "$full_tmp" "$key_tmp" 2>/dev/null || true
+        return 1
+    fi
+    chmod 644 "$full_tmp" 2>/dev/null || true
+    chmod 600 "$key_tmp" 2>/dev/null || true
+    chown root:root "$full_tmp" "$key_tmp" 2>/dev/null || true
+    if [[ -e "$dest_full" ]]; then
+        bak_full=$(mktemp "${dest_dir}/.bak.server-manage.fullchain.XXXXXX") || {
+            rm -f -- "$full_tmp" "$key_tmp" 2>/dev/null || true
+            return 1
+        }
+        rm -f -- "$bak_full"
+        mv "$dest_full" "$bak_full" || {
+            rm -f -- "$full_tmp" "$key_tmp" "$bak_full" 2>/dev/null || true
+            return 1
+        }
+    fi
+    if [[ -e "$dest_key" ]]; then
+        bak_key=$(mktemp "${dest_dir}/.bak.server-manage.privkey.XXXXXX") || {
+            copy_cert_pair_restore "$dest_full" "$dest_key" "$bak_full" "$bak_key" "$full_tmp" "$key_tmp"
+            return 1
+        }
+        rm -f -- "$bak_key"
+        mv "$dest_key" "$bak_key" || {
+            copy_cert_pair_restore "$dest_full" "$dest_key" "$bak_full" "$bak_key" "$full_tmp" "$key_tmp"
+            return 1
+        }
+    fi
+    if ! mv "$full_tmp" "$dest_full"; then
+        copy_cert_pair_restore "$dest_full" "$dest_key" "$bak_full" "$bak_key" "$full_tmp" "$key_tmp"
+        return 1
+    fi
+    if ! mv "$key_tmp" "$dest_key"; then
+        copy_cert_pair_restore "$dest_full" "$dest_key" "$bak_full" "$bak_key" "" "$key_tmp"
+        return 1
+    fi
+    rm -f -- "$bak_full" "$bak_key" 2>/dev/null || true
+    return 0
+}
+HOOK_CERT_PAIR_HELPER
 }
 
 handle_interrupt() {
@@ -362,6 +549,75 @@ _ssh_authorized_keys_available() {
     return 1
 }
 
+_ssh_authorized_keys_append() {
+    local ak="$1" key="$2" owner="${3:-}" dir tmp old_umask rc last_byte
+    [[ -n "$ak" && -n "$key" ]] || return 1
+    dir="$(dirname "$ak")"
+    mkdir -p "$dir" || return 1
+    if [[ -f "$ak" ]] && grep -Fxq -- "$key" "$ak" 2>/dev/null; then
+        return 0
+    fi
+    old_umask=$(umask)
+    umask 077
+    tmp=$(mktemp "${dir}/.tmp.server-manage.authorized-keys.XXXXXX")
+    rc=$?
+    umask "$old_umask"
+    [[ "$rc" -eq 0 ]] || return 1
+    _tmp_register "$tmp"
+    if [[ -f "$ak" ]]; then
+        cat "$ak" > "$tmp" || { rm -f "$tmp"; _tmp_unregister "$tmp"; return 1; }
+        if [[ -s "$tmp" ]]; then
+            last_byte=$(tail -c 1 "$tmp" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+            if [[ "$last_byte" != "0a" ]]; then
+                printf '\n' >> "$tmp" || { rm -f "$tmp"; _tmp_unregister "$tmp"; return 1; }
+            fi
+        fi
+    fi
+    printf '%s\n' "$key" >> "$tmp" || { rm -f "$tmp"; _tmp_unregister "$tmp"; return 1; }
+    chmod 600 "$tmp" 2>/dev/null || true
+    [[ -n "$owner" ]] && chown "$owner" "$tmp" 2>/dev/null || true
+    if ! mv "$tmp" "$ak"; then
+        rm -f "$tmp"
+        _tmp_unregister "$tmp"
+        return 1
+    fi
+    _tmp_unregister "$tmp"
+    chmod 600 "$ak" 2>/dev/null || true
+    [[ -n "$owner" ]] && chown "$owner" "$ak" 2>/dev/null || true
+    return 0
+}
+
+_ssh_authorized_keys_remove() {
+    local ak="$1" key="$2" owner="${3:-}" dir tmp old_umask rc grep_rc
+    [[ -n "$ak" && -n "$key" && -f "$ak" ]] || return 1
+    dir="$(dirname "$ak")"
+    old_umask=$(umask)
+    umask 077
+    tmp=$(mktemp "${dir}/.tmp.server-manage.authorized-keys.XXXXXX")
+    rc=$?
+    umask "$old_umask"
+    [[ "$rc" -eq 0 ]] || return 1
+    _tmp_register "$tmp"
+    grep -Fvx -- "$key" "$ak" > "$tmp"
+    grep_rc=$?
+    if [[ $grep_rc -gt 1 ]]; then
+        rm -f "$tmp"
+        _tmp_unregister "$tmp"
+        return 1
+    fi
+    chmod 600 "$tmp" 2>/dev/null || true
+    [[ -n "$owner" ]] && chown "$owner" "$tmp" 2>/dev/null || true
+    if ! mv "$tmp" "$ak"; then
+        rm -f "$tmp"
+        _tmp_unregister "$tmp"
+        return 1
+    fi
+    _tmp_unregister "$tmp"
+    chmod 600 "$ak" 2>/dev/null || true
+    [[ -n "$owner" ]] && chown "$owner" "$ak" 2>/dev/null || true
+    return 0
+}
+
 _ssh_non_root_sudo_available() {
     local passwd_file="${SSH_PASSWD_FILE:-/etc/passwd}"
     local group_file="${SSH_GROUP_FILE:-/etc/group}"
@@ -394,13 +650,13 @@ ufw_is_active() {
     LANG=C ufw status 2>/dev/null | grep -qi 'Status: active'
 }
 
-# 统一设置 sshd_config 的某个 directive：命中则替换，未命中则追加
-# 用法: _sshd_set_directive <Key> <Value> [file]
+# 统一设置 sshd_config 的某个 directive：命中则替换，未命中则插入到首个 Match 块之前
+# 用法: _sshd_set_directive <Key> <Value> [file] [skip_dropin_check]
 _sshd_set_directive() {
-    local key="$1" value="$2" file="${3:-$SSHD_CONFIG}"
+    local key="$1" value="$2" file="${3:-$SSHD_CONFIG}" skip_dropin_check="${4:-0}"
     [[ -f "$file" ]] || return 1
     # 检查 drop-in 是否已配置同名 directive（OpenSSH 默认 drop-in 优先生效）
-    if [[ -d /etc/ssh/sshd_config.d ]]; then
+    if [[ "$skip_dropin_check" != "1" && -d /etc/ssh/sshd_config.d ]]; then
         local overrides
         overrides=$(grep -lE "^[[:space:]]*${key}[[:space:]]+" /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true)
         if [[ -n "$overrides" ]]; then
@@ -575,6 +831,13 @@ validate_cidr() {
     fi
 }
 
+nft_addr_family_for_cidr() {
+    case "${1:-}" in
+        *:*) printf 'ip6' ;;
+        *)   printf 'ip' ;;
+    esac
+}
+
 validate_cidr_list() {
     local list="${1:-}" item
     [[ -n "$list" && "$list" != "null" ]] || return 0
@@ -704,28 +967,86 @@ validate_conf_file() {
 cron_remove_job() {
     local pattern="$1"
     local cron_tmp
-    cron_tmp=$(mktemp) || return 1
+    cron_tmp=$(_cron_tmp_create) || return 1
     crontab -l 2>/dev/null | grep -Fv -- "$pattern" > "$cron_tmp" || true
     if ! crontab "$cron_tmp" 2>/dev/null; then
         print_error "更新 crontab 失败"
-        rm -f "$cron_tmp"
+        _cron_tmp_cleanup "$cron_tmp"
         return 1
     fi
-    rm -f "$cron_tmp"
+    _cron_tmp_cleanup "$cron_tmp"
+}
+
+_cron_tmp_create() {
+    local tmp_dir tmp_file old_umask rc
+    old_umask=$(umask)
+    umask 077
+    tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/${SCRIPT_NAME:-server-manage}-cron.XXXXXX")
+    rc=$?
+    umask "$old_umask"
+    [[ "$rc" -eq 0 ]] || return 1
+    chmod 700 "$tmp_dir" 2>/dev/null || true
+    tmp_file="$tmp_dir/crontab"
+    : > "$tmp_file" || { rm -rf -- "$tmp_dir" 2>/dev/null || true; return 1; }
+    chmod 600 "$tmp_file" 2>/dev/null || true
+    printf '%s\n' "$tmp_file"
+}
+
+_cron_tmp_cleanup() {
+    local cron_tmp="${1:-}" tmp_dir base
+    [[ -n "$cron_tmp" ]] || return 0
+    tmp_dir="$(dirname "$cron_tmp")"
+    base="$(basename "$tmp_dir")"
+    case "$base" in
+        "${SCRIPT_NAME:-server-manage}-cron."*) rm -rf -- "$tmp_dir" 2>/dev/null || true ;;
+        *) rm -f -- "$cron_tmp" 2>/dev/null || true ;;
+    esac
+}
+
+cron_has_job_command() {
+    local command_path="$1"
+    crontab -l 2>/dev/null | awk -v cmd="$command_path" 'NF >= 6 && $6 == cmd { found=1 } END { exit(found ? 0 : 1) }'
+}
+
+cron_remove_job_command() {
+    local command_path="$1"
+    local cron_tmp
+    cron_tmp=$(_cron_tmp_create) || return 1
+    crontab -l 2>/dev/null | awk -v cmd="$command_path" '!(NF >= 6 && $6 == cmd)' > "$cron_tmp" || true
+    if ! crontab "$cron_tmp" 2>/dev/null; then
+        print_error "更新 crontab 失败"
+        _cron_tmp_cleanup "$cron_tmp"
+        return 1
+    fi
+    _cron_tmp_cleanup "$cron_tmp"
+}
+
+cron_add_job_command() {
+    local command_path="$1" line="$2"
+    local cron_tmp
+    cron_tmp=$(_cron_tmp_create) || return 1
+    crontab -l 2>/dev/null | awk -v cmd="$command_path" '!(NF >= 6 && $6 == cmd)' > "$cron_tmp" || true
+    echo "$line" >> "$cron_tmp"
+    if ! crontab "$cron_tmp" 2>/dev/null; then
+        print_error "更新 crontab 失败"
+        _cron_tmp_cleanup "$cron_tmp"
+        return 1
+    fi
+    _cron_tmp_cleanup "$cron_tmp"
 }
 
 cron_add_job() {
     local pattern="$1" line="$2"
     local cron_tmp
-    cron_tmp=$(mktemp) || return 1
+    cron_tmp=$(_cron_tmp_create) || return 1
     crontab -l 2>/dev/null | grep -Fv -- "$pattern" > "$cron_tmp" || true
     echo "$line" >> "$cron_tmp"
     if ! crontab "$cron_tmp" 2>/dev/null; then
         print_error "更新 crontab 失败"
-        rm -f "$cron_tmp"
+        _cron_tmp_cleanup "$cron_tmp"
         return 1
     fi
-    rm -f "$cron_tmp"
+    _cron_tmp_cleanup "$cron_tmp"
 }
 
 init_environment() {
@@ -759,12 +1080,20 @@ if [[ -f "$CONFIG_FILE" ]]; then
     fi
 fi
 _extract_ipv4_from_text() {
-    local raw="$1" ip=""
+    local raw="$1" ip="" octet _o1 _o2 _o3 _o4 _extra
     [[ -z "$raw" ]] && return 1
-    ip=$(printf '%s' "$raw" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1)
-    [[ -n "$ip" && "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-    echo "$ip"
-    return 0
+    while IFS= read -r ip; do
+        local valid=1
+        IFS='.' read -r _o1 _o2 _o3 _o4 _extra <<< "$ip"
+        [[ -z "${_extra:-}" ]] || continue
+        for octet in "$_o1" "$_o2" "$_o3" "$_o4"; do
+            [[ "$octet" =~ ^[0-9]+$ ]] && [ "$octet" -le 255 ] || { valid=0; break; }
+        done
+        [[ "$valid" -eq 1 ]] || continue
+        echo "$ip"
+        return 0
+    done < <(printf '%s' "$raw" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}')
+    return 1
 }
 
 # 统一公网 IP 获取函数（使用国内可达的 API）
@@ -806,31 +1135,44 @@ ddns_rebuild_cron() {
 ddns_create_script() {
     mkdir -p "$DDNS_CONFIG_DIR"
     mkdir -p "$(dirname "$DDNS_UPDATE_SCRIPT")"
-        cat > "$DDNS_UPDATE_SCRIPT" << 'EOF'
+    local ddns_script_tmp
+    ddns_script_tmp=$(mktemp "$(dirname "$DDNS_UPDATE_SCRIPT")/.tmp.server-manage.ddns-update.XXXXXX") || return 1
+    _tmp_register "$ddns_script_tmp"
+if ! cat > "$ddns_script_tmp" << 'EOF'
 #!/bin/bash
-if command -v flock >/dev/null 2>&1; then
-    exec 200>/var/lock/ddns-update.lock
-    flock -n 200 || exit 0
-else
-    mkdir /tmp/ddns-update.lock 2>/dev/null || exit 0
-    trap 'rmdir /tmp/ddns-update.lock 2>/dev/null' EXIT
-fi
 DDNS_CONFIG_DIR="/etc/ddns"
 DDNS_LOG="/var/log/ddns.log"
-DDNS_STAMP_DIR="/var/lib/ddns"
-mkdir -p "$DDNS_STAMP_DIR" 2>/dev/null || {
-    DDNS_STAMP_DIR="/tmp/ddns-state"
-    mkdir -p "$DDNS_STAMP_DIR" 2>/dev/null || true
-}
+DDNS_RUNTIME_DIR="/var/lib/server-manage/ddns"
+DDNS_STAMP_DIR="$DDNS_RUNTIME_DIR/stamps"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$DDNS_LOG"; }
+mkdir -p "$DDNS_RUNTIME_DIR" "$DDNS_STAMP_DIR" 2>/dev/null || {
+    log "无法创建 DDNS 状态目录: $DDNS_RUNTIME_DIR"
+    exit 1
+}
+chmod 700 /var/lib/server-manage "$DDNS_RUNTIME_DIR" "$DDNS_STAMP_DIR" 2>/dev/null || true
+if command -v flock >/dev/null 2>&1; then
+    exec 200>"$DDNS_RUNTIME_DIR/update.lock"
+    flock -n 200 || exit 0
+else
+    mkdir "$DDNS_RUNTIME_DIR/update.lock.d" 2>/dev/null || exit 0
+    trap 'rmdir "$DDNS_RUNTIME_DIR/update.lock.d" 2>/dev/null' EXIT
+fi
 
 extract_ipv4() {
-    local raw="$1" ip=""
+    local raw="$1" ip="" octet _o1 _o2 _o3 _o4 _extra
     [[ -z "$raw" ]] && return 1
-    ip=$(printf '%s' "$raw" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1)
-    [[ -n "$ip" && "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-    echo "$ip"
-    return 0
+    while IFS= read -r ip; do
+        local valid=1
+        IFS='.' read -r _o1 _o2 _o3 _o4 _extra <<< "$ip"
+        [[ -z "${_extra:-}" ]] || continue
+        for octet in "$_o1" "$_o2" "$_o3" "$_o4"; do
+            [[ "$octet" =~ ^[0-9]+$ ]] && [ "$octet" -le 255 ] || { valid=0; break; }
+        done
+        [[ "$valid" -eq 1 ]] || continue
+        echo "$ip"
+        return 0
+    done < <(printf '%s' "$raw" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}')
+    return 1
 }
 
 get_ip() {
@@ -949,15 +1291,45 @@ ddns_should_run() {
     return 0
 }
 
-for conf in "$DDNS_CONFIG_DIR"/*.conf; do
-    [ -f "$conf" ] || continue
-    parse_ddns_conf "$conf" || continue
-    ddns_should_run "$conf" || continue
-    [[ "$DDNS_IPV4" == "true" ]] && { ip=$(get_ip 4); [[ -n "$ip" ]] && update_cf "$DDNS_DOMAIN" A "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED"; }
-    [[ "$DDNS_IPV6" == "true" ]] && { ip=$(get_ip 6); [[ -n "$ip" ]] && update_cf "$DDNS_DOMAIN" AAAA "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED"; }
-done
+failed=0
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    failed=0
+    for conf in "$DDNS_CONFIG_DIR"/*.conf; do
+        [ -f "$conf" ] || continue
+        parse_ddns_conf "$conf" || continue
+        ddns_should_run "$conf" || continue
+        if [[ "$DDNS_IPV4" == "true" ]]; then
+            if ip=$(get_ip 4) && [[ -n "$ip" ]]; then
+                update_cf "$DDNS_DOMAIN" A "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED" || failed=1
+            else
+                log "[$DDNS_DOMAIN] A 获取公网 IPv4 失败"
+                failed=1
+            fi
+        fi
+        if [[ "$DDNS_IPV6" == "true" ]]; then
+            if ip=$(get_ip 6) && [[ -n "$ip" ]]; then
+                update_cf "$DDNS_DOMAIN" AAAA "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED" || failed=1
+            else
+                log "[$DDNS_DOMAIN] AAAA 获取公网 IPv6 失败"
+                failed=1
+            fi
+        fi
+    done
+    exit "$failed"
+fi
 EOF
-    chmod +x "$DDNS_UPDATE_SCRIPT"
+    then
+        rm -f -- "$ddns_script_tmp" 2>/dev/null || true
+        _tmp_unregister "$ddns_script_tmp"
+        return 1
+    fi
+    chmod 0755 "$ddns_script_tmp" 2>/dev/null || true
+    if ! mv "$ddns_script_tmp" "$DDNS_UPDATE_SCRIPT"; then
+        rm -f -- "$ddns_script_tmp" 2>/dev/null || true
+        _tmp_unregister "$ddns_script_tmp"
+        return 1
+    fi
+    _tmp_unregister "$ddns_script_tmp"
 }
 
 ddns_setup() {
@@ -980,10 +1352,9 @@ DDNS_IPV4=\"$ipv4\"
 DDNS_IPV6=\"$ipv6\"
 DDNS_PROXIED=\"$proxied\"
 DDNS_INTERVAL=\"$interval\""
-    write_file_atomic "$DDNS_CONFIG_DIR/${domain}.conf" "$ddns_conf_content" || { print_error "DDNS 配置写入失败"; return 1; }
-    chmod 600 "$DDNS_CONFIG_DIR/${domain}.conf"
-    ddns_create_script
-    ddns_rebuild_cron
+    write_private_file_atomic "$DDNS_CONFIG_DIR/${domain}.conf" "$ddns_conf_content" || { print_error "DDNS 配置写入失败"; return 1; }
+    ddns_create_script || { print_error "DDNS 更新脚本生成失败"; return 1; }
+    ddns_rebuild_cron || { print_error "DDNS cron 更新失败"; return 1; }
     print_success "DDNS 已启用 (每 ${interval} 分钟检测)"
     log_action "DDNS enabled: $domain interval=${interval}m"
     return 0
@@ -1003,10 +1374,9 @@ DDNS_IPV4=\"$ipv4\"
 DDNS_IPV6=\"$ipv6\"
 DDNS_PROXIED=\"$proxied\"
 DDNS_INTERVAL=\"$interval\""
-    write_file_atomic "$DDNS_CONFIG_DIR/${domain}.conf" "$ddns_conf_content" || { print_error "DDNS 配置写入失败"; return 1; }
-    chmod 600 "$DDNS_CONFIG_DIR/${domain}.conf"
-    ddns_create_script
-    ddns_rebuild_cron
+    write_private_file_atomic "$DDNS_CONFIG_DIR/${domain}.conf" "$ddns_conf_content" || { print_error "DDNS 配置写入失败"; return 1; }
+    ddns_create_script || { print_error "DDNS 更新脚本生成失败"; return 1; }
+    ddns_rebuild_cron || { print_error "DDNS cron 更新失败"; return 1; }
     log_action "DDNS enabled: $domain interval=${interval}m"
     return 0
 }
@@ -1113,8 +1483,15 @@ ddns_delete() {
 ddns_force_update() {
     if [[ -x "$DDNS_UPDATE_SCRIPT" ]]; then
         print_info "正在更新..."
-        "$DDNS_UPDATE_SCRIPT"
-        print_success "更新完成"
+        if "$DDNS_UPDATE_SCRIPT"; then
+            print_success "更新完成"
+        else
+            local rc=$?
+            print_error "DDNS 更新失败 (rc=$rc)，请查看日志"
+            tail -n 10 "$DDNS_LOG" 2>/dev/null || echo "暂无日志"
+            pause
+            return "$rc"
+        fi
         tail -n 10 "$DDNS_LOG" 2>/dev/null || echo "暂无日志"
     else
         print_warn "DDNS 未配置"
@@ -1250,7 +1627,8 @@ _ip_location_cache_path() {
 }
 
 _ip_location_refresh_background() {
-    local ip="$1" cache_file="$2" lock_file="${cache_file}.lock"
+    local ip="$1" cache_file="$2" lock_file
+    lock_file="${cache_file}.lock"
     mkdir -p "$CACHE_DIR" 2>/dev/null || return 0
     if command_exists flock; then
         (
@@ -1418,25 +1796,57 @@ show_dual_column_sysinfo() {
         printf " ${C_CYAN}%-8s${C_RESET}%s\n" "登录:" "无记录"
     fi
 }
+_ufw_validate_current_ssh_ports() {
+    local _ssh_port found=0
+    for _ssh_port in $CURRENT_SSH_PORTS; do
+        found=1
+        validate_port "$_ssh_port" || {
+            print_error "无法确认当前 SSH 端口，拒绝操作 UFW"
+            return 1
+        }
+    done
+    if [[ "$found" -eq 0 ]]; then
+        print_error "无法确认当前 SSH 端口，拒绝操作 UFW"
+        return 1
+    fi
+    return 0
+}
+
+_ufw_apply_default_ssh_rules() {
+    local _ssh_port
+    _ufw_validate_current_ssh_ports || return 1
+    print_info "配置默认规则..."
+    if ! ufw default deny incoming >/dev/null; then
+        print_error "设置 UFW 默认入站拒绝失败。"
+        return 1
+    fi
+    if ! ufw default allow outgoing >/dev/null; then
+        print_error "设置 UFW 默认出站允许失败。"
+        return 1
+    fi
+    for _ssh_port in $CURRENT_SSH_PORTS; do
+        if ! ufw allow "$_ssh_port/tcp" comment "SSH-Access" >/dev/null; then
+            print_error "放行 SSH 端口 ${_ssh_port}/tcp 失败，拒绝继续启用 UFW。"
+            return 1
+        fi
+    done
+    return 0
+}
+
 ufw_setup() {
-    install_package "ufw"
+    install_package "ufw" || { print_error "UFW 安装失败。"; pause; return 1; }
+    _require_cmd ufw "UFW" || return
     if is_systemd && systemctl is-active --quiet firewalld 2>/dev/null; then
         print_warn "检测到 firewalld 正在运行，请先禁用它。"
-        return
+        pause; return 1
     fi
     refresh_ssh_port
-    local _ssh_port
-    for _ssh_port in $CURRENT_SSH_PORTS; do
-        validate_port "$_ssh_port" || { print_error "无法确认当前 SSH 端口，拒绝启用 UFW"; pause; return 1; }
-    done
-    print_info "配置默认规则..."
-    ufw default deny incoming >/dev/null
-    ufw default allow outgoing >/dev/null
-    for _ssh_port in $CURRENT_SSH_PORTS; do
-        ufw allow "$_ssh_port/tcp" comment "SSH-Access" >/dev/null
-    done
+    _ufw_apply_default_ssh_rules || { pause; return 1; }
     if confirm "启用 UFW 可能导致 SSH 断开(若端口配置错误)，确认启用?"; then
-        echo "y" | ufw enable
+        if ! echo "y" | ufw enable >/dev/null; then
+            print_error "UFW 启用失败。"
+            pause; return 1
+        fi
         print_success "UFW 已启用。"
         log_action "UFW enabled with SSH ports $CURRENT_SSH_PORTS"
     fi
@@ -1479,18 +1889,20 @@ ufw_safe_reset() {
     if confirm "这将重置所有规则！脚本会尝试保留当前 SSH 端口，确定吗？"; then
         print_info "正在重置..."
         refresh_ssh_port
-        local _ssh_port
-        for _ssh_port in $CURRENT_SSH_PORTS; do
-            validate_port "$_ssh_port" || { print_error "无法确认当前 SSH 端口，拒绝重置 UFW"; pause; return 1; }
-        done
-        echo "y" | ufw disable >/dev/null
-        echo "y" | ufw reset >/dev/null
-        ufw default deny incoming >/dev/null
-        ufw default allow outgoing >/dev/null
-        for _ssh_port in $CURRENT_SSH_PORTS; do
-            ufw allow "$_ssh_port/tcp" comment "SSH-Access" >/dev/null
-        done
-        echo "y" | ufw enable >/dev/null
+        _ufw_validate_current_ssh_ports || { pause; return 1; }
+        if ! echo "y" | ufw disable >/dev/null; then
+            print_error "UFW 禁用失败，已中止重置。"
+            pause; return 1
+        fi
+        if ! echo "y" | ufw reset >/dev/null; then
+            print_error "UFW 重置失败。"
+            pause; return 1
+        fi
+        _ufw_apply_default_ssh_rules || { pause; return 1; }
+        if ! echo "y" | ufw enable >/dev/null; then
+            print_error "UFW 重新启用失败，请手动检查当前防火墙状态。"
+            pause; return 1
+        fi
         print_success "重置完成。SSH 端口 ${CURRENT_SSH_PORTS} 已放行。"
         log_action "UFW reset completed"
     fi
@@ -1532,6 +1944,7 @@ ufw_add() {
 }
 
 FIREWALL_SSH_OPEN_BACKENDS=""
+FIREWALL_UDP_OPEN_BACKENDS=""
 
 _firewall_iptables_input_restrictive() {
     local bin="$1"
@@ -1574,6 +1987,39 @@ _firewall_iptables_delete_tcp_accept() {
     "$bin" -D INPUT -p tcp -m state --state NEW -m tcp --dport "$port" \
         -m comment --comment "$comment" -j ACCEPT 2>/dev/null && return 0
     "$bin" -D INPUT -p tcp -m tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+}
+
+_firewall_iptables_has_udp_accept() {
+    local bin="$1" port="$2"
+    validate_port "$port" || return 1
+    command_exists "$bin" || return 1
+    "$bin" -S INPUT 2>/dev/null | awk -v p="$port" '
+        $1=="-A" && $2=="INPUT" &&
+        $0 ~ / -j ACCEPT( |$)/ &&
+        $0 ~ /(^| )-p udp( |$)/ &&
+        $0 ~ ("(^| )--dport " p "($| )") { found=1 }
+        END { exit found ? 0 : 1 }
+    '
+}
+
+_firewall_iptables_insert_udp_accept() {
+    local bin="$1" port="$2" comment="${3:-server-manage UDP}"
+    validate_port "$port" || return 1
+    command_exists "$bin" || return 1
+    _firewall_iptables_has_udp_accept "$bin" "$port" && return 0
+
+    "$bin" -I INPUT 1 -p udp -m udp --dport "$port" \
+        -m comment --comment "$comment" -j ACCEPT 2>/dev/null && return 0
+    "$bin" -I INPUT 1 -p udp -m udp --dport "$port" -j ACCEPT
+}
+
+_firewall_iptables_delete_udp_accept() {
+    local bin="$1" port="$2" comment="${3:-server-manage UDP}"
+    validate_port "$port" || return 1
+    command_exists "$bin" || return 0
+    "$bin" -D INPUT -p udp -m udp --dport "$port" \
+        -m comment --comment "$comment" -j ACCEPT 2>/dev/null && return 0
+    "$bin" -D INPUT -p udp -m udp --dport "$port" -j ACCEPT 2>/dev/null || true
 }
 
 _firewall_iptables_save_rules() {
@@ -1705,6 +2151,84 @@ firewall_rollback_ssh_port() {
     done
 }
 
+# firewall_prepare_non_ufw_udp_port <port> [comment]
+# UFW 未启用/不存在时，为必须可入站的 UDP 服务处理常见本机防火墙。
+# 返回值同 firewall_prepare_non_ufw_ssh_port。
+firewall_prepare_non_ufw_udp_port() {
+    local port="$1" comment="${2:-Managed-UDP}"
+    FIREWALL_UDP_OPEN_BACKENDS=""
+    validate_port "$port" || { print_error "端口无效: $port"; return 1; }
+    [[ "$PLATFORM" == "openwrt" ]] && return 0
+
+    if is_systemd && systemctl is-active --quiet firewalld 2>/dev/null; then
+        print_warn "检测到 firewalld 正在运行；UDP 端口 ${port} 必须同步放行。"
+        if ! command_exists firewall-cmd; then
+            print_error "firewalld 活跃但 firewall-cmd 不可用，拒绝继续。"
+            return 1
+        fi
+        if ! confirm "是否通过 firewalld 放行 ${port}/udp（运行时 + permanent）？"; then
+            return 2
+        fi
+        firewall-cmd --add-port="${port}/udp" >/dev/null || return 1
+        firewall-cmd --permanent --add-port="${port}/udp" >/dev/null 2>&1 || \
+            print_warn "firewalld permanent 规则写入失败；本次运行时已放行，但重启后可能丢失。"
+        FIREWALL_UDP_OPEN_BACKENDS+=" firewalld"
+        print_success "firewalld 已放行 ${port}/udp。"
+        return 0
+    fi
+
+    local restrictive=0 changed=0 backend
+    for backend in iptables ip6tables; do
+        command_exists "$backend" || continue
+        _firewall_iptables_input_restrictive "$backend" || continue
+        restrictive=1
+        if _firewall_iptables_has_udp_accept "$backend" "$port"; then
+            print_info "${backend} 已存在 ${port}/udp 放行规则。"
+            continue
+        fi
+        print_warn "检测到 ${backend} INPUT 链存在 DROP/REJECT，且未放行 ${port}/udp。"
+        if ! confirm "是否自动插入 ${backend} 放行规则并尽量持久化？"; then
+            [[ -n "$FIREWALL_UDP_OPEN_BACKENDS" ]] && firewall_rollback_udp_port "$port" "$FIREWALL_UDP_OPEN_BACKENDS" "$comment"
+            return 2
+        fi
+        if ! _firewall_iptables_insert_udp_accept "$backend" "$port" "$comment"; then
+            print_error "${backend} 插入 ${port}/udp 放行规则失败。"
+            [[ -n "$FIREWALL_UDP_OPEN_BACKENDS" ]] && firewall_rollback_udp_port "$port" "$FIREWALL_UDP_OPEN_BACKENDS" "$comment"
+            return 1
+        fi
+        FIREWALL_UDP_OPEN_BACKENDS+=" ${backend}"
+        changed=1
+        print_success "${backend} 已放行 ${port}/udp。"
+        _firewall_save_after_iptables_change "$backend"
+    done
+
+    if [[ $restrictive -eq 0 ]]; then
+        print_info "未检测到 UFW 以外的本地 INPUT DROP/REJECT；仍请确认云安全组已放行 ${port}/udp。"
+    elif [[ $changed -eq 0 ]]; then
+        print_info "检测到本地防火墙限制，但 ${port}/udp 已有放行规则。"
+    fi
+    return 0
+}
+
+firewall_rollback_udp_port() {
+    local port="$1" backends="${2:-}" comment="${3:-Managed-UDP}" backend
+    validate_port "$port" || return 0
+    for backend in $backends; do
+        case "$backend" in
+            iptables|ip6tables)
+                _firewall_iptables_delete_udp_accept "$backend" "$port" "$comment"
+                _firewall_save_after_iptables_change "$backend"
+                ;;
+            firewalld)
+                if command_exists firewall-cmd; then
+                    firewall-cmd --remove-port="${port}/udp" >/dev/null 2>&1 || true
+                    firewall-cmd --permanent --remove-port="${port}/udp" >/dev/null 2>&1 || true
+                fi
+                ;;
+        esac
+    done
+}
+
 # firewall_allow_tcp_port <port> [comment]
 # 返回值:
 #   0 = 已成功放行
@@ -1746,6 +2270,41 @@ firewall_allow_tcp_port() {
     return 1
 }
 
+# firewall_allow_udp_port <port> [comment]
+# 返回值同 firewall_allow_tcp_port；业务模块只追加规则，不自动启用/重置 UFW。
+firewall_allow_udp_port() {
+    local port="$1" comment="${2:-Managed-UDP}"
+    validate_port "$port" || { print_error "端口无效: $port"; return 1; }
+    if [[ "$PLATFORM" == "openwrt" ]]; then
+        print_warn "OpenWrt 防火墙请在 LuCI/fw4 中放行 ${port}/udp"
+        return 0
+    fi
+
+    if ! command_exists ufw; then
+        print_warn "未检测到 UFW — 本脚本不会自动安装。"
+        print_info "如需本地防火墙，请进入【防火墙管理】菜单完成 UFW 安装与启用；"
+        print_info "或在云厂商安全组放行 ${port}/udp。"
+        log_action "UFW absent during firewall_allow_udp_port port=${port}" "INFO"
+        return 2
+    fi
+
+    if ! ufw_is_active; then
+        print_warn "UFW 已安装但未启用 — 本脚本不会在业务流程里自动启用 UFW。"
+        print_info "如需本地防火墙保护，请进入【防火墙管理】→ 安装并启用 UFW；"
+        print_info "或在云厂商安全组放行 ${port}/udp。"
+        log_action "UFW inactive during firewall_allow_udp_port port=${port}" "INFO"
+        return 2
+    fi
+
+    # UFW 已启用 — 仅追加规则
+    if ufw allow "${port}/udp" comment "$comment" >/dev/null 2>&1; then
+        log_action "UFW allowed ${port}/udp comment=${comment}"
+        return 0
+    fi
+    print_error "UFW 添加规则失败: ${port}/udp"
+    return 1
+}
+
 firewall_apply_reality_port() {
     local port="$1"
     firewall_allow_tcp_port "$port" "SingBox-Reality"
@@ -1776,8 +2335,123 @@ _geoip_country_name() {
 }
 
 _geoip_load_conf() {
+    local line key value mode="" countries="" last_update="" cc
     GEOIP_MODE="" GEOIP_COUNTRIES="" GEOIP_LAST_UPDATE=""
-    [[ -f "$GEOIP_CONF" ]] && validate_conf_file "$GEOIP_CONF" && source "$GEOIP_CONF"
+    [[ -f "$GEOIP_CONF" ]] || return 1
+    validate_conf_file "$GEOIP_CONF" || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        [[ -z "${line// }" || "$line" =~ ^[[:space:]]*# ]] && continue
+        key="${line%%=*}"
+        key="${key//[[:space:]]/}"
+        value="${line#*=}"
+        case "$key" in
+            GEOIP_MODE|GEOIP_COUNTRIES|GEOIP_LAST_UPDATE) ;;
+            *) return 1 ;;
+        esac
+        if [[ "$value" =~ ^\"(.*)\"$ ]]; then
+            value="${BASH_REMATCH[1]}"
+        elif [[ "$value" =~ ^\'([^\']*)\'$ ]]; then
+            value="${BASH_REMATCH[1]}"
+        fi
+        case "$key" in
+            GEOIP_MODE) mode="$value" ;;
+            GEOIP_COUNTRIES) countries="$value" ;;
+            GEOIP_LAST_UPDATE) last_update="$value" ;;
+        esac
+    done < "$GEOIP_CONF"
+    [[ -z "$mode" || "$mode" =~ ^(whitelist|blacklist)$ ]] || return 1
+    for cc in $countries; do
+        [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || return 1
+    done
+    GEOIP_MODE="$mode"
+    GEOIP_COUNTRIES="$countries"
+    GEOIP_LAST_UPDATE="$last_update"
+    return 0
+}
+
+_geoip_service_file_path() {
+    printf '%s' "${GEOIP_SERVICE_FILE:-/etc/systemd/system/geoip-firewall.service}"
+}
+
+_geoip_apply_script_path() {
+    printf '%s' "${GEOIP_APPLY_SCRIPT:-/usr/local/bin/geoip-apply.sh}"
+}
+
+_geoip_update_script_path() {
+    printf '%s' "${GEOIP_UPDATE_SCRIPT:-/usr/local/bin/geoip-update.sh}"
+}
+
+_geoip_render_conf() {
+    local mode="$1" countries="$2" last_update="$3" cc
+    [[ "$mode" =~ ^(whitelist|blacklist)$ ]] || return 1
+    [[ "$last_update" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+    for cc in $countries; do
+        [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || return 1
+    done
+    printf 'GEOIP_MODE="%s"\n' "$mode"
+    printf 'GEOIP_COUNTRIES="%s"\n' "$countries"
+    printf 'GEOIP_LAST_UPDATE="%s"\n' "$last_update"
+}
+
+_geoip_write_conf() {
+    local mode="$1" countries="$2" last_update="$3" content
+    content="$(_geoip_render_conf "$mode" "$countries" "$last_update")" || return 1
+    write_private_file_atomic "$GEOIP_CONF" "$content"
+}
+
+_geoip_render_conf_last_update() {
+    local conf_file="$1" last_update="$2"
+    [[ "$last_update" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+    if [[ -f "$conf_file" ]]; then
+        awk -v last_update="$last_update" '
+            BEGIN { done=0 }
+            /^[[:space:]]*GEOIP_LAST_UPDATE[[:space:]]*=/ {
+                if (!done) print "GEOIP_LAST_UPDATE=\"" last_update "\""
+                done=1
+                next
+            }
+            { print }
+            END {
+                if (!done) print "GEOIP_LAST_UPDATE=\"" last_update "\""
+            }
+        ' "$conf_file"
+    else
+        printf 'GEOIP_LAST_UPDATE="%s"\n' "$last_update"
+    fi
+}
+
+_geoip_update_last_update() {
+    local conf_file="$1" last_update="${2:-$(date +%Y-%m-%d)}" content
+    validate_conf_file "$conf_file" || return 1
+    content="$(_geoip_render_conf_last_update "$conf_file" "$last_update")" || return 1
+    write_private_file_atomic "$conf_file" "$content"
+}
+
+_geoip_render_service_unit() {
+    local apply_script="${1:-/usr/local/bin/geoip-apply.sh}"
+    cat <<SVC_EOF
+[Unit]
+Description=GeoIP Firewall Rules
+After=network.target
+Before=ufw.service
+
+[Service]
+Type=oneshot
+ExecStart=${apply_script}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SVC_EOF
+}
+
+_geoip_install_service_unit() {
+    local service_file content
+    service_file="$(_geoip_service_file_path)"
+    content="$(_geoip_render_service_unit "$(_geoip_apply_script_path)")" || return 1
+    write_file_atomic "$service_file" "$content" || return 1
+    chmod 644 "$service_file" 2>/dev/null || true
 }
 
 _geoip_download() {
@@ -1834,7 +2508,7 @@ _geoip_apply() {
     local tmp_set="${set_name}_tmp"
     local set6_name="geoip_${mode}6"
     local tmp6_set="${set6_name}_tmp"
-    local total_entries=0 total6_entries=0
+    local total_entries=0 total6_entries=0 use_ip6tables=0 swapped4=0
     for cc in $countries; do
         local f="${GEOIP_DATA_DIR}/${cc,,}.zone"
         if [[ -f "$f" ]]; then
@@ -1857,6 +2531,7 @@ _geoip_apply() {
         print_error "检测到 IPv6 栈但缺少 ip6tables，拒绝应用 GeoIP 以避免 IPv6 绕过。"
         return 1
     fi
+    command_exists ip6tables && use_ip6tables=1
     # Bulk load into temp set
     ipset create "$tmp_set" hash:net maxelem 131072 2>/dev/null || ipset flush "$tmp_set" || return 1
     for cc in $countries; do
@@ -1868,29 +2543,44 @@ _geoip_apply() {
             return 1
         fi
     done
-    # Atomic swap
-    ipset create "$set_name" hash:net maxelem 131072 2>/dev/null || true
-    if ! ipset swap "$tmp_set" "$set_name"; then
-        print_error "GeoIP ipset swap 失败，保留旧集合。"
-        ipset destroy "$tmp_set" 2>/dev/null || true
-        return 1
-    fi
-    ipset destroy "$tmp_set" 2>/dev/null || true
-    if command_exists ip6tables; then
-        ipset create "$tmp6_set" hash:net family inet6 maxelem 131072 2>/dev/null || ipset flush "$tmp6_set" || return 1
+
+    if [[ "$use_ip6tables" -eq 1 ]]; then
+        if ! ipset create "$tmp6_set" hash:net family inet6 maxelem 131072 2>/dev/null && ! ipset flush "$tmp6_set"; then
+            ipset destroy "$tmp_set" 2>/dev/null || true
+            return 1
+        fi
         for cc in $countries; do
             local f6="${GEOIP_DATA_DIR}/${cc,,}.zone6"
             [[ -f "$f6" ]] || continue
             if ! sed -e '/^#/d' -e '/^$/d' -e '/:/!d' -e "s/^/add ${tmp6_set} /" "$f6" | ipset restore -exist 2>/dev/null; then
                 print_error "GeoIP 写入 IPv6 ipset 失败: ${cc}"
                 ipset destroy "$tmp6_set" 2>/dev/null || true
+                ipset destroy "$tmp_set" 2>/dev/null || true
                 return 1
             fi
         done
+    fi
+
+    # Swap only after both families have been populated. If IPv6 swap fails after
+    # IPv4 has moved, swap IPv4 back so an update failure does not half-commit.
+    ipset create "$set_name" hash:net maxelem 131072 2>/dev/null || true
+    if ! ipset swap "$tmp_set" "$set_name"; then
+        print_error "GeoIP ipset swap 失败，保留旧集合。"
+        ipset destroy "$tmp_set" 2>/dev/null || true
+        [[ "$use_ip6tables" -eq 1 ]] && ipset destroy "$tmp6_set" 2>/dev/null || true
+        return 1
+    fi
+    swapped4=1
+    if [[ "$use_ip6tables" -eq 1 ]]; then
         ipset create "$set6_name" hash:net family inet6 maxelem 131072 2>/dev/null || true
         if ! ipset swap "$tmp6_set" "$set6_name"; then
             print_error "GeoIP IPv6 ipset swap 失败，保留旧集合。"
+            if [[ "$swapped4" -eq 1 ]]; then
+                ipset swap "$tmp_set" "$set_name" 2>/dev/null || \
+                    print_warn "GeoIP IPv4 集合回滚失败，请手动检查 ipset: ${set_name}/${tmp_set}"
+            fi
             ipset destroy "$tmp6_set" 2>/dev/null || true
+            ipset destroy "$tmp_set" 2>/dev/null || true
             return 1
         fi
         ipset destroy "$tmp6_set" 2>/dev/null || true
@@ -1898,6 +2588,7 @@ _geoip_apply() {
             print_warn "GeoIP IPv6 数据为空；白名单模式将默认拦截公网 IPv6。"
         fi
     fi
+    ipset destroy "$tmp_set" 2>/dev/null || true
     # Build iptables chain
     iptables -N "$GEOIP_CHAIN" 2>/dev/null || iptables -F "$GEOIP_CHAIN" || return 1
     iptables -A "$GEOIP_CHAIN" -i lo -j RETURN || return 1
@@ -1945,8 +2636,11 @@ _geoip_clear() {
 }
 
 _geoip_install_persistence() {
+    local apply_script update_script apply_content update_content
+    apply_script="$(_geoip_apply_script_path)"
+    update_script="$(_geoip_update_script_path)"
     # Apply script (runs on boot)
-    cat > /usr/local/bin/geoip-apply.sh << 'APPLY_EOF'
+    apply_content="$(cat << 'APPLY_EOF'
 #!/bin/bash
 CONF="/etc/server-manage/geoip.conf"
 DATA="/etc/server-manage/geoip-data"
@@ -1982,6 +2676,8 @@ set6_name="geoip_${GEOIP_MODE}6"
 tmp6_set="${set6_name}_tmp"
 total_entries=0
 total6_entries=0
+use_ip6tables=0
+swapped4=0
 for cc in $GEOIP_COUNTRIES; do
     [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || continue
     f="${DATA}/${cc,,}.zone"
@@ -1995,6 +2691,7 @@ for cc in $GEOIP_COUNTRIES; do
 done
 [ "$total_entries" -gt 0 ] || exit 1
 [ -e /proc/net/if_inet6 ] && ! command -v ip6tables >/dev/null 2>&1 && exit 1
+command -v ip6tables >/dev/null 2>&1 && use_ip6tables=1
 ipset create "$tmp_set" hash:net maxelem 131072 2>/dev/null || ipset flush "$tmp_set" || exit 1
 for cc in $GEOIP_COUNTRIES; do
     [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || continue
@@ -2002,21 +2699,32 @@ for cc in $GEOIP_COUNTRIES; do
     [ -f "$f" ] || continue
     sed -e '/^#/d' -e '/^$/d' -e '/^[^0-9]/d' -e "s/^/add ${tmp_set} /" "$f" | ipset restore -exist 2>/dev/null || { ipset destroy "$tmp_set" 2>/dev/null || true; exit 1; }
 done
-ipset create "$set_name" hash:net maxelem 131072 2>/dev/null || true
-ipset swap "$tmp_set" "$set_name" || { ipset destroy "$tmp_set" 2>/dev/null || true; exit 1; }
-ipset destroy "$tmp_set" 2>/dev/null || true
-if command -v ip6tables >/dev/null 2>&1; then
-    ipset create "$tmp6_set" hash:net family inet6 maxelem 131072 2>/dev/null || ipset flush "$tmp6_set" || exit 1
+if [ "$use_ip6tables" -eq 1 ]; then
+    if ! ipset create "$tmp6_set" hash:net family inet6 maxelem 131072 2>/dev/null && ! ipset flush "$tmp6_set"; then
+        ipset destroy "$tmp_set" 2>/dev/null || true
+        exit 1
+    fi
     for cc in $GEOIP_COUNTRIES; do
         [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || continue
         f6="${DATA}/${cc,,}.zone6"
         [ -f "$f6" ] || continue
-        sed -e '/^#/d' -e '/^$/d' -e '/:/!d' -e "s/^/add ${tmp6_set} /" "$f6" | ipset restore -exist 2>/dev/null || { ipset destroy "$tmp6_set" 2>/dev/null || true; exit 1; }
+        sed -e '/^#/d' -e '/^$/d' -e '/:/!d' -e "s/^/add ${tmp6_set} /" "$f6" | ipset restore -exist 2>/dev/null || { ipset destroy "$tmp6_set" 2>/dev/null || true; ipset destroy "$tmp_set" 2>/dev/null || true; exit 1; }
     done
+fi
+ipset create "$set_name" hash:net maxelem 131072 2>/dev/null || true
+ipset swap "$tmp_set" "$set_name" || { ipset destroy "$tmp_set" 2>/dev/null || true; [ "$use_ip6tables" -eq 1 ] && ipset destroy "$tmp6_set" 2>/dev/null || true; exit 1; }
+swapped4=1
+if [ "$use_ip6tables" -eq 1 ]; then
     ipset create "$set6_name" hash:net family inet6 maxelem 131072 2>/dev/null || true
-    ipset swap "$tmp6_set" "$set6_name" || { ipset destroy "$tmp6_set" 2>/dev/null || true; exit 1; }
+    if ! ipset swap "$tmp6_set" "$set6_name"; then
+        [ "$swapped4" -eq 1 ] && ipset swap "$tmp_set" "$set_name" 2>/dev/null || true
+        ipset destroy "$tmp6_set" 2>/dev/null || true
+        ipset destroy "$tmp_set" 2>/dev/null || true
+        exit 1
+    fi
     ipset destroy "$tmp6_set" 2>/dev/null || true
 fi
+ipset destroy "$tmp_set" 2>/dev/null || true
 iptables -N "$CHAIN" 2>/dev/null || iptables -F "$CHAIN" || exit 1
 iptables -A "$CHAIN" -i lo -j RETURN || exit 1
 iptables -A "$CHAIN" -s 127.0.0.0/8 -j RETURN || exit 1
@@ -2047,9 +2755,11 @@ if command -v ip6tables >/dev/null 2>&1; then
     ip6tables -C INPUT -j "$CHAIN6" 2>/dev/null || ip6tables -I INPUT 1 -j "$CHAIN6" || exit 1
 fi
 APPLY_EOF
-    chmod 700 /usr/local/bin/geoip-apply.sh
+)"
+    write_file_atomic "$apply_script" "$apply_content" || return 1
+    chmod 700 "$apply_script"
     # Update script (cron weekly)
-    cat > /usr/local/bin/geoip-update.sh << 'UPDATE_EOF'
+    update_content="$(cat << 'UPDATE_EOF'
 #!/bin/bash
 CONF="/etc/server-manage/geoip.conf"
 DATA="/etc/server-manage/geoip-data"
@@ -2104,30 +2814,44 @@ for cc in $GEOIP_COUNTRIES; do
     fi
 done
 /usr/local/bin/geoip-apply.sh || exit 1
-sed -i "s/^GEOIP_LAST_UPDATE=.*/GEOIP_LAST_UPDATE=\"$(date +%Y-%m-%d)\"/" "$CONF"
+update_last_update() {
+    last_update="$(date +%Y-%m-%d)"
+    [[ "$last_update" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || exit 1
+    dir="$(dirname "$CONF")"
+    tmp="$(mktemp "${dir}/.tmp.server-manage.geoip.XXXXXX")" || exit 1
+    if awk -v last_update="$last_update" '
+        BEGIN { done=0 }
+        /^[[:space:]]*GEOIP_LAST_UPDATE[[:space:]]*=/ {
+            if (!done) print "GEOIP_LAST_UPDATE=\"" last_update "\""
+            done=1
+            next
+        }
+        { print }
+        END {
+            if (!done) print "GEOIP_LAST_UPDATE=\"" last_update "\""
+        }
+    ' "$CONF" > "$tmp"; then
+        chmod 600 "$tmp" 2>/dev/null || true
+        chown root:root "$tmp" 2>/dev/null || true
+        mv "$tmp" "$CONF" || { rm -f "$tmp"; exit 1; }
+    else
+        rm -f "$tmp"
+        exit 1
+    fi
+}
+update_last_update
 UPDATE_EOF
-    chmod 700 /usr/local/bin/geoip-update.sh
+)"
+    write_file_atomic "$update_script" "$update_content" || return 1
+    chmod 700 "$update_script"
     # Systemd boot service
     if is_systemd; then
-        cat > /etc/systemd/system/geoip-firewall.service << 'SVC_EOF'
-[Unit]
-Description=GeoIP Firewall Rules
-After=network.target
-Before=ufw.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/geoip-apply.sh
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-SVC_EOF
-        systemctl daemon-reload
-        systemctl enable geoip-firewall >/dev/null 2>&1
+        _geoip_install_service_unit || return 1
+        systemctl daemon-reload || return 1
+        systemctl enable geoip-firewall >/dev/null 2>&1 || return 1
     fi
     # Weekly cron (Sunday 04:00)
-    cron_add_job "geoip-update.sh" "0 4 * * 0 /usr/local/bin/geoip-update.sh >/dev/null 2>&1"
+    cron_add_job "$(basename "$update_script")" "0 4 * * 0 ${update_script} >/dev/null 2>&1"
 }
 
 geoip_setup() {
@@ -2209,20 +2933,29 @@ geoip_setup() {
         local f="${GEOIP_DATA_DIR}/${cc,,}.zone"
         [[ -f "$f" ]] && total=$((total + $(grep -c '^[0-9]' "$f" 2>/dev/null)))
     done
-    mkdir -p "$GEOIP_CONF_DIR"
-    cat > "$GEOIP_CONF" << EOF
-GEOIP_MODE="$mode"
-GEOIP_COUNTRIES="$countries"
-GEOIP_LAST_UPDATE="$(date +%Y-%m-%d)"
-EOF
-    chmod 600 "$GEOIP_CONF"
-    _geoip_install_persistence
-    print_success "GeoIP 规则已生效！"
+    if ! _geoip_write_conf "$mode" "$countries" "$(date +%Y-%m-%d)"; then
+        print_error "GeoIP 配置写入失败，未安装持久化任务。"
+        pause; return 1
+    fi
+    local persistence_ok=1
+    if ! _geoip_install_persistence; then
+        persistence_ok=0
+        print_warn "GeoIP 当前规则已生效，但持久化/自动更新任务安装失败。"
+        print_warn "请检查文件权限、crontab 或 systemd 状态；重启后规则可能不会自动恢复。"
+    fi
+    print_success "GeoIP 当前规则已生效！"
     echo "  模式: $([[ "$mode" == "whitelist" ]] && echo "白名单" || echo "黑名单")"
     echo "  国家: $countries"
     echo "  IP段: ${total} 条"
-    echo "  自动更新: 每周日 04:00"
-    log_action "GeoIP configured: mode=$mode countries=$countries entries=$total"
+    if [[ "$persistence_ok" -eq 1 ]]; then
+        echo "  自动更新: 每周日 04:00"
+        log_action "GeoIP configured: mode=$mode countries=$countries entries=$total"
+    else
+        echo "  自动更新: 未安装成功"
+        log_action "GeoIP configured without persistence: mode=$mode countries=$countries entries=$total"
+        pause
+        return 1
+    fi
     pause
 }
 
@@ -2276,7 +3009,10 @@ geoip_update() {
             print_error "GeoIP 规则重新加载失败，已保留旧规则"
             pause; return 1
         fi
-        sed -i "s/^GEOIP_LAST_UPDATE=.*/GEOIP_LAST_UPDATE=\"$(date +%Y-%m-%d)\"/" "$GEOIP_CONF"
+        if ! _geoip_update_last_update "$GEOIP_CONF"; then
+            print_error "GeoIP 更新时间写入失败"
+            pause; return 1
+        fi
         print_success "更新完成"
         log_action "GeoIP data updated: $GEOIP_COUNTRIES"
     else
@@ -2295,11 +3031,11 @@ geoip_disable() {
     _geoip_clear
     rm -f "$GEOIP_CONF"
     rm -rf "$GEOIP_DATA_DIR"
-    rm -f /usr/local/bin/geoip-apply.sh /usr/local/bin/geoip-update.sh
-    cron_remove_job "geoip-update.sh"
+    rm -f "$(_geoip_apply_script_path)" "$(_geoip_update_script_path)"
+    cron_remove_job "$(basename "$(_geoip_update_script_path)")"
     if is_systemd; then
         systemctl disable geoip-firewall 2>/dev/null || true
-        rm -f /etc/systemd/system/geoip-firewall.service
+        rm -f "$(_geoip_service_file_path)"
         systemctl daemon-reload
     fi
     print_success "GeoIP 已禁用，所有规则已清除。"
@@ -2404,6 +3140,53 @@ menu_ufw() {
         esac
     done
 }
+_f2b_rollback_jail_local() {
+    local target="${1:-}" backup="${2:-}" had_target="${3:-0}"
+    if [[ "$had_target" -eq 1 && -n "$backup" && -f "$backup" ]]; then
+        mv "$backup" "$target" 2>/dev/null || true
+    else
+        rm -f -- "$target" 2>/dev/null || true
+    fi
+    [[ -n "$backup" ]] && _tmp_unregister "$backup"
+}
+
+_f2b_apply_jail_local() {
+    local conf_content="${1:-}" banaction="${2:-}"
+    local target="${FAIL2BAN_JAIL_LOCAL}" backup="" had_target=0
+    [[ -n "$target" && -n "$conf_content" ]] || return 1
+    if [[ -f "$target" ]]; then
+        had_target=1
+        backup=$(mktemp "$(dirname "$target")/.bak.server-manage.fail2ban.XXXXXX") || return 1
+        _tmp_register "$backup"
+        if ! cp -a "$target" "$backup"; then
+            rm -f -- "$backup" 2>/dev/null || true
+            _tmp_unregister "$backup"
+            return 1
+        fi
+    fi
+    if ! write_file_atomic "$target" "$conf_content"; then
+        _f2b_rollback_jail_local "$target" "$backup" "$had_target"
+        return 1
+    fi
+    if command_exists fail2ban-client && ! fail2ban-client -d >/dev/null 2>&1; then
+        _f2b_rollback_jail_local "$target" "$backup" "$had_target"
+        return 1
+    fi
+    if is_systemd; then
+        systemctl enable fail2ban >/dev/null || true
+        if ! systemctl restart fail2ban; then
+            _f2b_rollback_jail_local "$target" "$backup" "$had_target"
+            return 1
+        fi
+    fi
+    rm -f -- "$backup" 2>/dev/null || true
+    [[ -n "$backup" ]] && _tmp_unregister "$backup"
+    print_success "配置已写入: $target (banaction=$banaction)"
+    command_exists fail2ban-client && print_success "配置校验通过"
+    is_systemd && print_success "Fail2ban 已启动 (banaction=$banaction)。"
+    return 0
+}
+
 f2b_setup() {
     print_title "Fail2ban 安装与配置"
     install_package "fail2ban" "silent"
@@ -2591,7 +3374,8 @@ f2b_setup() {
 
     # 迁移：清理旧的 UFW 封禁规则
     if ufw_is_active; then
-        local old_f2b_rules=$(ufw status numbered 2>/dev/null | grep -ciE "f2b|fail2ban")
+        local old_f2b_rules
+        old_f2b_rules=$(ufw status numbered 2>/dev/null | grep -ciE "f2b|fail2ban")
         if [[ "$old_f2b_rules" -gt 0 ]]; then
             print_warn "检测到 UFW 中有 ${old_f2b_rules} 条 Fail2ban 旧规则"
             print_info "新配置使用 ipset 替代 UFW 封禁，旧规则已无用且拖慢系统"
@@ -2628,28 +3412,14 @@ port = http,https
 maxretry = 5
 logpath = /var/log/nginx/access.log"
     fi
-    write_file_atomic "$FAIL2BAN_JAIL_LOCAL" "$conf_content"
-    print_success "配置已写入: $FAIL2BAN_JAIL_LOCAL (banaction=$banaction)"
-    
-    # 配置预检
-    if command_exists fail2ban-client; then
-        if ! fail2ban-client -d >/dev/null 2>&1; then
-            print_error "Fail2ban 配置校验失败！请检查配置。"
-            echo "运行 fail2ban-client -d 查看详情"
-            pause; return
-        fi
-        print_success "配置校验通过"
-    fi
-    if is_systemd; then
-        systemctl enable fail2ban >/dev/null || true
-        if systemctl restart fail2ban; then
-            print_success "Fail2ban 已启动 (banaction=$banaction)。"
-            log_action "Fail2ban configured: port=$port, maxretry=$maxretry, bantime=$bantime, banaction=$banaction"
-        else
-            print_error "Fail2ban 启动失败！"
-            echo "请检查日志: journalctl -u fail2ban -n 20"
-            log_action "Fail2ban configuration failed" "ERROR"
-        fi
+    if _f2b_apply_jail_local "$conf_content" "$banaction"; then
+        log_action "Fail2ban configured: port=$port, maxretry=$maxretry, bantime=$bantime, banaction=$banaction"
+    else
+        print_error "Fail2ban 配置应用失败，已回滚。"
+        echo "运行 fail2ban-client -d 或 journalctl -u fail2ban -n 20 查看详情"
+        log_action "Fail2ban configuration failed and rolled back" "ERROR"
+        pause
+        return 1
     fi
     pause
 }
@@ -2699,7 +3469,7 @@ _f2b_active_jails() {
 
 _f2b_banned_ips_for_jail() {
     local jail="$1"
-    fail2ban-client status "$jail" 2>/dev/null | awk -F: '/Banned IP/ {print $2}' | xargs
+    fail2ban-client status "$jail" 2>/dev/null | sed -n 's/^[[:space:]|`-]*Banned IP list:[[:space:]]*//p' | xargs
 }
 
 f2b_status() {
@@ -2714,7 +3484,8 @@ f2b_status() {
         systemctl status fail2ban --no-pager -l 2>/dev/null | head -n 5 || echo "服务未运行"
     fi
     # Show all active jails
-    local jails=$(fail2ban-client status 2>/dev/null | grep "Jail list" | cut -d: -f2 | tr -d ' ')
+    local jails
+    jails=$(fail2ban-client status 2>/dev/null | grep "Jail list" | cut -d: -f2 | tr -d ' ')
     if [[ -z "$jails" ]]; then
         print_warn "没有活跃的 jail"
         pause; return
@@ -2725,10 +3496,11 @@ f2b_status() {
     for jail in $jails; do
         unset IFS
         echo -e "${C_CYAN}[$jail]${C_RESET}"
-        local status_out=$(fail2ban-client status "$jail" 2>/dev/null)
-        local cur_banned=$(echo "$status_out" | grep "Currently banned" | awk '{print $NF}')
-        local total_banned=$(echo "$status_out" | grep "Total banned" | awk '{print $NF}')
-        local banned_ips=$(echo "$status_out" | grep "Banned IP" | cut -d: -f2 | xargs)
+        local status_out cur_banned total_banned banned_ips
+        status_out=$(fail2ban-client status "$jail" 2>/dev/null)
+        cur_banned=$(echo "$status_out" | grep "Currently banned" | awk '{print $NF}')
+        total_banned=$(echo "$status_out" | grep "Total banned" | awk '{print $NF}')
+        banned_ips=$(echo "$status_out" | sed -n 's/^[[:space:]|`-]*Banned IP list:[[:space:]]*//p' | xargs)
         echo "  当前封禁: ${cur_banned:-0} | 累计封禁: ${total_banned:-0}"
         if [[ -n "$banned_ips" && "$banned_ips" != " " ]]; then
             echo "  封禁 IP: $banned_ips"
@@ -2737,7 +3509,8 @@ f2b_status() {
     unset IFS
     # Show ignoreip if configured
     if [[ -f "$FAIL2BAN_JAIL_LOCAL" ]]; then
-        local ignore=$(grep '^ignoreip' "$FAIL2BAN_JAIL_LOCAL" | cut -d= -f2 | xargs)
+        local ignore
+        ignore=$(grep '^ignoreip' "$FAIL2BAN_JAIL_LOCAL" | cut -d= -f2 | xargs)
         [[ -n "$ignore" ]] && echo -e "\n${C_CYAN}[白名单]${C_RESET} $ignore"
     fi
     pause
@@ -2824,7 +3597,8 @@ f2b_ban() {
         pause; return
     fi
     # List active jails for selection
-    local jails_raw=$(fail2ban-client status 2>/dev/null | grep "Jail list" | cut -d: -f2 | tr -d ' ')
+    local jails_raw
+    jails_raw=$(fail2ban-client status 2>/dev/null | grep "Jail list" | cut -d: -f2 | tr -d ' ')
     if [[ -z "$jails_raw" ]]; then
         print_warn "没有活跃的 jail"; pause; return
     fi
@@ -2918,7 +3692,8 @@ menu_f2b() {
         print_title "Fail2ban 入侵防御"
         if command_exists fail2ban-client; then
             if systemctl is-active fail2ban &>/dev/null; then
-                local banned_count=$(fail2ban-client status sshd 2>/dev/null | grep "Currently banned" | awk '{print $NF}')
+                local banned_count
+                banned_count=$(fail2ban-client status sshd 2>/dev/null | grep "Currently banned" | awk '{print $NF}')
                 echo -e "${C_GREEN}状态: 运行中${C_RESET} | 当前封禁: ${banned_count:-0} 个 IP"
             else
                 echo -e "${C_YELLOW}状态: 已安装但未运行${C_RESET}"
@@ -3000,6 +3775,22 @@ _fail2ban_set_sshd_port() {
     mv "$tmpfile" "$jail_file"
 }
 
+_ssh_socket_dropin_path() {
+    local socket_unit="$1"
+    printf '/etc/systemd/system/%s.d/server-manage-port.conf' "$socket_unit"
+}
+
+_ssh_socket_dropin_rollback() {
+    local socket_dropin="${1:-}" socket_backup="${2:-}" socket_created="${3:-0}"
+    [[ -n "$socket_dropin" ]] || return 0
+    if [[ -n "$socket_backup" && -f "$socket_backup" ]]; then
+        mv "$socket_backup" "$socket_dropin" 2>/dev/null || true
+    elif [[ "$socket_created" -eq 1 ]]; then
+        rm -f "$socket_dropin" 2>/dev/null || true
+    fi
+    systemctl daemon-reload 2>/dev/null || true
+}
+
 ssh_change_port() {
     print_title "修改 SSH 端口"
     refresh_ssh_port
@@ -3059,8 +3850,9 @@ ssh_change_port() {
     cp "$target_conf" "$backup_file"
 
     if [[ -n "$socket_unit" ]]; then
-        local socket_dropin_dir="/etc/systemd/system/${socket_unit}.d"
-        socket_dropin="${socket_dropin_dir}/server-manage-port.conf"
+        socket_dropin=$(_ssh_socket_dropin_path "$socket_unit")
+        local socket_dropin_dir
+        socket_dropin_dir=$(dirname "$socket_dropin")
         mkdir -p "$socket_dropin_dir"
         if [[ -f "$socket_dropin" ]]; then
             socket_backup="${socket_dropin}.bak.$(date +%s)"
@@ -3068,19 +3860,50 @@ ssh_change_port() {
         else
             socket_created=1
         fi
-        cat > "$socket_dropin" <<EOF
+        local socket_tmp
+        socket_tmp=$(mktemp "${socket_dropin_dir}/.tmp.server-manage.ssh-socket.XXXXXX") || {
+            print_error "创建 SSH socket drop-in 临时文件失败，已回滚。"
+            mv "$backup_file" "$target_conf" 2>/dev/null || true
+            [[ -n "$socket_backup" ]] && rm -f "$socket_backup"
+            pause; return 1
+        }
+        _tmp_register "$socket_tmp"
+        if ! cat > "$socket_tmp" <<EOF
 [Socket]
 ListenStream=
 ListenStream=0.0.0.0:${port}
 ListenStream=[::]:${port}
 EOF
+        then
+            print_error "写入 SSH socket drop-in 失败，已回滚。"
+            rm -f "$socket_tmp" 2>/dev/null || true
+            _tmp_unregister "$socket_tmp"
+            mv "$backup_file" "$target_conf" 2>/dev/null || true
+            [[ -n "$socket_backup" ]] && rm -f "$socket_backup"
+            pause; return 1
+        fi
+        chmod 0644 "$socket_tmp" 2>/dev/null || true
+        if ! mv "$socket_tmp" "$socket_dropin"; then
+            print_error "安装 SSH socket drop-in 失败，已回滚。"
+            rm -f "$socket_tmp" 2>/dev/null || true
+            _tmp_unregister "$socket_tmp"
+            mv "$backup_file" "$target_conf" 2>/dev/null || true
+            [[ -n "$socket_backup" ]] && rm -f "$socket_backup"
+            pause; return 1
+        fi
+        _tmp_unregister "$socket_tmp"
         systemctl daemon-reload 2>/dev/null || true
     fi
 
     # 先放行新端口（防止改完连不上）
     local ufw_opened=0 firewall_opened_backends=""
     if ufw_is_active; then
-        ufw allow "$port/tcp" comment "SSH-New" >/dev/null
+        if ! ufw allow "$port/tcp" comment "SSH-New" >/dev/null; then
+            print_error "UFW 放行新 SSH 端口失败，已中止修改。"
+            [[ -n "$socket_unit" ]] && _ssh_socket_dropin_rollback "$socket_dropin" "$socket_backup" "$socket_created"
+            rm -f "$backup_file"
+            pause; return 1
+        fi
         ufw_opened=1
         print_success "UFW 已放行新端口 $port。"
     else
@@ -3088,7 +3911,9 @@ EOF
             if ! firewall_prepare_non_ufw_ssh_port "$port" "SSH-New"; then
                 print_error "无法确认本地防火墙已放行新 SSH 端口，拒绝继续修改以避免失联。"
                 print_info "请先手动放行 ${port}/tcp（云安全组 + 本机防火墙），再重试。"
-                pause; return
+                [[ -n "$socket_unit" ]] && _ssh_socket_dropin_rollback "$socket_dropin" "$socket_backup" "$socket_created"
+                rm -f "$backup_file"
+                pause; return 1
             fi
             firewall_opened_backends="$FIREWALL_SSH_OPEN_BACKENDS"
         else
@@ -3099,21 +3924,21 @@ EOF
         fi
     fi
 
-    # 写入端口配置
-    if grep -qE "^\s*#?\s*Port\s" "$target_conf"; then
-        sed -i -E "s|^\s*#?\s*Port\s+.*|Port ${port}|" "$target_conf"
-    else
-        printf '\n# server-manage: appended Port\nPort %s\n' "$port" >> "$target_conf"
+    # 写入端口配置。必须插入到首个 Match 块之前，否则只会作用于匹配块并导致 sshd -t 失败/配置无效。
+    if ! _sshd_set_directive "Port" "$port" "$target_conf" 1; then
+        print_error "写入 SSH 端口配置失败，已回滚。"
+        mv "$backup_file" "$target_conf" 2>/dev/null || true
+        [[ -n "$socket_unit" ]] && _ssh_socket_dropin_rollback "$socket_dropin" "$socket_backup" "$socket_created"
+        [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
+        [[ -n "$firewall_opened_backends" ]] && firewall_rollback_ssh_port "$port" "$firewall_opened_backends" "SSH-New"
+        pause; return
     fi
 
     # 校验配置语法
     if ! sshd -t 2>/dev/null; then
         print_error "sshd 配置校验失败！已回滚。"
         mv "$backup_file" "$target_conf"
-        if [[ -n "$socket_unit" ]]; then
-            if [[ -n "$socket_backup" ]]; then mv "$socket_backup" "$socket_dropin" 2>/dev/null || true; elif [[ $socket_created -eq 1 ]]; then rm -f "$socket_dropin"; fi
-            systemctl daemon-reload 2>/dev/null || true
-        fi
+        [[ -n "$socket_unit" ]] && _ssh_socket_dropin_rollback "$socket_dropin" "$socket_backup" "$socket_created"
         [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
         [[ -n "$firewall_opened_backends" ]] && firewall_rollback_ssh_port "$port" "$firewall_opened_backends" "SSH-New"
         pause; return
@@ -3122,10 +3947,7 @@ EOF
     if ! _restart_sshd; then
         print_error "重启失败！已回滚配置。"
         mv "$backup_file" "$target_conf" 2>/dev/null || true
-        if [[ -n "$socket_unit" ]]; then
-            if [[ -n "$socket_backup" ]]; then mv "$socket_backup" "$socket_dropin" 2>/dev/null || true; elif [[ $socket_created -eq 1 ]]; then rm -f "$socket_dropin"; fi
-            systemctl daemon-reload 2>/dev/null || true
-        fi
+        [[ -n "$socket_unit" ]] && _ssh_socket_dropin_rollback "$socket_dropin" "$socket_backup" "$socket_created"
         [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
         [[ -n "$firewall_opened_backends" ]] && firewall_rollback_ssh_port "$port" "$firewall_opened_backends" "SSH-New"
         _restart_sshd || true
@@ -3143,10 +3965,7 @@ EOF
     if [[ $listen_ok -ne 1 ]]; then
         print_error "重启后未检测到 SSH 在新端口 ${port}/tcp 监听，已回滚配置。"
         mv "$backup_file" "$target_conf" 2>/dev/null || true
-        if [[ -n "$socket_unit" ]]; then
-            if [[ -n "$socket_backup" ]]; then mv "$socket_backup" "$socket_dropin" 2>/dev/null || true; elif [[ $socket_created -eq 1 ]]; then rm -f "$socket_dropin"; fi
-            systemctl daemon-reload 2>/dev/null || true
-        fi
+        [[ -n "$socket_unit" ]] && _ssh_socket_dropin_rollback "$socket_dropin" "$socket_backup" "$socket_created"
         [[ $ufw_opened -eq 1 ]] && { ufw delete allow "$port/tcp" 2>/dev/null || true; }
         [[ -n "$firewall_opened_backends" ]] && firewall_rollback_ssh_port "$port" "$firewall_opened_backends" "SSH-New"
         _restart_sshd || true
@@ -3217,9 +4036,12 @@ ssh_keys() {
             print_warn "该公钥已存在，无需重复添加。"
             pause; return
         fi
-        echo "$key" >> "$dir/authorized_keys"
-        chmod 700 "$dir"; chmod 600 "$dir/authorized_keys"
-        chown -R "$user:$user" "$dir"
+        chmod 700 "$dir" 2>/dev/null || true
+        chown "$user:$user" "$dir" 2>/dev/null || true
+        _ssh_authorized_keys_append "$dir/authorized_keys" "$key" "$user:$user" || {
+            print_error "公钥写入失败"
+            pause; return
+        }
         print_success "公钥已添加。"
         log_action "SSH key added for user $user"
         ;;
@@ -3275,22 +4097,7 @@ ssh_keys() {
         if [[ "$didx" =~ ^[0-9]+$ ]] && [[ "$didx" -ge 1 && "$didx" -le ${#keys[@]} ]]; then
             local target_key="${keys[$((didx-1))]}"
             if confirm "确认删除第 ${didx} 个公钥?"; then
-                local tmp_ak grep_rc
-                tmp_ak=$(mktemp "$(dirname "$ak")/.tmp.server-manage.authorized-keys.XXXXXX") || { print_error "创建临时文件失败"; pause; return; }
-                _tmp_register "$tmp_ak"
-                grep -Fvx -- "$target_key" "$ak" > "$tmp_ak"
-                grep_rc=$?
-                if [[ $grep_rc -gt 1 ]]; then
-                    rm -f "$tmp_ak"
-                    _tmp_unregister "$tmp_ak"
-                    print_error "删除失败"
-                    pause; return
-                fi
-                cat "$tmp_ak" > "$ak" || { rm -f "$tmp_ak"; _tmp_unregister "$tmp_ak"; print_error "写入失败"; pause; return; }
-                rm -f "$tmp_ak"
-                _tmp_unregister "$tmp_ak"
-                chmod 600 "$ak"
-                chown "$user:$user" "$ak" 2>/dev/null || true
+                _ssh_authorized_keys_remove "$ak" "$target_key" "$user:$user" || { print_error "写入失败"; pause; return; }
                 print_success "已删除。"
                 log_action "SSH key deleted for user $user (index=$didx)"
             fi
@@ -3332,9 +4139,12 @@ ssh_keys() {
             if grep -qF "$pub_key" "$imp_dir/authorized_keys" 2>/dev/null; then
                 print_warn "该公钥已存在，无需重复添加。"
             else
-                echo "$pub_key" >> "$imp_dir/authorized_keys"
-                chmod 700 "$imp_dir"; chmod 600 "$imp_dir/authorized_keys"
-                chown -R "$imp_user:$imp_user" "$imp_dir"
+                chmod 700 "$imp_dir" 2>/dev/null || true
+                chown "$imp_user:$imp_user" "$imp_dir" 2>/dev/null || true
+                _ssh_authorized_keys_append "$imp_dir/authorized_keys" "$pub_key" "$imp_user:$imp_user" || {
+                    print_error "公钥导入失败"
+                    pause; return
+                }
                 print_success "公钥已导入 ${imp_user} 的 authorized_keys。"
                 log_action "SSH pubkey auto-imported for user $imp_user from $key_file"
             fi
@@ -3693,6 +4503,97 @@ opt_cleanup() {
     pause
 }
 
+_hostname_file_path() {
+    printf '%s' "/etc/hostname"
+}
+
+_hosts_file_path() {
+    printf '%s' "/etc/hosts"
+}
+
+_hostname_write_file() {
+    local new_name="$1"
+    write_file_atomic "$(_hostname_file_path)" "$new_name"
+}
+
+_hostname_render_hosts_conf() {
+    local hosts_file="$1" old_name="$2" new_name="$3"
+    awk -v old="$old_name" -v new="$new_name" '
+        function first_field(text, fields, count, i) {
+            count = split(text, fields, /[[:space:]]+/)
+            for (i = 1; i <= count; i++) {
+                if (fields[i] != "") return fields[i]
+            }
+            return ""
+        }
+        function render_line(line, add_new,   hash, head, comment, leading, rest, count, i, token, out, seen, has_new) {
+            hash = index(line, "#")
+            if (hash) {
+                head = substr(line, 1, hash - 1)
+                comment = substr(line, hash)
+            } else {
+                head = line
+                comment = ""
+            }
+            if (head ~ /^[[:space:]]*$/) return line
+            match(head, /^[[:space:]]*/)
+            leading = substr(head, RSTART, RLENGTH)
+            rest = substr(head, length(leading) + 1)
+            count = split(rest, fields, /[[:space:]]+/)
+            if (count < 1 || fields[1] == "") return line
+            out = leading fields[1]
+            has_new = 0
+            delete seen
+            for (i = 2; i <= count; i++) {
+                token = fields[i]
+                if (token == "") continue
+                if (old != "" && old != new && token == old) token = new
+                if (token == new) has_new = 1
+                if (!(token in seen)) {
+                    out = out " " token
+                    seen[token] = 1
+                }
+            }
+            if (add_new && fields[1] == "127.0.0.1" && !has_new) {
+                out = out " " new
+                has_new = 1
+            }
+            if (has_new) saw_new = 1
+            return out (comment != "" ? " " comment : "")
+        }
+        { rendered[NR] = render_line($0, 0) }
+        END {
+            target = 0
+            if (!saw_new) {
+                for (i = 1; i <= NR; i++) {
+                    hash = index(rendered[i], "#")
+                    head = hash ? substr(rendered[i], 1, hash - 1) : rendered[i]
+                    if (first_field(head) == "127.0.0.1") {
+                        target = i
+                        break
+                    }
+                }
+            }
+            for (i = 1; i <= NR; i++) {
+                if (i == target) print render_line(rendered[i], 1)
+                else print rendered[i]
+            }
+            if (!saw_new && target == 0) {
+                print "127.0.0.1 localhost " new
+            }
+        }
+    ' "$hosts_file" 2>/dev/null || {
+        printf '127.0.0.1 localhost %s\n' "$new_name"
+    }
+}
+
+_hostname_update_hosts() {
+    local old_name="$1" new_name="$2" hosts_file content
+    hosts_file="$(_hosts_file_path)"
+    content="$(_hostname_render_hosts_conf "$hosts_file" "$old_name" "$new_name")" || return 1
+    write_file_atomic "$hosts_file" "$content"
+}
+
 opt_hostname() {
     print_title "修改主机名"
     echo "当前: $(hostname)"
@@ -3703,7 +4604,8 @@ opt_hostname() {
         pause; return
     fi
     # 先保存旧主机名，再执行修改
-    local old_name=$(hostname 2>/dev/null)
+    local old_name
+    old_name=$(hostname 2>/dev/null || true)
     if [[ "$PLATFORM" == "openwrt" ]]; then
         if ! command_exists uci; then
             print_error "OpenWrt 缺少 uci，无法持久化主机名。"
@@ -3718,26 +4620,107 @@ opt_hostname() {
     elif command_exists hostnamectl; then
         hostnamectl set-hostname "$new_name" || { print_error "hostnamectl 设置失败。"; pause; return 1; }
     else
-        hostname "$new_name" || { print_error "临时主机名设置失败。"; pause; return 1; }
-        echo "$new_name" > /etc/hostname || { print_error "/etc/hostname 写入失败。"; pause; return 1; }
+        local hostname_file old_hostname_file had_hostname_file=0
+        hostname_file="$(_hostname_file_path)"
+        if [[ -f "$hostname_file" ]]; then
+            old_hostname_file=$(cat "$hostname_file")
+            had_hostname_file=1
+        else
+            old_hostname_file=""
+        fi
+        _hostname_write_file "$new_name" || { print_error "/etc/hostname 写入失败。"; pause; return 1; }
+        if ! hostname "$new_name"; then
+            if [[ "$had_hostname_file" -eq 1 ]]; then
+                write_file_atomic "$hostname_file" "$old_hostname_file" >/dev/null 2>&1 || true
+            else
+                rm -f "$hostname_file" 2>/dev/null || true
+            fi
+            print_error "临时主机名设置失败。"
+            pause; return 1
+        fi
     fi
 
-    # 安全替换 /etc/hosts 中的旧主机名
-    if [[ -n "$old_name" && "$old_name" != "$new_name" ]] && grep -qF "$old_name" /etc/hosts 2>/dev/null; then
-        local escaped_old=$(printf '%s\n' "$old_name" | sed 's/[.[\*^$/]/\\&/g')
-        local escaped_new=$(printf '%s\n' "$new_name" | sed 's/[&/\]/\\&/g')
-        sed -i "s/\b${escaped_old}\b/${escaped_new}/g" /etc/hosts
-    elif ! grep -q "$new_name" /etc/hosts 2>/dev/null; then
-        sed -i "s/^127\.0\.0\.1\s\+localhost.*/127.0.0.1 localhost ${new_name}/" /etc/hosts
+    if ! _hostname_update_hosts "$old_name" "$new_name"; then
+        print_warn "主机名已设置，但 /etc/hosts 更新失败，请手动检查。"
+        pause; return 1
     fi
     print_success "主机名已修改为: $new_name"
     log_action "Hostname changed to $new_name"
     pause
 }
 
+_swap_file_path() {
+    printf '%s' "/swapfile"
+}
+
+_swap_fstab_path() {
+    printf '%s' "/etc/fstab"
+}
+
+_swap_fstab_has_swapfile() {
+    local swap_file="$(_swap_file_path)" fstab="$(_swap_fstab_path)"
+    [[ -f "$fstab" ]] || return 1
+    awk -v sf="$swap_file" '$1 == sf && $3 == "swap" { found=1 } END { exit(found ? 0 : 1) }' "$fstab"
+}
+
+_swap_fstab_add_swapfile() {
+    local swap_file="$(_swap_file_path)" fstab="$(_swap_fstab_path)" fstab_dir tmp
+    _swap_fstab_has_swapfile && return 0
+    fstab_dir="$(dirname "$fstab")"
+    mkdir -p "$fstab_dir" || return 1
+    tmp=$(mktemp "${fstab_dir}/.tmp.server-manage.fstab.XXXXXX") || return 1
+    _tmp_register "$tmp"
+    if [[ -f "$fstab" ]]; then
+        awk -v sf="$swap_file" '
+            { print; if ($1 == sf && $3 == "swap") found=1 }
+            END { if (!found) printf "%s none swap sw 0 0\n", sf }
+        ' "$fstab" > "$tmp" || {
+            rm -f "$tmp"
+            _tmp_unregister "$tmp"
+            return 1
+        }
+        chmod --reference="$fstab" "$tmp" 2>/dev/null || true
+        chown --reference="$fstab" "$tmp" 2>/dev/null || true
+    else
+        printf '%s none swap sw 0 0\n' "$swap_file" > "$tmp" || {
+            rm -f "$tmp"
+            _tmp_unregister "$tmp"
+            return 1
+        }
+        chmod 644 "$tmp" 2>/dev/null || true
+    fi
+    if ! mv "$tmp" "$fstab"; then
+        rm -f "$tmp"
+        _tmp_unregister "$tmp"
+        return 1
+    fi
+    _tmp_unregister "$tmp"
+}
+
+_swap_fstab_remove_swapfile() {
+    local swap_file="$(_swap_file_path)" fstab="$(_swap_fstab_path)" tmp
+    [[ -f "$fstab" ]] || return 0
+    tmp=$(mktemp "$(dirname "$fstab")/.tmp.server-manage.fstab.XXXXXX") || return 1
+    _tmp_register "$tmp"
+    awk -v sf="$swap_file" '!($1 == sf && $3 == "swap")' "$fstab" > "$tmp" || {
+        rm -f "$tmp"
+        _tmp_unregister "$tmp"
+        return 1
+    }
+    chmod --reference="$fstab" "$tmp" 2>/dev/null || true
+    chown --reference="$fstab" "$tmp" 2>/dev/null || true
+    if ! mv "$tmp" "$fstab"; then
+        rm -f "$tmp"
+        _tmp_unregister "$tmp"
+        return 1
+    fi
+    _tmp_unregister "$tmp"
+}
+
 opt_swap() {
     print_title "Swap 管理"
     local size=$(free -m | awk '/Swap/ {print $2}')
+    local swap_file="$(_swap_file_path)"
     echo "当前 Swap: ${size}MB"
     echo ""
     echo "1. 开启/修改 Swap
@@ -3751,38 +4734,36 @@ opt_swap() {
             pause; return
         fi
         print_info "正在设置 ${s}MB Swap..."
-        swapoff /swapfile 2>/dev/null || true
-        rm -f /swapfile
+        swapoff "$swap_file" 2>/dev/null || true
+        rm -f "$swap_file"
         # 检测文件系统类型，btrfs 不支持 fallocate 创建 swap
         local fs_type=$(df -T / 2>/dev/null | awk 'NR==2{print $2}')
         if [[ "$fs_type" == "btrfs" ]]; then
-            truncate -s 0 /swapfile
-            chattr +C /swapfile 2>/dev/null || true
-            if ! dd if=/dev/zero of=/swapfile bs=1M count="$s" status=progress; then
-                print_error "创建 Swap 文件失败 (磁盘空间不足?)"; rm -f /swapfile; pause; return
+            truncate -s 0 "$swap_file"
+            chattr +C "$swap_file" 2>/dev/null || true
+            if ! dd if=/dev/zero of="$swap_file" bs=1M count="$s" status=progress; then
+                print_error "创建 Swap 文件失败 (磁盘空间不足?)"; rm -f "$swap_file"; pause; return
             fi
-        elif ! fallocate -l "${s}M" /swapfile 2>/dev/null; then
-            if ! dd if=/dev/zero of=/swapfile bs=1M count="$s" status=progress; then
-                print_error "创建 Swap 文件失败 (磁盘空间不足?)"; rm -f /swapfile; pause; return
+        elif ! fallocate -l "${s}M" "$swap_file" 2>/dev/null; then
+            if ! dd if=/dev/zero of="$swap_file" bs=1M count="$s" status=progress; then
+                print_error "创建 Swap 文件失败 (磁盘空间不足?)"; rm -f "$swap_file"; pause; return
             fi
         fi
-        chmod 600 /swapfile
-        if ! mkswap /swapfile >/dev/null; then
-            print_error "mkswap 失败"; rm -f /swapfile; pause; return
+        chmod 600 "$swap_file"
+        if ! mkswap "$swap_file" >/dev/null; then
+            print_error "mkswap 失败"; rm -f "$swap_file"; pause; return
         fi
-        if ! swapon /swapfile; then
-            print_error "swapon 失败"; rm -f /swapfile; pause; return
+        if ! swapon "$swap_file"; then
+            print_error "swapon 失败"; rm -f "$swap_file"; pause; return
         fi
-        if ! grep -q "/swapfile" /etc/fstab; then
-            echo "/swapfile none swap sw 0 0" >> /etc/fstab
-        fi
+        _swap_fstab_add_swapfile || { print_error "写入 fstab 失败"; pause; return; }
         print_success "Swap 设置成功。"
         log_action "Swap configured: ${s}MB"
     elif [[ "$c" == "2" ]]; then
         if confirm "确认删除 Swap？"; then
-            swapoff -a 2>/dev/null || true
-            rm -f /swapfile
-            sed -i '/\/swapfile/d' /etc/fstab
+            swapoff "$swap_file" 2>/dev/null || true
+            rm -f "$swap_file"
+            _swap_fstab_remove_swapfile || { print_error "更新 fstab 失败"; pause; return; }
             print_success "Swap 已删除。"
             log_action "Swap removed"
         fi
@@ -3802,25 +4783,55 @@ opt_bbr() {
         pause; return
     fi
     if confirm "开启 BBR 加速？"; then
-        [[ ! -f /etc/sysctl.conf.bak ]] && cp /etc/sysctl.conf /etc/sysctl.conf.bak
-        sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-        sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-        if sysctl -p >/dev/null 2>&1; then
-            local verify_cc
-            verify_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
-            if [[ "$verify_cc" == "bbr" ]]; then
-                print_success "BBR 已开启。"
-                log_action "BBR enabled"
-            else
-                print_error "BBR 未实际生效 (当前: $verify_cc)，请检查内核是否支持。"
-                log_action "BBR enable failed: verify_cc=$verify_cc" "ERROR"
-            fi
-        else
-            print_error "sysctl -p 执行失败，BBR 未应用。"
-            log_action "BBR enable failed: sysctl -p" "ERROR"
+        local sysctl_conf sysctl_backup sysctl_dir tmp_candidate verify_cc
+        sysctl_conf="$(_sysctl_conf_path)"
+        sysctl_backup="$(_sysctl_bbr_backup_path)"
+        sysctl_dir="$(dirname "$sysctl_conf")"
+        mkdir -p "$sysctl_dir" || { print_error "创建 sysctl 配置目录失败"; pause; return 1; }
+        tmp_candidate=$(mktemp "${sysctl_dir}/.tmp.server-manage.bbr.XXXXXX") || { print_error "创建临时 BBR 配置失败"; pause; return 1; }
+        _tmp_register "$tmp_candidate"
+        if ! _sysctl_render_bbr_conf "$sysctl_conf" "fq" "bbr" > "$tmp_candidate"; then
+            rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
+            print_error "生成 BBR 配置失败"; pause; return 1
         fi
+        if [[ -f "$sysctl_conf" ]]; then
+            chmod --reference="$sysctl_conf" "$tmp_candidate" 2>/dev/null || true
+            chown --reference="$sysctl_conf" "$tmp_candidate" 2>/dev/null || true
+        else
+            chmod 644 "$tmp_candidate" 2>/dev/null || true
+        fi
+        if ! sysctl -p "$tmp_candidate" >/dev/null 2>&1; then
+            rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
+            print_error "sysctl -p 执行失败，BBR 未写入正式配置。"
+            log_action "BBR enable failed before commit: sysctl -p" "ERROR"
+            pause; return 1
+        fi
+        verify_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+        if [[ "$verify_cc" != "bbr" ]]; then
+            rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
+            [[ -f "$sysctl_conf" ]] && sysctl -p "$sysctl_conf" >/dev/null 2>&1 || true
+            print_error "BBR 未实际生效 (当前: $verify_cc)，未写入正式配置。"
+            log_action "BBR enable failed before commit: verify_cc=$verify_cc" "ERROR"
+            pause; return 1
+        fi
+        if [[ ! -f "$sysctl_backup" && -f "$sysctl_conf" ]]; then
+            if ! cp -a "$sysctl_conf" "$sysctl_backup"; then
+                rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
+                sysctl -p "$sysctl_conf" >/dev/null 2>&1 || true
+                print_error "备份 sysctl 配置失败，未写入正式配置。"
+                log_action "BBR enable failed before commit: backup" "ERROR"
+                pause; return 1
+            fi
+        fi
+        if ! mv "$tmp_candidate" "$sysctl_conf"; then
+            rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
+            [[ -f "$sysctl_conf" ]] && sysctl -p "$sysctl_conf" >/dev/null 2>&1 || true
+            print_error "写入 $sysctl_conf 失败"
+            pause; return 1
+        fi
+        _tmp_unregister "$tmp_candidate"
+        print_success "BBR 已开启。"
+        log_action "BBR enabled"
     fi
     pause
 }
@@ -3860,6 +4871,138 @@ select_timezone() {
     log_action "Timezone changed to $z"
 }
 
+_sysctl_conf_path() {
+    printf '%s' "/etc/sysctl.conf"
+}
+
+_sysctl_backup_path() {
+    printf '%s.pre-tuning' "$(_sysctl_conf_path)"
+}
+
+_sysctl_bbr_backup_path() {
+    printf '%s.bak' "$(_sysctl_conf_path)"
+}
+
+_sysctl_render_tuned_conf() {
+    local conf_file="$1" params="$2"
+    if [[ -f "$conf_file" ]]; then
+        awk '
+            /^# BEGIN server-manage sysctl tuning/ { in_new=1; next }
+            in_new {
+                if (/^# END server-manage sysctl tuning/) in_new=0
+                next
+            }
+            /^# server-manage sysctl tuning/ { in_legacy=1; next }
+            in_legacy {
+                if ($0 == "") in_legacy=0
+                next
+            }
+            { print }
+        ' "$conf_file"
+    fi
+    printf '\n%s\n' "$params"
+}
+
+_sysctl_render_bbr_conf() {
+    local conf_file="$1" qdisc="${2:-fq}" cc="${3:-bbr}"
+    if [[ -f "$conf_file" ]]; then
+        awk '
+            /^# BEGIN server-manage bbr/ { in_bbr=1; next }
+            in_bbr {
+                if (/^# END server-manage bbr/) in_bbr=0
+                next
+            }
+            /^[[:space:]]*net\.core\.default_qdisc[[:space:]=]/ { next }
+            /^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]=]/ { next }
+            { print }
+        ' "$conf_file"
+    fi
+    printf '\n# BEGIN server-manage bbr\n'
+    printf 'net.core.default_qdisc = %s\n' "$qdisc"
+    printf 'net.ipv4.tcp_congestion_control = %s\n' "$cc"
+    printf '# END server-manage bbr\n'
+}
+
+_sysctl_render_wireguard_forward_conf() {
+    local conf_file="$1" value="${2:-1}"
+    if [[ -f "$conf_file" ]]; then
+        awk '
+            /^# BEGIN server-manage wireguard ip-forward/ { in_wg=1; next }
+            in_wg {
+                if (/^# END server-manage wireguard ip-forward/) in_wg=0
+                next
+            }
+            { print }
+        ' "$conf_file"
+    fi
+    if [[ "$value" == "1" ]]; then
+        printf '\n# BEGIN server-manage wireguard ip-forward\n'
+        printf 'net.ipv4.ip_forward = 1\n'
+        printf '# END server-manage wireguard ip-forward\n'
+    fi
+}
+
+_sysctl_commit_candidate() {
+    local tmp_candidate="$1" target_conf="$2" err_prefix="$3"
+    if ! sysctl -p "$tmp_candidate" >/dev/null 2>&1; then
+        print_error "${err_prefix}: sysctl -p 校验失败"
+        return 1
+    fi
+    if ! mv "$tmp_candidate" "$target_conf"; then
+        sysctl -p "$target_conf" >/dev/null 2>&1 || true
+        print_error "${err_prefix}: 写入 $target_conf 失败"
+        return 1
+    fi
+}
+
+_sysctl_apply_wireguard_forward() {
+    local value="${1:-1}" sysctl_conf sysctl_dir tmp_candidate
+    sysctl_conf="$(_sysctl_conf_path)"
+    sysctl_dir="$(dirname "$sysctl_conf")"
+    mkdir -p "$sysctl_dir" || { print_error "创建 sysctl 配置目录失败"; return 1; }
+    tmp_candidate=$(mktemp "${sysctl_dir}/.tmp.server-manage.wg-forward.XXXXXX") || {
+        print_error "创建临时 sysctl 配置失败"
+        return 1
+    }
+    _tmp_register "$tmp_candidate"
+    if ! _sysctl_render_wireguard_forward_conf "$sysctl_conf" "$value" > "$tmp_candidate"; then
+        rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
+        print_error "生成 WireGuard IP 转发配置失败"
+        return 1
+    fi
+    if [[ -f "$sysctl_conf" ]]; then
+        chmod --reference="$sysctl_conf" "$tmp_candidate" 2>/dev/null || true
+        chown --reference="$sysctl_conf" "$tmp_candidate" 2>/dev/null || true
+    else
+        chmod 644 "$tmp_candidate" 2>/dev/null || true
+    fi
+    if ! _sysctl_commit_candidate "$tmp_candidate" "$sysctl_conf" "WireGuard IP 转发配置"; then
+        rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
+        return 1
+    fi
+    _tmp_unregister "$tmp_candidate"
+}
+
+_sysctl_enable_wireguard_forward() {
+    _sysctl_apply_wireguard_forward 1
+}
+
+_sysctl_disable_wireguard_forward() {
+    local sysctl_conf tmp_check
+    sysctl_conf="$(_sysctl_conf_path)"
+    _sysctl_apply_wireguard_forward 0 || return 1
+    tmp_check=$(mktemp) || return 0
+    _tmp_register "$tmp_check"
+    _sysctl_render_wireguard_forward_conf "$sysctl_conf" 0 > "$tmp_check" || {
+        rm -f "$tmp_check"; _tmp_unregister "$tmp_check"
+        return 0
+    }
+    if ! grep -q '^[[:space:]]*net\.ipv4\.ip_forward[[:space:]=]' "$tmp_check"; then
+        sysctl -w net.ipv4.ip_forward=0 >/dev/null 2>&1 || true
+    fi
+    rm -f "$tmp_check"; _tmp_unregister "$tmp_check"
+}
+
 opt_sysctl() {
     print_title "内核参数调优"
     echo -e "${C_CYAN}当前关键参数:${C_RESET}"
@@ -3876,10 +5019,13 @@ opt_sysctl() {
     echo "  0. 返回"
     read -e -r -p "选择: " sc
     [[ "$sc" == "0" || -z "$sc" ]] && return
+    local sysctl_conf sysctl_backup
+    sysctl_conf="$(_sysctl_conf_path)"
+    sysctl_backup="$(_sysctl_backup_path)"
     if [[ "$sc" == "4" ]]; then
-        if [[ -f /etc/sysctl.conf.pre-tuning ]]; then
-            cp /etc/sysctl.conf.pre-tuning /etc/sysctl.conf
-            sysctl -p >/dev/null 2>&1
+        if [[ -f "$sysctl_backup" ]]; then
+            cp "$sysctl_backup" "$sysctl_conf"
+            sysctl -p "$sysctl_conf" >/dev/null 2>&1
             print_success "已回滚到调优前的配置。"
             log_action "Sysctl tuning rolled back"
         else
@@ -3887,8 +5033,6 @@ opt_sysctl() {
         fi
         pause; return
     fi
-    # Backup before modifying
-    [[ ! -f /etc/sysctl.conf.pre-tuning ]] && cp /etc/sysctl.conf /etc/sysctl.conf.pre-tuning
     local params=""
     local block_start="# BEGIN server-manage sysctl tuning"
     local block_end="# END server-manage sysctl tuning"
@@ -3940,14 +5084,45 @@ ${block_end}"
         ;;
     *) print_error "无效选择"; pause; return ;;
     esac
-    # Remove old tuning block and append new. 旧版本没有 END 标记，保留兼容删除。
-    sed -i '/^# BEGIN server-manage sysctl tuning/,/^# END server-manage sysctl tuning/d; /^# server-manage sysctl tuning/,/^$/d' /etc/sysctl.conf
-    printf '\n%s\n' "$params" >> /etc/sysctl.conf
-    if sysctl -p >/dev/null 2>&1; then
+    local sysctl_dir tmp_candidate
+    sysctl_dir="$(dirname "$sysctl_conf")"
+    mkdir -p "$sysctl_dir" || { print_error "创建 sysctl 配置目录失败"; pause; return 1; }
+    tmp_candidate=$(mktemp "${sysctl_dir}/.tmp.server-manage.sysctl.XXXXXX") || { print_error "创建临时 sysctl 配置失败"; pause; return 1; }
+    _tmp_register "$tmp_candidate"
+    if ! _sysctl_render_tuned_conf "$sysctl_conf" "$params" > "$tmp_candidate"; then
+        rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
+        print_error "生成 sysctl 配置失败"; pause; return 1
+    fi
+    if [[ -f "$sysctl_conf" ]]; then
+        chmod --reference="$sysctl_conf" "$tmp_candidate" 2>/dev/null || true
+        chown --reference="$sysctl_conf" "$tmp_candidate" 2>/dev/null || true
+    else
+        chmod 644 "$tmp_candidate" 2>/dev/null || true
+    fi
+    if sysctl -p "$tmp_candidate" >/dev/null 2>&1; then
+        if [[ ! -f "$sysctl_backup" && -f "$sysctl_conf" ]]; then
+            if ! cp -a "$sysctl_conf" "$sysctl_backup"; then
+                rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
+                sysctl -p "$sysctl_conf" >/dev/null 2>&1 || true
+                print_error "备份 sysctl 配置失败，未写入正式配置。"
+                log_action "Sysctl tuning failed before commit: backup" "ERROR"
+                pause; return 1
+            fi
+        fi
+        if ! mv "$tmp_candidate" "$sysctl_conf"; then
+            rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
+            sysctl -p "$sysctl_conf" >/dev/null 2>&1 || true
+            print_error "写入 $sysctl_conf 失败"
+            pause; return 1
+        fi
+        _tmp_unregister "$tmp_candidate"
         print_success "内核参数已应用 (无需重启)。"
         log_action "Sysctl tuning applied: preset=$sc"
     else
-        print_error "sysctl -p 执行失败，请检查 /etc/sysctl.conf"
+        rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
+        print_error "sysctl -p 执行失败，未写入正式配置。"
+        log_action "Sysctl tuning failed before commit: preset=$sc" "ERROR"
+        pause; return 1
     fi
     pause
 }
@@ -3980,6 +5155,10 @@ menu_opt() {
 net_iperf3() {
     print_title "iPerf3 测速"
     install_package "iperf3"
+    if ! command_exists iperf3; then
+        print_error "iperf3 安装失败或命令不可用。"
+        pause; return 1
+    fi
     read -e -r -p "监听端口 [5201]: " port
     port=${port:-5201}
     if ! validate_port "$port"; then
@@ -3989,10 +5168,25 @@ net_iperf3() {
     local ufw_opened=0
         if ufw_is_active; then
         if ! ufw status 2>/dev/null | grep -q "$port/tcp"; then
-            ufw allow "$port/tcp" comment "iPerf3-Temp" >/dev/null
+            if ! ufw allow "$port/tcp" comment "iPerf3-Temp" >/dev/null; then
+                print_error "临时放行端口 $port 失败。"
+                pause; return 1
+            fi
             ufw_opened=1
             print_info "临时放行端口 $port"
         fi
+    fi
+    iperf3 -s -p "$port" &
+    local iperf_pid=$!
+    sleep 0.2
+    if ! jobs -pr | grep -qx "$iperf_pid"; then
+        wait "$iperf_pid" 2>/dev/null || true
+        if [[ $ufw_opened -eq 1 ]]; then
+            ufw delete allow "$port/tcp" >/dev/null 2>&1 || true
+            print_info "防火墙规则已移除。"
+        fi
+        print_error "iPerf3 服务启动失败。"
+        pause; return 1
     fi
     local ip4=$(get_public_ipv4)
     local ip6=$(get_public_ipv6 || echo "")
@@ -4003,8 +5197,6 @@ net_iperf3() {
     [[ -n "$ip6" && "$ip6" != "未检测到" ]] && echo -e "IPv6 Upload: ${C_YELLOW}iperf3 -6 -c $ip6 -p $port${C_RESET}"
     [[ -n "$ip6" && "$ip6" != "未检测到" ]] && echo -e "IPv6 Download: ${C_YELLOW}iperf3 -6 -c $ip6 -p $port -R${C_RESET}"
     echo -e "${C_RED}按 Ctrl+C 停止测试...${C_RESET}"
-    iperf3 -s -p "$port" &
-    local iperf_pid=$!
     local cleaned=0
 
     cleanup_iperf() {
@@ -4028,6 +5220,168 @@ net_iperf3() {
     cleanup_iperf
     log_action "iPerf3 test completed on port $port"
     pause
+}
+
+_net_resolved_conf_path() {
+    printf '%s' "/etc/systemd/resolved.conf"
+}
+
+_net_gai_conf_path() {
+    printf '%s' "/etc/gai.conf"
+}
+
+_net_openwrt_reload_network() {
+    /etc/init.d/network reload
+}
+
+_net_render_resolved_dns_conf() {
+    local conf_file="$1" dns="$2"
+    if [[ -f "$conf_file" ]]; then
+        awk -v dns="$dns" '
+            BEGIN { in_resolve=0; seen_resolve=0; inserted=0 }
+            /^[[:space:]]*\[Resolve\][[:space:]]*$/ {
+                print
+                if (!inserted) {
+                    print "DNS=" dns
+                    inserted=1
+                }
+                in_resolve=1
+                seen_resolve=1
+                next
+            }
+            /^[[:space:]]*\[/ {
+                in_resolve=0
+            }
+            in_resolve && /^[[:space:]]*DNS[[:space:]]*=/ {
+                next
+            }
+            { print }
+            END {
+                if (!seen_resolve) {
+                    print ""
+                    print "[Resolve]"
+                    print "DNS=" dns
+                }
+            }
+        ' "$conf_file"
+    else
+        printf '[Resolve]\nDNS=%s\n' "$dns"
+    fi
+}
+
+_net_apply_systemd_resolved_dns() {
+    local dns="$1" res_conf old_content had_file=0 new_content
+    res_conf="$(_net_resolved_conf_path)"
+    if [[ -f "$res_conf" ]]; then
+        old_content=$(cat "$res_conf")
+        had_file=1
+    else
+        old_content=""
+    fi
+    new_content="$(_net_render_resolved_dns_conf "$res_conf" "$dns")" || return 1
+    if ! write_file_atomic "$res_conf" "$new_content"; then
+        print_error "写入 $res_conf 失败"
+        return 1
+    fi
+    if systemctl restart systemd-resolved; then
+        return 0
+    fi
+    print_error "重启 systemd-resolved 失败，正在回滚 DNS 配置"
+    if [[ "$had_file" -eq 1 ]]; then
+        write_file_atomic "$res_conf" "$old_content" >/dev/null 2>&1 || true
+    else
+        rm -f "$res_conf" 2>/dev/null || true
+    fi
+    return 1
+}
+
+_net_render_gai_conf() {
+    local conf_file="$1" mode="${2:-ipv6}"
+    if [[ -f "$conf_file" ]]; then
+        awk '
+            /^# BEGIN server-manage ip-priority/ { in_block=1; next }
+            in_block {
+                if (/^# END server-manage ip-priority/) in_block=0
+                next
+            }
+            /^[[:space:]]*precedence[[:space:]]+::ffff:0:0\/96[[:space:]]+100([[:space:]]*(#.*)?)?$/ { next }
+            { print }
+        ' "$conf_file"
+    fi
+    if [[ "$mode" == "ipv4" ]]; then
+        printf '\n# BEGIN server-manage ip-priority\n'
+        printf 'precedence ::ffff:0:0/96  100\n'
+        printf '# END server-manage ip-priority\n'
+    fi
+}
+
+_net_apply_gai_priority() {
+    local mode="$1" gai_path new_content
+    gai_path="$(_net_gai_conf_path)"
+    mkdir -p "$(dirname "$gai_path")" || return 1
+    new_content="$(_net_render_gai_conf "$gai_path" "$mode")" || return 1
+    write_file_atomic "$gai_path" "$new_content"
+}
+
+_net_openwrt_restore_dns_snapshot() {
+    local iface="$1" had_dns="$2" dns_snapshot="$3" had_peerdns="$4" peerdns_snapshot="$5"
+    local rc=0
+    uci -q delete "network.${iface}.dns" 2>/dev/null || true
+    if [[ "$had_dns" == "true" && -n "$dns_snapshot" ]]; then
+        local ip
+        while IFS= read -r ip; do
+            [[ -n "$ip" ]] || continue
+            uci add_list "network.${iface}.dns=$ip" >/dev/null 2>&1 || rc=1
+        done <<< "$dns_snapshot"
+    fi
+    if [[ "$had_peerdns" == "true" ]]; then
+        uci set "network.${iface}.peerdns=${peerdns_snapshot}" >/dev/null 2>&1 || rc=1
+    else
+        uci -q delete "network.${iface}.peerdns" 2>/dev/null || true
+    fi
+    uci commit network >/dev/null 2>&1 || rc=1
+    _net_openwrt_reload_network >/dev/null 2>&1 || rc=1
+    return "$rc"
+}
+
+_net_openwrt_apply_dns() {
+    local iface="$1" dns="$2"
+    local had_dns=false dns_snapshot="" had_peerdns=false peerdns_snapshot="" ip
+    if dns_snapshot=$(uci -q get "network.${iface}.dns" 2>/dev/null); then
+        had_dns=true
+    fi
+    if peerdns_snapshot=$(uci -q get "network.${iface}.peerdns" 2>/dev/null); then
+        had_peerdns=true
+    fi
+
+    uci -q delete "network.${iface}.dns" 2>/dev/null || true
+    for ip in $dns; do
+        if ! uci add_list "network.${iface}.dns=$ip"; then
+            print_error "写入 OpenWrt DNS 失败: $ip"
+            _net_openwrt_restore_dns_snapshot "$iface" "$had_dns" "$dns_snapshot" "$had_peerdns" "$peerdns_snapshot" \
+                || print_error "恢复 OpenWrt DNS 配置失败，请手动检查 network 配置。"
+            return 1
+        fi
+    done
+    if ! uci set "network.${iface}.peerdns=0"; then
+        print_error "设置 OpenWrt peerdns 失败"
+        _net_openwrt_restore_dns_snapshot "$iface" "$had_dns" "$dns_snapshot" "$had_peerdns" "$peerdns_snapshot" \
+            || print_error "恢复 OpenWrt DNS 配置失败，请手动检查 network 配置。"
+        return 1
+    fi
+    if ! uci commit network; then
+        print_error "提交 OpenWrt network 配置失败"
+        _net_openwrt_restore_dns_snapshot "$iface" "$had_dns" "$dns_snapshot" "$had_peerdns" "$peerdns_snapshot" \
+            || print_error "恢复 OpenWrt DNS 配置失败，请手动检查 network 配置。"
+        return 1
+    fi
+    if ! _net_openwrt_reload_network 2>/dev/null; then
+        print_error "重载 OpenWrt network 失败，已恢复原 DNS 配置。"
+        _net_openwrt_restore_dns_snapshot "$iface" "$had_dns" "$dns_snapshot" "$had_peerdns" "$peerdns_snapshot" \
+            || print_error "恢复 OpenWrt DNS 配置失败，请手动检查 network 配置。"
+        return 1
+    fi
+    return 0
 }
 
 net_dns() {
@@ -4099,20 +5453,10 @@ net_dns() {
         dns_iface="$network_wan"
         uci -q get "network.${dns_iface}" >/dev/null 2>&1 || dns_iface="$network_lan"
         uci -q get "network.${dns_iface}" >/dev/null 2>&1 || { print_error "未找到 OpenWrt wan/lan 网络接口"; pause; return 1; }
-        uci delete "network.${dns_iface}.dns" 2>/dev/null || true
-        for ip in $dns; do
-            uci add_list "network.${dns_iface}.dns=$ip" || { print_error "写入 OpenWrt DNS 失败: $ip"; pause; return 1; }
-        done
-        uci set "network.${dns_iface}.peerdns=0" || { print_error "设置 OpenWrt peerdns 失败"; pause; return 1; }
-        uci commit network || { print_error "提交 OpenWrt network 配置失败"; pause; return 1; }
-        /etc/init.d/network reload 2>/dev/null || true
+        _net_openwrt_apply_dns "$dns_iface" "$dns" || { pause; return 1; }
         print_success "DNS 已通过 uci 修改 (接口: ${dns_iface}, 持久化)。"
     elif is_systemd && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        local res_conf="/etc/systemd/resolved.conf"
-        grep -q '^\[Resolve\]' "$res_conf" || echo -e "\n[Resolve]" >> "$res_conf"
-        sed -i '/^DNS=/d' "$res_conf"
-        sed -i '/^\[Resolve\]/a DNS='"$dns" "$res_conf"
-        systemctl restart systemd-resolved
+        _net_apply_systemd_resolved_dns "$dns" || { pause; return 1; }
         print_success "DNS 已修改。"
     else
         local resolv_content=""
@@ -4208,18 +5552,21 @@ menu_net() {
                 read -e -r -p "选: " p
                 case $p in
                     1)
-                        [[ ! -f /etc/gai.conf ]] && touch /etc/gai.conf
-                        sed -i '/^#\?precedence ::ffff:0:0\/96  100/d' /etc/gai.conf
-                        echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
-                        print_success "IPv4 优先。"
-                        log_action "IP priority changed: ipv4"
+                        if _net_apply_gai_priority ipv4; then
+                            print_success "IPv4 优先。"
+                            log_action "IP priority changed: ipv4"
+                        else
+                            print_error "写入 /etc/gai.conf 失败。"
+                        fi
                         pause
                         ;;
                     2)
-                        [[ ! -f /etc/gai.conf ]] && touch /etc/gai.conf
-                        sed -i '/^#\?precedence ::ffff:0:0\/96  100/d' /etc/gai.conf
-                        print_success "IPv6 优先。"
-                        log_action "IP priority changed: ipv6"
+                        if _net_apply_gai_priority ipv6; then
+                            print_success "IPv6 优先。"
+                            log_action "IP priority changed: ipv6"
+                        else
+                            print_error "写入 /etc/gai.conf 失败。"
+                        fi
                         pause
                         ;;
                     0|q|Q|"") ;;
@@ -4244,9 +5591,33 @@ menu_net() {
 # 不需要额外的 source 调用。此注释仅用于人类阅读。
 _web_dep_check_results=()
 
+_web_dep_run_check() {
+    local check_id="$1"
+    case "$check_id" in
+        jq) command_exists jq ;;
+        nginx) command_exists nginx ;;
+        nginx_dirs) _check_nginx_dirs ;;
+        certbot) command_exists certbot ;;
+        certbot_dns_cf) _check_certbot_dns_cf ;;
+        *) return 1 ;;
+    esac
+}
+
+_web_dep_run_install() {
+    local install_id="$1"
+    case "$install_id" in
+        jq) install_package jq silent ;;
+        nginx) _install_nginx ;;
+        nginx_dirs) mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/snippets ;;
+        certbot) _install_certbot ;;
+        certbot_dns_cf) _install_certbot_dns_cf ;;
+        *) return 1 ;;
+    esac
+}
+
 _web_dep_verify() {
-    local name="$1" check_cmd="$2"
-    if eval "$check_cmd" >/dev/null 2>&1; then
+    local name="$1" check_id="$2"
+    if _web_dep_run_check "$check_id" >/dev/null 2>&1; then
         _web_dep_check_results+=("${C_GREEN}✓${C_RESET} $name")
         return 0
     else
@@ -4256,11 +5627,11 @@ _web_dep_verify() {
 }
 
 _web_dep_fix() {
-    local name="$1" check_cmd="$2" install_func="$3"
-    if ! eval "$check_cmd" >/dev/null 2>&1; then
+    local name="$1" check_id="$2" install_id="$3"
+    if ! _web_dep_run_check "$check_id" >/dev/null 2>&1; then
         print_info "修复: $name ..."
-        if eval "$install_func"; then
-            if eval "$check_cmd" >/dev/null 2>&1; then
+        if _web_dep_run_install "$install_id"; then
+            if _web_dep_run_check "$check_id" >/dev/null 2>&1; then
                 print_success "$name 修复成功"
                 return 0
             fi
@@ -4276,12 +5647,19 @@ _purge_snap_certbot() {
         print_info "检测到 snap 版 certbot，正在清理..."
         snap remove certbot 2>/dev/null || true
         snap remove certbot-dns-cloudflare 2>/dev/null || true
-        rm -f /usr/bin/certbot /snap/bin/certbot 2>/dev/null || true
+        local link target
+        for link in /usr/bin/certbot /snap/bin/certbot; do
+            if [[ -L "$link" ]]; then
+                target=$(readlink "$link" 2>/dev/null || true)
+                if [[ "$link" == "/snap/bin/certbot" || "$target" == "/snap/bin/certbot" || "$target" == *"/snap/certbot/"* ]]; then
+                    rm -f "$link" 2>/dev/null || true
+                fi
+            fi
+        done
         if [[ $(snap list 2>/dev/null | tail -n +2 | wc -l) -eq 0 ]]; then
             print_info "snap 中无其他软件包，清理 snapd..."
             systemctl stop snapd snapd.socket 2>/dev/null || true
             apt-get purge -y snapd 2>/dev/null || true
-            rm -rf /snap /var/snap /var/lib/snapd ~/snap 2>/dev/null || true
             print_success "snapd 已清理"
         fi
         log_action "Purged snap certbot"
@@ -4375,6 +5753,203 @@ _install_nginx() {
     is_systemd && systemctl enable --now nginx >/dev/null 2>&1 || true
 }
 
+# 检测 nginx 是否具备 stream 模块（ssl_preread 分流依赖）。
+# 三种可用形态：静态编入(--with-stream)、动态模块已加载(modules-enabled 下有 stream so),
+# 或发行版把 stream so 装在 modules 目录但未 load（此时需 load_module，交给 _ensure_nginx_stream 处理）。
+_check_nginx_stream() {
+    command_exists nginx || return 1
+    local vout; vout="$(nginx -V 2>&1)"
+    # 静态编入：nginx -V 中出现独立 token "--with-stream"。
+    # 关键：必须逐 token 精确匹配（tr 空格换行 + grep -x），否则会把
+    #   --with-stream=dynamic（动态模块，需 .so + load_module，非静态可用）
+    #   --with-stream_ssl_module / --with-stream_ssl_preread_module（子模块 token）
+    # 这类子串误判为「静态编入可用」——Debian 12 官方 nginx 正是 --with-stream=dynamic
+    # 且 /usr/lib/nginx/modules 为空，误判会导致 stream{} 加载失败却报可用。
+    if tr ' ' '\n' <<< "$vout" | grep -qx -- '--with-stream'; then
+        return 0
+    fi
+    # 动态模块：必须「已在 modules-enabled 下 load」且「对应 .so 真实存在」才算当前可用。
+    if ls /etc/nginx/modules-enabled/ 2>/dev/null | grep -q 'stream' && _nginx_stream_module_available; then
+        return 0
+    fi
+    return 1
+}
+
+# 动态 stream 模块的 so 是否存在（用于判断能否走 load_module 而无需换源）
+_nginx_stream_module_available() {
+    ls /usr/lib/nginx/modules/ngx_stream_module.so \
+       /usr/share/nginx/modules/ngx_stream_module.so 2>/dev/null | grep -q . && return 0
+    return 1
+}
+
+# 安装官方 nginx.org 源（带 stream 模块，静态编入）。仅 Debian/Ubuntu。
+_nginx_keyring_path() {
+    printf '%s' "${NGINX_KEYRING_FILE:-/usr/share/keyrings/nginx-archive-keyring.gpg}"
+}
+
+_nginx_source_list_path() {
+    printf '%s' "${NGINX_SOURCE_LIST_FILE:-/etc/apt/sources.list.d/nginx.list}"
+}
+
+_nginx_preferences_path() {
+    printf '%s' "${NGINX_APT_PIN_FILE:-/etc/apt/preferences.d/99nginx}"
+}
+
+_nginx_stream_module_conf_path() {
+    printf '%s' "${NGINX_STREAM_MODULE_CONF:-/etc/nginx/modules-enabled/50-mod-stream.conf}"
+}
+
+_nginx_render_official_source() {
+    local distro="$1" codename="$2" keyring="$3"
+    [[ "$distro" =~ ^(debian|ubuntu)$ ]] || return 1
+    [[ "$codename" =~ ^[A-Za-z0-9._+-]+$ ]] || return 1
+    [[ "$keyring" == /* && "$keyring" != *$'\n'* ]] || return 1
+    printf 'deb [signed-by=%s] http://nginx.org/packages/%s %s nginx\n' "$keyring" "$distro" "$codename"
+}
+
+_nginx_render_official_pin() {
+    printf 'Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n'
+}
+
+_nginx_install_official_keyring() {
+    local keyring dir tmp_key tmp_ring
+    command_exists curl || return 1
+    command_exists gpg || return 1
+    keyring="$(_nginx_keyring_path)"
+    dir="$(dirname "$keyring")"
+    mkdir -p "$dir" || return 1
+    tmp_key=$(mktemp "${dir}/.tmp.server-manage.nginx-key.XXXXXX") || return 1
+    _tmp_register "$tmp_key"
+    tmp_ring=$(mktemp "${dir}/.tmp.server-manage.nginx-keyring.XXXXXX") || {
+        rm -f "$tmp_key" 2>/dev/null || true
+        _tmp_unregister "$tmp_key"
+        return 1
+    }
+    _tmp_register "$tmp_ring"
+    if ! curl -fsSL https://nginx.org/keys/nginx_signing.key -o "$tmp_key"; then
+        rm -f "$tmp_key" "$tmp_ring" 2>/dev/null || true
+        _tmp_unregister "$tmp_key"; _tmp_unregister "$tmp_ring"
+        return 1
+    fi
+    if ! gpg --batch --yes --dearmor -o "$tmp_ring" "$tmp_key" 2>/dev/null; then
+        rm -f "$tmp_key" "$tmp_ring" 2>/dev/null || true
+        _tmp_unregister "$tmp_key"; _tmp_unregister "$tmp_ring"
+        return 1
+    fi
+    chmod 644 "$tmp_ring" 2>/dev/null || true
+    chown root:root "$tmp_ring" 2>/dev/null || true
+    if ! mv "$tmp_ring" "$keyring"; then
+        rm -f "$tmp_key" "$tmp_ring" 2>/dev/null || true
+        _tmp_unregister "$tmp_key"; _tmp_unregister "$tmp_ring"
+        return 1
+    fi
+    _tmp_unregister "$tmp_ring"
+    rm -f "$tmp_key" 2>/dev/null || true
+    _tmp_unregister "$tmp_key"
+    return 0
+}
+
+_nginx_write_official_apt_files() {
+    local distro="$1" codename="$2" keyring source_file pin_file source_content pin_content
+    keyring="$(_nginx_keyring_path)"
+    source_file="$(_nginx_source_list_path)"
+    pin_file="$(_nginx_preferences_path)"
+    source_content="$(_nginx_render_official_source "$distro" "$codename" "$keyring")" || return 1
+    pin_content="$(_nginx_render_official_pin)" || return 1
+    write_file_atomic "$source_file" "$source_content" || return 1
+    chmod 644 "$source_file" 2>/dev/null || true
+    write_file_atomic "$pin_file" "$pin_content" || return 1
+    chmod 644 "$pin_file" 2>/dev/null || true
+}
+
+_nginx_write_stream_module_conf() {
+    local so="$1" conf_file content
+    [[ -f "$so" && "$so" == /* && "$so" != *$'\n'* ]] || return 1
+    conf_file="$(_nginx_stream_module_conf_path)"
+    content="$(printf 'load_module %s;\n' "$so")" || return 1
+    write_file_atomic "$conf_file" "$content" || return 1
+    chmod 644 "$conf_file" 2>/dev/null || true
+}
+
+_install_nginx_official() {
+    [[ "$PLATFORM" == "debian" ]] || return 1
+    command_exists curl || install_package "curl" "silent" || return 1
+    install_package "gnupg2" "silent" || install_package "gnupg" "silent" || true
+    install_package "ca-certificates" "silent" || true
+    install_package "lsb-release" "silent" || true
+    local codename; codename=$(lsb_release -cs 2>/dev/null || true)
+    [[ -n "$codename" ]] || { print_error "无法获取发行版代号 (lsb_release)"; return 1; }
+    local distro="ubuntu"
+    grep -qi debian /etc/os-release 2>/dev/null && distro="debian"
+    if ! _nginx_install_official_keyring; then
+        print_error "下载 nginx.org 签名密钥失败"
+        return 1
+    fi
+    if ! _nginx_write_official_apt_files "$distro" "$codename"; then
+        print_error "写入 nginx.org apt 源失败"
+        return 1
+    fi
+    APT_UPDATED=0
+    update_apt_cache
+    DEBIAN_FRONTEND=noninteractive apt-get install -y nginx >/dev/null 2>&1 || return 1
+    # enable --now 对已运行的 nginx 是 no-op（不会重启），换源装的带 stream 新二进制不会生效；
+    # 显式 restart 确保运行态换成新二进制，再复核 stream 可用。
+    if is_systemd; then
+        systemctl enable nginx >/dev/null 2>&1 || true
+        systemctl restart nginx >/dev/null 2>&1 || true
+    else
+        service nginx restart >/dev/null 2>&1 || nginx -s reload >/dev/null 2>&1 || true
+    fi
+    _check_nginx_stream
+}
+
+# 确保 nginx 具备可用的 stream 模块。返回 0 表示可用。
+# 策略：已可用→直接返回；有动态 so→注入 load_module；否则装官方源（静态编入）。
+_ensure_nginx_stream() {
+    if _check_nginx_stream; then
+        return 0
+    fi
+    # 发行版自带 libnginx-mod-stream 的情况：先尝试装该包
+    if [[ "$PLATFORM" == "debian" ]]; then
+        if ! _nginx_stream_module_available; then
+            update_apt_cache
+            apt-get install -y libnginx-mod-stream >/dev/null 2>&1 || true
+        fi
+    fi
+    # 有动态 so 但未加载 → 注入 load_module 到 nginx.conf 顶部
+    if _nginx_stream_module_available; then
+        local so=""
+        for so in /usr/lib/nginx/modules/ngx_stream_module.so /usr/share/nginx/modules/ngx_stream_module.so; do
+            [[ -f "$so" ]] && break
+        done
+        # Debian 的 libnginx-mod-stream 会在 modules-enabled 放 .conf 自动 load，
+        # 若已如此则 _check_nginx_stream 已返回 0；这里兜底手动 load。
+        if ! ls /etc/nginx/modules-enabled/ 2>/dev/null | grep -q stream; then
+            _nginx_write_stream_module_conf "$so" || return 1
+        fi
+        # 关键：load_module 只在 nginx 启动时处理，reload(SIGHUP) 不会把新动态模块加载进
+        # 正在运行的 master 进程。若此处只 reload，运行态 nginx 仍无 stream，而调用方（enable）
+        # 随后会让 sing-box 下沉释放 443，届时公网 443 无人监听 → 节点全废却可能误报成功。
+        # 故写入 load_module 后必须 restart（而非 reload），让模块真正加载，再复核。
+        if nginx -t >/dev/null 2>&1; then
+            if is_systemd; then
+                systemctl restart nginx >/dev/null 2>&1 || true
+            else
+                service nginx restart >/dev/null 2>&1 || { nginx -s stop 2>/dev/null; nginx 2>/dev/null; } || true
+            fi
+            # restart 后用运行态证据复核：nginx -V 含 stream 模块，或已能实际解析 stream{}。
+            # _check_nginx_stream 只看配置文件存在偏乐观，这里叠加 nginx -t 通过 + 服务在跑。
+            if _check_nginx_stream && nginx -t >/dev/null 2>&1 \
+               && { ! is_systemd || systemctl is-active --quiet nginx; }; then
+                return 0
+            fi
+        fi
+    fi
+    # 最后手段：换官方源装带 stream 的 nginx
+    print_warn "当前 nginx 无 stream 模块，尝试安装官方 nginx.org 源版本 (含 stream)..."
+    _install_nginx_official
+}
+
 _check_certbot_dns_cf() {
     command_exists certbot || return 1
     certbot plugins 2>/dev/null | grep -q dns-cloudflare || return 1
@@ -4420,6 +5995,70 @@ _nginx_reload() {
     fi
 }
 
+# Reality 443 共存：建站请求的 HTTPS 端口下沉。
+# 共存启用且用户请求 443 时，改写为 web 内部端口（真站退到 loopback，443 归 nginx stream）。
+# 回显最终生效端口（stdout）；说明打到 stderr，不污染回显。未启用或非 443 原样返回。
+# 依赖 15-singbox-reality.sh 的 reality_coexist_enabled / reality_coexist_web_port（构建时同脚本）。
+_web_coexist_https_port() {
+    local requested="$1" web_port
+    if ! declare -F reality_coexist_enabled >/dev/null 2>&1 || ! reality_coexist_enabled; then
+        printf '%s' "$requested"; return 0
+    fi
+    [[ "$requested" == "443" ]] || { printf '%s' "$requested"; return 0; }
+    web_port="$(reality_coexist_web_port 2>/dev/null || true)"
+    validate_port "$web_port" || { printf '%s' "$requested"; return 0; }
+    print_warn "本机已启用 Reality 443 共存，网站自动使用 ${web_port}，由 nginx 分流层统一对外提供 443。" >&2
+    printf '%s' "$web_port"
+}
+
+# Reality 443 共存：计算 80→HTTPS 跳转应带的端口后缀。
+# 常规：非 443 端口跳转要带 ":端口"。但共存下真站虽监听 web 内部端口(如 12443)，
+# 对外仍由 nginx stream 经 443 提供，故此时后缀必须为空（跳到隐含 443），否则会 301 到
+# 公网不可达的内部端口导致真站 HTTP 入口失效。回显后缀（空或 ":端口"）到 stdout。
+_web_coexist_redir_suffix() {
+    local https_port="$1" web_port
+    if declare -F reality_coexist_enabled >/dev/null 2>&1 && reality_coexist_enabled; then
+        web_port="$(reality_coexist_web_port 2>/dev/null || true)"
+        # 该站监听的正是共存 web 内部端口 → 对外是 443，后缀留空
+        [[ -n "$web_port" && "$https_port" == "$web_port" ]] && { printf '%s' ""; return 0; }
+    fi
+    [[ "$https_port" != "443" ]] && printf ':%s' "$https_port"
+    return 0
+}
+
+# Reality 443 共存：判断某端口是否为共存 web 内部端口（仅 loopback，不应对公网放行）。
+# 返回 0 表示"是内部端口，调用方应跳过 ufw allow"；否则返回 1（正常放行）。
+_web_coexist_is_inner_port() {
+    local port="$1" web_port
+    declare -F reality_coexist_enabled >/dev/null 2>&1 && reality_coexist_enabled || return 1
+    web_port="$(reality_coexist_web_port 2>/dev/null || true)"
+    [[ -n "$web_port" && "$port" == "$web_port" ]]
+}
+
+_web_allow_public_tcp_port() {
+    local port="$1" comment="${2:-Web}" label="${3:-${port}/tcp}" rc
+    if ! declare -F firewall_allow_tcp_port >/dev/null 2>&1; then
+        print_warn "未找到防火墙放行 helper，请手动确认 ${label} 已放行。"
+        return 2
+    fi
+    firewall_allow_tcp_port "$port" "$comment"
+    rc=$?
+    case "$rc" in
+        0)
+            print_success "已放行端口 ${label}"
+            return 0
+            ;;
+        2)
+            print_info "请确认服务器防火墙/云安全组已放行 ${label}"
+            return 0
+            ;;
+        *)
+            print_error "防火墙放行失败: ${label}"
+            return 1
+            ;;
+    esac
+}
+
 # 确保 SSL 参数文件存在
 _ensure_ssl_params() {
     [[ -f /etc/nginx/snippets/ssl-params.conf ]] && return 0
@@ -4445,17 +6084,45 @@ _nginx_tls_http2_block() {
     minor=${version#*.}; minor=${minor%%.*}
     patch=${version##*.}
 
+    # Reality 443 共存：若本 server 监听的正是共存 web 内部端口，则只绑 loopback
+    # （127.0.0.1 + [::1]），使该站仅能经 nginx stream 443 分流到达，杜绝内部端口公网暴露。
+    # 非共存 / 非内部端口保持原样绑全地址。
+    local host_v4="" host_v6="[::]:"
+    if declare -F reality_coexist_enabled >/dev/null 2>&1 && reality_coexist_enabled; then
+        local _wp; _wp="$(reality_coexist_web_port 2>/dev/null || true)"
+        if [[ -n "$_wp" && "$port" == "$_wp" ]]; then
+            host_v4="127.0.0.1:"; host_v6="[::1]:"
+        fi
+    fi
+
     if [[ -n "$version" ]] && {
         (( major > 1 )) ||
         (( major == 1 && minor > 25 )) ||
         (( major == 1 && minor == 25 && patch >= 1 ))
     }; then
-        printf '    listen %s ssl;\n' "$port"
-        printf '    listen [::]:%s ssl;\n' "$port"
+        printf '    listen %s%s ssl;\n' "$host_v4" "$port"
+        printf '    listen %s%s ssl;\n' "$host_v6" "$port"
         printf '    http2 on;\n'
     else
-        printf '    listen %s ssl %s;\n' "$port" "http2"
-        printf '    listen [::]:%s ssl %s;\n' "$port" "http2"
+        printf '    listen %s%s ssl %s;\n' "$host_v4" "$port" "http2"
+        printf '    listen %s%s ssl %s;\n' "$host_v6" "$port" "http2"
+    fi
+}
+
+_nginx_deploy_conf_restore() {
+    local avail="$1" enabled="$2" had_avail="$3" had_enabled="$4" enabled_was_symlink="$5" old_enabled_target="$6" backup_avail="$7" backup_enabled="$8"
+    rm -f "$enabled"
+    if [[ "$had_enabled" -eq 1 ]]; then
+        if [[ "$enabled_was_symlink" -eq 1 && -n "$old_enabled_target" ]]; then
+            ln -s "$old_enabled_target" "$enabled" 2>/dev/null || true
+        elif [[ -n "$backup_enabled" && -e "$backup_enabled" ]]; then
+            mv "$backup_enabled" "$enabled" 2>/dev/null || true
+        fi
+    fi
+    if [[ "$had_avail" -eq 1 && -n "$backup_avail" && -e "$backup_avail" ]]; then
+        mv "$backup_avail" "$avail" 2>/dev/null || true
+    else
+        rm -f "$avail"
     fi
 }
 
@@ -4463,8 +6130,10 @@ _nginx_tls_http2_block() {
 # 用法: _nginx_deploy_conf "域名" "配置内容" 成功返回0，失败返回1
 _nginx_deploy_conf() {
     local domain="$1" conf_content="$2"
-    local avail="/etc/nginx/sites-available/${domain}.conf"
-    local enabled="/etc/nginx/sites-enabled/${domain}.conf"
+    local sites_available="${NGINX_SITES_AVAILABLE_DIR:-/etc/nginx/sites-available}"
+    local sites_enabled="${NGINX_SITES_ENABLED_DIR:-/etc/nginx/sites-enabled}"
+    local avail="${sites_available}/${domain}.conf"
+    local enabled="${sites_enabled}/${domain}.conf"
     local backup_avail="" backup_enabled="" old_enabled_target=""
     local had_avail=0 had_enabled=0 enabled_was_symlink=0
 
@@ -4484,7 +6153,13 @@ _nginx_deploy_conf() {
     fi
 
     write_file_atomic "$avail" "$conf_content" || { print_error "写入 Nginx 配置失败"; rm -f "$backup_avail" "$backup_enabled"; return 1; }
-    ln -sfn "$avail" "$enabled" || { print_error "启用 Nginx 配置失败"; rm -f "$backup_avail" "$backup_enabled"; return 1; }
+    if ! ln -sfn "$avail" "$enabled"; then
+        print_error "启用 Nginx 配置失败"
+        _nginx_deploy_conf_restore "$avail" "$enabled" "$had_avail" "$had_enabled" "$enabled_was_symlink" "$old_enabled_target" "$backup_avail" "$backup_enabled"
+        nginx -t >/dev/null 2>&1 && _nginx_reload >/dev/null 2>&1 || true
+        rm -f "$backup_avail" "$backup_enabled"
+        return 1
+    fi
 
     if nginx -t >/dev/null 2>&1 && _nginx_reload; then
         rm -f "$backup_avail" "$backup_enabled"
@@ -4493,19 +6168,7 @@ _nginx_deploy_conf() {
 
     print_error "Nginx 配置测试或重载失败，正在恢复旧配置！"
     nginx -t 2>&1 | tail -5
-    rm -f "$enabled"
-    if [[ "$had_enabled" -eq 1 ]]; then
-        if [[ "$enabled_was_symlink" -eq 1 && -n "$old_enabled_target" ]]; then
-            ln -s "$old_enabled_target" "$enabled"
-        elif [[ -n "$backup_enabled" && -e "$backup_enabled" ]]; then
-            mv "$backup_enabled" "$enabled"
-        fi
-    fi
-    if [[ "$had_avail" -eq 1 && -n "$backup_avail" && -e "$backup_avail" ]]; then
-        mv "$backup_avail" "$avail"
-    else
-        rm -f "$avail"
-    fi
+    _nginx_deploy_conf_restore "$avail" "$enabled" "$had_avail" "$had_enabled" "$enabled_was_symlink" "$old_enabled_target" "$backup_avail" "$backup_enabled"
     nginx -t >/dev/null 2>&1 && _nginx_reload >/dev/null 2>&1 || true
     rm -f "$backup_avail" "$backup_enabled"
     return 1
@@ -4540,19 +6203,19 @@ web_env_check() {
     fi
     print_info "Web 环境依赖自检..."
     local deps=(
-        "jq|command_exists jq|install_package jq silent"
-        "nginx|command_exists nginx|_install_nginx"
-        "nginx 目录结构|_check_nginx_dirs|mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/snippets"
-        "certbot|command_exists certbot|_install_certbot"
-        "certbot dns-cloudflare 插件|_check_certbot_dns_cf|_install_certbot_dns_cf"
+        "jq|jq|jq"
+        "nginx|nginx|nginx"
+        "nginx 目录结构|nginx_dirs|nginx_dirs"
+        "certbot|certbot|certbot"
+        "certbot dns-cloudflare 插件|certbot_dns_cf|certbot_dns_cf"
     )
 
     # 第一轮: 检查
     _web_dep_check_results=()
     local need_fix=0
     for dep in "${deps[@]}"; do
-        IFS='|' read -r name check_cmd install_func <<< "$dep"
-        if ! _web_dep_verify "$name" "$check_cmd"; then
+        IFS='|' read -r name check_id install_id <<< "$dep"
+        if ! _web_dep_verify "$name" "$check_id"; then
             need_fix=1
         fi
     done
@@ -4566,8 +6229,8 @@ web_env_check() {
         print_warn "检测到缺失依赖，正在自动修复..."
         local fix_failed=0
         for dep in "${deps[@]}"; do
-            IFS='|' read -r name check_cmd install_func <<< "$dep"
-            if ! _web_dep_fix "$name" "$check_cmd" "$install_func"; then
+            IFS='|' read -r name check_id install_id <<< "$dep"
+            if ! _web_dep_fix "$name" "$check_id" "$install_id"; then
                 fix_failed=1
             fi
         done
@@ -4577,8 +6240,8 @@ web_env_check() {
             print_error "部分依赖修复失败，最终验证:"
             local final_ok=1
             for dep in "${deps[@]}"; do
-                IFS='|' read -r name check_cmd install_func <<< "$dep"
-                if eval "$check_cmd" >/dev/null 2>&1; then
+                IFS='|' read -r name check_id install_id <<< "$dep"
+                if _web_dep_run_check "$check_id" >/dev/null 2>&1; then
                     echo -e "  ${C_GREEN}✓${C_RESET} $name"
                 else
                     echo -e "  ${C_RED}✗${C_RESET} $name"
@@ -4614,15 +6277,24 @@ web_env_check() {
 _web_cleanup_domain() {
     local domain="$1" quiet="${2:-}"
     [[ -z "$domain" ]] && return 1
+    if ! validate_domain "$domain"; then
+        [[ -z "$quiet" ]] && print_error "域名格式无效，拒绝清理: $domain"
+        return 1
+    fi
     local cleaned=0
+    local cert_prefix="${CERT_PATH_PREFIX%/}"
+    if [[ -z "$cert_prefix" || "$cert_prefix" == "/" ]]; then
+        [[ -z "$quiet" ]] && print_error "证书目录前缀异常，拒绝清理"
+        return 1
+    fi
 
     # Certbot 证书
-    if certbot certificates 2>/dev/null | grep -q "$domain"; then
+    if certbot certificates 2>/dev/null | grep -Fq -- "$domain"; then
         certbot delete --cert-name "$domain" --non-interactive 2>/dev/null && cleaned=$((cleaned+1))
         [[ -z "$quiet" ]] && print_success "证书已删除"
     fi
     # 本地证书拷贝
-    rm -rf "${CERT_PATH_PREFIX:?}/${domain}" 2>/dev/null
+    rm -rf "${cert_prefix}/${domain}" 2>/dev/null
 
     # Nginx 配置
     local ng_en="/etc/nginx/sites-enabled/${domain}.conf"
@@ -4632,13 +6304,20 @@ _web_cleanup_domain() {
         nginx -t >/dev/null 2>&1 && _nginx_reload 2>/dev/null
         cleaned=$((cleaned+1))
         [[ -z "$quiet" ]] && print_success "Nginx 配置已删除"
+        # 443 共存：站点 conf 已删，刷新 stream SNI 白名单剔除该域名（未启用则 no-op）。
+        # 与建站三处（09c/09d/09e）对称，避免白名单残留指向已消失 web server 的死映射。
+        declare -F reality_coexist_refresh >/dev/null && reality_coexist_refresh || true
     fi
 
     # Hook 脚本
-    local hook="${CERT_HOOKS_DIR}/renew-${domain}.sh"
-    [[ ! -f "$hook" ]] && hook="/root/cert-renew-hook-${domain}.sh"
-    if [[ -f "$hook" ]]; then
-        rm -f "$hook"; cleaned=$((cleaned+1))
+    local hook hook_cleaned=false
+    for hook in "${CERT_HOOKS_DIR}/renew-${domain}.sh" "/root/cert-renew-hook-${domain}.sh"; do
+        if [[ -f "$hook" ]]; then
+            rm -f "$hook" && hook_cleaned=true
+        fi
+    done
+    if [[ "$hook_cleaned" == "true" ]]; then
+        cleaned=$((cleaned+1))
         [[ -z "$quiet" ]] && print_success "Hook 脚本已删除"
     fi
 
@@ -4801,20 +6480,102 @@ _cf_get_zone_id() {
 
 _cf_dns_delete() {
     local zone_id=$1 token=$2 type=$3 name=$4
-    local resp=$(_cf_api GET "/zones/$zone_id/dns_records?type=$type&name=$name" "$token")
+    local resp
+    resp=$(_cf_api GET "/zones/$zone_id/dns_records?type=$type&name=$name" "$token")
     if ! _cf_api_ok "$resp"; then
         print_error "读取 DNS 记录失败: $(_cf_api_err "$resp")"
         return 1
     fi
     local rid=$(echo "$resp" | jq -r '.result[0].id // empty')
     [[ -n "$rid" ]] || return 0
-    _cf_api DELETE "/zones/$zone_id/dns_records/$rid" "$token" >/dev/null
+    resp=$(_cf_api DELETE "/zones/$zone_id/dns_records/$rid" "$token")
+    if ! _cf_api_ok "$resp"; then
+        print_error "删除 DNS 记录失败: $(_cf_api_err "$resp")"
+        return 1
+    fi
+}
+
+_cf_dns_snapshot_records() {
+    local zone_id="$1" token="$2" name="$3"
+    shift 3
+    local types=("$@")
+    [[ ${#types[@]} -gt 0 ]] || types=(A AAAA CNAME)
+
+    local type resp snapshot='[]'
+    for type in "${types[@]}"; do
+        resp=$(_cf_api GET "/zones/$zone_id/dns_records?type=$type&name=$name" "$token")
+        if ! _cf_api_ok "$resp"; then
+            print_error "读取 DNS 快照失败: $type $(_cf_api_err "$resp")"
+            return 1
+        fi
+        snapshot=$(jq -c --argjson acc "$snapshot" \
+            '$acc + [(.result // [])[] | {type,name,content,ttl,proxied,comment,tags} | with_entries(select(.value != null))]' \
+            <<< "$resp") || {
+            print_error "解析 DNS 快照失败: $type"
+            return 1
+        }
+    done
+    printf '%s\n' "$snapshot"
+}
+
+_cf_dns_restore_records() {
+    local zone_id="$1" token="$2" name="$3" snapshot="$4"
+    shift 4
+    local types=("$@")
+    [[ ${#types[@]} -gt 0 ]] || types=(A AAAA CNAME)
+
+    if ! jq -e 'type == "array"' >/dev/null 2>&1 <<< "$snapshot"; then
+        print_error "DNS 快照格式无效，无法恢复"
+        return 1
+    fi
+
+    local type resp id payload record
+    for type in "${types[@]}"; do
+        resp=$(_cf_api GET "/zones/$zone_id/dns_records?type=$type&name=$name" "$token")
+        if ! _cf_api_ok "$resp"; then
+            print_error "读取待恢复 DNS 记录失败: $type $(_cf_api_err "$resp")"
+            return 1
+        fi
+        while IFS= read -r id; do
+            [[ -n "$id" ]] || continue
+            resp=$(_cf_api DELETE "/zones/$zone_id/dns_records/$id" "$token")
+            if ! _cf_api_ok "$resp"; then
+                print_error "删除待恢复 DNS 记录失败: $type $(_cf_api_err "$resp")"
+                return 1
+            fi
+        done < <(jq -r '.result[]?.id // empty' <<< "$resp")
+    done
+
+    while IFS= read -r record; do
+        [[ -n "$record" ]] || continue
+        payload=$(jq -c '{
+            type: .type,
+            name: .name,
+            content: .content,
+            ttl: (.ttl // 1),
+            proxied: (.proxied // false)
+        }
+        + (if has("comment") then {comment: .comment} else {} end)
+        + (if has("tags") then {tags: .tags} else {} end)' <<< "$record") || {
+            print_error "构造 DNS 恢复 payload 失败"
+            return 1
+        }
+        resp=$(_cf_api POST "/zones/$zone_id/dns_records" "$token" --data "$payload")
+        if ! _cf_api_ok "$resp"; then
+            print_error "恢复 DNS 记录失败: $(_cf_api_err "$resp")"
+            return 1
+        fi
+    done < <(jq -c '.[]' <<< "$snapshot")
+    return 0
 }
 
 # 通用 DNS 记录更新
 _cf_update_dns_record() {
     local zone_id="$1" token="$2" domain="$3" type="$4" ip="$5" proxied="$6"
-    [[ -z "$ip" ]] && return 0
+    if [[ -z "$ip" ]]; then
+        print_error "$type 记录缺少目标 IP，已中止"
+        return 1
+    fi
     print_info "处理 $type 记录 -> $ip (代理: $proxied)"
     local records=$(_cf_api GET "/zones/$zone_id/dns_records?type=$type&name=$domain" "$token")
     if ! _cf_api_ok "$records"; then
@@ -4823,7 +6584,11 @@ _cf_update_dns_record() {
     fi
     local record_id=$(jq -r '.result[0].id // empty' <<< "$records")
     local count=$(jq -r '.result | length' <<< "$records")
-    [[ "$count" -gt 1 ]] && print_warn "警告: 存在 ${count} 条 $type 记录，仅更新第一条。建议手动清理多余记录。"
+    local extra_ids=""
+    if [[ "$count" -gt 1 ]]; then
+        print_warn "警告: 存在 ${count} 条 $type 记录，将保留第一条并清理多余记录。"
+        extra_ids=$(jq -r '.result[1:][] | .id // empty' <<< "$records")
+    fi
     local data=$(jq -n --arg type "$type" --arg name "$domain" --arg content "$ip" --argjson proxied "$proxied" \
         '{type:$type, name:$name, content:$content, ttl:1, proxied:$proxied}')
     local resp
@@ -4833,6 +6598,15 @@ _cf_update_dns_record() {
         resp=$(_cf_api POST "/zones/$zone_id/dns_records" "$token" --data "$data")
     fi
     if _cf_api_ok "$resp"; then
+        local extra_id delete_resp
+        while IFS= read -r extra_id; do
+            [[ -n "$extra_id" ]] || continue
+            delete_resp=$(_cf_api DELETE "/zones/$zone_id/dns_records/$extra_id" "$token")
+            if ! _cf_api_ok "$delete_resp"; then
+                print_error "删除多余 $type 记录失败: $(_cf_api_err "$delete_resp")"
+                return 1
+            fi
+        done <<< "$extra_ids"
         print_success "$([[ -n "$record_id" ]] && echo '更新' || echo '创建')成功"
         return 0
     else
@@ -4850,6 +6624,7 @@ cf_dns_sync_node_grey() {
     local zone_id
     zone_id=$(_cf_get_zone_id "$domain" "$token")
     [[ -z "$zone_id" ]] && { print_error "无法获取 Zone ID: $domain"; return 1; }
+    [[ -n "$ipv4" || -n "$ipv6" ]] || { print_error "未提供任何公网 IP，无法同步 DNS/DDNS"; return 1; }
     local has_v4=false has_v6=false
     if [[ -n "$ipv4" ]]; then
         _cf_update_dns_record "$zone_id" "$token" "$domain" "A" "$ipv4" "false" || return 1
@@ -4912,12 +6687,17 @@ web_cf_dns_update() {
         0|q|Q|"") return ;;
         *) print_error "无效选择，请输入 1/2/3，或输入 0 返回"; pause; return ;;
     esac
-    # 选择 IPv6 但未检测到时给予提示
-    if [[ ("$mode" == "2" || "$mode" == "3") && -z "$ipv6" ]]; then
-        print_warn "未检测到 IPv6 地址，AAAA 记录将跳过"
+    if [[ "$mode" == "1" && -z "$ipv4" ]]; then
+        print_error "仅 IPv4 模式未检测到 IPv4 地址，无法配置 A 记录"
+        pause; return 1
     fi
-    if [[ ("$mode" == "1" || "$mode" == "3") && -z "$ipv4" ]]; then
-        print_warn "未检测到 IPv4 地址，A 记录将跳过"
+    if [[ "$mode" == "2" && -z "$ipv6" ]]; then
+        print_error "仅 IPv6 模式未检测到 IPv6 地址，无法配置 AAAA 记录"
+        pause; return 1
+    fi
+    if [[ "$mode" == "3" && ( -z "$ipv4" || -z "$ipv6" ) ]]; then
+        print_error "双栈解析需要同时检测到 IPv4 和 IPv6 地址"
+        pause; return 1
     fi
     # 读取并验证 Token
     if ! _cf_read_token "CF_API_TOKEN"; then
@@ -4946,16 +6726,19 @@ web_cf_dns_update() {
 
     # 使用提取的模块级函数
     case $mode in
-        1) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "A" "$ipv4" "$proxied" ;;
-        2) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "AAAA" "$ipv6" "$proxied" ;;
-        3) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "A" "$ipv4" "$proxied"
-           _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "AAAA" "$ipv6" "$proxied" ;;
+        1) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "A" "$ipv4" "$proxied" || { pause; return 1; } ;;
+        2) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "AAAA" "$ipv6" "$proxied" || { pause; return 1; } ;;
+        3) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "A" "$ipv4" "$proxied" || { pause; return 1; }
+           _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "AAAA" "$ipv6" "$proxied" || { pause; return 1; } ;;
     esac
     print_success "DNS 配置完成。"
     log_action "Cloudflare DNS updated for $DOMAIN"
     local ddns_v4=$([[ "$mode" == "1" || "$mode" == "3" ]] && echo "true" || echo "false")
     local ddns_v6=$([[ "$mode" == "2" || "$mode" == "3" ]] && echo "true" || echo "false")
-    ddns_setup "$DOMAIN" "$CF_API_TOKEN" "$zone_id" "$ddns_v4" "$ddns_v6" "$proxied"
+    if ! ddns_setup "$DOMAIN" "$CF_API_TOKEN" "$zone_id" "$ddns_v4" "$ddns_v6" "$proxied"; then
+        print_error "DDNS 配置失败"
+        pause; return 1
+    fi
     _CF_RESULT_DOMAIN="$DOMAIN"
     _CF_RESULT_TOKEN="$CF_API_TOKEN"
     sleep 2
@@ -5000,19 +6783,60 @@ _cf_get_origin_ruleset() {
 _cf_put_origin_ruleset() {
     local token="$1" zone_id="$2" rules_json="$3"
     local url="https://api.cloudflare.com/client/v4/zones/${zone_id}/rulesets/phases/http_request_origin/entrypoint"
-    local payload=$(jq -n \
+    local payload
+    payload=$(jq -n \
         --argjson rules "$rules_json" \
-        '{ "rules": $rules }')
-    local resp=$(curl -s -X PUT "$url" \
-        -H "Authorization: Bearer $token" \
-        -H "Content-Type: application/json" \
-        --data "$payload")
-    if [[ "$(echo "$resp" | jq -r '.success')" == "true" ]]; then
-        return 0
-    else
-        echo "$resp" | jq -r '.errors[0].message // "未知错误"'
+        '{ "rules": $rules }') || { echo "构造 Origin Rules payload 失败"; return 1; }
+    local attempt resp curl_rc
+    for attempt in 1 2 3; do
+        resp=$(curl -sS --connect-timeout 10 --max-time 30 -X PUT "$url" \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json" \
+            --data "$payload" 2>/dev/null)
+        curl_rc=$?
+        [[ $curl_rc -eq 0 && -n "$resp" ]] && break
+        [[ $attempt -lt 3 ]] && sleep $((attempt * 2))
+    done
+    if [[ ${curl_rc:-1} -ne 0 || -z "${resp:-}" ]]; then
+        echo "Origin Rules 写入失败或超时"
         return 1
     fi
+    if _cf_api_ok "$resp"; then
+        return 0
+    else
+        _cf_api_err "$resp"
+        return 1
+    fi
+}
+
+_cf_origin_rules_snapshot() {
+    local token="$1" zone_id="$2" existing rules
+    if ! existing=$(_cf_get_origin_ruleset "$token" "$zone_id"); then
+        print_error "Origin Rules 快照读取失败"
+        return 1
+    fi
+    if [[ -n "$existing" ]]; then
+        rules=$(jq -c '.result.rules // []' <<< "$existing" 2>/dev/null) || {
+            print_error "Origin Rules 快照解析失败"
+            return 1
+        }
+    else
+        rules="[]"
+    fi
+    printf '%s\n' "$rules"
+}
+
+_cf_origin_rules_restore() {
+    local token="$1" zone_id="$2" rules_snapshot="$3" err
+    if ! jq -e 'type == "array"' >/dev/null 2>&1 <<< "$rules_snapshot"; then
+        print_error "Origin Rules 快照格式无效，无法恢复"
+        return 1
+    fi
+    if ! err=$(_cf_put_origin_ruleset "$token" "$zone_id" "$rules_snapshot"); then
+        print_error "Origin Rules 快照恢复失败: $err"
+        return 1
+    fi
+    return 0
 }
 
 web_cf_origin_rule_create() {
@@ -5186,6 +7010,9 @@ web_cf_origin_rule_delete() {
     done
     read -e -r -p "输入要删除的规则编号 (0=取消): " choice
     if [[ "$choice" == "0" || -z "$choice" ]]; then return; fi
+    if [[ ! "$choice" =~ ^[0-9]+$ ]]; then
+        print_error "编号无效"; pause; return
+    fi
     local idx=$((choice - 1))
     if [[ $idx -lt 0 || $idx -ge $count ]]; then
         print_error "编号无效"; pause; return
@@ -5205,9 +7032,66 @@ web_cf_origin_rule_delete() {
     pause
 }
 
+_web_add_domain_clean_start() {
+    local domain="$1" cert_prefix="${CERT_PATH_PREFIX%/}" root_part
+    [[ -n "$domain" && -n "$cert_prefix" && "$cert_prefix" != "/" ]] || return 1
+    root_part="${domain#*.}"
+
+    local paths=(
+        "${CONFIG_DIR}/${domain}.conf"
+        "${cert_prefix}/${domain}"
+        "${CERT_HOOKS_DIR}/renew-${domain}.sh"
+        "/root/cert-renew-hook-${domain}.sh"
+        "/root/.cloudflare-${domain}.ini"
+        "${DDNS_CONFIG_DIR}/${domain}.conf"
+        "${DDNS_CONFIG_DIR}/origin.${domain}.conf"
+        "/etc/nginx/sites-available/${domain}.conf"
+        "/etc/nginx/sites-enabled/${domain}.conf"
+        "/etc/letsencrypt/live/${domain}"
+    )
+    if [[ "$root_part" != "$domain" ]]; then
+        paths+=("${DDNS_CONFIG_DIR}/origin.${root_part}.conf")
+    fi
+
+    local path
+    for path in "${paths[@]}"; do
+        [[ -e "$path" || -L "$path" ]] && return 1
+    done
+    if command_exists certbot && certbot certificates 2>/dev/null | grep -Fq -- "$domain"; then
+        return 1
+    fi
+    return 0
+}
+
+_web_add_domain_rollback() {
+    local domain="$1" clean_start="${2:-0}"
+    local zone_id="${3:-}" token="${4:-}" dns_snapshot="${5:-}" restore_dns="${6:-0}"
+    if [[ "$restore_dns" == "1" && -n "$zone_id" && -n "$token" && -n "$dns_snapshot" ]]; then
+        print_warn "安装失败，正在恢复 Cloudflare DNS 快照..."
+        if _cf_dns_restore_records "$zone_id" "$token" "$domain" "$dns_snapshot" A AAAA CNAME; then
+            print_success "Cloudflare DNS 已恢复到安装前状态"
+        else
+            print_warn "Cloudflare DNS 快照恢复失败，请人工核查 ${domain} 的 A/AAAA/CNAME 记录"
+        fi
+    fi
+
+    if [[ "$clean_start" != "1" ]]; then
+        print_warn "安装失败：检测到该域名安装前已有本地配置/证书，已跳过自动清理以避免误删旧配置"
+        print_info "请检查 ${CONFIG_DIR}/${domain}.conf、${CERT_PATH_PREFIX%/}/${domain}、续签 Hook 与 DDNS 配置是否需要手动清理"
+        return 0
+    fi
+
+    print_warn "安装失败，正在清理本次创建的本地半成品..."
+    _web_cleanup_domain "$domain" "quiet" || {
+        print_warn "半成品清理未完全成功，请稍后通过删除域名配置重试"
+        return 1
+    }
+    return 0
+}
+
 web_add_domain() {
     print_title "添加域名配置 (SSL + Nginx)"
-    web_env_check || { pause; return; }
+    web_env_check || { pause; return 1; }
 
     # 配置收集阶段
     echo -e "\n${C_CYAN}=== 收集配置信息 ===${C_RESET}\n"
@@ -5218,7 +7102,7 @@ web_add_domain() {
     echo -e "  ${C_GRAY}权限需要: Zone.DNS + Zone.SSL${C_RESET}"
     echo -e "  ${C_GRAY}创建: CF 后台 -> My Profile -> API Tokens -> Create Token${C_RESET}"
     if ! _cf_read_token "CF_API_TOKEN"; then
-        pause; return
+        pause; return 1
     fi
 
     # 2. 选择域名 (自动列出 Token 可管理的域名)
@@ -5227,7 +7111,7 @@ web_add_domain() {
     zones_json=$(_cf_list_zones "$CF_API_TOKEN" "status=active")
     if ! _cf_api_ok "$zones_json"; then
         print_error "获取域名列表失败: $(_cf_api_err "$zones_json")"
-        pause; return
+        pause; return 1
     fi
     while IFS='|' read -r zname zid; do
         [[ -z "$zname" ]] && continue
@@ -5237,7 +7121,7 @@ web_add_domain() {
 
     if [[ ${#zone_list[@]} -eq 0 ]]; then
         print_error "该 Token 无可管理的域名，请检查 Token 权限"
-        pause; return
+        pause; return 1
     fi
 
     echo -e "${C_CYAN}可用域名:${C_RESET}"
@@ -5299,6 +7183,8 @@ web_add_domain() {
             if validate_port "$NGINX_HTTPS_PORT"; then break; fi
             print_warn "端口无效"
         done
+        # Reality 443 共存：请求 443 时下沉到 web 内部端口，443 归 nginx stream 分流。
+        NGINX_HTTPS_PORT="$(_web_coexist_https_port "$NGINX_HTTPS_PORT")"
         read -e -r -p "后端协议 [1]http [2]https: " proto
         BACKEND_PROTOCOL=$([[ "$proto" == "2" ]] && echo "https" || echo "http")
         print_guide "后端服务地址"
@@ -5404,25 +7290,36 @@ web_add_domain() {
     #  执行阶段
     # ══════════════════════════════════════════════════════════════
     local step=1
+    local rollback_clean_start=0
+    local dns_snapshot="" dns_restore_needed=0
+    _web_add_domain_clean_start "$DOMAIN" && rollback_clean_start=1
 
     # ── DNS 解析 ──
     if [[ "$dns_mode" != "0" ]]; then
         echo -e "\n${C_CYAN}=== [${step}] DNS 解析 ===${C_RESET}"
+        dns_snapshot=$(_cf_dns_snapshot_records "$zone_id" "$CF_API_TOKEN" "$DOMAIN" A AAAA CNAME) || {
+            print_error "DNS 快照创建失败，已中止以避免后续失败无法恢复 Cloudflare 远端状态"
+            pause; return 1
+        }
+        dns_restore_needed=1
         case $dns_mode in
             1) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "A" "$ipv4" "$dns_proxied" ;;
             2) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "AAAA" "$ipv6" "$dns_proxied" ;;
-            3) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "A" "$ipv4" "$dns_proxied"
-               _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "AAAA" "$ipv6" "$dns_proxied" ;;
-        esac
+            3) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "A" "$ipv4" "$dns_proxied" \
+               && _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "AAAA" "$ipv6" "$dns_proxied" ;;
+        esac || {
+            print_error "DNS 记录配置失败"
+            _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"
+            pause; return 1
+        }
         ((step++))
     fi
 
     # ── SSL 证书 ──
     echo -e "\n${C_CYAN}=== [${step}] SSL 证书申请 ===${C_RESET}"
-    mkdir -p "${CERT_PATH_PREFIX}/${DOMAIN}"
+    mkdir -p "${CERT_PATH_PREFIX}/${DOMAIN}" || { print_error "证书目录创建失败"; _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
     local CLOUDFLARE_CREDENTIALS="/root/.cloudflare-${DOMAIN}.ini"
-    write_file_atomic "$CLOUDFLARE_CREDENTIALS" "dns_cloudflare_api_token = $CF_API_TOKEN"
-    chmod 600 "$CLOUDFLARE_CREDENTIALS"
+    write_private_file_atomic "$CLOUDFLARE_CREDENTIALS" "dns_cloudflare_api_token = $CF_API_TOKEN" || { print_error "Cloudflare 凭据写入失败"; _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
     print_info "正在申请证书 (DNS 验证，可能需要 1-2 分钟)..."
     if certbot certonly \
         --dns-cloudflare \
@@ -5435,18 +7332,19 @@ web_add_domain() {
         --non-interactive; then
         print_success "证书获取成功！"
         local cert_dir="${CERT_PATH_PREFIX}/${DOMAIN}"
-        cp -L "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "$cert_dir/fullchain.pem"
-        cp -L "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "$cert_dir/privkey.pem"
-        chmod 644 "$cert_dir/fullchain.pem"
-        chmod 600 "$cert_dir/privkey.pem"
+        copy_cert_pair_atomic "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "$cert_dir" || {
+            print_error "证书复制失败"
+            _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"
+            pause; return 1
+        }
         ((step++))
 
         # ── Nginx 反向代理 ──
         if [[ $do_nginx -eq 1 ]]; then
             echo -e "\n${C_CYAN}=== [${step}] Nginx 反向代理 ===${C_RESET}"
             _ensure_ssl_params
-            local redir_port=""
-            [[ "$NGINX_HTTPS_PORT" != "443" ]] && redir_port=":${NGINX_HTTPS_PORT}"
+            local redir_port
+            redir_port="$(_web_coexist_redir_suffix "$NGINX_HTTPS_PORT")"
             local nginx_conf="# Config for $DOMAIN
 # Generated by $SCRIPT_NAME $VERSION
 server {
@@ -5474,28 +7372,35 @@ $(_nginx_tls_http2_block "$NGINX_HTTPS_PORT")
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_buffering off;
     }
-}"
+            }"
             if ! _nginx_deploy_conf "$DOMAIN" "$nginx_conf"; then
-                pause; return
+                _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"
+                pause; return 1
             fi
             print_success "Nginx 配置已生效"
+            # 443 共存模式：把本站域名加入 stream SNI 白名单（未启用则 no-op）
+            declare -F reality_coexist_refresh >/dev/null && reality_coexist_refresh || true
             ((step++))
 
             # ── 防火墙 ──
             echo -e "\n${C_CYAN}=== [${step}] 防火墙 ===${C_RESET}"
-            if ufw_is_active; then
-                ufw allow "$NGINX_HTTP_PORT/tcp" comment "Nginx-HTTP" >/dev/null 2>&1 || true
-                ufw allow "$NGINX_HTTPS_PORT/tcp" comment "Nginx-HTTPS" >/dev/null 2>&1 || true
-                print_success "防火墙规则已更新"
+            _web_allow_public_tcp_port "$NGINX_HTTP_PORT" "Nginx-HTTP" "${NGINX_HTTP_PORT}/tcp" || { _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
+            # 443 共存：HTTPS 端口若已下沉为 web 内部端口，则它仅需 loopback 可达（对外走 443 stream），
+            # 不放行到公网，避免真站直连入口被旁路探测。
+            if declare -F _web_coexist_is_inner_port >/dev/null && _web_coexist_is_inner_port "$NGINX_HTTPS_PORT"; then
+                print_info "共存模式：${NGINX_HTTPS_PORT} 为内部端口，仅 loopback 可达，不放行到公网（对外由 443 提供）"
             else
-                print_info "UFW 未启用，跳过"
+                _web_allow_public_tcp_port "$NGINX_HTTPS_PORT" "Nginx-HTTPS" "${NGINX_HTTPS_PORT}/tcp" || { _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
+            fi
+            if command_exists ufw && ufw_is_active; then
+                print_success "防火墙规则已更新"
             fi
             ((step++))
         fi
 
         # ── 证书自动续签 ──
         echo -e "\n${C_CYAN}=== [${step}] 证书自动续签 ===${C_RESET}"
-        mkdir -p "$CERT_HOOKS_DIR"
+        mkdir -p "$CERT_HOOKS_DIR" || { print_error "续签 Hook 目录创建失败"; _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
         local DEPLOY_HOOK_SCRIPT="${CERT_HOOKS_DIR}/renew-${DOMAIN}.sh"
         local hook_content="#!/bin/bash
 # Auto-generated renewal hook for $DOMAIN
@@ -5506,12 +7411,10 @@ CERT_DIR=\"${cert_dir}\"
 LETSENCRYPT_LIVE=\"/etc/letsencrypt/live/\${DOMAIN}\"
 echo \"[\$(date)] Starting renewal hook for \$DOMAIN\" >> /var/log/cert-renew.log
 
+$(render_cert_pair_hook_helper)
+
 # Copy certificates
-if [[ -f \"\${LETSENCRYPT_LIVE}/fullchain.pem\" ]]; then
-    cp -L \"\${LETSENCRYPT_LIVE}/fullchain.pem\" \"\${CERT_DIR}/fullchain.pem\"
-    cp -L \"\${LETSENCRYPT_LIVE}/privkey.pem\" \"\${CERT_DIR}/privkey.pem\"
-    chmod 644 \"\${CERT_DIR}/fullchain.pem\"
-    chmod 600 \"\${CERT_DIR}/privkey.pem\"
+if copy_cert_pair_atomic \"\${LETSENCRYPT_LIVE}/fullchain.pem\" \"\${LETSENCRYPT_LIVE}/privkey.pem\" \"\${CERT_DIR}\"; then
     echo \"[\$(date)] Certificates copied successfully\" >> /var/log/cert-renew.log
 else
     echo \"[\$(date)] ERROR: Certificate files not found\" >> /var/log/cert-renew.log
@@ -5535,11 +7438,11 @@ echo \"[\$(date)] Nginx reloaded\" >> /var/log/cert-renew.log
 echo \"[\$(date)] Renewal hook completed for \$DOMAIN\" >> /var/log/cert-renew.log
 exit 0
 "
-        write_file_atomic "$DEPLOY_HOOK_SCRIPT" "$hook_content"
-        chmod +x "$DEPLOY_HOOK_SCRIPT"
+        write_file_atomic "$DEPLOY_HOOK_SCRIPT" "$hook_content" || { print_error "续签 Hook 写入失败"; _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
+        chmod +x "$DEPLOY_HOOK_SCRIPT" || { print_error "续签 Hook 授权失败"; _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
         local cron_tag="CertRenew_${DOMAIN}"
         local cron_minute=$(( $(echo "$DOMAIN" | cksum | cut -d' ' -f1) % 60 ))
-        cron_add_job "$cron_tag" "${cron_minute} 3 * * * certbot renew --quiet --cert-name '${DOMAIN}' --deploy-hook '${DEPLOY_HOOK_SCRIPT}' # ${cron_tag}"
+        cron_add_job "$cron_tag" "${cron_minute} 3 * * * certbot renew --quiet --cert-name '${DOMAIN}' --deploy-hook '${DEPLOY_HOOK_SCRIPT}' # ${cron_tag}" || { print_error "自动续签 cron 配置失败"; _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
         print_success "自动续签已配置 (每日 3:$(printf '%02d' $cron_minute) AM)"
 
         # 保存域名管理配置
@@ -5558,7 +7461,7 @@ NGINX_HTTPS_PORT=\"$NGINX_HTTPS_PORT\"
 LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
 "
         fi
-        write_file_atomic "${CONFIG_DIR}/${DOMAIN}.conf" "$config_content"
+        write_file_atomic "${CONFIG_DIR}/${DOMAIN}.conf" "$config_content" || { print_error "域名管理配置写入失败"; _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
         ((step++))
 
         # ── DDNS 动态解析 ──
@@ -5567,8 +7470,13 @@ LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
             local ddns_ipv4="false" ddns_ipv6="false"
             [[ "$dns_mode" == "1" || "$dns_mode" == "3" ]] && ddns_ipv4="true"
             [[ "$dns_mode" == "2" || "$dns_mode" == "3" ]] && ddns_ipv6="true"
-            ddns_setup "$DOMAIN" "$CF_API_TOKEN" "$zone_id" "$ddns_ipv4" "$ddns_ipv6" "$dns_proxied"
+            ddns_setup "$DOMAIN" "$CF_API_TOKEN" "$zone_id" "$ddns_ipv4" "$ddns_ipv6" "$dns_proxied" || {
+                print_error "DDNS 配置失败"
+                _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"
+                pause; return 1
+            }
         fi
+        dns_restore_needed=0
 
         # ══════════════════════════════════════════════════════════════
         #  完成报告
@@ -5599,7 +7507,12 @@ LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
         echo "1. 域名 DNS 是否正确解析到本机
 2. API Token 权限是否正确
 3. 网络连接是否正常"
-        rm -f "$CLOUDFLARE_CREDENTIALS"
+        if [[ "$rollback_clean_start" == "1" ]]; then
+            _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"
+        else
+            rm -f "$CLOUDFLARE_CREDENTIALS"
+        fi
+        pause; return 1
     fi
     pause
 }
@@ -5749,7 +7662,10 @@ web_delete_domain() {
     echo -e "${C_RESET}"
     if ! confirm "确认彻底删除吗?"; then return; fi
     print_info "正在执行清理..."
-    _web_cleanup_domain "$target_domain"
+    if ! _web_cleanup_domain "$target_domain"; then
+        print_error "域名清理失败。"
+        pause; return 1
+    fi
     log_action "Deleted domain config: $target_domain"
     pause
 }
@@ -5835,6 +7751,48 @@ _replace_proxy_pass_backend() {
         }
         { print }
     ' "$conf_file"
+}
+
+_web_update_reverse_proxy_backend() {
+    local target_conf="${1:-}" new_backend="${2:-}"
+    local backup_conf tmp_conf conf_dir base
+    [[ -n "$target_conf" && -f "$target_conf" && -n "$new_backend" ]] || return 1
+    conf_dir="$(dirname "$target_conf")"
+    base="$(basename "$target_conf")"
+    backup_conf=$(mktemp "${conf_dir}/.${base}.bak.XXXXXX") || return 1
+    _tmp_register "$backup_conf"
+    tmp_conf=$(mktemp "${conf_dir}/.${base}.tmp.XXXXXX") || {
+        rm -f "$backup_conf"
+        _tmp_unregister "$backup_conf"
+        return 1
+    }
+    _tmp_register "$tmp_conf"
+    if ! cp -a "$target_conf" "$backup_conf"; then
+        rm -f "$backup_conf" "$tmp_conf"
+        _tmp_unregister "$backup_conf"; _tmp_unregister "$tmp_conf"
+        return 1
+    fi
+    if ! _replace_proxy_pass_backend "$new_backend" "$target_conf" > "$tmp_conf"; then
+        rm -f "$backup_conf" "$tmp_conf"
+        _tmp_unregister "$backup_conf"; _tmp_unregister "$tmp_conf"
+        return 1
+    fi
+    chmod --reference="$target_conf" "$tmp_conf" 2>/dev/null || true
+    chown --reference="$target_conf" "$tmp_conf" 2>/dev/null || true
+    if ! mv "$tmp_conf" "$target_conf"; then
+        rm -f "$backup_conf" "$tmp_conf"
+        _tmp_unregister "$backup_conf"; _tmp_unregister "$tmp_conf"
+        return 1
+    fi
+    _tmp_unregister "$tmp_conf"
+    if nginx -t >/dev/null 2>&1 && _nginx_reload; then
+        rm -f "$backup_conf"
+        _tmp_unregister "$backup_conf"
+        return 0
+    fi
+    mv "$backup_conf" "$target_conf" 2>/dev/null || true
+    _tmp_unregister "$backup_conf"
+    return 1
 }
 
 _cert_name_matches_domain() {
@@ -5958,11 +7916,10 @@ web_reverse_proxy_site() {
                 if [[ ! -f "$custom_cert" || ! -f "$custom_key" ]]; then
                     print_error "证书文件不存在"; pause; return
                 fi
-                mkdir -p "$cert_dir"
-                cp -L "$custom_cert" "$cert_dir/fullchain.pem"
-                cp -L "$custom_key" "$cert_dir/privkey.pem"
-                chmod 644 "$cert_dir/fullchain.pem"
-                chmod 600 "$cert_dir/privkey.pem"
+                copy_cert_pair_atomic "$custom_cert" "$custom_key" "$cert_dir" || {
+                    print_error "证书导入失败"
+                    pause; return
+                }
                 has_cert=1
                 ;;
             *) pause; return ;;
@@ -6011,11 +7968,13 @@ web_reverse_proxy_site() {
     [[ "$sp" == "0" ]] && return
     HTTPS_PORT=${sp:-443}
     validate_port "$HTTPS_PORT" || { print_error "端口无效"; pause; return; }
+    # Reality 443 共存：请求 443 时下沉到 web 内部端口，443 归 nginx stream 分流。
+    HTTPS_PORT="$(_web_coexist_https_port "$HTTPS_PORT")"
     
     # 确保 SSL 参数文件存在
     _ensure_ssl_params
-    local redir_port=""
-    [[ "$HTTPS_PORT" != "443" ]] && redir_port=":${HTTPS_PORT}"
+    local redir_port
+    redir_port="$(_web_coexist_redir_suffix "$HTTPS_PORT")"
     
     # 根据模板生成 Nginx 配置
     local nginx_conf=""
@@ -6233,11 +8192,18 @@ $(_nginx_tls_http2_block "$HTTPS_PORT")
         pause; return
     fi
     print_success "Nginx 反代配置已生效。"
+    # 443 共存模式：把本站域名加入 stream SNI 白名单（未启用则 no-op）
+    declare -F reality_coexist_refresh >/dev/null && reality_coexist_refresh || true
     
     # 防火墙规则
-    if ufw_is_active; then
-        ufw allow "$HTTP_PORT/tcp" comment "ReverseProxy-HTTP" >/dev/null 2>&1 || true
-        ufw allow "$HTTPS_PORT/tcp" comment "ReverseProxy-HTTPS" >/dev/null 2>&1 || true
+    _web_allow_public_tcp_port "$HTTP_PORT" "ReverseProxy-HTTP" "${HTTP_PORT}/tcp" || { pause; return 1; }
+    # 443 共存：HTTPS 端口若已下沉为 web 内部端口，仅 loopback 可达（对外走 443 stream），不放行到公网。
+    if declare -F _web_coexist_is_inner_port >/dev/null && _web_coexist_is_inner_port "$HTTPS_PORT"; then
+        print_info "共存模式：${HTTPS_PORT} 为内部端口，仅 loopback 可达，不放行到公网（对外由 443 提供）"
+    else
+        _web_allow_public_tcp_port "$HTTPS_PORT" "ReverseProxy-HTTPS" "${HTTPS_PORT}/tcp" || { pause; return 1; }
+    fi
+    if command_exists ufw && ufw_is_active; then
         print_success "防火墙规则已更新。"
     fi
     draw_line
@@ -6309,22 +8275,10 @@ web_edit_reverse_proxy() {
         print_warn "新地址与当前相同，无需修改。"
         pause; return
     fi
-    cp "$target_conf" "${target_conf}.bak"
-    local tmp_conf
-    tmp_conf=$(mktemp "${target_conf}.tmp.XXXXXX") || { print_error "创建临时配置失败"; pause; return; }
-    if ! _replace_proxy_pass_backend "$new_backend" "$target_conf" > "$tmp_conf"; then
-        rm -f "$tmp_conf"
-        print_error "更新配置失败"
-        pause; return
-    fi
-    mv "$tmp_conf" "$target_conf"
-    if nginx -t >/dev/null 2>&1; then
-        _nginx_reload
-        rm -f "${target_conf}.bak"
+    if _web_update_reverse_proxy_backend "$target_conf" "$new_backend"; then
         print_success "反向代理后端已更新: ${target_domain}"
         echo -e "  ${current_backend} → ${C_GREEN}${new_backend}${C_RESET}"
     else
-        mv "${target_conf}.bak" "$target_conf"
         print_error "Nginx 配置测试失败，已回滚。"
         nginx -t 2>&1 | tail -5
     fi
@@ -6440,6 +8394,26 @@ menu_web() {
     done
 }
 # 整合 DNS + 证书 + Nginx + DDNS + Origin Rules 为一条龙流程
+
+_web_home_expose_rollback() {
+    local domain="$1" zone_id="$2" token="$3" dns_snapshot="$4" restore_dns="${5:-0}"
+    local origin_rules_snapshot="${6:-}" restore_origin="${7:-0}" cleanup_local="${8:-0}"
+
+    if [[ "$restore_origin" == "1" && -n "$origin_rules_snapshot" ]]; then
+        print_warn "配置失败，正在恢复 Cloudflare Origin Rules 快照..."
+        _cf_origin_rules_restore "$token" "$zone_id" "$origin_rules_snapshot" || \
+            print_warn "Origin Rules 快照恢复失败，请人工核查 ${domain} 的回源规则"
+    fi
+    if [[ "$restore_dns" == "1" && -n "$dns_snapshot" ]]; then
+        print_warn "配置失败，正在恢复 Cloudflare DNS 快照..."
+        _cf_dns_restore_records "$zone_id" "$token" "$domain" "$dns_snapshot" A AAAA CNAME || \
+            print_warn "Cloudflare DNS 快照恢复失败，请人工核查 ${domain} 的 A/AAAA/CNAME 记录"
+    fi
+    if [[ "$cleanup_local" == "1" ]]; then
+        print_warn "正在清理本地半成品..."
+        _web_cleanup_domain "$domain" "quiet" || true
+    fi
+}
 
 web_home_expose() {
     print_title "家宽内网服务公网暴露（一键配置）"
@@ -6561,7 +8535,7 @@ web_home_expose() {
     print_success "后端地址: ${backend_addr}"
 
     # 6. Nginx HTTPS 监听端口
-    local https_port=""
+    local https_port="" requested_https_port="" origin_rule_needed=0
     print_guide "Nginx HTTPS 监听端口 (对外暴露的端口)"
     echo -e "  ${C_GRAY}家宽通常 443 被封，建议用 8443${C_RESET}"
     echo -e "  ${C_GRAY}CF 支持的 HTTPS 端口: 443 2053 2083 2087 2096 8443${C_RESET}"
@@ -6573,6 +8547,16 @@ web_home_expose() {
         fi
         print_warn "端口无效"
     done
+    requested_https_port="$https_port"
+    # Reality 443 共存：用户选择 443 时，Nginx 下沉到 web 内部端口；公网 443 由 stream 分流。
+    https_port="$(_web_coexist_https_port "$https_port")"
+    if [[ "$https_port" != "443" ]]; then
+        if declare -F _web_coexist_is_inner_port >/dev/null && _web_coexist_is_inner_port "$https_port"; then
+            origin_rule_needed=0
+        else
+            origin_rule_needed=1
+        fi
+    fi
 
 
     # 7. DDNS 间隔
@@ -6605,7 +8589,11 @@ web_home_expose() {
     echo -e "  根域名:       ${C_GREEN}${root_domain}${C_RESET} (Zone: ${zone_id})"
     echo -e "  公网 IP:      ${C_GREEN}${public_ip}${C_RESET}"
     echo -e "  后端地址:     ${C_GREEN}${backend_addr}${C_RESET} (内网服务)"
-    echo -e "  HTTPS 端口:   ${C_GREEN}${https_port}${C_RESET} (Nginx 对外监听)"
+    if declare -F _web_coexist_is_inner_port >/dev/null && _web_coexist_is_inner_port "$https_port"; then
+        echo -e "  HTTPS 端口:   ${C_GREEN}${requested_https_port}${C_RESET} (对外) / ${C_GREEN}${https_port}${C_RESET} (Nginx 内部监听)"
+    else
+        echo -e "  HTTPS 端口:   ${C_GREEN}${https_port}${C_RESET} (Nginx 对外监听)"
+    fi
     echo -e "  DDNS 间隔:    ${C_GREEN}${ddns_interval} 分钟${C_RESET}"
     echo -e "  加速模式:     ${C_GREEN}CF CDN 代理${C_RESET} (A 记录 + Proxied)"
     echo ""
@@ -6615,12 +8603,16 @@ web_home_expose() {
     echo -e "    ${auto_step}. SSL 证书申请 (Let's Encrypt DNS 验证)"; ((auto_step++))
     echo -e "    ${auto_step}. Nginx 反向代理 (:${https_port} -> ${backend_addr})"; ((auto_step++))
     echo -e "    ${auto_step}. DDNS 自动更新 (每 ${ddns_interval} 分钟)"; ((auto_step++))
-    echo -e "    ${auto_step}. 防火墙放行端口 ${https_port}"; ((auto_step++))
-    [[ "$https_port" != "443" ]] && { echo -e "    ${auto_step}. CF Origin Rule (用户 :443 -> 回源 :${https_port})"; ((auto_step++)); }
+    if declare -F _web_coexist_is_inner_port >/dev/null && _web_coexist_is_inner_port "$https_port"; then
+        echo -e "    ${auto_step}. 共存模式刷新 SNI 白名单（公网 443 -> 内部 ${https_port}）"; ((auto_step++))
+    else
+        echo -e "    ${auto_step}. 防火墙放行端口 ${https_port}"; ((auto_step++))
+    fi
+    [[ "$origin_rule_needed" -eq 1 ]] && { echo -e "    ${auto_step}. CF Origin Rule (用户 :443 -> 回源 :${https_port})"; ((auto_step++)); }
     echo ""
     echo -e "  ${C_YELLOW}[手动操作提醒]${C_RESET}"
     echo -e "  ${C_YELLOW}  请确保路由器 (OpenWrt/爱快等) 已做端口转发:${C_RESET}"
-    echo -e "  ${C_YELLOW}  外网 ${https_port}/TCP -> 内网运行 Nginx 的设备IP:${https_port}/TCP${C_RESET}"
+    echo -e "  ${C_YELLOW}  外网 ${requested_https_port}/TCP -> 内网运行 Nginx 的设备IP:${requested_https_port}/TCP${C_RESET}"
     if [[ "$backend_addr" != 127.0.0.1:* ]]; then
         echo -e "  ${C_YELLOW}  后端服务在其他设备 (${backend_addr})，请确保内网互通${C_RESET}"
     fi
@@ -6631,26 +8623,44 @@ web_home_expose() {
 
     # Phase 2: 自动执行
     local step=1 total_steps=5
-    [[ "$https_port" != "443" ]] && total_steps=$((total_steps + 1))
+    local dns_snapshot="" dns_restore_needed=0 origin_rules_snapshot="" origin_restore_needed=0
+    [[ "$origin_rule_needed" -eq 1 ]] && total_steps=$((total_steps + 1))
 
     # Step: DNS 解析
     echo -e "\n${C_CYAN}=== [${step}/${total_steps}] DNS 解析 ===${C_RESET}"
+    dns_snapshot=$(_cf_dns_snapshot_records "$zone_id" "$token" "$full_domain" A AAAA CNAME) || {
+        print_error "DNS 快照创建失败，已中止以避免后续失败无法恢复 Cloudflare 远端状态"
+        pause; return 1
+    }
+    dns_restore_needed=1
     # 重新配置时可能残留旧 CNAME，CF 不允许同名 A/CNAME 共存，需先清除
-    _cf_dns_delete "$zone_id" "$token" "CNAME" "$full_domain" >/dev/null 2>&1
+    if ! _cf_dns_delete "$zone_id" "$token" "CNAME" "$full_domain"; then
+        print_error "清理旧 CNAME 记录失败，已中止以避免 A/CNAME 冲突或覆盖失败。"
+        _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 0
+        pause; return 1
+    fi
     print_info "创建 A 记录: ${full_domain} -> ${public_ip} (开启 CF 代理)"
     if ! _cf_update_dns_record "$zone_id" "$token" "$full_domain" "A" "$public_ip" "true"; then
         print_error "DNS 记录创建失败"
-        pause; return
+        _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 0
+        pause; return 1
     fi
     ((step++))
 
     # Step: SSL 证书
     echo -e "\n${C_CYAN}=== [${step}/${total_steps}] SSL 证书申请 ===${C_RESET}"
     local cert_dir="${CERT_PATH_PREFIX}/${full_domain}"
-    mkdir -p "$cert_dir"
+    mkdir -p "$cert_dir" || {
+        print_error "证书目录创建失败"
+        _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 1
+        pause; return 1
+    }
     local cf_cred="/root/.cloudflare-${full_domain}.ini"
-    write_file_atomic "$cf_cred" "dns_cloudflare_api_token = $token"
-    chmod 600 "$cf_cred"
+    write_private_file_atomic "$cf_cred" "dns_cloudflare_api_token = $token" || {
+        print_error "Cloudflare 凭据写入失败"
+        _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 1
+        pause; return 1
+    }
     print_info "正在申请证书 (DNS 验证，可能需要 1-2 分钟)..."
     if certbot certonly \
         --dns-cloudflare \
@@ -6661,23 +8671,24 @@ web_home_expose() {
         --agree-tos \
         --no-eff-email \
         --non-interactive; then
-        cp -L "/etc/letsencrypt/live/${full_domain}/fullchain.pem" "$cert_dir/fullchain.pem"
-        cp -L "/etc/letsencrypt/live/${full_domain}/privkey.pem" "$cert_dir/privkey.pem"
-        chmod 644 "$cert_dir/fullchain.pem"
-        chmod 600 "$cert_dir/privkey.pem"
+        copy_cert_pair_atomic "/etc/letsencrypt/live/${full_domain}/fullchain.pem" "/etc/letsencrypt/live/${full_domain}/privkey.pem" "$cert_dir" || {
+            print_error "证书复制失败"
+            _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 1
+            pause; return 1
+        }
         print_success "证书获取成功"
     else
         print_error "证书申请失败！请检查 Token 权限和网络"
-        rm -f "$cf_cred"
-        pause; return
+        _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 1
+        pause; return 1
     fi
     ((step++))
 
     # Step: Nginx 反向代理
     echo -e "\n${C_CYAN}=== [${step}/${total_steps}] Nginx 反向代理 ===${C_RESET}"
     _ensure_ssl_params
-    local redir_port=""
-    [[ "$https_port" != "443" ]] && redir_port=":${https_port}"
+    local redir_port
+    redir_port="$(_web_coexist_redir_suffix "$https_port")"
     local nginx_conf="# 家宽公网暴露 - ${full_domain}
 # Generated by $SCRIPT_NAME $VERSION (web_home_expose)
 server {
@@ -6708,9 +8719,12 @@ $(_nginx_tls_http2_block "$https_port")
     }
 }"
     if ! _nginx_deploy_conf "$full_domain" "$nginx_conf"; then
-        pause; return
+        _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 1
+        pause; return 1
     fi
     print_success "Nginx 已部署 (:${https_port} -> ${backend_addr})"
+    # 443 共存模式：把本站域名加入 stream SNI 白名单（未启用则 no-op）
+    declare -F reality_coexist_refresh >/dev/null && reality_coexist_refresh || true
     ((step++))
 
     # Step: DDNS
@@ -6718,47 +8732,75 @@ $(_nginx_tls_http2_block "$https_port")
     local ddns_domain="$full_domain"
     local ddns_proxied="true"
     mkdir -p "$DDNS_CONFIG_DIR"
-    local ddns_conf_content="DDNS_DOMAIN="${ddns_domain}"
-DDNS_TOKEN="${token}"
-DDNS_ZONE_ID="${zone_id}"
-DDNS_IPV4="true"
-DDNS_IPV6="false"
-DDNS_PROXIED="${ddns_proxied}"
-DDNS_INTERVAL="${ddns_interval}""
-    write_file_atomic "$DDNS_CONFIG_DIR/${ddns_domain}.conf" "$ddns_conf_content" || { print_error "DDNS 配置写入失败"; pause; return; }
-    chmod 600 "$DDNS_CONFIG_DIR/${ddns_domain}.conf"
-    ddns_create_script
-    ddns_rebuild_cron
+    local ddns_conf_content="DDNS_DOMAIN=\"${ddns_domain}\"
+DDNS_TOKEN=\"${token}\"
+DDNS_ZONE_ID=\"${zone_id}\"
+DDNS_IPV4=\"true\"
+DDNS_IPV6=\"false\"
+DDNS_PROXIED=\"${ddns_proxied}\"
+DDNS_INTERVAL=\"${ddns_interval}\""
+    write_private_file_atomic "$DDNS_CONFIG_DIR/${ddns_domain}.conf" "$ddns_conf_content" || {
+        print_error "DDNS 配置写入失败"
+        _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 1
+        pause; return 1
+    }
+    ddns_create_script || {
+        print_error "DDNS 更新脚本生成失败"
+        _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 1
+        pause; return 1
+    }
+    ddns_rebuild_cron || {
+        print_error "DDNS cron 更新失败"
+        _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 1
+        pause; return 1
+    }
     print_success "DDNS 已配置: ${ddns_domain} (每 ${ddns_interval} 分钟)"
     ((step++))
 
     # Step: 防火墙
     echo -e "\n${C_CYAN}=== [${step}/${total_steps}] 防火墙 ===${C_RESET}"
-    if ufw_is_active; then
-        ufw allow "${https_port}/tcp" comment "HomeExpose-${full_domain}" >/dev/null 2>&1 || true
-        print_success "已放行端口 ${https_port}/tcp"
+    if declare -F _web_coexist_is_inner_port >/dev/null && _web_coexist_is_inner_port "$https_port"; then
+        print_info "共存模式：${https_port} 为内部端口，仅 loopback 可达，不放行到公网（对外由 443 提供）"
+        if ! command_exists ufw || ! ufw_is_active; then
+            print_info "UFW 未启用，跳过 (共存模式请确保服务器防火墙已放行公网 ${requested_https_port})"
+        fi
     else
-        print_info "UFW 未启用，跳过 (请确保服务器防火墙已放行 ${https_port})"
+        _web_allow_public_tcp_port "$https_port" "HomeExpose-${full_domain}" "${https_port}/tcp" || {
+            _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 1
+            pause; return 1
+        }
     fi
     ((step++))
 
-    # Step: Origin Rule (端口非 443 时)
-    if [[ "$https_port" != "443" ]]; then
+    # Step: Origin Rule (公网 443 需回源到非内部端口时)
+    if [[ "$origin_rule_needed" -eq 1 ]]; then
         echo -e "\n${C_CYAN}=== [${step}/${total_steps}] CF Origin Rule (端口回源) ===${C_RESET}"
         print_info "创建回源规则: 用户访问 :443 -> CF 回源 :${https_port}"
         local existing
         if ! existing=$(_cf_get_origin_ruleset "$token" "$zone_id"); then
-            print_warn "Origin Rules 读取失败，已跳过自动创建，避免覆盖该 Zone 的既有回源规则。"
-            print_warn "可稍后通过菜单 [10.创建回源规则] 手动添加"
-            ((step++))
+            print_error "Origin Rules 读取失败，端口回源规则未创建。"
+            print_warn "请稍后通过菜单 [10.创建回源规则] 手动添加后再使用该公网 443 入口。"
+            _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 1
+            pause
+            return 1
         else
             local existing_rules="[]"
             if [[ -n "$existing" ]]; then
-                existing_rules=$(echo "$existing" | jq '.result.rules // []')
+                existing_rules=$(echo "$existing" | jq -c '.result.rules // []') || {
+                    print_error "Origin Rules 响应解析失败"
+                    _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 1
+                    pause; return 1
+                }
             fi
+            origin_rules_snapshot="$existing_rules"
+            origin_restore_needed=1
             # 移除同域名旧规则
         local filtered_rules=$(echo "$existing_rules" | jq --arg d "$full_domain" \
-            '[.[] | select(.expression != ("http.host eq \"" + $d + "\""))]')
+            '[.[] | select(.expression != ("http.host eq \"" + $d + "\""))]') || {
+                print_error "Origin Rules 过滤旧规则失败"
+                _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 1
+                pause; return 1
+            }
         # 构建新规则
         local new_rule=$(jq -n \
             --arg expr "http.host eq \"${full_domain}\"" \
@@ -6770,12 +8812,22 @@ DDNS_INTERVAL="${ddns_interval}""
                 "expression": $expr,
                 "description": $desc,
                 "enabled": true
-            }')
-        local final_rules=$(echo "$filtered_rules" | jq --argjson new "$new_rule" '. + [$new]')
+            }') || {
+                print_error "Origin Rules 新规则构造失败"
+                _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 1
+                pause; return 1
+            }
+        local final_rules=$(echo "$filtered_rules" | jq --argjson new "$new_rule" '. + [$new]') || {
+            print_error "Origin Rules 新旧规则合并失败"
+            _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 1
+            pause; return 1
+        }
         local err
             if ! err=$(_cf_put_origin_ruleset "$token" "$zone_id" "$final_rules"); then
-                print_warn "Origin Rule 创建失败: $err"
-                print_warn "可稍后通过菜单 [10.创建回源规则] 手动添加"
+                print_error "Origin Rule 创建失败: $err"
+                _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 1
+                pause
+                return 1
             else
                 print_success "Origin Rule 已创建 (用户 :443 -> 回源 :${https_port})"
             fi
@@ -6804,11 +8856,9 @@ CERT_DIR=\"${cert_dir}\"
 LETSENCRYPT_LIVE=\"/etc/letsencrypt/live/\${DOMAIN}\"
 echo \"[\$(date)] Starting renewal hook for \$DOMAIN\" >> /var/log/cert-renew.log
 
-if [[ -f \"\${LETSENCRYPT_LIVE}/fullchain.pem\" ]]; then
-    cp -L \"\${LETSENCRYPT_LIVE}/fullchain.pem\" \"\${CERT_DIR}/fullchain.pem\"
-    cp -L \"\${LETSENCRYPT_LIVE}/privkey.pem\" \"\${CERT_DIR}/privkey.pem\"
-    chmod 644 \"\${CERT_DIR}/fullchain.pem\"
-    chmod 600 \"\${CERT_DIR}/privkey.pem\"
+$(render_cert_pair_hook_helper)
+
+if copy_cert_pair_atomic \"\${LETSENCRYPT_LIVE}/fullchain.pem\" \"\${LETSENCRYPT_LIVE}/privkey.pem\" \"\${CERT_DIR}\"; then
     echo \"[\$(date)] Certificates copied successfully\" >> /var/log/cert-renew.log
 else
     echo \"[\$(date)] ERROR: Certificate files not found\" >> /var/log/cert-renew.log
@@ -6823,27 +8873,44 @@ fi
 echo \"[\$(date)] Renewal hook completed for \$DOMAIN\" >> /var/log/cert-renew.log
 exit 0
 "
-    write_file_atomic "$hook_script" "$hook_content"
-    chmod +x "$hook_script"
+    if ! write_file_atomic "$hook_script" "$hook_content"; then
+        print_error "证书续签 Hook 写入失败，正在清理本地半成品"
+        _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 1
+        pause; return 1
+    fi
+    if ! chmod +x "$hook_script"; then
+        print_error "证书续签 Hook 权限设置失败，正在清理本地半成品"
+        _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 1
+        pause; return 1
+    fi
 
     # Crontab 自动续签
     local cron_tag="CertRenew_${full_domain}"
     local cron_minute=$(( $(echo "$full_domain" | cksum | cut -d' ' -f1) % 60 ))
-    cron_add_job "$cron_tag" "${cron_minute} 3 * * * certbot renew --quiet --cert-name '${full_domain}' --deploy-hook '${hook_script}' # ${cron_tag}"
+    if ! cron_add_job "$cron_tag" "${cron_minute} 3 * * * certbot renew --quiet --cert-name '${full_domain}' --deploy-hook '${hook_script}' # ${cron_tag}"; then
+        print_error "证书续签 cron 安装失败，正在清理本地半成品"
+        _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 1
+        pause; return 1
+    fi
 
     # 域名管理配置文件
-    cat > "${CONFIG_DIR}/${full_domain}.conf" << CONFEOF
-# Domain configuration for ${full_domain}
+    local domain_config_content="# Domain configuration for ${full_domain}
 # Generated by $SCRIPT_NAME $VERSION (web_home_expose)
-DOMAIN="${full_domain}"
-CERT_PATH="${cert_dir}"
-DEPLOY_HOOK_SCRIPT="${hook_script}"
-CLOUDFLARE_CREDENTIALS="${cf_cred}"
-NGINX_HTTP_PORT="80"
-NGINX_HTTPS_PORT="${https_port}"
-LOCAL_PROXY_PASS="http://${backend_addr}"
-HOME_EXPOSE="true"
-CONFEOF
+DOMAIN=\"${full_domain}\"
+CERT_PATH=\"${cert_dir}\"
+DEPLOY_HOOK_SCRIPT=\"${hook_script}\"
+CLOUDFLARE_CREDENTIALS=\"${cf_cred}\"
+NGINX_HTTP_PORT=\"80\"
+NGINX_HTTPS_PORT=\"${https_port}\"
+LOCAL_PROXY_PASS=\"http://${backend_addr}\"
+HOME_EXPOSE=\"true\""
+    if ! write_file_atomic "${CONFIG_DIR}/${full_domain}.conf" "$domain_config_content"; then
+        print_error "域名管理配置写入失败，正在清理本地半成品"
+        _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 1
+        pause; return 1
+    fi
+    dns_restore_needed=0
+    origin_restore_needed=0
 
     # 完成报告
     echo ""
@@ -6855,7 +8922,7 @@ CONFEOF
     echo ""
     echo -e "  ${C_CYAN}[访问链路]${C_RESET}"
     echo -e "    用户 -> ${C_GREEN}${full_domain}${C_RESET} (CF CDN 代理)"
-    [[ "$https_port" != "443" ]] && \
+    [[ "$origin_rule_needed" -eq 1 ]] && \
     echo -e "      -> Origin Rule :443 -> :${C_GREEN}${https_port}${C_RESET}"
     echo -e "      -> 家宽路由器 -> 内网 Nginx -> ${C_GREEN}${backend_addr}${C_RESET}"
     echo ""
@@ -6870,7 +8937,7 @@ CONFEOF
     echo ""
     echo -e "  ${C_YELLOW}[路由器操作 - 需要手动完成]${C_RESET}"
     echo -e "    请在路由器 (OpenWrt/爱快等) 做端口转发:"
-    echo -e "    外网 ${C_GREEN}${https_port}${C_RESET}/TCP -> 运行 Nginx 的设备IP:${C_GREEN}${https_port}${C_RESET}/TCP"
+    echo -e "    外网 ${C_GREEN}${requested_https_port}${C_RESET}/TCP -> 运行 Nginx 的设备IP:${C_GREEN}${requested_https_port}${C_RESET}/TCP"
     if [[ "$backend_addr" != 127.0.0.1:* ]]; then
         echo -e "    后端服务在 ${C_GREEN}${backend_addr}${C_RESET}，请确保内网互通"
     fi
@@ -6918,23 +8985,38 @@ CONFEOF
 
         # 通过 uci 配置 (兼容所有 OpenWrt 版本)
         local uci_cmds="
+DHCP_BACKUP=\$(mktemp /tmp/server-manage-dhcp.XXXXXX 2>/dev/null) || exit 1
+cleanup_dhcp_domain() { rm -f \"\$DHCP_BACKUP\" 2>/dev/null; }
+rollback_dhcp_domain() {
+    rc=\${1:-1}
+    if [ -f \"\$DHCP_BACKUP\" ]; then
+        uci import dhcp < \"\$DHCP_BACKUP\" >/dev/null 2>&1 || true
+        uci commit dhcp >/dev/null 2>&1 || true
+        /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+    fi
+    cleanup_dhcp_domain
+    exit \"\$rc\"
+}
+trap cleanup_dhcp_domain EXIT
+uci export dhcp > \"\$DHCP_BACKUP\" || rollback_dhcp_domain 1
 # 精确清除: 遍历查找并删除匹配的 domain 条目
 idx=0
 while uci -q get dhcp.@domain[\$idx] >/dev/null 2>&1; do
-    name=\$(uci -q get dhcp.@domain[\$idx].name 2>/dev/null)
+    name=\$(uci -q get dhcp.@domain[\$idx].name 2>/dev/null) || rollback_dhcp_domain 1
     if [ \"\$name\" = '${full_domain}' ]; then
-        uci delete dhcp.@domain[\$idx]
+        uci delete dhcp.@domain[\$idx] || rollback_dhcp_domain 1
     else
         idx=\$((idx + 1))
     fi
 done
 # 添加新记录
-uci add dhcp domain
-uci set dhcp.@domain[-1].name='${full_domain}'
-uci set dhcp.@domain[-1].ip='${nginx_ip}'
-uci commit dhcp
-/etc/init.d/dnsmasq restart
-	"
+uci add dhcp domain >/dev/null || rollback_dhcp_domain 1
+uci set dhcp.@domain[-1].name='${full_domain}' || rollback_dhcp_domain 1
+uci set dhcp.@domain[-1].ip='${nginx_ip}' || rollback_dhcp_domain 1
+uci commit dhcp || rollback_dhcp_domain 1
+/etc/init.d/dnsmasq restart || rollback_dhcp_domain 1
+cleanup_dhcp_domain
+		"
         if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
             "$router_ssh" "${uci_cmds}" 2>&1; then
             print_success "内网 DNS 劫持配置成功！"
@@ -6959,6 +9041,62 @@ docker_remove_conflicting_packages() {
     apt-get remove -y "${conflicts[@]}" >/dev/null 2>&1 || true
 }
 
+_docker_keyring_path() {
+    printf '%s' "${DOCKER_KEYRING_FILE:-/etc/apt/keyrings/docker.gpg}"
+}
+
+_docker_source_list_path() {
+    printf '%s' "${DOCKER_SOURCE_LIST_FILE:-/etc/apt/sources.list.d/docker.list}"
+}
+
+_docker_compose_bin_path() {
+    printf '%s' "${DOCKER_COMPOSE_BIN:-/usr/local/bin/docker-compose}"
+}
+
+_docker_render_apt_source() {
+    local arch="$1" docker_gpg="$2" docker_repo_os="$3" version_codename="$4"
+    printf 'deb [arch=%s signed-by=%s] https://download.docker.com/linux/%s %s stable\n' \
+        "$arch" "$docker_gpg" "$docker_repo_os" "$version_codename"
+}
+
+_docker_install_keyring() {
+    local docker_repo_os="$1" docker_gpg="$2" dir tmp_armored tmp_gpg
+    [[ "$docker_gpg" == /* ]] || return 1
+    dir="$(dirname "$docker_gpg")"
+    mkdir -p "$dir" || return 1
+    tmp_armored=$(mktemp "${dir}/.tmp.server-manage.docker-gpg.asc.XXXXXX") || return 1
+    _tmp_register "$tmp_armored"
+    tmp_gpg=$(mktemp "${dir}/.tmp.server-manage.docker-gpg.XXXXXX") || {
+        rm -f -- "$tmp_armored" 2>/dev/null || true
+        _tmp_unregister "$tmp_armored"
+        return 1
+    }
+    _tmp_register "$tmp_gpg"
+    if curl -fsSL "https://download.docker.com/linux/${docker_repo_os}/gpg" -o "$tmp_armored" 2>/dev/null \
+        && gpg --dearmor < "$tmp_armored" > "$tmp_gpg" 2>/dev/null; then
+        chmod 0644 "$tmp_gpg" 2>/dev/null || true
+        chown root:root "$tmp_gpg" 2>/dev/null || true
+        if mv "$tmp_gpg" "$docker_gpg"; then
+            rm -f -- "$tmp_armored" 2>/dev/null || true
+            _tmp_unregister "$tmp_armored"
+            _tmp_unregister "$tmp_gpg"
+            return 0
+        fi
+    fi
+    rm -f -- "$tmp_armored" "$tmp_gpg" 2>/dev/null || true
+    _tmp_unregister "$tmp_armored"
+    _tmp_unregister "$tmp_gpg"
+    return 1
+}
+
+_docker_write_apt_source() {
+    local docker_list="$1" arch="$2" docker_gpg="$3" docker_repo_os="$4" version_codename="$5" content
+    [[ "$docker_list" == /* && "$docker_gpg" == /* ]] || return 1
+    content="$(_docker_render_apt_source "$arch" "$docker_gpg" "$docker_repo_os" "$version_codename")"
+    write_file_atomic "$docker_list" "$content" || return 1
+    chmod 0644 "$docker_list" 2>/dev/null || true
+}
+
 docker_install() {
     print_title "Docker 安装"
     if command_exists docker; then
@@ -6973,9 +9111,13 @@ docker_install() {
     install_package "ca-certificates" "silent"
     install_package "curl" "silent"
     install_package "gnupg" "silent"
-    local keyring_dir="/etc/apt/keyrings"
-    mkdir -p "$keyring_dir"
-    local docker_gpg="$keyring_dir/docker.gpg"
+    local docker_gpg="$(_docker_keyring_path)"
+    local keyring_dir
+    keyring_dir="$(dirname "$docker_gpg")"
+    if ! mkdir -p "$keyring_dir"; then
+        print_error "Docker keyring 目录创建失败。"
+        pause; return 1
+    fi
     local os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
     local docker_repo_os="${os_id}"
     [[ "$docker_repo_os" != "ubuntu" && "$docker_repo_os" != "debian" ]] && docker_repo_os="debian"
@@ -6983,11 +9125,10 @@ docker_install() {
         print_info "添加 Docker GPG 密钥..."
         # 根据实际系统选择正确的官方仓库 OS；非 Debian/Ubuntu 系回退到 debian 时，
         # GPG URL 与 apt source 必须保持一致。
-        if ! curl -fsSL "https://download.docker.com/linux/${docker_repo_os}/gpg" | gpg --dearmor -o "$docker_gpg" 2>/dev/null; then
+        if ! _docker_install_keyring "$docker_repo_os" "$docker_gpg"; then
             print_error "GPG 密钥下载失败。"
-            pause; return
+            pause; return 1
         fi
-        chmod a+r "$docker_gpg"
     fi
     local version_codename=$(grep 'VERSION_CODENAME' /etc/os-release | cut -d= -f2)
     if [[ -z "$version_codename" ]]; then
@@ -6996,24 +9137,33 @@ docker_install() {
     if [[ -z "$version_codename" ]]; then
         print_error "无法检测系统版本代号，Docker 源配置可能失败。"
         print_info "请手动安装 Docker: https://docs.docker.com/engine/install/"
-        pause; return
+        pause; return 1
     fi
-    local docker_list="/etc/apt/sources.list.d/docker.list"
+    local docker_list="$(_docker_source_list_path)"
     if [[ ! -f "$docker_list" ]]; then
         print_info "添加 Docker 软件源..."
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=$docker_gpg] https://download.docker.com/linux/${docker_repo_os} $version_codename stable" > "$docker_list"
-    fi
-    apt-get update -qq 2>/dev/null || true
-    if apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null 2>&1; then
-        print_success "Docker 安装成功。"
-        if is_systemd; then
-            systemctl enable docker >/dev/null 2>&1 || true
-            systemctl start docker || true
+        if ! _docker_write_apt_source "$docker_list" "$(dpkg --print-architecture)" "$docker_gpg" "$docker_repo_os" "$version_codename"; then
+            print_error "Docker 软件源写入失败。"
+            pause; return 1
         fi
+    fi
+    if ! apt-get update -qq >/dev/null 2>&1; then
+        print_error "Docker 软件源更新失败。"
+        pause; return 1
+    fi
+    if apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null 2>&1; then
+        if is_systemd; then
+            if ! systemctl enable docker >/dev/null 2>&1 || ! systemctl start docker >/dev/null 2>&1; then
+                print_error "Docker 已安装但服务启动失败。"
+                pause; return 1
+            fi
+        fi
+        print_success "Docker 安装成功。"
         docker --version
         log_action "Docker installed"
     else
         print_error "Docker 安装失败。"
+        pause; return 1
     fi
     pause
 }
@@ -7044,6 +9194,7 @@ docker_uninstall() {
     fi
     rm -f /etc/apt/sources.list.d/docker.list
     rm -f /etc/apt/keyrings/docker.gpg
+    hash -r 2>/dev/null || true
     print_success "Docker 已卸载。"
     log_action "Docker uninstalled"
     pause
@@ -7056,6 +9207,96 @@ _docker_compose_standalone_arch() {
         armv7l|armv7*) echo "armv7" ;;
         *) uname -m ;;
     esac
+}
+
+_docker_compose_install_standalone() {
+    local compose_url="$1" target_bin="$(_docker_compose_bin_path)" target_dir tmp_bin tmp_sha hash
+    [[ "$target_bin" == /* ]] || return 1
+    target_dir="$(dirname "$target_bin")"
+    mkdir -p "$target_dir" || return 1
+    tmp_bin=$(mktemp "${target_dir}/.tmp.server-manage.docker-compose.XXXXXX") || return 1
+    _tmp_register "$tmp_bin"
+    tmp_sha=$(mktemp "${target_dir}/.tmp.server-manage.docker-compose.sha256.XXXXXX") || {
+        rm -f -- "$tmp_bin" 2>/dev/null || true
+        _tmp_unregister "$tmp_bin"
+        return 1
+    }
+    _tmp_register "$tmp_sha"
+    if curl -fL --retry 3 "$compose_url" -o "$tmp_bin" 2>/dev/null \
+        && curl -fL --retry 3 "${compose_url}.sha256" -o "$tmp_sha" 2>/dev/null \
+        && hash=$(awk '{print $1; exit}' "$tmp_sha") \
+        && [[ "$hash" =~ ^[a-fA-F0-9]{64}$ ]] \
+        && printf '%s  %s\n' "$hash" "$tmp_bin" | sha256sum -c - >/dev/null; then
+        chmod 0755 "$tmp_bin" 2>/dev/null || true
+        chown root:root "$tmp_bin" 2>/dev/null || true
+        if mv "$tmp_bin" "$target_bin"; then
+            rm -f -- "$tmp_sha" 2>/dev/null || true
+            _tmp_unregister "$tmp_bin"
+            _tmp_unregister "$tmp_sha"
+            return 0
+        fi
+    fi
+    rm -f -- "$tmp_bin" "$tmp_sha" 2>/dev/null || true
+    _tmp_unregister "$tmp_bin"
+    _tmp_unregister "$tmp_sha"
+    return 1
+}
+
+_docker_systemd_reload_restart() {
+    is_systemd || return 0
+    systemctl daemon-reload >/dev/null || return 1
+    systemctl restart docker >/dev/null || return 1
+}
+
+_docker_restore_proxy_conf() {
+    local backup="$1" had_old="$2"
+    if [[ "$had_old" -eq 1 && -f "$backup" ]]; then
+        mkdir -p "$DOCKER_PROXY_DIR" 2>/dev/null || true
+        cp -a "$backup" "$DOCKER_PROXY_CONF" 2>/dev/null || true
+    else
+        rm -f "$DOCKER_PROXY_CONF" 2>/dev/null || true
+    fi
+}
+
+_docker_apply_proxy_conf() {
+    local proxy_conf="$1" backup="" had_old=0
+    mkdir -p "$DOCKER_PROXY_DIR" || return 1
+    if [[ -f "$DOCKER_PROXY_CONF" ]]; then
+        backup=$(mktemp "${DOCKER_PROXY_DIR}/.http-proxy.conf.bak.XXXXXX") || return 1
+        cp -a "$DOCKER_PROXY_CONF" "$backup" || { rm -f "$backup"; return 1; }
+        had_old=1
+    fi
+    if ! write_file_atomic "$DOCKER_PROXY_CONF" "$proxy_conf"; then
+        rm -f "$backup" 2>/dev/null || true
+        return 1
+    fi
+    if ! _docker_systemd_reload_restart; then
+        _docker_restore_proxy_conf "$backup" "$had_old"
+        _docker_systemd_reload_restart >/dev/null 2>&1 || true
+        rm -f "$backup" 2>/dev/null || true
+        return 1
+    fi
+    rm -f "$backup" 2>/dev/null || true
+    return 0
+}
+
+_docker_clear_proxy_conf() {
+    local backup="" had_old=0
+    if [[ -f "$DOCKER_PROXY_CONF" ]]; then
+        mkdir -p "$DOCKER_PROXY_DIR" || return 1
+        backup=$(mktemp "${DOCKER_PROXY_DIR}/.http-proxy.conf.bak.XXXXXX") || return 1
+        cp -a "$DOCKER_PROXY_CONF" "$backup" || { rm -f "$backup"; return 1; }
+        had_old=1
+    fi
+    rm -f "$DOCKER_PROXY_CONF" || { rm -f "$backup" 2>/dev/null || true; return 1; }
+    if ! _docker_systemd_reload_restart; then
+        _docker_restore_proxy_conf "$backup" "$had_old"
+        _docker_systemd_reload_restart >/dev/null 2>&1 || true
+        rm -f "$backup" 2>/dev/null || true
+        return 1
+    fi
+    rm -f "$backup" 2>/dev/null || true
+    return 0
 }
 
 docker_compose_install() {
@@ -7097,22 +9338,14 @@ docker_compose_install() {
     local compose_arch
     compose_arch=$(_docker_compose_standalone_arch)
     local compose_url="https://github.com/docker/compose/releases/download/${compose_version}/docker-compose-linux-${compose_arch}"
-    local tmp_bin tmp_sha hash
-    tmp_bin=$(mktemp /tmp/docker-compose.XXXXXX) || { print_error "创建临时文件失败"; pause; return; }
-    tmp_sha=$(mktemp /tmp/docker-compose.sha256.XXXXXX) || { rm -f "$tmp_bin"; print_error "创建临时文件失败"; pause; return; }
-    if curl -fL --retry 3 "$compose_url" -o "$tmp_bin" 2>/dev/null \
-        && curl -fL --retry 3 "${compose_url}.sha256" -o "$tmp_sha" 2>/dev/null \
-        && hash=$(awk '{print $1; exit}' "$tmp_sha") \
-        && [[ "$hash" =~ ^[a-fA-F0-9]{64}$ ]] \
-        && printf '%s  %s\n' "$hash" "$tmp_bin" | sha256sum -c - >/dev/null; then
-        install -m 0755 "$tmp_bin" /usr/local/bin/docker-compose
+    if _docker_compose_install_standalone "$compose_url"; then
         print_success "Docker Compose Standalone 安装成功。"
         docker-compose --version
         log_action "Docker Compose standalone installed"
     else
         print_error "下载失败。"
+        pause; return 1
     fi
-    rm -f "$tmp_bin" "$tmp_sha"
     pause
 }
 
@@ -7136,7 +9369,6 @@ docker_proxy_config() {
                 print_error "代理地址格式无效 (应为 http(s)://host:port 或 socks5://host:port)"
                 pause; return
             fi
-            mkdir -p "$DOCKER_PROXY_DIR"
             local proxy_conf="[Service]
 Environment=\"HTTP_PROXY=$proxy\"
 Environment=\"HTTPS_PROXY=$proxy\"
@@ -7144,19 +9376,17 @@ Environment=\"NO_PROXY=localhost,127.0.0.1,::1\"
 Environment=\"http_proxy=$proxy\"
 Environment=\"https_proxy=$proxy\"
 Environment=\"no_proxy=localhost,127.0.0.1,::1\""
-            write_file_atomic "$DOCKER_PROXY_CONF" "$proxy_conf"
-            if is_systemd; then
-                systemctl daemon-reload || true
-                systemctl restart docker || true
+            if ! _docker_apply_proxy_conf "$proxy_conf"; then
+                print_error "Docker 代理配置失败，已回滚。"
+                pause; return 1
             fi
             print_success "Docker 代理已配置。"
             log_action "Docker proxy configured: $proxy"
             ;;
         2)
-            rm -f "$DOCKER_PROXY_CONF"
-            if is_systemd; then
-                systemctl daemon-reload || true
-                systemctl restart docker || true
+            if ! _docker_clear_proxy_conf; then
+                print_error "代理配置清除失败，已回滚。"
+                pause; return 1
             fi
             print_success "代理配置已清除。"
             log_action "Docker proxy removed"
@@ -7183,18 +9413,26 @@ docker_images_manage() {
             ;;
         2)
             if confirm "删除未使用的镜像？"; then
-                docker image prune -a -f
-                print_success "清理完成。"
-                log_action "Docker unused images pruned"
+                if docker image prune -a -f; then
+                    print_success "清理完成。"
+                    log_action "Docker unused images pruned"
+                else
+                    print_error "镜像清理失败。"
+                    pause; return 1
+                fi
             fi
             ;;
         3)
             if confirm "删除所有镜像？这将影响所有容器！"; then
                 local all_images=$(docker images -q)
                 if [[ -n "$all_images" ]]; then
-                    docker rmi -f $all_images
-                    print_success "所有镜像已删除。"
-                    log_action "Docker all images removed"
+                    if docker rmi -f $all_images; then
+                        print_success "所有镜像已删除。"
+                        log_action "Docker all images removed"
+                    else
+                        print_error "镜像删除失败。"
+                        pause; return 1
+                    fi
                 else
                     print_warn "没有镜像可删除。"
                 fi
@@ -7269,10 +9507,10 @@ docker_containers_manage() {
                     print_warn "无运行中容器"
                 elif docker stop $rq >/dev/null; then
                     print_success "已停止"
+                    log_action "Docker all containers stopped"
                 else
                     print_error "停止失败"
                 fi
-                log_action "Docker all containers stopped"
             fi
             pause; continue
         fi
@@ -7283,10 +9521,10 @@ docker_containers_manage() {
                     print_warn "无容器"
                 elif docker rm -f $aq >/dev/null; then
                     print_success "已删除"
+                    log_action "Docker all containers removed"
                 else
                     print_error "删除失败"
                 fi
-                log_action "Docker all containers removed"
             fi
             pause; continue
         fi
@@ -7311,8 +9549,12 @@ docker_containers_manage() {
                 ;;
             5)
                 if confirm "确认删除容器 $target_name?"; then
-                    docker rm -f "$target_id" && print_success "已删除: $target_name" || print_error "删除失败"
-                    log_action "Docker container removed: $target_name"
+                    if docker rm -f "$target_id"; then
+                        print_success "已删除: $target_name"
+                        log_action "Docker container removed: $target_name"
+                    else
+                        print_error "删除失败"
+                    fi
                 fi
                 ;;
             *) print_error "无效操作" ;;
@@ -7354,9 +9596,12 @@ menu_docker() {
             7)
                 if command_exists docker; then
                     if confirm "清理未使用的容器、网络、镜像、构建缓存？"; then
-                        docker system prune -a -f --volumes
-                        print_success "清理完成。"
-                        log_action "Docker system pruned"
+                        if docker system prune -a -f --volumes; then
+                            print_success "清理完成。"
+                            log_action "Docker system pruned"
+                        else
+                            print_error "清理失败。"
+                        fi
                     fi
                 else
                     print_error "Docker 未安装。"
@@ -7536,7 +9781,7 @@ wg_check_openwrt_compat() {
 
     # ── [信息] br-lan 网段 ──
     local br_lan_addr
-    br_lan_addr=$(ip -4 addr show br-lan 2>/dev/null | grep -oP 'inet \K[0-9.]+/[0-9]+' | head -1)
+    br_lan_addr=$(ip -4 addr show br-lan 2>/dev/null | awk '/^[[:space:]]*inet[[:space:]]/ { print $2; exit }')
     if [[ -n "$br_lan_addr" ]]; then
         echo -e "  ${C_CYAN}[INFO]${C_RESET} br-lan 网段: ${br_lan_addr}"
     else
@@ -7576,10 +9821,53 @@ readonly WG_DB_FILE="${WG_SHARED_DB_FILE}"
 readonly WG_CONF="/etc/wireguard/${WG_INTERFACE}.conf"
 readonly WG_ROLE_FILE="${WG_SHARED_ROLE_FILE}"
 
+wg_write_private_file() {
+    local file="$1" content="$2" dir tmp old_umask _rc
+    dir="$(dirname "$file")"
+    mkdir -p "$dir" || return 1
+    old_umask=$(umask)
+    umask 077
+    tmp=$(mktemp "${dir}/.tmp.server-manage.wg.XXXXXX")
+    _rc=$?
+    umask "$old_umask"
+    [[ $_rc -eq 0 ]] || return 1
+    if declare -F _tmp_register >/dev/null 2>&1; then _tmp_register "$tmp"; fi
+    if ! printf '%s\n' "$content" > "$tmp"; then
+        rm -f -- "$tmp" 2>/dev/null || true
+        if declare -F _tmp_unregister >/dev/null 2>&1; then _tmp_unregister "$tmp"; fi
+        return 1
+    fi
+    chmod 600 "$tmp" 2>/dev/null || true
+    chown root:root "$tmp" 2>/dev/null || true
+    if ! mv -f "$tmp" "$file"; then
+        rm -f -- "$tmp" 2>/dev/null || true
+        if declare -F _tmp_unregister >/dev/null 2>&1; then _tmp_unregister "$tmp"; fi
+        return 1
+    fi
+    if declare -F _tmp_unregister >/dev/null 2>&1; then _tmp_unregister "$tmp"; fi
+    return 0
+}
+
+wg_shared_export_file() {
+    local dir="${WG_EXPORT_DIR:-/root/wireguard-exports}" tmp old_umask _rc
+    mkdir -p "$dir" || return 1
+    chmod 700 "$dir" 2>/dev/null || true
+    old_umask=$(umask)
+    umask 077
+    tmp=$(mktemp "${dir}/${SCRIPT_NAME}-wg-peers.XXXXXX")
+    _rc=$?
+    umask "$old_umask"
+    [[ $_rc -eq 0 ]] || return 1
+    chmod 600 "$tmp" 2>/dev/null || true
+    chown root:root "$tmp" 2>/dev/null || true
+    printf '%s\n' "$tmp"
+}
+
 wg_shared_db_init() {
     mkdir -p "$WG_SHARED_DB_DIR"
     [[ -f "$WG_SHARED_DB_FILE" ]] && return 0
-    cat > "$WG_SHARED_DB_FILE" << 'WGEOF'
+    local content
+    content=$(cat <<'WGEOF'
 {
   "role": "",
   "server": {},
@@ -7587,7 +9875,8 @@ wg_shared_db_init() {
   "client": {}
 }
 WGEOF
-    chmod 600 "$WG_SHARED_DB_FILE"
+)
+    wg_write_private_file "$WG_SHARED_DB_FILE" "$content"
 }
 
 wg_shared_db_get() { jq -r "$@" "$WG_SHARED_DB_FILE" 2>/dev/null; }
@@ -7607,7 +9896,9 @@ wg_shared_db_set() {
             flock -w 5 200 || { rm -f "$tmp"; print_error "无法获取数据库锁"; return 1; }
         fi
         if jq "$@" "$WG_SHARED_DB_FILE" > "$tmp" 2>/dev/null; then
-            mv "$tmp" "$WG_SHARED_DB_FILE"; chmod 600 "$WG_SHARED_DB_FILE"
+            chmod 600 "$tmp" 2>/dev/null || true
+            chown root:root "$tmp" 2>/dev/null || true
+            mv "$tmp" "$WG_SHARED_DB_FILE"
         else
             rm -f "$tmp"; print_error "数据库写入失败"; return 1
         fi
@@ -7628,9 +9919,84 @@ wg_shared_get_role() {
 
 wg_shared_set_role() {
     mkdir -p /etc/wireguard
-    echo "$1" > "$WG_SHARED_ROLE_FILE"
-    chmod 600 "$WG_SHARED_ROLE_FILE"
+    wg_write_private_file "$WG_SHARED_ROLE_FILE" "$1" || return 1
     wg_shared_db_set --arg r "$1" '.role = $r' 2>/dev/null || true
+}
+
+wg_shared_gateway_lans() {
+    local get_fn="${1:-}"
+    declare -F "$get_fn" >/dev/null 2>&1 || return 1
+    local pc
+    pc=$("$get_fn" '.peers | length' 2>/dev/null)
+    [[ "$pc" =~ ^[0-9]+$ ]] || pc=0
+
+    local i=0 seen="" result="" enabled is_gw lans IFS_BAK sub
+    while [[ $i -lt $pc ]]; do
+        enabled=$("$get_fn" ".peers[$i].enabled" 2>/dev/null)
+        is_gw=$("$get_fn" ".peers[$i].is_gateway // false" 2>/dev/null)
+        lans=$("$get_fn" ".peers[$i].lan_subnets // empty" 2>/dev/null)
+        if [[ "$enabled" == "true" && "$is_gw" == "true" && -n "$lans" && "$lans" != "null" ]]; then
+            IFS_BAK="$IFS"; IFS=','
+            for sub in $lans; do
+                sub=$(echo "$sub" | xargs)
+                [[ -n "$sub" ]] || continue
+                validate_cidr "$sub" || continue
+                case "$seen" in
+                    *"|$sub|"*) ;;
+                    *)
+                        seen="${seen}|${sub}|"
+                        [[ -n "$result" ]] && result="${result}"$'\n'
+                        result="${result}${sub}"
+                        ;;
+                esac
+            done
+            IFS="$IFS_BAK"
+        fi
+        i=$((i + 1))
+    done
+    printf '%s\n' "$result" | sed '/^$/d'
+}
+
+wg_shared_sync_gateway_routes() {
+    local get_fn="${1:-}" iface="${2:-}" state_file="${3:-$WG_SHARED_ROUTE_STATE_FILE}"
+    [[ -n "$iface" ]] || return 1
+    command_exists ip || return 1
+
+    local current old rc=0
+    current=$(wg_shared_gateway_lans "$get_fn") || return 1
+
+    if [[ -f "$state_file" ]]; then
+        while IFS= read -r old || [[ -n "$old" ]]; do
+            old=$(echo "$old" | xargs)
+            [[ -n "$old" ]] || continue
+            validate_cidr "$old" || continue
+            if ! printf '%s\n' "$current" | grep -Fxq -- "$old"; then
+                if [[ "$old" == *:* ]]; then
+                    ip -6 route del "$old" dev "$iface" >/dev/null 2>&1 || true
+                else
+                    ip route del "$old" dev "$iface" >/dev/null 2>&1 || true
+                fi
+            fi
+        done < "$state_file"
+    fi
+
+    while IFS= read -r old || [[ -n "$old" ]]; do
+        old=$(echo "$old" | xargs)
+        [[ -n "$old" ]] || continue
+        if [[ "$old" == *:* ]]; then
+            ip -6 route replace "$old" dev "$iface" >/dev/null 2>&1 || rc=1
+        elif ! ip route replace "$old" dev "$iface" >/dev/null 2>&1; then
+            rc=1
+        fi
+    done <<< "$current"
+    [[ "$rc" -eq 0 ]] || return 1
+
+    if [[ -n "$current" ]]; then
+        wg_write_private_file "$state_file" "$current" || return 1
+    else
+        rm -f -- "$state_file" 2>/dev/null || return 1
+    fi
+    return 0
 }
 
 wg_db_init() { wg_shared_db_init; }
@@ -7638,6 +10004,36 @@ wg_db_get() { wg_shared_db_get "$@"; }
 wg_db_set() { wg_shared_db_set "$@"; }
 wg_get_role() { wg_shared_get_role; }
 wg_set_role() { wg_shared_set_role "$@"; }
+
+wg_shared_endpoint_host() {
+    local host="${1:-}"
+    if [[ "$host" =~ ^\[(.*)\]:[0-9]+$ ]]; then
+        host="${BASH_REMATCH[1]}"
+    elif [[ "$host" =~ ^\[(.*)\]$ ]]; then
+        host="${BASH_REMATCH[1]}"
+    elif [[ "$host" =~ ^([^:]+):[0-9]+$ ]]; then
+        host="${BASH_REMATCH[1]}"
+    fi
+    printf '%s\n' "$host"
+}
+
+wg_shared_normalize_endpoint_host() {
+    local endpoint="${1:-}" host
+    host=$(wg_shared_endpoint_host "$endpoint")
+    validate_host "$host" || return 1
+    printf '%s\n' "$host"
+}
+
+wg_shared_format_endpoint() {
+    local host port
+    host=$(wg_shared_endpoint_host "${1:-}")
+    port="${2:-}"
+    if [[ "$host" == *:* ]]; then
+        printf '[%s]:%s\n' "$host" "$port"
+    else
+        printf '%s:%s\n' "$host" "$port"
+    fi
+}
 
 wg_is_installed() { command_exists wg && [[ -f "$WG_DB_FILE" ]]; }
 wg_is_running()   { ip link show "$WG_INTERFACE" &>/dev/null; }
@@ -7765,6 +10161,77 @@ wg_format_bytes() {
     }'
 }
 
+_wg_openwrt_restore_network_uci_snapshot() {
+    local snapshot="${1:-}"
+    [[ -s "$snapshot" ]] || return 0
+    uci revert network >/dev/null 2>&1 || true
+    if ! uci import network < "$snapshot" >/dev/null 2>&1; then
+        print_warn "恢复 OpenWrt network UCI 配置失败，请手动检查。"
+        return 1
+    fi
+    if ! uci commit network >/dev/null 2>&1; then
+        print_warn "提交恢复后的 OpenWrt network UCI 配置失败，请手动检查。"
+        return 1
+    fi
+}
+
+_wg_openwrt_write_network_uci_from_db() {
+    local priv_key="${1:-}" port="${2:-}" server_ip="${3:-}" mask="${4:-}" mtu="${5:-}"
+    local pc i
+
+    while uci -q get network.@wireguard_wg0[0] >/dev/null 2>&1; do
+        uci delete network.@wireguard_wg0[0] || return 1
+    done
+
+    uci set network.wg0=interface || return 1
+    uci set network.wg0.proto='wireguard' || return 1
+    uci set network.wg0.private_key="$priv_key" || return 1
+    uci -q delete network.wg0.addresses 2>/dev/null || true
+    uci add_list network.wg0.addresses="${server_ip}/${mask}" || return 1
+    uci set network.wg0.listen_port="$port" || return 1
+    uci set network.wg0.mtu="$mtu" || return 1
+    uci set network.wg0.route_allowed_ips='1' || return 1
+
+    pc=$(wg_db_get '.peers | length') || return 1
+    i=0
+    while [[ $i -lt $pc ]]; do
+        if [[ "$(wg_db_get ".peers[$i].enabled")" == "true" ]]; then
+            local peer_name pub_key psk peer_ip is_gw lan_sub sub IFS_BAK
+            peer_name=$(wg_db_get ".peers[$i].name") || return 1
+            pub_key=$(wg_db_get ".peers[$i].public_key") || return 1
+            psk=$(wg_db_get ".peers[$i].preshared_key") || return 1
+            peer_ip=$(wg_db_get ".peers[$i].ip") || return 1
+            is_gw=$(wg_db_get ".peers[$i].is_gateway // false") || return 1
+            lan_sub=$(wg_db_get ".peers[$i].lan_subnets // empty") || return 1
+
+            uci add network wireguard_wg0 >/dev/null || return 1
+            uci set network.@wireguard_wg0[-1].description="$peer_name" || return 1
+            uci set network.@wireguard_wg0[-1].public_key="$pub_key" || return 1
+            uci set network.@wireguard_wg0[-1].preshared_key="$psk" || return 1
+            uci set network.@wireguard_wg0[-1].persistent_keepalive='25' || return 1
+
+            uci -q delete network.@wireguard_wg0[-1].allowed_ips 2>/dev/null || true
+            uci add_list network.@wireguard_wg0[-1].allowed_ips="${peer_ip}/32" || return 1
+            if [[ "$is_gw" == "true" && -n "$lan_sub" && "$lan_sub" != "null" ]]; then
+                IFS_BAK="$IFS"; IFS=','
+                for sub in $lan_sub; do
+                    sub=$(echo "$sub" | xargs)
+                    if [[ -n "$sub" ]]; then
+                        uci add_list network.@wireguard_wg0[-1].allowed_ips="$sub" || {
+                            IFS="$IFS_BAK"
+                            return 1
+                        }
+                    fi
+                done
+                IFS="$IFS_BAK"
+            fi
+        fi
+        i=$((i + 1))
+    done
+
+    uci commit network || return 1
+}
+
 
 wg_rebuild_uci_conf() {
     [[ "$(wg_get_role)" != "server" ]] && return 1
@@ -7782,87 +10249,70 @@ wg_rebuild_uci_conf() {
     mtu=$(wg_db_get '.server.mtu // empty')
     [[ -z "$mtu" || "$mtu" == "null" ]] && mtu=$WG_MTU_DIRECT
 
-    # --- 清除旧 uci peer 条目 ---
-    while uci -q get network.@wireguard_wg0[0] >/dev/null 2>&1; do
-        uci delete network.@wireguard_wg0[0]
-    done
+    local uci_snapshot_dir uci_snapshot
+    uci_snapshot_dir=$(mktemp -d "${TMPDIR:-/tmp}/${SCRIPT_NAME}-wg-uci.XXXXXX") || {
+        print_error "创建 OpenWrt network UCI 快照目录失败"
+        return 1
+    }
+    chmod 700 "$uci_snapshot_dir" 2>/dev/null || true
+    uci_snapshot="${uci_snapshot_dir}/network.uci"
+    if ! uci export network > "$uci_snapshot" 2>/dev/null; then
+        rm -rf "$uci_snapshot_dir" 2>/dev/null || true
+        print_error "备份 OpenWrt network UCI 配置失败"
+        return 1
+    fi
 
-    # --- 设置 wg0 接口基本参数 ---
-    uci set network.wg0=interface
-    uci set network.wg0.proto='wireguard'
-    uci set network.wg0.private_key="$priv_key"
-    uci -q delete network.wg0.addresses 2>/dev/null
-    uci add_list network.wg0.addresses="${server_ip}/${mask}"
-    uci set network.wg0.listen_port="$port"
-    uci set network.wg0.mtu="$mtu"
-    uci set network.wg0.route_allowed_ips='1'
-
-    # --- 遍历 enabled peers，创建 uci wireguard_wg0 section ---
-    local pc=$(wg_db_get '.peers | length') i=0
-    while [[ $i -lt $pc ]]; do
-        if [[ "$(wg_db_get ".peers[$i].enabled")" == "true" ]]; then
-            local peer_name=$(wg_db_get ".peers[$i].name")
-            local pub_key=$(wg_db_get ".peers[$i].public_key")
-            local psk=$(wg_db_get ".peers[$i].preshared_key")
-            local peer_ip=$(wg_db_get ".peers[$i].ip")
-            local is_gw=$(wg_db_get ".peers[$i].is_gateway // false")
-            local lan_sub=$(wg_db_get ".peers[$i].lan_subnets // empty")
-
-            uci add network wireguard_wg0 >/dev/null
-            local idx_uci
-            # 获取刚添加的 section 索引（最后一个）
-            idx_uci=$(( $(uci show network | grep -c 'wireguard_wg0') / 5 - 1 ))
-            [[ $idx_uci -lt 0 ]] && idx_uci=0
-
-            uci set network.@wireguard_wg0[-1].description="$peer_name"
-            uci set network.@wireguard_wg0[-1].public_key="$pub_key"
-            uci set network.@wireguard_wg0[-1].preshared_key="$psk"
-            uci set network.@wireguard_wg0[-1].persistent_keepalive='25'
-
-            # AllowedIPs
-            uci -q delete network.@wireguard_wg0[-1].allowed_ips 2>/dev/null
-            uci add_list network.@wireguard_wg0[-1].allowed_ips="${peer_ip}/32"
-            if [[ "$is_gw" == "true" && -n "$lan_sub" && "$lan_sub" != "null" ]]; then
-                local IFS=','
-                for sub in $lan_sub; do
-                    sub=$(echo "$sub" | xargs)
-                    [[ -n "$sub" ]] && uci add_list network.@wireguard_wg0[-1].allowed_ips="$sub"
-                done
-                unset IFS
-            fi
-        fi
-        i=$((i + 1))
-    done
-
-    uci commit network
+    _wg_openwrt_write_network_uci_from_db "$priv_key" "$port" "$server_ip" "$mask" "$mtu"
+    local uci_rc=$?
+    if [[ $uci_rc -ne 0 ]]; then
+        print_error "OpenWrt network UCI 配置提交失败"
+        _wg_openwrt_restore_network_uci_snapshot "$uci_snapshot" || true
+        rm -rf "$uci_snapshot_dir" 2>/dev/null || true
+        return 1
+    fi
 
     # --- 非 peer 热应用路径仍允许重启接口；peer 操作传 no_reload 后用 wg syncconf 热同步 ---
     if wg_is_running && [[ "$apply_mode" != "no_reload" ]]; then
-        ifdown wg0 2>/dev/null
+        ifdown wg0 2>/dev/null || true
         sleep 1
-        ifup wg0 2>/dev/null
+        if ! ifup wg0 2>/dev/null; then
+            print_error "OpenWrt wg0 接口重载失败"
+            _wg_openwrt_restore_network_uci_snapshot "$uci_snapshot" || true
+            rm -rf "$uci_snapshot_dir" 2>/dev/null || true
+            return 1
+        fi
         sleep 1
-        wg_sync_peer_routes
+        if ! wg_sync_peer_routes; then
+            print_error "OpenWrt WireGuard 路由同步失败"
+            _wg_openwrt_restore_network_uci_snapshot "$uci_snapshot" || true
+            rm -rf "$uci_snapshot_dir" 2>/dev/null || true
+            return 1
+        fi
     fi
+    rm -rf "$uci_snapshot_dir" 2>/dev/null || true
+    return 0
 }
 
 wg_apply_runtime_conf() {
     wg_rebuild_conf || return 1
     wg_is_running || return 0
-    local tmp
-    tmp=$(mktemp "/tmp/${SCRIPT_NAME}-wg-sync.XXXXXX") || return 1
+    local tmp_dir tmp
+    tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/${SCRIPT_NAME}-wg-sync.XXXXXX") || return 1
+    chmod 700 "$tmp_dir" 2>/dev/null || true
+    tmp="${tmp_dir}/sync.conf"
     awk '
         /^\[Interface\]$/ { section="interface"; print; next }
         /^\[Peer\]$/ { section="peer"; print; next }
         section=="interface" && /^(PrivateKey|ListenPort|FwMark)[[:space:]]*=/ { print; next }
         section=="peer" && /^(PublicKey|PresharedKey|AllowedIPs|Endpoint|PersistentKeepalive)[[:space:]]*=/ { print; next }
-    ' "$WG_CONF" > "$tmp"
+    ' "$WG_CONF" > "$tmp" || { rm -rf "$tmp_dir"; return 1; }
+    chmod 600 "$tmp" 2>/dev/null || true
     if wg syncconf "$WG_INTERFACE" "$tmp" >/dev/null 2>&1; then
-        rm -f "$tmp"
-        wg_sync_peer_routes
+        rm -rf "$tmp_dir"
+        wg_sync_peer_routes || return 1
         return 0
     fi
-    rm -f "$tmp"
+    rm -rf "$tmp_dir"
     return 1
 }
 
@@ -7870,22 +10320,7 @@ wg_apply_runtime_conf() {
 # (部分 OpenWrt 固件的 proto-wireguard 不支持 route_allowed_ips，需手动添加)
 wg_sync_peer_routes() {
     wg_is_running || return 0
-    local pc=$(wg_db_get '.peers | length') i=0
-    while [[ $i -lt ${pc:-0} ]]; do
-        if [[ "$(wg_db_get ".peers[$i].enabled")" == "true" ]]; then
-            local is_gw=$(wg_db_get ".peers[$i].is_gateway // false")
-            local lans=$(wg_db_get ".peers[$i].lan_subnets // empty")
-            if [[ "$is_gw" == "true" && -n "$lans" && "$lans" != "null" ]]; then
-                local IFS_BAK="$IFS"; IFS=','
-                for sub in $lans; do
-                    sub=$(echo "$sub" | xargs)
-                    [[ -n "$sub" ]] && ip route replace "$sub" dev "$WG_INTERFACE" 2>/dev/null || true
-                done
-                IFS="$IFS_BAK"
-            fi
-        fi
-        i=$((i + 1))
-    done
+    wg_shared_sync_gateway_routes wg_db_get "$WG_INTERFACE"
 }
 
 # 生成 wg0.conf 只读快照（供导出/备份/查看用，不用于运行）
@@ -7904,9 +10339,8 @@ wg_rebuild_conf() {
     mask=$(echo "$subnet" | cut -d'/' -f2)
     mtu=$(wg_db_get '.server.mtu // empty')
     [[ -z "$mtu" || "$mtu" == "null" ]] && mtu=$WG_MTU_DIRECT
-    local old_umask _rc
-    old_umask=$(umask)
-    umask 077
+    local conf_content
+    conf_content=$(
     {
         echo "[Interface]"
         echo "PrivateKey = ${priv_key}"
@@ -7931,20 +10365,19 @@ wg_rebuild_conf() {
             fi
             i=$((i + 1))
         done
-    } > "$WG_CONF"
-    _rc=$?
-    umask "$old_umask"
-    [[ $_rc -eq 0 ]] || return 1
-    chmod 600 "$WG_CONF"
+    }
+)
+    wg_write_private_file "$WG_CONF" "$conf_content"
 }
 
 wg_regenerate_client_confs() {
     local pc=$(wg_db_get '.peers | length')
     [[ "$pc" -eq 0 ]] && return
-    local spub sep sport sdns mask mtu
+    local spub sep sport endpoint sdns mask mtu
     spub=$(wg_db_get '.server.public_key')
     sep=$(wg_db_get '.server.endpoint')
     sport=$(wg_db_get '.server.port')
+    endpoint=$(wg_shared_format_endpoint "$sep" "$sport")
     sdns=$(wg_db_get '.server.dns')
     mask=$(echo "$(wg_db_get '.server.subnet')" | cut -d'/' -f2)
     mtu=$(wg_db_get '.server.mtu // empty')
@@ -7963,14 +10396,312 @@ MTU = ${mtu}"
 [Peer]
 PublicKey = ${spub}
 PresharedKey = $(wg_db_get ".peers[$i].preshared_key")
-Endpoint = ${sep}:${sport}
+Endpoint = ${endpoint}
 AllowedIPs = $(wg_db_get ".peers[$i].client_allowed_ips")
 PersistentKeepalive = 25"
-        write_file_atomic "/etc/wireguard/clients/${name}.conf" "$conf_content"
-        chmod 600 "/etc/wireguard/clients/${name}.conf"
+        wg_write_private_file "/etc/wireguard/clients/${name}.conf" "$conf_content" || return 1
         i=$((i + 1))
     done
 }
+_wg_openwrt_rc_local_path() {
+    printf '%s' "${WG_OPENWRT_RC_LOCAL_FILE:-/etc/rc.local}"
+}
+
+_wg_openwrt_delete_allow_port_rules() {
+    local h
+    for h in $(nft -a list chain inet fw4 input_wan 2>/dev/null | grep 'wg_allow_port' | awk '{print $NF}'); do
+        nft delete rule inet fw4 input_wan handle "$h" 2>/dev/null || true
+    done
+}
+
+_wg_openwrt_delete_allow_port_rules_matching() {
+    local want="${1:-}" mode="${2:-match}" h
+    validate_port "$want" || return 1
+    for h in $(nft -a list chain inet fw4 input_wan 2>/dev/null | awk -v want="$want" -v mode="$mode" '
+        /wg_allow_port/ {
+            dport = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i == "dport") dport = $(i + 1)
+            }
+            if ((mode == "match" && dport == want) || (mode == "except" && dport != want)) print $NF
+        }
+    '); do
+        nft delete rule inet fw4 input_wan handle "$h" 2>/dev/null || true
+    done
+}
+
+_wg_openwrt_list_wireguard_ifaces() {
+    ip link show type wireguard 2>/dev/null | awk '
+        /^[0-9]+:/ {
+            name=$0
+            sub(/^[0-9]+:[[:space:]]*/, "", name)
+            sub(/:.*/, "", name)
+            sub(/@.*/, "", name)
+            current=name
+            next
+        }
+        /link\/none/ && current != "" {
+            print current
+            current=""
+        }
+    '
+}
+
+_wg_openwrt_allow_port_handles() {
+    local want="${1:-}"
+    validate_port "$want" || return 1
+    nft -a list chain inet fw4 input_wan 2>/dev/null | awk -v want="$want" '
+        /wg_allow_port/ {
+            dport = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i == "dport") dport = $(i + 1)
+            }
+            if (dport == want) print $NF
+        }
+    '
+}
+
+_wg_openwrt_persist_allow_port() {
+    local port="${1:-}"
+    validate_port "$port" || { print_error "WireGuard UDP 端口无效: $port"; return 1; }
+    local snapshot_dir snapshot
+    snapshot_dir=$(mktemp -d "${TMPDIR:-/tmp}/${SCRIPT_NAME}-wg-fw.XXXXXX") || {
+        print_error "创建 OpenWrt firewall UCI 快照目录失败"
+        return 1
+    }
+    chmod 700 "$snapshot_dir" 2>/dev/null || true
+    snapshot="${snapshot_dir}/firewall.uci"
+    if ! uci export firewall > "$snapshot" 2>/dev/null; then
+        rm -rf "$snapshot_dir" 2>/dev/null || true
+        print_error "备份 OpenWrt firewall UCI 配置失败"
+        return 1
+    fi
+    if ! _wg_openwrt_write_allow_port_uci "$port"; then
+        print_error "OpenWrt 防火墙持久化放行 ${port}/udp 失败"
+        _wg_openwrt_restore_uci_package firewall "$snapshot" || true
+        rm -rf "$snapshot_dir" 2>/dev/null || true
+        return 1
+    fi
+    rm -rf "$snapshot_dir" 2>/dev/null || true
+}
+
+_wg_openwrt_write_allow_port_uci() {
+    local port="${1:-}"
+    validate_port "$port" || return 1
+    uci set firewall.wg_allow_port=rule || return 1
+    uci set firewall.wg_allow_port.name='Allow-WG-UDP' || return 1
+    uci set firewall.wg_allow_port.src='wan' || return 1
+    uci set firewall.wg_allow_port.dest_port="$port" || return 1
+    uci set firewall.wg_allow_port.proto='udp' || return 1
+    uci set firewall.wg_allow_port.target='ACCEPT' || return 1
+    uci commit firewall || return 1
+}
+
+_wg_openwrt_write_allow_port_rc_local() {
+    local port="${1:-}" rc_block rc_file
+    validate_port "$port" || return 1
+    rc_file="$(_wg_openwrt_rc_local_path)"
+    _wg_rc_local_cleanup_managed_entries allow-port "$rc_file" || return 1
+    rc_block="# BEGIN server-manage wireguard allow-port\nnft insert rule inet fw4 input_wan udp dport ${port} counter accept comment \\\"wg_allow_port\\\" 2>/dev/null || true # wg_allow_port\n# END server-manage wireguard allow-port"
+    _wg_rc_local_insert_block "$rc_block" "$rc_file"
+}
+
+_wg_openwrt_apply_allow_port() {
+    local port="${1:-}" before_handles after_handles h
+    validate_port "$port" || { print_error "WireGuard UDP 端口无效: $port"; return 1; }
+    if ! nft list chain inet fw4 input_wan >/dev/null 2>&1; then
+        print_error "OpenWrt fw4 input_wan 链不存在，无法实时放行 ${port}/udp"
+        return 1
+    fi
+    before_handles=$(_wg_openwrt_allow_port_handles "$port" 2>/dev/null || true)
+    if ! nft insert rule inet fw4 input_wan udp dport "$port" counter accept comment "wg_allow_port" 2>/dev/null; then
+        print_error "OpenWrt nft 实时放行 ${port}/udp 失败"
+        return 1
+    fi
+    if ! _wg_openwrt_persist_allow_port "$port"; then
+        after_handles=$(_wg_openwrt_allow_port_handles "$port" 2>/dev/null || true)
+        for h in $after_handles; do
+            printf '%s\n' "$before_handles" | grep -Fxq -- "$h" || nft delete rule inet fw4 input_wan handle "$h" 2>/dev/null || true
+        done
+        return 1
+    fi
+    for h in $before_handles; do
+        nft delete rule inet fw4 input_wan handle "$h" 2>/dev/null || true
+    done
+    _wg_openwrt_delete_allow_port_rules_matching "$port" except
+    _wg_openwrt_write_allow_port_rc_local "$port" || print_warn "写入 /etc/rc.local 端口放行规则失败"
+    return 0
+}
+
+_wg_openwrt_rollback_server_modify() {
+    local old_port="${1:-}" old_dns="${2:-}" old_ep="${3:-}" old_lan="${4:-}" port_firewall_changed="${5:-false}"
+    validate_port "$old_port" || return 1
+    if [[ "$port_firewall_changed" == "true" ]]; then
+        _wg_openwrt_apply_allow_port "$old_port" >/dev/null 2>&1 || print_warn "回滚 OpenWrt 防火墙端口到 ${old_port}/udp 失败，请手动检查"
+    fi
+    if ! wg_db_set --argjson p "$old_port" \
+                  --arg d "$old_dns" \
+                  --arg e "$old_ep" \
+                  --arg l "${old_lan:-}" \
+                  '.server.port = $p | .server.dns = $d | .server.endpoint = $e | .server.server_lan_subnet = $l' >/dev/null 2>&1; then
+        print_warn "回滚 WireGuard 服务端数据库失败，请手动检查"
+        return 1
+    fi
+    _wg_update_peer_routes >/dev/null 2>&1 || true
+    wg_rebuild_uci_conf >/dev/null 2>&1 || true
+    wg_rebuild_conf >/dev/null 2>&1 || true
+    wg_regenerate_client_confs >/dev/null 2>&1 || true
+}
+
+_wg_openwrt_configure_server_uci() {
+    local server_privkey="${1:-}" server_ip="${2:-}" wg_mask="${3:-}" wg_port="${4:-}" mtu="${5:-}"
+    local snapshot_dir network_snapshot firewall_snapshot
+    snapshot_dir=$(mktemp -d "${TMPDIR:-/tmp}/${SCRIPT_NAME}-wg-server-uci.XXXXXX") || {
+        print_error "创建 OpenWrt UCI 配置快照目录失败"
+        return 1
+    }
+    chmod 700 "$snapshot_dir" 2>/dev/null || true
+    network_snapshot="${snapshot_dir}/network.uci"
+    firewall_snapshot="${snapshot_dir}/firewall.uci"
+    if ! uci export network > "$network_snapshot" 2>/dev/null; then
+        rm -rf "$snapshot_dir" 2>/dev/null || true
+        print_error "备份 OpenWrt network UCI 配置失败"
+        return 1
+    fi
+    if ! uci export firewall > "$firewall_snapshot" 2>/dev/null; then
+        rm -rf "$snapshot_dir" 2>/dev/null || true
+        print_error "备份 OpenWrt firewall UCI 配置失败"
+        return 1
+    fi
+    if ! _wg_openwrt_write_server_uci "$server_privkey" "$server_ip" "$wg_mask" "$wg_port" "$mtu"; then
+        print_error "OpenWrt 网络/防火墙 UCI 配置提交失败"
+        _wg_openwrt_restore_uci_package network "$network_snapshot" || true
+        _wg_openwrt_restore_uci_package firewall "$firewall_snapshot" || true
+        rm -rf "$snapshot_dir" 2>/dev/null || true
+        return 1
+    fi
+    rm -rf "$snapshot_dir" 2>/dev/null || true
+}
+
+_wg_openwrt_write_server_uci() {
+    local server_privkey="${1:-}" server_ip="${2:-}" wg_mask="${3:-}" wg_port="${4:-}" mtu="${5:-}"
+    uci set network.wg0=interface || return 1
+    uci set network.wg0.proto='wireguard' || return 1
+    uci set network.wg0.private_key="$server_privkey" || return 1
+    uci -q delete network.wg0.addresses 2>/dev/null || true
+    uci add_list network.wg0.addresses="${server_ip}/${wg_mask}" || return 1
+    uci set network.wg0.listen_port="$wg_port" || return 1
+    uci set network.wg0.mtu="$mtu" || return 1
+    uci set network.wg0.route_allowed_ips='1' || return 1
+
+    uci set firewall.wg_zone=zone || return 1
+    uci set firewall.wg_zone.name='wg' || return 1
+    uci set firewall.wg_zone.input='ACCEPT' || return 1
+    uci set firewall.wg_zone.output='ACCEPT' || return 1
+    uci set firewall.wg_zone.forward='ACCEPT' || return 1
+    uci set firewall.wg_zone.masq='1' || return 1
+    uci -q delete firewall.wg_zone.network 2>/dev/null || true
+    uci add_list firewall.wg_zone.network='wg0' || return 1
+    uci set firewall.wg_fwd_lan=forwarding || return 1
+    uci set firewall.wg_fwd_lan.src='lan' || return 1
+    uci set firewall.wg_fwd_lan.dest='wg' || return 1
+    uci set firewall.wg_fwd_wg=forwarding || return 1
+    uci set firewall.wg_fwd_wg.src='wg' || return 1
+    uci set firewall.wg_fwd_wg.dest='lan' || return 1
+
+    uci commit network || return 1
+    uci commit firewall || return 1
+}
+
+_wg_openwrt_snapshot_file() {
+    local src="${1:-}" dst="${2:-}" marker="${3:-}"
+    [[ -n "$src" && -n "$dst" && -n "$marker" ]] || return 1
+    [[ -e "$src" ]] || return 0
+    mkdir -p "$(dirname "$dst")" || return 1
+    cp -p "$src" "$dst" || return 1
+    : > "$marker"
+}
+
+_wg_openwrt_restore_snapshot_file() {
+    local dst="${1:-}" snap="${2:-}" marker="${3:-}"
+    [[ -n "$dst" && -n "$snap" && -n "$marker" ]] || return 0
+    if [[ -f "$marker" ]]; then
+        mkdir -p "$(dirname "$dst")" 2>/dev/null || true
+        cp -p "$snap" "$dst" 2>/dev/null || print_warn "恢复 $dst 失败，请手动检查。"
+    else
+        rm -f "$dst" 2>/dev/null || print_warn "删除新建文件 $dst 失败，请手动检查。"
+    fi
+}
+
+_wg_openwrt_snapshot_server_install() {
+    local snapshot_dir="${1:-}" rc_file sysctl_conf
+    [[ -n "$snapshot_dir" ]] || return 1
+    mkdir -p "$snapshot_dir" || return 1
+    if ! uci export network > "${snapshot_dir}/network.uci" 2>/dev/null; then
+        print_error "备份 OpenWrt network UCI 配置失败"
+        return 1
+    fi
+    if ! uci export firewall > "${snapshot_dir}/firewall.uci" 2>/dev/null; then
+        print_error "备份 OpenWrt firewall UCI 配置失败"
+        return 1
+    fi
+    rc_file="$(_wg_openwrt_rc_local_path)"
+    _wg_openwrt_snapshot_file "$WG_DB_FILE" "${snapshot_dir}/db" "${snapshot_dir}/db.exists" || return 1
+    _wg_openwrt_snapshot_file "$WG_ROLE_FILE" "${snapshot_dir}/role" "${snapshot_dir}/role.exists" || return 1
+    _wg_openwrt_snapshot_file "$WG_CONF" "${snapshot_dir}/conf" "${snapshot_dir}/conf.exists" || return 1
+    _wg_openwrt_snapshot_file "$WG_SHARED_ROUTE_STATE_FILE" "${snapshot_dir}/routes" "${snapshot_dir}/routes.exists" || return 1
+    _wg_openwrt_snapshot_file "$rc_file" "${snapshot_dir}/rc.local" "${snapshot_dir}/rc.local.exists" || return 1
+    sysctl_conf="$(_sysctl_conf_path)"
+    _wg_openwrt_snapshot_file "$sysctl_conf" "${snapshot_dir}/sysctl.conf" "${snapshot_dir}/sysctl.exists" || return 1
+    sysctl -n net.ipv4.ip_forward > "${snapshot_dir}/ip_forward.runtime" 2>/dev/null || true
+}
+
+_wg_openwrt_restore_uci_package() {
+    local pkg="${1:-}" snapshot="${2:-}"
+    [[ -n "$pkg" && -s "$snapshot" ]] || return 0
+    uci revert "$pkg" >/dev/null 2>&1 || true
+    if ! uci import "$pkg" < "$snapshot" >/dev/null 2>&1; then
+        print_warn "恢复 OpenWrt ${pkg} UCI 配置失败，请手动检查。"
+        return 1
+    fi
+    if ! uci commit "$pkg" >/dev/null 2>&1; then
+        print_warn "提交恢复后的 OpenWrt ${pkg} UCI 配置失败，请手动检查。"
+        return 1
+    fi
+}
+
+_wg_openwrt_rollback_server_install() {
+    local snapshot_dir="${1:-}" rollback_forward="${2:-false}" rc_file sysctl_conf ip_forward_runtime
+    [[ -n "$snapshot_dir" ]] || return 0
+    ifdown wg0 2>/dev/null || true
+    wg_mihomo_bypass_clean >/dev/null 2>&1 || true
+    _wg_openwrt_delete_allow_port_rules >/dev/null 2>&1 || true
+    rc_file="$(_wg_openwrt_rc_local_path)"
+    _wg_rc_local_cleanup_managed_entries all "$rc_file" >/dev/null 2>&1 || true
+
+    _wg_openwrt_restore_uci_package network "${snapshot_dir}/network.uci" || true
+    _wg_openwrt_restore_uci_package firewall "${snapshot_dir}/firewall.uci" || true
+    /etc/init.d/network reload >/dev/null 2>&1 || true
+    /etc/init.d/firewall reload >/dev/null 2>&1 || true
+
+    _wg_openwrt_restore_snapshot_file "$WG_DB_FILE" "${snapshot_dir}/db" "${snapshot_dir}/db.exists"
+    _wg_openwrt_restore_snapshot_file "$WG_ROLE_FILE" "${snapshot_dir}/role" "${snapshot_dir}/role.exists"
+    _wg_openwrt_restore_snapshot_file "$WG_CONF" "${snapshot_dir}/conf" "${snapshot_dir}/conf.exists"
+    _wg_openwrt_restore_snapshot_file "$WG_SHARED_ROUTE_STATE_FILE" "${snapshot_dir}/routes" "${snapshot_dir}/routes.exists"
+    _wg_openwrt_restore_snapshot_file "$rc_file" "${snapshot_dir}/rc.local" "${snapshot_dir}/rc.local.exists"
+    if [[ "$rollback_forward" == "true" ]]; then
+        sysctl_conf="$(_sysctl_conf_path)"
+        _wg_openwrt_restore_snapshot_file "$sysctl_conf" "${snapshot_dir}/sysctl.conf" "${snapshot_dir}/sysctl.exists"
+        ip_forward_runtime=$(cat "${snapshot_dir}/ip_forward.runtime" 2>/dev/null || true)
+        if [[ "$ip_forward_runtime" =~ ^[01]$ ]]; then
+            sysctl -w "net.ipv4.ip_forward=${ip_forward_runtime}" >/dev/null 2>&1 || true
+        elif [[ -f "$sysctl_conf" ]]; then
+            sysctl -p "$sysctl_conf" >/dev/null 2>&1 || true
+        fi
+    fi
+    rmdir "$(dirname "$WG_CONF")" 2>/dev/null || true
+}
+
 wg_server_install() {
     print_title "安装 WireGuard 服务端"
     if wg_is_installed && [[ "$(wg_get_role)" == "server" ]]; then
@@ -7991,19 +10722,32 @@ wg_server_install() {
     print_info "[2/7] 安装软件包..."
     wg_install_packages || { pause; return 1; }
 
+    local wg_install_snapshot_dir=""
+    local wg_forward_changed=false
+    wg_install_snapshot_dir=$(mktemp -d "${TMPDIR:-/tmp}/${SCRIPT_NAME}-wg-openwrt-install.XXXXXX") || {
+        print_error "创建 OpenWrt 安装回滚快照目录失败"
+        pause; return 1
+    }
+    if ! _wg_openwrt_snapshot_server_install "$wg_install_snapshot_dir"; then
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
+
     # ── [3/7] 配置 IP 转发 ──
     print_info "[3/7] 配置 IP 转发..."
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
-    if ! grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null; then
-        sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf 2>/dev/null
-        echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+    if ! _sysctl_enable_wireguard_forward; then
+        print_error "IP 转发配置失败"
+        _wg_openwrt_rollback_server_install "$wg_install_snapshot_dir" "$wg_forward_changed"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
     fi
+    wg_forward_changed=true
     print_success "IP 转发已开启"
 
     # ── [4/7] 配置服务端参数 ──
     print_info "[4/7] 配置服务端参数..."
 
-    local wg_port listen_addr mtu wg_dns wg_endpoint
+    local wg_port listen_addr mtu wg_dns wg_endpoint=""
     local wg_subnet="10.66.66.0/24"
     listen_addr="0.0.0.0"
     mtu=$WG_MTU_DIRECT
@@ -8039,7 +10783,7 @@ wg_server_install() {
     # 服务端 LAN 子网 (自动检测 br-lan)
     local server_lan_subnet=""
     local br_lan_addr
-    br_lan_addr=$(ip -4 addr show br-lan 2>/dev/null | grep -oP 'inet \K[0-9.]+/[0-9]+' | head -1)
+    br_lan_addr=$(ip -4 addr show br-lan 2>/dev/null | awk '/^[[:space:]]*inet[[:space:]]/ { print $2; exit }')
     if [[ -n "$br_lan_addr" ]]; then
         # 从 br-lan 地址推算网段 (如 10.10.100.1/24 → 10.10.100.0/24)
         local lan_ip lan_mask lan_prefix
@@ -8090,12 +10834,24 @@ wg_server_install() {
             done
         fi
     fi
+    if ! wg_endpoint=$(wg_shared_normalize_endpoint_host "$wg_endpoint"); then
+        print_error "公网端点无效，仅支持 IP 或域名"
+        _wg_openwrt_rollback_server_install "$wg_install_snapshot_dir" "$wg_forward_changed"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
 
     # ── [5/7] 生成密钥 ──
     print_info "[5/7] 生成服务端密钥..."
     local server_privkey server_pubkey
     server_privkey=$(wg genkey)
     server_pubkey=$(echo "$server_privkey" | wg pubkey)
+    if [[ -z "$server_privkey" || -z "$server_pubkey" ]]; then
+        print_error "WireGuard 服务端密钥生成失败"
+        _wg_openwrt_rollback_server_install "$wg_install_snapshot_dir" "$wg_forward_changed"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
     print_success "密钥已生成"
 
     # 服务器名称
@@ -8107,20 +10863,41 @@ wg_server_install() {
 
     # ── [6/7] 写入数据库 + 配置 OpenWrt 网络和防火墙 ──
     print_info "[6/7] 写入配置..."
-    wg_db_init
-    wg_set_role "server"
-    wg_db_set --arg sname "$server_name" \
-              --arg pk "$server_privkey" \
-              --arg pub "$server_pubkey" \
-              --arg ip "$server_ip" \
-              --arg sub "$wg_subnet" \
-              --arg port "$wg_port" \
-              --arg dns "$wg_dns" \
-              --arg ep "$wg_endpoint" \
-              --arg laddr "$listen_addr" \
-              --argjson mtu "$mtu" \
-              --arg ddns "${ddns_domain:-}" \
-              --arg lan "${server_lan_subnet:-}" \
+    # 配置 uci 网络接口
+    print_info "配置 OpenWrt 网络接口..."
+    local wg_mask
+    wg_mask=$(echo "$wg_subnet" | cut -d'/' -f2)
+    if ! _wg_openwrt_configure_server_uci "$server_privkey" "$server_ip" "$wg_mask" "$wg_port" "$mtu"; then
+        _wg_openwrt_rollback_server_install "$wg_install_snapshot_dir" "$wg_forward_changed"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
+
+    print_info "配置 OpenWrt 防火墙端口..."
+    if ! _wg_openwrt_apply_allow_port "$wg_port"; then
+        _wg_openwrt_rollback_server_install "$wg_install_snapshot_dir" "$wg_forward_changed"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
+
+    if ! wg_db_init; then
+        print_error "WireGuard 数据库初始化失败"
+        _wg_openwrt_rollback_server_install "$wg_install_snapshot_dir" "$wg_forward_changed"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
+    if ! wg_db_set --arg sname "$server_name" \
+                   --arg pk "$server_privkey" \
+                   --arg pub "$server_pubkey" \
+                   --arg ip "$server_ip" \
+                   --arg sub "$wg_subnet" \
+                   --arg port "$wg_port" \
+                   --arg dns "$wg_dns" \
+                   --arg ep "$wg_endpoint" \
+                   --arg laddr "$listen_addr" \
+                   --argjson mtu "$mtu" \
+                   --arg ddns "${ddns_domain:-}" \
+                   --arg lan "${server_lan_subnet:-}" \
     '.server = {
         name: $sname,
         private_key: $pk,
@@ -8134,69 +10911,54 @@ wg_server_install() {
         mtu: $mtu,
         ddns_domain: $ddns,
         server_lan_subnet: $lan
-    } | .schema_version = 2'
-
-    # 配置 uci 网络接口
-    print_info "配置 OpenWrt 网络接口..."
-    local wg_mask
-    wg_mask=$(echo "$wg_subnet" | cut -d'/' -f2)
-    uci set network.wg0=interface
-    uci set network.wg0.proto='wireguard'
-    uci set network.wg0.private_key="$server_privkey"
-    uci -q delete network.wg0.addresses 2>/dev/null
-    uci add_list network.wg0.addresses="${server_ip}/${wg_mask}"
-    uci set network.wg0.listen_port="$wg_port"
-    uci set network.wg0.mtu="$mtu"
-    uci set network.wg0.route_allowed_ips='1'
-
-    # 配置 uci 防火墙 zone + forwarding
-    print_info "配置 OpenWrt 防火墙..."
-    uci set firewall.wg_zone=zone
-    uci set firewall.wg_zone.name='wg'
-    uci set firewall.wg_zone.input='ACCEPT'
-    uci set firewall.wg_zone.output='ACCEPT'
-    uci set firewall.wg_zone.forward='ACCEPT'
-    uci set firewall.wg_zone.masq='1'
-    uci -q delete firewall.wg_zone.network 2>/dev/null
-    uci add_list firewall.wg_zone.network='wg0'
-    uci set firewall.wg_fwd_lan=forwarding
-    uci set firewall.wg_fwd_lan.src='lan'
-    uci set firewall.wg_fwd_lan.dest='wg'
-    uci set firewall.wg_fwd_wg=forwarding
-    uci set firewall.wg_fwd_wg.src='wg'
-    uci set firewall.wg_fwd_wg.dest='lan'
-
-    uci commit network
-    uci commit firewall
-
-    # nft 实时放行 WG UDP 端口 (不重启防火墙)
-    nft insert rule inet fw4 input_wan udp dport "$wg_port" counter accept comment \"wg_allow_port\" 2>/dev/null || true
-    # uci 持久化防火墙端口放行规则
-    uci set firewall.wg_allow_port=rule
-    uci set firewall.wg_allow_port.name='Allow-WG-UDP'
-    uci set firewall.wg_allow_port.src='wan'
-    uci set firewall.wg_allow_port.dest_port="$wg_port"
-    uci set firewall.wg_allow_port.proto='udp'
-    uci set firewall.wg_allow_port.target='ACCEPT'
-    uci commit firewall
+    } | .schema_version = 2'; then
+        print_error "WireGuard 数据库写入失败"
+        _wg_openwrt_rollback_server_install "$wg_install_snapshot_dir" "$wg_forward_changed"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
+    if ! wg_set_role "server"; then
+        print_error "WireGuard 角色写入失败"
+        _wg_openwrt_rollback_server_install "$wg_install_snapshot_dir" "$wg_forward_changed"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
 
     # 生成只读快照 wg0.conf
-    wg_rebuild_conf
+    if ! wg_rebuild_conf; then
+        print_error "生成 WireGuard 配置快照失败"
+        _wg_openwrt_rollback_server_install "$wg_install_snapshot_dir" "$wg_forward_changed"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
 
     # ── [7/7] Mihomo bypass + 启动 ──
     print_info "[7/7] 配置 Mihomo bypass 并启动..."
-    wg_setup_mihomo_bypass "$wg_subnet"
-    ifup wg0 2>/dev/null
+    if ! wg_setup_mihomo_bypass "$wg_subnet"; then
+        print_error "Mihomo bypass 配置失败"
+        _wg_openwrt_rollback_server_install "$wg_install_snapshot_dir" "$wg_forward_changed"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
+    if ! ifup wg0 2>/dev/null; then
+        print_error "启动 wg0 失败"
+        _wg_openwrt_rollback_server_install "$wg_install_snapshot_dir" "$wg_forward_changed"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
     sleep 2
     wg_sync_peer_routes
 
     # ── 安装结果展示 ──
     draw_line
-    if wg_is_running; then
-        print_success "WireGuard 服务端安装并启动成功！"
-    else
-        print_warn "WireGuard 已安装，但启动可能失败，请检查日志"
+    if ! wg_is_running; then
+        print_error "wg0 未运行，请检查 logread | grep netifd"
+        _wg_openwrt_rollback_server_install "$wg_install_snapshot_dir" "$wg_forward_changed"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
     fi
+    rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+    print_success "WireGuard 服务端安装并启动成功！"
     echo -e "  角色:       ${C_GREEN}服务端 (Server)${C_RESET}"
     echo -e "  监听地址:   ${C_GREEN}${listen_addr}:${wg_port}/udp${C_RESET}"
     echo -e "  MTU:        ${C_GREEN}${mtu}${C_RESET}"
@@ -8231,14 +10993,14 @@ wg_modify_server() {
     echo -e "  当前 DNS:   ${C_GREEN}${cur_dns}${C_RESET}"
     echo -e "  当前端点:   ${C_GREEN}${cur_ep}${C_RESET}"
     [[ -n "$cur_lan" && "$cur_lan" != "null" ]] && echo -e "  当前 LAN:   ${C_GREEN}${cur_lan}${C_RESET}"
-    local changed=false lan_changed=false
+    local changed=false lan_changed=false port_changed=false port_firewall_changed=false
 
     read -e -r -p "新监听端口 [${cur_port}]: " new_port
     new_port=${new_port:-$cur_port}
     if [[ "$new_port" != "$cur_port" ]]; then
         if validate_port "$new_port"; then
-            wg_db_set --argjson p "$new_port" '.server.port = $p'
             changed=true
+            port_changed=true
             print_info "端口将更改为 ${new_port}"
         else
             print_warn "端口无效，保持原值"
@@ -8249,7 +11011,6 @@ wg_modify_server() {
     read -e -r -p "新客户端 DNS [${cur_dns}]: " new_dns
     new_dns=${new_dns:-$cur_dns}
     if [[ "$new_dns" != "$cur_dns" ]]; then
-        wg_db_set --arg d "$new_dns" '.server.dns = $d'
         changed=true
         print_info "DNS 将更改为 ${new_dns}"
     fi
@@ -8257,9 +11018,13 @@ wg_modify_server() {
     read -e -r -p "新公网端点 [${cur_ep}]: " new_ep
     new_ep=${new_ep:-$cur_ep}
     if [[ "$new_ep" != "$cur_ep" ]]; then
-        wg_db_set --arg e "$new_ep" '.server.endpoint = $e'
-        changed=true
-        print_info "端点将更改为 ${new_ep}"
+        if ! new_ep=$(wg_shared_normalize_endpoint_host "$new_ep"); then
+            print_warn "端点无效，保持原值"
+            new_ep="$cur_ep"
+        else
+            changed=true
+            print_info "端点将更改为 ${new_ep}"
+        fi
     fi
 
     read -e -r -p "新服务端 LAN 子网 [${cur_lan:-无}]: " new_lan
@@ -8269,7 +11034,6 @@ wg_modify_server() {
             print_warn "LAN 子网格式无效，保持原值"
             new_lan="$cur_lan"
         else
-            wg_db_set --arg l "$new_lan" '.server.server_lan_subnet = $l'
             changed=true
             lan_changed=true
             print_info "LAN 子网将更改为 ${new_lan}"
@@ -8278,43 +11042,58 @@ wg_modify_server() {
 
     if [[ "$changed" != "true" ]]; then
         print_info "未做任何更改"
-        pause; return
+        pause; return 0
+    fi
+
+    if [[ "$port_changed" == "true" ]]; then
+        if ! _wg_openwrt_apply_allow_port "$new_port"; then
+            print_error "新 WireGuard UDP 端口未放行，已取消修改"
+            pause; return 1
+        fi
+        port_firewall_changed=true
+    fi
+
+    if ! wg_db_set --argjson p "$new_port" \
+                  --arg d "$new_dns" \
+                  --arg e "$new_ep" \
+                  --arg l "${new_lan:-}" \
+                  '.server.port = $p | .server.dns = $d | .server.endpoint = $e | .server.server_lan_subnet = $l'; then
+        print_error "WireGuard 数据库写入失败，正在回滚"
+        _wg_openwrt_rollback_server_modify "$cur_port" "$cur_dns" "$cur_ep" "$cur_lan" "$port_firewall_changed"
+        pause; return 1
     fi
 
     if [[ "$lan_changed" == "true" ]]; then
-        _wg_update_peer_routes
-        wg_mihomo_bypass_rebuild 2>/dev/null || true
+        if ! _wg_update_peer_routes; then
+            print_error "更新 peer 路由失败，正在回滚"
+            _wg_openwrt_rollback_server_modify "$cur_port" "$cur_dns" "$cur_ep" "$cur_lan" "$port_firewall_changed"
+            pause; return 1
+        fi
     fi
 
-    wg_rebuild_uci_conf
-    wg_rebuild_conf
-    wg_regenerate_client_confs
-
-    # 端口变更: 更新 nft 防火墙规则 + uci 持久化
-    if [[ "$new_port" != "$cur_port" ]]; then
-        # 删除旧端口 nft 规则
-        local h
-        for h in $(nft -a list chain inet fw4 input_wan 2>/dev/null | grep 'wg_allow_port' | awk '{print $NF}'); do
-            nft delete rule inet fw4 input_wan handle "$h" 2>/dev/null || true
-        done
-        # 添加新端口 nft 规则
-        nft insert rule inet fw4 input_wan udp dport "$new_port" counter accept comment \"wg_allow_port\" 2>/dev/null || true
-        # 更新 uci 持久化
-        uci set firewall.wg_allow_port.dest_port="$new_port"
-        uci commit firewall
-        # 更新 /etc/rc.local
-        sed -i '/wg_allow_port/d' /etc/rc.local 2>/dev/null || true
-        if grep -q "^exit 0" /etc/rc.local 2>/dev/null; then
-            sed -i "/^exit 0/i nft insert rule inet fw4 input_wan udp dport $new_port counter accept comment \\\"wg_allow_port\\\" 2>/dev/null || true" \
-                /etc/rc.local 2>/dev/null || true
-        else
-            echo "nft insert rule inet fw4 input_wan udp dport $new_port counter accept comment \"wg_allow_port\" 2>/dev/null || true" >> /etc/rc.local
-        fi
+    if ! wg_rebuild_uci_conf; then
+        print_error "重建 OpenWrt WireGuard UCI 配置失败，正在回滚"
+        _wg_openwrt_rollback_server_modify "$cur_port" "$cur_dns" "$cur_ep" "$cur_lan" "$port_firewall_changed"
+        pause; return 1
+    fi
+    if ! wg_rebuild_conf; then
+        print_error "生成 WireGuard 配置快照失败，正在回滚"
+        _wg_openwrt_rollback_server_modify "$cur_port" "$cur_dns" "$cur_ep" "$cur_lan" "$port_firewall_changed"
+        pause; return 1
+    fi
+    if ! wg_regenerate_client_confs; then
+        print_error "重生成客户端配置失败，正在回滚"
+        _wg_openwrt_rollback_server_modify "$cur_port" "$cur_dns" "$cur_ep" "$cur_lan" "$port_firewall_changed"
+        pause; return 1
     fi
 
     # LAN 子网或端口变更都需要重建 bypass (因为 bypass 包含所有子网)
     if [[ "$new_port" != "$cur_port" || "${new_lan:-}" != "${cur_lan:-}" ]]; then
-        wg_mihomo_bypass_rebuild
+        if ! wg_mihomo_bypass_rebuild; then
+            print_error "重建 Mihomo bypass/端口规则失败，正在回滚"
+            _wg_openwrt_rollback_server_modify "$cur_port" "$cur_dns" "$cur_ep" "$cur_lan" "$port_firewall_changed"
+            pause; return 1
+        fi
     fi
 
     print_success "服务端配置已更新"
@@ -8453,9 +11232,11 @@ wg_start() {
         wg_sync_peer_routes
         print_success "WireGuard 已启动"
         log_action "WireGuard started"
+        return 0
     else
         print_error "启动失败，请检查 logread | grep netifd"
         log_action "WireGuard start failed"
+        return 1
     fi
 }
 
@@ -8470,8 +11251,11 @@ wg_stop() {
     if ! wg_is_running; then
         print_success "WireGuard 已停止"
         log_action "WireGuard stopped"
+        return 0
     else
         print_error "停止失败"
+        log_action "WireGuard stop failed"
+        return 1
     fi
 }
 
@@ -8486,23 +11270,64 @@ wg_restart() {
         wg_sync_peer_routes
         print_success "WireGuard 已重启"
         log_action "WireGuard restarted"
+        return 0
     else
         print_error "重启失败"
         log_action "WireGuard restart failed"
+        return 1
     fi
 }
 
 # ── Mihomo bypass 函数 ──
 
+_wg_rc_local_cleanup_managed_entries() {
+    local kind="${1:-all}" rc_file="${2:-/etc/rc.local}" tmp_out rc_dir
+    case "$kind" in all|bypass|allow-port) ;; *) return 1 ;; esac
+    [[ -f "$rc_file" ]] || return 0
+    rc_dir="$(dirname "$rc_file")"
+    tmp_out=$(mktemp "${rc_dir}/.${SCRIPT_NAME}-wg-rc-clean.XXXXXX") || return 1
+    if awk -v kind="$kind" '
+        function marker_matches(line) {
+            if (kind == "all") return 1
+            return index(line, " " kind) > 0
+        }
+        /^# BEGIN server-manage wireguard / {
+            if (marker_matches($0)) { skip=1; next }
+        }
+        /^# END server-manage wireguard / {
+            if (skip) { skip=0; next }
+        }
+        skip { next }
+        kind != "allow-port" && /^# WireGuard bypass Mihomo/ { next }
+        kind != "allow-port" && /# wg_bypass[[:space:]]*$/ { next }
+        kind != "allow-port" && /# wg_peer_route[[:space:]]*$/ { next }
+        kind != "allow-port" && /# wg_ep_resolve[[:space:]]*$/ { next }
+        kind != "bypass" && /# wg_allow_port[[:space:]]*$/ { next }
+        kind != "bypass" && /nft insert rule inet fw4 input_wan udp dport .*comment .*wg_allow_port/ { next }
+        { print }
+    ' "$rc_file" > "$tmp_out"; then
+        chmod +x "$tmp_out" 2>/dev/null || true
+        mv "$tmp_out" "$rc_file" || { rm -f "$tmp_out"; return 1; }
+        chmod +x "$rc_file" 2>/dev/null || true
+        rm -f "$tmp_out"
+        return 0
+    fi
+    rm -f "$tmp_out"
+    return 1
+}
+
 _wg_rc_local_insert_block() {
     local rc_block="${1:-}" rc_file="${2:-/etc/rc.local}"
     [[ -n "$rc_block" ]] || return 1
-    local tmp_block tmp_out
-    tmp_block=$(mktemp "/tmp/${SCRIPT_NAME}-wg-rc-block.XXXXXX") || return 1
-    tmp_out=$(mktemp "/tmp/${SCRIPT_NAME}-wg-rc-local.XXXXXX") || { rm -f "$tmp_block"; return 1; }
+    local tmp_block tmp_out rc_dir
+    rc_dir="$(dirname "$rc_file")"
+    tmp_block=$(mktemp "${rc_dir}/.${SCRIPT_NAME}-wg-rc-block.XXXXXX") || return 1
+    tmp_out=$(mktemp "${rc_dir}/.${SCRIPT_NAME}-wg-rc-local.XXXXXX") || { rm -f "$tmp_block"; return 1; }
     if [[ ! -f "$rc_file" ]]; then
-        printf '#!/bin/sh\nexit 0\n' > "$rc_file" 2>/dev/null || { rm -f "$tmp_block" "$tmp_out"; return 1; }
-        chmod +x "$rc_file" 2>/dev/null || true
+        printf '#!/bin/sh\nexit 0\n' > "$tmp_out" 2>/dev/null || { rm -f "$tmp_block" "$tmp_out"; return 1; }
+        chmod 755 "$tmp_out" 2>/dev/null || true
+        mv "$tmp_out" "$rc_file" || { rm -f "$tmp_block" "$tmp_out"; return 1; }
+        tmp_out=$(mktemp "${rc_dir}/.${SCRIPT_NAME}-wg-rc-local.XXXXXX") || { rm -f "$tmp_block"; return 1; }
     fi
     printf '%b\n' "$rc_block" > "$tmp_block"
     if awk '
@@ -8511,7 +11336,8 @@ _wg_rc_local_insert_block() {
         { print }
         END { if (!inserted) printf "%s", block }
     ' "$tmp_block" "$rc_file" > "$tmp_out"; then
-        cat "$tmp_out" > "$rc_file"
+        chmod +x "$tmp_out" 2>/dev/null || true
+        mv "$tmp_out" "$rc_file" || { rm -f "$tmp_block" "$tmp_out"; return 1; }
         chmod +x "$rc_file" 2>/dev/null || true
         rm -f "$tmp_block" "$tmp_out"
         return 0
@@ -8559,16 +11385,18 @@ wg_setup_mihomo_bypass() {
     # wg0 接口流量跳过 Mihomo tproxy
     nft insert rule inet fw4 mangle_prerouting iifname \"wg0\" counter return comment \"wg_bypass_iface\" 2>/dev/null || true
     # 所有 VPN 相关子网跳过 Mihomo
-    local cidr
+    local cidr nft_family
     for cidr in "${unique_subnets[@]}"; do
-        nft insert rule inet fw4 mangle_prerouting ip daddr "$cidr" counter return comment \"wg_bypass_subnet\" 2>/dev/null || true
+        nft_family=$(nft_addr_family_for_cidr "$cidr")
+        nft insert rule inet fw4 mangle_prerouting "$nft_family" daddr "$cidr" counter return comment \"wg_bypass_subnet\" 2>/dev/null || true
     done
 
     # 持久化到 /etc/rc.local
-    sed -i '/wg_bypass/d; /WireGuard bypass/d; /wg_peer_route/d' /etc/rc.local 2>/dev/null || true
-    local rc_block="# WireGuard bypass Mihomo\nnft insert rule inet fw4 mangle_prerouting iifname \\\"wg0\\\" counter return comment \\\"wg_bypass_iface\\\" 2>/dev/null || true"
+    _wg_rc_local_cleanup_managed_entries bypass || print_warn "清理 /etc/rc.local 旧 bypass 规则失败"
+    local rc_block="# BEGIN server-manage wireguard bypass\n# WireGuard bypass Mihomo\nnft insert rule inet fw4 mangle_prerouting iifname \\\"wg0\\\" counter return comment \\\"wg_bypass_iface\\\" 2>/dev/null || true # wg_bypass"
     for cidr in "${unique_subnets[@]}"; do
-        rc_block="${rc_block}\nnft insert rule inet fw4 mangle_prerouting ip daddr \\\"${cidr}\\\" counter return comment \\\"wg_bypass_subnet\\\" 2>/dev/null || true"
+        nft_family=$(nft_addr_family_for_cidr "$cidr")
+        rc_block="${rc_block}\nnft insert rule inet fw4 mangle_prerouting ${nft_family} daddr \\\"${cidr}\\\" counter return comment \\\"wg_bypass_subnet\\\" 2>/dev/null || true"
     done
     # 网关 peer LAN 路由持久化 (proto-wireguard 不一定自动创建)
     local pc=$(wg_db_get '.peers | length' 2>/dev/null) pi=0
@@ -8586,6 +11414,7 @@ wg_setup_mihomo_bypass() {
         fi
         pi=$((pi + 1))
     done
+    rc_block="${rc_block}\n# END server-manage wireguard bypass"
     _wg_rc_local_insert_block "$rc_block" || print_warn "写入 /etc/rc.local 持久化规则失败"
 
     print_success "Mihomo bypass 规则已配置 (${#unique_subnets[@]} 个子网)"
@@ -8645,12 +11474,8 @@ wg_mihomo_bypass_clean() {
     for h in $(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print $NF}'); do
         nft delete rule inet fw4 mangle_prerouting handle "$h" 2>/dev/null || true
     done
-    # 清理 wg_allow_port
-    for h in $(nft -a list chain inet fw4 input_wan 2>/dev/null | grep 'wg_allow_port' | awk '{print $NF}'); do
-        nft delete rule inet fw4 input_wan handle "$h" 2>/dev/null || true
-    done
     # 清理 /etc/rc.local 中的持久化条目
-    sed -i '/wg_bypass/d; /wg_allow_port/d; /wg_peer_route/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null || true
+    _wg_rc_local_cleanup_managed_entries bypass || true
 }
 
 wg_mihomo_bypass_rebuild() {
@@ -8659,31 +11484,13 @@ wg_mihomo_bypass_rebuild() {
     wg_port=$(wg_db_get '.server.port')
     [[ -z "$wg_subnet" || "$wg_subnet" == "null" ]] && return 1
 
-    wg_setup_mihomo_bypass "$wg_subnet"
+    wg_setup_mihomo_bypass "$wg_subnet" || return 1
 
     # 重建端口放行规则
     if [[ -n "$wg_port" && "$wg_port" != "null" ]]; then
-        # 先清理旧的 nft 规则
-        local h
-        for h in $(nft -a list chain inet fw4 input_wan 2>/dev/null | grep 'wg_allow_port' | awk '{print $NF}'); do
-            nft delete rule inet fw4 input_wan handle "$h" 2>/dev/null || true
-        done
-        nft insert rule inet fw4 input_wan udp dport "$wg_port" counter accept comment \"wg_allow_port\" 2>/dev/null || true
-        # 持久化到 /etc/rc.local
-        sed -i '/wg_allow_port/d' /etc/rc.local 2>/dev/null || true
-        local rc_block="nft insert rule inet fw4 input_wan udp dport ${wg_port} counter accept comment \\\"wg_allow_port\\\" 2>/dev/null || true"
-        _wg_rc_local_insert_block "$rc_block" || print_warn "写入 /etc/rc.local 端口放行规则失败"
-        # uci 持久化防火墙规则
-        if ! uci -q get firewall.wg_allow_port &>/dev/null; then
-            uci set firewall.wg_allow_port=rule
-            uci set firewall.wg_allow_port.name='Allow-WG-UDP'
-            uci set firewall.wg_allow_port.src='wan'
-            uci set firewall.wg_allow_port.dest_port="$wg_port"
-            uci set firewall.wg_allow_port.proto='udp'
-            uci set firewall.wg_allow_port.target='ACCEPT'
-            uci commit firewall
-        fi
+        _wg_openwrt_apply_allow_port "$wg_port" || return 1
     fi
+    return 0
 }
 
 # ── 卸载 ──
@@ -8709,10 +11516,7 @@ wg_uninstall() {
     ifdown wg0 2>/dev/null || true
     ifdown wg_mesh 2>/dev/null || true
     local _wg_ifaces
-    _wg_ifaces=$(ip -o link show type wireguard 2>/dev/null | awk -F': ' '{print $2}' | tr -d ' ')
-    if [[ -z "$_wg_ifaces" ]]; then
-        _wg_ifaces=$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^wg[0-9_-]|^wg_' | tr -d ' ')
-    fi
+    _wg_ifaces=$(_wg_openwrt_list_wireguard_ifaces | tr '\n' ' ')
     for _must in "$WG_INTERFACE" wg_mesh wg-mesh; do
         if ip link show "$_must" &>/dev/null && ! echo "$_wg_ifaces" | grep -qw "$_must"; then
             _wg_ifaces="${_wg_ifaces:+$_wg_ifaces $_must}"
@@ -8753,18 +11557,26 @@ wg_uninstall() {
         fi
         _fwi=$((_fwi + 1))
     done
-    uci commit network 2>/dev/null || true
-    uci commit firewall 2>/dev/null || true
+    if ! uci commit network; then
+        print_error "提交 OpenWrt network 清理失败，已中止卸载。请修复 UCI 后重试，避免本地状态先被删除。"
+        pause; return 1
+    fi
+    if ! uci commit firewall; then
+        print_error "提交 OpenWrt firewall 清理失败，已中止卸载。请修复 UCI 后重试，避免本地状态先被删除。"
+        pause; return 1
+    fi
 
     print_info "[3/6] 清理 Mihomo bypass 和 nft 规则..."
     wg_mihomo_bypass_clean
     # 旧版 prio 100 策略路由没有可验证标记，不能粗暴删除第三方规则。
 
     print_info "[4/6] 清理看门狗和定时任务..."
-    if crontab -l 2>/dev/null | grep -q "wg-watchdog.sh"; then
-        cron_remove_job "wg-watchdog.sh"
-    fi
-    rm -f /usr/bin/wg-watchdog.sh /usr/local/bin/wg-watchdog.sh /var/log/wg-watchdog.log 2>/dev/null || true
+    cron_remove_job_command "/usr/bin/wg-watchdog.sh" 2>/dev/null || true
+    cron_remove_job_command "/usr/local/bin/wg-watchdog.sh" 2>/dev/null || true
+    rm -f /usr/bin/wg-watchdog.sh /usr/local/bin/wg-watchdog.sh \
+          /var/log/wg-watchdog.log /var/run/server-manage/wg-watchdog.log \
+          /var/run/server-manage/.wg-watchdog-log.* \
+          /tmp/wg-watchdog.log /tmp/wg-watchdog.log.tmp 2>/dev/null || true
 
     print_info "[5/6] 删除配置文件..."
     rm -f "$WG_CONF" 2>/dev/null || true
@@ -8784,8 +11596,7 @@ wg_uninstall() {
 
     if [[ "$role" == "server" ]]; then
         if confirm "是否恢复 IP 转发设置? (如果其他服务需要转发请选 N)"; then
-            sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf 2>/dev/null || true
-            sysctl -w net.ipv4.ip_forward=0 >/dev/null 2>&1 || true
+            _sysctl_disable_wireguard_forward || print_warn "恢复 IP 转发设置失败，请手动检查 /etc/sysctl.conf"
         fi
     fi
 
@@ -8802,9 +11613,26 @@ wg_openwrt_clean_cmd() {
     draw_line
     cat << 'CLEANEOF'
 # === 停止所有 WireGuard 接口 ===
+die() { echo "[!] $*" >&2; exit 1; }
+list_wg_ifaces() {
+    ip link show type wireguard 2>/dev/null | awk '
+        /^[0-9]+:/ {
+            name=$0
+            sub(/^[0-9]+:[[:space:]]*/, "", name)
+            sub(/:.*/, "", name)
+            sub(/@.*/, "", name)
+            current=name
+            next
+        }
+        /link\/none/ && current != "" {
+            print current
+            current=""
+        }
+    '
+}
 ifdown wg0 2>/dev/null; true
 ifdown wg_mesh 2>/dev/null; true
-for iface in $(ip -o link show type wireguard 2>/dev/null | awk -F': ' '{print $2}'); do
+for iface in $(list_wg_ifaces); do
     ip link set "$iface" down 2>/dev/null; true
     ip link delete "$iface" 2>/dev/null; true
     echo "[+] 已删除接口: $iface"
@@ -8819,7 +11647,7 @@ done
 
 # === 清理看门狗 ===
 rm -f /usr/bin/wg-watchdog.sh 2>/dev/null; true
-(crontab -l 2>/dev/null | grep -v wg-watchdog) | crontab - 2>/dev/null; true
+(crontab -l 2>/dev/null | awk '$6 != "/usr/bin/wg-watchdog.sh"') | crontab - 2>/dev/null; true
 /etc/init.d/cron restart 2>/dev/null; true
 echo '[+] 看门狗已清理'
 
@@ -8871,11 +11699,31 @@ done
 for h in $(nft -a list chain inet fw4 input_wan 2>/dev/null | grep 'wg_allow_port' | awk '{print $NF}'); do
     nft delete rule inet fw4 input_wan handle "$h" 2>/dev/null; true
 done
-sed -i '/wg_bypass/d; /wg_allow_port/d; /WireGuard bypass/d' /etc/rc.local 2>/dev/null; true
+if [ -f /etc/rc.local ]; then
+    WG_RC_TMP="$(mktemp /etc/.rc.local.clean.XXXXXX 2>/dev/null)" || { echo '[!] 创建 rc.local 清理临时文件失败' >&2; exit 1; }
+    if awk '
+        /^# BEGIN server-manage wireguard / { skip=1; next }
+        /^# END server-manage wireguard / { skip=0; next }
+        skip { next }
+        /^# WireGuard bypass Mihomo/ { next }
+        /# wg_bypass[[:space:]]*$/ { next }
+        /# wg_peer_route[[:space:]]*$/ { next }
+        /# wg_ep_resolve[[:space:]]*$/ { next }
+        /# wg_allow_port[[:space:]]*$/ { next }
+        /nft insert rule inet fw4 input_wan udp dport .*comment .*wg_allow_port/ { next }
+        { print }
+    ' /etc/rc.local > "$WG_RC_TMP"; then
+        chmod +x "$WG_RC_TMP" 2>/dev/null && mv "$WG_RC_TMP" /etc/rc.local || { rm -f "$WG_RC_TMP"; die "安装清理后的 /etc/rc.local 失败"; }
+    else
+        rm -f "$WG_RC_TMP"
+        die "生成清理后的 /etc/rc.local 失败"
+    fi
+    rm -f "$WG_RC_TMP"
+fi
 
 # === 提交配置 ===
-uci commit network
-uci commit firewall
+uci commit network || die "提交 network 清理失败"
+uci commit firewall || die "提交 firewall 清理失败"
 
 # === 最终验证 ===
 echo ''
@@ -8889,6 +11737,26 @@ CLEANEOF
     echo -e "${C_CYAN}执行后可在 LuCI -> Network -> Interfaces 确认 wg0 已消失${C_RESET}"
     pause
 }
+_wg_openwrt_snapshot_db() {
+    [[ -f "$WG_DB_FILE" ]] || return 1
+    cat "$WG_DB_FILE"
+}
+
+_wg_openwrt_restore_peer_snapshot() {
+    local snapshot="${1:-}" cleanup_file="${2:-}" rebuild_bypass="${3:-false}"
+    [[ -n "$snapshot" ]] || return 1
+    wg_write_private_file "$WG_DB_FILE" "$snapshot" || return 1
+    wg_rebuild_uci_conf "no_reload" >/dev/null 2>&1 || true
+    wg_apply_runtime_conf >/dev/null 2>&1 || true
+    wg_regenerate_client_confs >/dev/null 2>&1 || true
+    if [[ -n "$cleanup_file" ]]; then
+        rm -f -- "$cleanup_file" 2>/dev/null || true
+    fi
+    if [[ "$rebuild_bypass" == "true" ]]; then
+        wg_mihomo_bypass_rebuild >/dev/null 2>&1 || true
+    fi
+}
+
 wg_add_peer() {
     wg_check_server || return 1
     print_title "添加 WireGuard 设备 (Peer)"
@@ -8906,9 +11774,9 @@ wg_add_peer() {
     peer_ip=$(wg_next_ip) || { pause; return 1; }
     echo -e "  分配 IP: ${C_GREEN}${peer_ip}${C_RESET}"
     local peer_privkey peer_pubkey psk
-    peer_privkey=$(wg genkey)
-    peer_pubkey=$(echo "$peer_privkey" | wg pubkey)
-    psk=$(wg genpsk)
+    peer_privkey=$(wg genkey) || { print_error "生成 peer 私钥失败"; pause; return 1; }
+    peer_pubkey=$(printf '%s\n' "$peer_privkey" | wg pubkey) || { print_error "生成 peer 公钥失败"; pause; return 1; }
+    psk=$(wg genpsk) || { print_error "生成预共享密钥失败"; pause; return 1; }
 
     # ── 设备类型选择 (三种) ──
     local peer_type="standard"
@@ -9039,44 +11907,23 @@ wg_add_peer() {
         esac
     fi
 
-    # ── 生成客户端配置文件 ──
-    local spub sep sport sdns mask
-    spub=$(wg_db_get '.server.public_key')
-    sep=$(wg_db_get '.server.endpoint')
-    sport=$(wg_db_get '.server.port')
-    sdns=$(wg_db_get '.server.dns')
-    mask=$(echo "$server_subnet" | cut -d'/' -f2)
-    local dns_line=""
-    [[ "$is_gateway" != "true" ]] && dns_line="DNS = ${sdns}"
-    local client_conf="[Interface]
-PrivateKey = ${peer_privkey}
-Address = ${peer_ip}/${mask}
-${dns_line}
-[Peer]
-PublicKey = ${spub}
-PresharedKey = ${psk}
-Endpoint = ${sep}:${sport}
-AllowedIPs = ${client_allowed_ips}
-PersistentKeepalive = 25"
-    client_conf=$(echo "$client_conf" | sed '/^$/N;/^\n$/d')
-    mkdir -p /etc/wireguard/clients
     local conf_file="/etc/wireguard/clients/${peer_name}.conf"
-    write_file_atomic "$conf_file" "$client_conf"
-    chmod 600 "$conf_file"
+    local db_snapshot
+    db_snapshot=$(_wg_openwrt_snapshot_db) || { print_error "读取 WireGuard 数据库快照失败"; pause; return 1; }
 
     # ── 写入数据库 ──
     local now; now=$(date '+%Y-%m-%d %H:%M:%S')
-    wg_db_set --arg name "$peer_name" \
-              --arg ip "$peer_ip" \
-              --arg privkey "$peer_privkey" \
-              --arg pubkey "$peer_pubkey" \
-              --arg psk "$psk" \
-              --arg allowed "$client_allowed_ips" \
-              --arg created "$now" \
-              --arg gw "$is_gateway" \
-              --arg lans "$lan_subnets" \
-              --arg ptype "$peer_type" \
-              --arg route_mode "$route_mode" \
+    if ! wg_db_set --arg name "$peer_name" \
+                   --arg ip "$peer_ip" \
+                   --arg privkey "$peer_privkey" \
+                   --arg pubkey "$peer_pubkey" \
+                   --arg psk "$psk" \
+                   --arg allowed "$client_allowed_ips" \
+                   --arg created "$now" \
+                   --arg gw "$is_gateway" \
+                   --arg lans "$lan_subnets" \
+                   --arg ptype "$peer_type" \
+                   --arg route_mode "$route_mode" \
     '.peers += [{
         name: $name,
         ip: $ip,
@@ -9090,21 +11937,44 @@ PersistentKeepalive = 25"
         lan_subnets: $lans,
         peer_type: $ptype,
         route_mode: $route_mode
-    }]'
+    }]'; then
+        print_error "数据库写入失败，设备未添加"
+        pause; return 1
+    fi
 
     # ── 网关设备: 联动更新其他 peer 的 allowed_ips ──
     if [[ "$is_gateway" == "true" && -n "$lan_subnets" ]]; then
-        _wg_update_peer_routes
+        if ! _wg_update_peer_routes; then
+            print_error "联动更新客户端路由失败，正在回滚"
+            _wg_openwrt_restore_peer_snapshot "$db_snapshot" "$conf_file" true
+            pause; return 1
+        fi
     fi
 
     # ── 重建配置并应用 ──
-    wg_rebuild_uci_conf "no_reload"
-    wg_apply_runtime_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
-    wg_regenerate_client_confs
+    if ! wg_rebuild_uci_conf "no_reload"; then
+        print_error "重建 OpenWrt WireGuard UCI 配置失败，正在回滚"
+        _wg_openwrt_restore_peer_snapshot "$db_snapshot" "$conf_file" "$is_gateway"
+        pause; return 1
+    fi
+    if ! wg_apply_runtime_conf; then
+        print_error "WireGuard 运行配置热应用失败，正在回滚"
+        _wg_openwrt_restore_peer_snapshot "$db_snapshot" "$conf_file" "$is_gateway"
+        pause; return 1
+    fi
+    if ! wg_regenerate_client_confs; then
+        print_error "重生成客户端配置失败，正在回滚"
+        _wg_openwrt_restore_peer_snapshot "$db_snapshot" "$conf_file" "$is_gateway"
+        pause; return 1
+    fi
 
     # 网关 peer 添加/删除会改变 LAN 子网列表，需重建 Mihomo bypass
     if [[ "$is_gateway" == "true" ]]; then
-        wg_mihomo_bypass_rebuild 2>/dev/null
+        if ! wg_mihomo_bypass_rebuild; then
+            print_error "重建 Mihomo bypass/端口规则失败，正在回滚"
+            _wg_openwrt_restore_peer_snapshot "$db_snapshot" "$conf_file" true
+            pause; return 1
+        fi
     fi
 
     # ── 结果展示 ──
@@ -9182,22 +12052,23 @@ _wg_update_peer_routes() {
             local _new="$server_subnet"
             [[ -n "$server_lan" && "$server_lan" != "null" ]] && _new="${_new}, ${server_lan}"
             [[ -n "$_other" ]] && _new="${_new}, ${_other}"
-            wg_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a'
+            wg_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a' || return 1
         elif [[ "$_ptype" == "clash" ]]; then
             # Clash: VPN 子网 + 服务端 LAN + 所有网关 LAN
             local _new="$server_subnet"
             [[ -n "$server_lan" && "$server_lan" != "null" ]] && _new="${_new}, ${server_lan}"
             [[ -n "$_all_lans" ]] && _new="${_new}, ${_all_lans}"
-            wg_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a'
+            wg_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a' || return 1
         else
             # 标准: VPN 子网 + 服务端 LAN + 所有网关 LAN
             local _new="$server_subnet"
             [[ -n "$server_lan" && "$server_lan" != "null" ]] && _new="${_new}, ${server_lan}"
             [[ -n "$_all_lans" ]] && _new="${_new}, ${_all_lans}"
-            wg_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a'
+            wg_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a' || return 1
         fi
         _pi=$((_pi + 1))
     done
+    return 0
 }
 
 wg_toggle_peer() {
@@ -9205,26 +12076,46 @@ wg_toggle_peer() {
     print_title "启用/禁用 WireGuard 设备"
     wg_select_peer "选择要切换状态的设备序号" true || return
     local target_idx=$REPLY
-    local target_name target_pubkey current_state
+    local target_name current_state
     target_name=$(wg_db_get ".peers[$target_idx].name")
-    target_pubkey=$(wg_db_get ".peers[$target_idx].public_key")
     current_state=$(wg_db_get ".peers[$target_idx].enabled")
+    local db_snapshot
+    db_snapshot=$(_wg_openwrt_snapshot_db) || { print_error "读取 WireGuard 数据库快照失败"; pause; return 1; }
     if [[ "$current_state" == "true" ]]; then
         if confirm "确认禁用设备 '${target_name}'？"; then
-            wg_db_set --argjson idx "$target_idx" '.peers[$idx].enabled = false'
-            if wg_is_running; then
-                wg set "$WG_INTERFACE" peer "$target_pubkey" remove 2>/dev/null || true
+            if ! wg_db_set --argjson idx "$target_idx" '.peers[$idx].enabled = false'; then
+                print_error "数据库写入失败，设备状态未修改"
+                pause; return 1
             fi
-            wg_rebuild_uci_conf "no_reload"
-            wg_apply_runtime_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
+            if ! wg_rebuild_uci_conf "no_reload"; then
+                print_error "重建 OpenWrt WireGuard UCI 配置失败，正在回滚"
+                _wg_openwrt_restore_peer_snapshot "$db_snapshot"
+                pause; return 1
+            fi
+            if ! wg_apply_runtime_conf; then
+                print_error "WireGuard 运行配置热应用失败，正在回滚"
+                _wg_openwrt_restore_peer_snapshot "$db_snapshot"
+                pause; return 1
+            fi
             print_success "设备 '${target_name}' 已禁用"
             log_action "WireGuard peer disabled: ${target_name}"
         fi
     else
         if confirm "确认启用设备 '${target_name}'？"; then
-            wg_db_set --argjson idx "$target_idx" '.peers[$idx].enabled = true'
-            wg_rebuild_uci_conf "no_reload"
-            wg_apply_runtime_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
+            if ! wg_db_set --argjson idx "$target_idx" '.peers[$idx].enabled = true'; then
+                print_error "数据库写入失败，设备状态未修改"
+                pause; return 1
+            fi
+            if ! wg_rebuild_uci_conf "no_reload"; then
+                print_error "重建 OpenWrt WireGuard UCI 配置失败，正在回滚"
+                _wg_openwrt_restore_peer_snapshot "$db_snapshot"
+                pause; return 1
+            fi
+            if ! wg_apply_runtime_conf; then
+                print_error "WireGuard 运行配置热应用失败，正在回滚"
+                _wg_openwrt_restore_peer_snapshot "$db_snapshot"
+                pause; return 1
+            fi
             print_success "设备 '${target_name}' 已启用"
             log_action "WireGuard peer enabled: ${target_name}"
         fi
@@ -9237,32 +12128,54 @@ wg_delete_peer() {
     print_title "删除 WireGuard 设备"
     wg_select_peer "选择要删除的设备序号" true || return
     local target_idx=$REPLY
-    local target_name target_pubkey
+    local target_name
     target_name=$(wg_db_get ".peers[$target_idx].name")
-    target_pubkey=$(wg_db_get ".peers[$target_idx].public_key")
     if ! confirm "确认删除设备 '${target_name}'？"; then
         return
     fi
-    if wg_is_running; then
-        wg set "$WG_INTERFACE" peer "$target_pubkey" remove 2>/dev/null || true
-    fi
     local _del_gw=$(wg_db_get ".peers[$target_idx].is_gateway // false")
     local _del_lans=$(wg_db_get ".peers[$target_idx].lan_subnets // empty")
-    wg_db_set --argjson idx "$target_idx" 'del(.peers[$idx])'
+    local conf_file="/etc/wireguard/clients/${target_name}.conf"
+    local db_snapshot
+    db_snapshot=$(_wg_openwrt_snapshot_db) || { print_error "读取 WireGuard 数据库快照失败"; pause; return 1; }
+    if ! wg_db_set --argjson idx "$target_idx" 'del(.peers[$idx])'; then
+        print_error "数据库写入失败，设备未删除"
+        pause; return 1
+    fi
 
     # 网关删除后联动更新其他 peer
     if [[ "$_del_gw" == "true" && -n "$_del_lans" && "$_del_lans" != "null" ]]; then
-        _wg_update_peer_routes
+        if ! _wg_update_peer_routes; then
+            print_error "联动更新客户端路由失败，正在回滚"
+            _wg_openwrt_restore_peer_snapshot "$db_snapshot" "" true
+            pause; return 1
+        fi
     fi
 
-    rm -f "/etc/wireguard/clients/${target_name}.conf"
-    wg_rebuild_uci_conf "no_reload"
-    wg_apply_runtime_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
-    wg_regenerate_client_confs
+    if ! wg_rebuild_uci_conf "no_reload"; then
+        print_error "重建 OpenWrt WireGuard UCI 配置失败，正在回滚"
+        _wg_openwrt_restore_peer_snapshot "$db_snapshot" "" "$_del_gw"
+        pause; return 1
+    fi
+    if ! wg_apply_runtime_conf; then
+        print_error "WireGuard 运行配置热应用失败，正在回滚"
+        _wg_openwrt_restore_peer_snapshot "$db_snapshot" "" "$_del_gw"
+        pause; return 1
+    fi
+    rm -f -- "$conf_file" 2>/dev/null || print_warn "删除客户端配置文件失败: $conf_file"
+    if ! wg_regenerate_client_confs; then
+        print_error "重生成客户端配置失败，正在回滚"
+        _wg_openwrt_restore_peer_snapshot "$db_snapshot" "" "$_del_gw"
+        pause; return 1
+    fi
 
     # 网关 peer 删除后 LAN 子网列表变化，需重建 Mihomo bypass
     if [[ "$_del_gw" == "true" ]]; then
-        wg_mihomo_bypass_rebuild 2>/dev/null
+        if ! wg_mihomo_bypass_rebuild; then
+            print_error "重建 Mihomo bypass/端口规则失败，正在回滚"
+            _wg_openwrt_restore_peer_snapshot "$db_snapshot" "" true
+            pause; return 1
+        fi
     fi
 
     print_success "设备 '${target_name}' 已删除"
@@ -9345,13 +12258,14 @@ _wg_show_openwrt_deploy() {
     sport=$(wg_db_get '.server.port')
     ssub=$(wg_db_get '.server.subnet')
     mask=$(echo "$ssub" | cut -d'/' -f2)
-    local ep_host="$sep"
+    local ep_host
+    ep_host=$(wg_shared_endpoint_host "$sep")
 
     local uci_allowed_lines=""
     local IFS_BAK="$IFS"; IFS=','
     for cidr in $client_allowed_ips; do
         cidr=$(echo "$cidr" | xargs)
-        [[ -n "$cidr" ]] && uci_allowed_lines="${uci_allowed_lines}uci add_list network.wg_server.allowed_ips='${cidr}'
+        [[ -n "$cidr" ]] && uci_allowed_lines="${uci_allowed_lines}uci add_list network.wg_server.allowed_ips='${cidr}' || return 1
 "
     done
     IFS="$IFS_BAK"
@@ -9363,16 +12277,84 @@ _wg_show_openwrt_deploy() {
     cat << OPENWRT_EOF
 
 # === 清理旧配置 ===
+die() { echo "[!] \$*" >&2; exit 1; }
+WG_UCI_SNAPSHOT_DIR=""
+restore_uci_snapshots() {
+    [ -n "\$WG_UCI_SNAPSHOT_DIR" ] || return 0
+    if [ -s "\$WG_UCI_SNAPSHOT_DIR/network.uci" ]; then
+        uci revert network >/dev/null 2>&1 || true
+        uci import network < "\$WG_UCI_SNAPSHOT_DIR/network.uci" >/dev/null 2>&1 || true
+        uci commit network >/dev/null 2>&1 || true
+    fi
+    if [ -s "\$WG_UCI_SNAPSHOT_DIR/firewall.uci" ]; then
+        uci revert firewall >/dev/null 2>&1 || true
+        uci import firewall < "\$WG_UCI_SNAPSHOT_DIR/firewall.uci" >/dev/null 2>&1 || true
+        uci commit firewall >/dev/null 2>&1 || true
+    fi
+}
+cleanup_uci_snapshots() {
+    [ -n "\$WG_UCI_SNAPSHOT_DIR" ] && rm -rf "\$WG_UCI_SNAPSHOT_DIR" 2>/dev/null; true
+}
+die_restore() {
+    msg="\$1"
+    restore_uci_snapshots
+    cleanup_uci_snapshots
+    die "\$msg"
+}
+WG_UCI_SNAPSHOT_DIR="\$(mktemp -d /tmp/server-manage-wg-deploy-uci.XXXXXX 2>/dev/null)" || die "创建 UCI 回滚快照目录失败"
+chmod 700 "\$WG_UCI_SNAPSHOT_DIR" 2>/dev/null || true
+uci export network > "\$WG_UCI_SNAPSHOT_DIR/network.uci" 2>/dev/null || die_restore "备份 network UCI 失败"
+uci export firewall > "\$WG_UCI_SNAPSHOT_DIR/firewall.uci" 2>/dev/null || die_restore "备份 firewall UCI 失败"
+list_wg_ifaces() {
+    ip link show type wireguard 2>/dev/null | awk '
+        /^[0-9]+:/ {
+            name=\$0
+            sub(/^[0-9]+:[[:space:]]*/, "", name)
+            sub(/:.*/, "", name)
+            sub(/@.*/, "", name)
+            current=name
+            next
+        }
+        /link\\/none/ && current != "" {
+            print current
+            current=""
+        }
+    '
+}
+wg_resolve_real() {
+    WG_RESOLVE_HOST="\$1"
+    WG_RESOLVE_DNS="\$2"
+    nslookup "\$WG_RESOLVE_HOST" "\$WG_RESOLVE_DNS" 2>/dev/null | awk '
+        /^Name:/ { seen_name=1; next }
+        seen_name && /^Address[[:space:]][0-9]+:/ {
+            ip=\$3
+            if (ip !~ /^(198\\.18\\.|198\\.19\\.)/) { print ip; exit }
+            next
+        }
+        seen_name && /^Address:/ {
+            ip=\$2
+            sub(/#.*/, "", ip)
+            if (ip !~ /^(198\\.18\\.|198\\.19\\.)/) { print ip; exit }
+            next
+        }
+    '
+}
 ifdown wg0 2>/dev/null; true
-for iface in \$(ip -o link show type wireguard 2>/dev/null | awk -F': ' '{print \$2}'); do
+for iface in \$(list_wg_ifaces); do
     ip link set "\$iface" down 2>/dev/null; true
     ip link delete "\$iface" 2>/dev/null; true
 done
 for iface in wg0 wg_mesh wg-mesh; do
     ip link show "\$iface" >/dev/null 2>&1 && { ip link set "\$iface" down; ip link delete "\$iface"; } 2>/dev/null; true
 done
-rm -f /usr/bin/wg-watchdog.sh 2>/dev/null; true
-(crontab -l 2>/dev/null | grep -v wg-watchdog) | crontab - 2>/dev/null; true
+rm -f /usr/bin/wg-watchdog.sh /var/run/server-manage/wg-watchdog.log /var/run/server-manage/.wg-watchdog-log.* /tmp/wg-watchdog.log /tmp/wg-watchdog.log.tmp 2>/dev/null; true
+WG_CRON_TMP="\$(mktemp /tmp/.wg-watchdog-cron.XXXXXX 2>/dev/null)" && {
+    crontab -l 2>/dev/null | awk '\$6 != "/usr/bin/wg-watchdog.sh"' > "\$WG_CRON_TMP"
+    mkdir -p /etc/crontabs 2>/dev/null
+    cp "\$WG_CRON_TMP" /etc/crontabs/root 2>/dev/null
+    chmod 600 /etc/crontabs/root 2>/dev/null
+    rm -f "\$WG_CRON_TMP"
+}; true
 /etc/init.d/wg-client disable 2>/dev/null; true
 rm -f /etc/init.d/wg-client 2>/dev/null; true
 while uci -q get network.@wireguard_wg0[0] >/dev/null 2>&1; do uci delete network.@wireguard_wg0[0]; done
@@ -9390,9 +12372,40 @@ done
 for h in \$(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print \$NF}'); do
     nft delete rule inet fw4 mangle_prerouting handle "\$h" 2>/dev/null; true
 done
-sed -i '/wg_bypass/d; /WireGuard bypass/d; /ip rule.*prio 100/d' /etc/rc.local 2>/dev/null; true
-uci commit network 2>/dev/null; true
-uci commit firewall 2>/dev/null; true
+wg_rc_local_cleanup_managed() {
+    WG_RC_KIND="\${1:-all}"
+    [ -f /etc/rc.local ] || return 0
+    WG_RC_CLEAN_TMP="\$(mktemp /etc/.rc.local.clean.XXXXXX 2>/dev/null)" || { echo '[!] 创建 rc.local 清理临时文件失败' >&2; return 1; }
+    if awk -v kind="\$WG_RC_KIND" '
+        function marker_matches(line) {
+            if (kind == "all") return 1
+            return index(line, " " kind) > 0
+        }
+        /^# BEGIN server-manage wireguard / {
+            if (marker_matches(\$0)) { skip=1; next }
+        }
+        /^# END server-manage wireguard / {
+            if (skip) { skip=0; next }
+        }
+        skip { next }
+        kind != "allow-port" && /^# WireGuard bypass Mihomo/ { next }
+        kind != "allow-port" && /# wg_bypass[[:space:]]*$/ { next }
+        kind != "allow-port" && /# wg_peer_route[[:space:]]*$/ { next }
+        kind != "allow-port" && /# wg_ep_resolve[[:space:]]*$/ { next }
+        kind != "bypass" && /# wg_allow_port[[:space:]]*$/ { next }
+        kind != "bypass" && /nft insert rule inet fw4 input_wan udp dport .*comment .*wg_allow_port/ { next }
+        { print }
+    ' /etc/rc.local > "\$WG_RC_CLEAN_TMP"; then
+        chmod +x "\$WG_RC_CLEAN_TMP" 2>/dev/null && mv "\$WG_RC_CLEAN_TMP" /etc/rc.local || { rm -f "\$WG_RC_CLEAN_TMP"; return 1; }
+        rm -f "\$WG_RC_CLEAN_TMP"
+        return 0
+    fi
+    rm -f "\$WG_RC_CLEAN_TMP"
+    return 1
+}
+wg_rc_local_cleanup_managed all || die_restore "清理 /etc/rc.local 旧 WireGuard 片段失败"
+uci commit network >/dev/null 2>&1 || die_restore "提交清理后的 network 配置失败"
+uci commit firewall >/dev/null 2>&1 || die_restore "提交清理后的 firewall 配置失败"
 
 # === 安装 WireGuard 组件 ===
 WG_KERNEL=0
@@ -9407,140 +12420,252 @@ opkg install wireguard-tools 2>/dev/null || echo '[!] wireguard-tools 安装失�
 opkg install luci-proto-wireguard 2>/dev/null || echo '[!] luci-proto-wireguard 安装失败'
 /etc/init.d/rpcd restart 2>/dev/null; true
 sleep 1
+wg_proto_registered() {
+    ubus call network get_proto_handlers 2>/dev/null | grep -q '"wireguard"'
+}
+wg_ensure_wireguard_proto() {
+    wg_proto_registered && return 0
+    echo '[*] 重启 network/netifd 以加载 WireGuard 协议处理器...'
+    /etc/init.d/network restart >/dev/null 2>&1 || return 1
+    sleep 5
+    wg_proto_registered
+}
+wg_ensure_wireguard_proto || die_restore "netifd 未注册 wireguard 协议"
 
 # === 配置 WireGuard 接口 ===
-uci set network.wg0=interface
-uci set network.wg0.proto='wireguard'
-uci set network.wg0.private_key='${peer_privkey}'
-uci delete network.wg0.addresses 2>/dev/null; true
-uci add_list network.wg0.addresses='${peer_ip}/${mask}'
-uci set network.wg0.mtu='1420'
-uci set network.wg_server=wireguard_wg0
-uci set network.wg_server.public_key='${spub}'
-uci set network.wg_server.preshared_key='${psk}'
-uci set network.wg_server.endpoint_host='${ep_host}'
-uci set network.wg_server.endpoint_port='${sport}'
-uci set network.wg_server.persistent_keepalive='25'
-uci set network.wg_server.route_allowed_ips='1'
+write_wg_uci() {
+    uci set network.wg0=interface || return 1
+    uci set network.wg0.proto='wireguard' || return 1
+    uci set network.wg0.private_key='${peer_privkey}' || return 1
+    uci delete network.wg0.addresses 2>/dev/null; true
+    uci add_list network.wg0.addresses='${peer_ip}/${mask}' || return 1
+    uci set network.wg0.mtu='1420' || return 1
+    uci set network.wg_server=wireguard_wg0 || return 1
+    uci set network.wg_server.public_key='${spub}' || return 1
+    uci set network.wg_server.preshared_key='${psk}' || return 1
+    uci set network.wg_server.endpoint_host='${ep_host}' || return 1
+    uci set network.wg_server.endpoint_port='${sport}' || return 1
+    uci set network.wg_server.persistent_keepalive='25' || return 1
+    uci set network.wg_server.route_allowed_ips='1' || return 1
 ${uci_allowed_lines}
-# === 配置防火墙 ===
-uci set firewall.wg_zone=zone
-uci set firewall.wg_zone.name='wg'
-uci set firewall.wg_zone.input='ACCEPT'
-uci set firewall.wg_zone.output='ACCEPT'
-uci set firewall.wg_zone.forward='ACCEPT'
-uci set firewall.wg_zone.masq='1'
-uci add_list firewall.wg_zone.network='wg0'
-uci set firewall.wg_fwd_lan=forwarding
-uci set firewall.wg_fwd_lan.src='lan'
-uci set firewall.wg_fwd_lan.dest='wg'
-uci set firewall.wg_fwd_wg=forwarding
-uci set firewall.wg_fwd_wg.src='wg'
-uci set firewall.wg_fwd_wg.dest='lan'
-uci commit network
-uci commit firewall
+    # === 配置防火墙 ===
+    uci set firewall.wg_zone=zone || return 1
+    uci set firewall.wg_zone.name='wg' || return 1
+    uci set firewall.wg_zone.input='ACCEPT' || return 1
+    uci set firewall.wg_zone.output='ACCEPT' || return 1
+    uci set firewall.wg_zone.forward='ACCEPT' || return 1
+    uci set firewall.wg_zone.masq='1' || return 1
+    uci add_list firewall.wg_zone.network='wg0' || return 1
+    uci set firewall.wg_fwd_lan=forwarding || return 1
+    uci set firewall.wg_fwd_lan.src='lan' || return 1
+    uci set firewall.wg_fwd_lan.dest='wg' || return 1
+    uci set firewall.wg_fwd_wg=forwarding || return 1
+    uci set firewall.wg_fwd_wg.src='wg' || return 1
+    uci set firewall.wg_fwd_wg.dest='lan' || return 1
+    uci commit network || return 1
+    uci commit firewall || return 1
+}
+write_wg_uci || die_restore "写入 WireGuard UCI 配置失败"
+ubus call network reload >/dev/null 2>&1 || true
+sleep 1
 
 # === Mihomo/OpenClash bypass: WG endpoint 流量直连 ===
 # 关键: 使用外部 DNS 直连解析, 绕过 OpenClash fake-ip 劫持
 EP_IP='${ep_host}'
+case "\${EP_IP}" in
+    *:*) ;;
+    *)
 if ! echo "\${EP_IP}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\$'; then
     # 依次尝试多个外部 DNS 直连解析 (绕过本地 Clash/Mihomo fake-ip)
     for DNS_SRV in 223.5.5.5 119.29.29.29 8.8.8.8; do
-        EP_IP=\$(nslookup '${ep_host}' \$DNS_SRV 2>/dev/null | awk '/^Address:/{a=\$2} END{if(a) print a}')
-        # 验证不是 fake-ip (198.18.0.0/15)
+        EP_IP=\$(wg_resolve_real '${ep_host}' "\$DNS_SRV")
         if [ -n "\$EP_IP" ]; then
-            case "\$EP_IP" in 198.18.*|198.19.*) EP_IP=""; continue ;; esac
             echo "[+] endpoint 解析: ${ep_host} -> \$EP_IP (via \$DNS_SRV)"
             break
         fi
     done
 fi
+        ;;
+esac
 if [ -z "\${EP_IP}" ]; then
     echo '[!] 警告: 无法解析 endpoint 真实 IP, bypass 规则可能无效!'
 fi
 if [ -n "\${EP_IP}" ]; then
-    ip rule del to "\${EP_IP}" lookup main prio 100 2>/dev/null; true
-    ip rule add to "\${EP_IP}" lookup main prio 100
-    nft list chain inet fw4 mangle_prerouting &>/dev/null && {
-        nft insert rule inet fw4 mangle_prerouting ip daddr "\${EP_IP}" udp dport ${sport} counter return comment \"wg_bypass\" 2>/dev/null; true
+    case "\${EP_IP}" in
+        *:*)
+            NFT_FAMILY="ip6"
+            ip -6 rule del to "\${EP_IP}" lookup main prio 100 2>/dev/null; true
+            ip -6 rule add to "\${EP_IP}" lookup main prio 100
+            ;;
+        *)
+            NFT_FAMILY="ip"
+            ip rule del to "\${EP_IP}" lookup main prio 100 2>/dev/null; true
+            ip rule add to "\${EP_IP}" lookup main prio 100
+            ;;
+    esac
+    nft list chain inet fw4 mangle_prerouting >/dev/null 2>&1 && {
+        nft insert rule inet fw4 mangle_prerouting "\${NFT_FAMILY}" daddr "\${EP_IP}" udp dport ${sport} counter return comment \"wg_bypass\" 2>/dev/null; true
         nft insert rule inet fw4 mangle_prerouting iifname \"wg0\" counter return comment \"wg_bypass_iface\" 2>/dev/null; true
     }
     echo "[+] Mihomo bypass 规则已添加: \${EP_IP}"
 fi
 
 # 持久化: rc.local 中使用外部 DNS 动态解析 (每次开机重新解析)
-sed -i '/wg_bypass/d; /WireGuard bypass/d; /wg_ep_resolve/d; /ip rule.*prio 100/d' /etc/rc.local 2>/dev/null; true
-WG_RC_BLOCK="/tmp/wg-rc-block.\$\$"
-WG_RC_TMP="\$(mktemp /tmp/rc.local.XXXXXX 2>/dev/null || echo /tmp/rc.local.\$\$)"
-cat > "\$WG_RC_BLOCK" << 'WG_RC_EOF'
+wg_rc_local_cleanup_managed bypass || die_restore "清理 rc.local 旧 bypass 片段失败"
+WG_RC_BLOCK="\$(mktemp /etc/.wg-rc-block.XXXXXX 2>/dev/null)" || die_restore "创建 rc.local 片段临时文件失败"
+WG_RC_TMP="\$(mktemp /etc/.rc.local.XXXXXX 2>/dev/null)" || { rm -f "\$WG_RC_BLOCK"; die_restore "创建 rc.local 临时文件失败"; }
+if ! cat > "\$WG_RC_BLOCK" << 'WG_RC_EOF'
+# BEGIN server-manage wireguard bypass
 # WireGuard bypass Mihomo (dynamic resolve, bypass fake-ip) # wg_bypass
-WG_EP=\$(nslookup '${ep_host}' 223.5.5.5 2>/dev/null | awk '/^Address:/{a=\$2} END{if(a) print a}') # wg_ep_resolve
-[ -n "\$WG_EP" ] && { ip rule add to "\$WG_EP" lookup main prio 100 2>/dev/null; true; } # wg_bypass
-[ -n "\$WG_EP" ] && nft insert rule inet fw4 mangle_prerouting ip daddr "\$WG_EP" udp dport ${sport} counter return comment "wg_bypass" 2>/dev/null; true # wg_bypass
+wg_resolve_real() {
+    WG_RESOLVE_HOST="\$1"
+    WG_RESOLVE_DNS="\$2"
+    nslookup "\$WG_RESOLVE_HOST" "\$WG_RESOLVE_DNS" 2>/dev/null | awk '
+        /^Name:/ { seen_name=1; next }
+        seen_name && /^Address[[:space:]][0-9]+:/ {
+            ip=\$3
+            if (ip !~ /^(198\\.18\\.|198\\.19\\.)/) { print ip; exit }
+            next
+        }
+        seen_name && /^Address:/ {
+            ip=\$2
+            sub(/#.*/, "", ip)
+            if (ip !~ /^(198\\.18\\.|198\\.19\\.)/) { print ip; exit }
+            next
+        }
+    '
+}
+case '${ep_host}' in
+    *:*) WG_EP='${ep_host}' ;;
+    *)
+        WG_EP=""
+        for WG_DNS_SRV in 223.5.5.5 119.29.29.29 8.8.8.8; do
+            WG_EP=\$(wg_resolve_real '${ep_host}' "\$WG_DNS_SRV")
+            [ -n "\$WG_EP" ] && break
+        done
+        ;;
+esac # wg_ep_resolve
+[ -n "\$WG_EP" ] && case "\$WG_EP" in *:*) WG_NFT_FAMILY=ip6; ip -6 rule add to "\$WG_EP" lookup main prio 100 2>/dev/null; true ;; *) WG_NFT_FAMILY=ip; ip rule add to "\$WG_EP" lookup main prio 100 2>/dev/null; true ;; esac # wg_bypass
+[ -n "\$WG_EP" ] && nft insert rule inet fw4 mangle_prerouting "\$WG_NFT_FAMILY" daddr "\$WG_EP" udp dport ${sport} counter return comment "wg_bypass" 2>/dev/null; true # wg_bypass
 nft insert rule inet fw4 mangle_prerouting iifname "wg0" counter return comment "wg_bypass_iface" 2>/dev/null; true # wg_bypass
+# END server-manage wireguard bypass
 WG_RC_EOF
-[ -f /etc/rc.local ] || { printf '#!/bin/sh\nexit 0\n' > /etc/rc.local; chmod +x /etc/rc.local 2>/dev/null; }
-awk '
+then
+    rm -f "\$WG_RC_BLOCK" "\$WG_RC_TMP"
+    die_restore "写入 rc.local 片段失败"
+fi
+if [ ! -f /etc/rc.local ]; then
+    WG_RC_NEW="\$(mktemp /etc/.rc.local.new.XXXXXX 2>/dev/null)" || { rm -f "\$WG_RC_BLOCK" "\$WG_RC_TMP"; die_restore "创建 rc.local 初始化临时文件失败"; }
+    printf '#!/bin/sh\nexit 0\n' > "\$WG_RC_NEW" || { rm -f "\$WG_RC_BLOCK" "\$WG_RC_TMP" "\$WG_RC_NEW"; die_restore "写入 rc.local 初始化文件失败"; }
+    chmod +x "\$WG_RC_NEW" 2>/dev/null && mv "\$WG_RC_NEW" /etc/rc.local || { rm -f "\$WG_RC_BLOCK" "\$WG_RC_TMP" "\$WG_RC_NEW"; die_restore "安装 /etc/rc.local 失败"; }
+fi
+if awk '
     FNR == NR { block = block \$0 ORS; next }
     /^[[:space:]]*exit[[:space:]]+0([[:space:]]*(#.*)?)?\$/ && !inserted { printf "%s", block; inserted=1 }
     { print }
     END { if (!inserted) printf "%s", block }
-' "\$WG_RC_BLOCK" /etc/rc.local > "\$WG_RC_TMP" && cat "\$WG_RC_TMP" > /etc/rc.local
+	' "\$WG_RC_BLOCK" /etc/rc.local > "\$WG_RC_TMP"; then
+    chmod +x "\$WG_RC_TMP" 2>/dev/null && mv "\$WG_RC_TMP" /etc/rc.local || { rm -f "\$WG_RC_BLOCK" "\$WG_RC_TMP"; die_restore "安装 /etc/rc.local 失败"; }
+else
+    rm -f "\$WG_RC_BLOCK" "\$WG_RC_TMP"
+    die_restore "生成 /etc/rc.local 失败"
+fi
 chmod +x /etc/rc.local 2>/dev/null; true
 rm -f "\$WG_RC_BLOCK" "\$WG_RC_TMP"
 
 # === 开机自恢复服务 ===
-cat > /etc/init.d/wg-client << 'INITEOF'
+WG_CLIENT_TMP="\$(mktemp /etc/init.d/.wg-client.XXXXXX 2>/dev/null)" || die_restore "创建 wg-client init 临时文件失败"
+if ! cat > "\$WG_CLIENT_TMP" << 'INITEOF'
 #!/bin/sh /etc/rc.common
 START=99
 USE_PROCD=0
 boot() { start; }
+wg_is_up() {
+    ifstatus wg0 2>/dev/null | grep -q '"up": true'
+}
+wg_proto_registered() {
+    ubus call network get_proto_handlers 2>/dev/null | grep -q '"wireguard"'
+}
+wg_ensure_wireguard_proto() {
+    wg_proto_registered && return 0
+    logger -t wg-client "wireguard proto missing, restarting network"
+    /etc/init.d/network restart >/dev/null 2>&1 || true
+    sleep 5
+    wg_proto_registered
+}
 start() {
     if command -v wg >/dev/null 2>&1 && uci -q get network.wg0.proto >/dev/null 2>&1; then
-        ifup wg0 2>/dev/null; return 0
+        wg_ensure_wireguard_proto || logger -t wg-client "wireguard proto still missing after network restart"
+        ifup wg0 >/dev/null 2>&1 || true
+        sleep 2
+        wg_is_up && return 0
+        logger -t wg-client "WireGuard configured but not up, restoring"
+    else
+        logger -t wg-client "WireGuard missing, restoring..."
     fi
-    logger -t wg-client "WireGuard missing, restoring..."
     for _r in 1 2 3; do opkg update && break; sleep 3; done
     opkg install kmod-wireguard wireguard-tools luci-proto-wireguard 2>/dev/null
     /etc/init.d/rpcd restart 2>/dev/null; sleep 1
-    uci set network.wg0=interface
-    uci set network.wg0.proto='wireguard'
-    uci set network.wg0.private_key='${peer_privkey}'
-    uci set network.wg0.mtu='1420'
-    uci delete network.wg0.addresses 2>/dev/null; true
-    uci add_list network.wg0.addresses='${peer_ip}/${mask}'
-    uci set network.wg_server=wireguard_wg0
-    uci set network.wg_server.public_key='${spub}'
-    uci set network.wg_server.preshared_key='${psk}'
-    uci set network.wg_server.endpoint_host='${ep_host}'
-    uci set network.wg_server.endpoint_port='${sport}'
-    uci set network.wg_server.persistent_keepalive='25'
-    uci set network.wg_server.route_allowed_ips='1'
-    ${uci_allowed_lines}uci set firewall.wg_zone=zone
-    uci set firewall.wg_zone.name='wg'
-    uci set firewall.wg_zone.input='ACCEPT'
-    uci set firewall.wg_zone.output='ACCEPT'
-    uci set firewall.wg_zone.forward='ACCEPT'
-    uci set firewall.wg_zone.masq='1'
-    uci add_list firewall.wg_zone.network='wg0'
-    uci set firewall.wg_fwd_lan=forwarding
-    uci set firewall.wg_fwd_lan.src='lan'
-    uci set firewall.wg_fwd_lan.dest='wg'
-    uci set firewall.wg_fwd_wg=forwarding
-    uci set firewall.wg_fwd_wg.src='wg'
-    uci set firewall.wg_fwd_wg.dest='lan'
-    uci commit network
-    uci commit firewall
-    ifup wg0
+    restore_wg_uci() {
+        uci set network.wg0=interface || return 1
+        uci set network.wg0.proto='wireguard' || return 1
+        uci set network.wg0.private_key='${peer_privkey}' || return 1
+        uci set network.wg0.mtu='1420' || return 1
+        uci delete network.wg0.addresses 2>/dev/null; true
+        uci add_list network.wg0.addresses='${peer_ip}/${mask}' || return 1
+        uci set network.wg_server=wireguard_wg0 || return 1
+        uci set network.wg_server.public_key='${spub}' || return 1
+        uci set network.wg_server.preshared_key='${psk}' || return 1
+        uci set network.wg_server.endpoint_host='${ep_host}' || return 1
+        uci set network.wg_server.endpoint_port='${sport}' || return 1
+        uci set network.wg_server.persistent_keepalive='25' || return 1
+        uci set network.wg_server.route_allowed_ips='1' || return 1
+${uci_allowed_lines}        uci set firewall.wg_zone=zone || return 1
+        uci set firewall.wg_zone.name='wg' || return 1
+        uci set firewall.wg_zone.input='ACCEPT' || return 1
+        uci set firewall.wg_zone.output='ACCEPT' || return 1
+        uci set firewall.wg_zone.forward='ACCEPT' || return 1
+        uci set firewall.wg_zone.masq='1' || return 1
+        uci add_list firewall.wg_zone.network='wg0' || return 1
+        uci set firewall.wg_fwd_lan=forwarding || return 1
+        uci set firewall.wg_fwd_lan.src='lan' || return 1
+        uci set firewall.wg_fwd_lan.dest='wg' || return 1
+        uci set firewall.wg_fwd_wg=forwarding || return 1
+        uci set firewall.wg_fwd_wg.src='wg' || return 1
+        uci set firewall.wg_fwd_wg.dest='lan' || return 1
+        uci commit network || return 1
+        uci commit firewall || return 1
+    }
+    if ! restore_wg_uci; then
+        logger -t wg-client "WireGuard restore failed"
+        return 1
+    fi
+    wg_ensure_wireguard_proto || {
+        logger -t wg-client "wireguard proto missing before ifup"
+        return 1
+    }
+    ubus call network reload >/dev/null 2>&1 || true
+    sleep 1
+    ifup wg0 >/dev/null 2>&1 || true
+    sleep 2
+    if ! wg_is_up; then
+        logger -t wg-client "WireGuard restore failed"
+        return 1
+    fi
     logger -t wg-client "WireGuard restored"
 }
 INITEOF
-chmod 0700 /etc/init.d/wg-client
-/etc/init.d/wg-client enable
+then
+    rm -f "\$WG_CLIENT_TMP"
+    die_restore "写入 wg-client init 失败"
+fi
+chmod 0700 "\$WG_CLIENT_TMP" && mv "\$WG_CLIENT_TMP" /etc/init.d/wg-client || { rm -f "\$WG_CLIENT_TMP"; die_restore "安装 wg-client init 失败"; }
+rm -f "\$WG_CLIENT_TMP"
+/etc/init.d/wg-client enable || die_restore "启用 wg-client init 失败"
 echo '[+] 开机自恢复服务已安装'
 
 # === 启动接口 ===
-ifup wg0
+ifup wg0 || die_restore "启动 wg0 失败"
 
 # === 验证 ===
 sleep 3
@@ -9560,33 +12685,123 @@ OPENWRT_EOF
     if [[ ! "$ep_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         cat << 'WDEOF'
 
-# === WireGuard 看门狗 (fake-ip检测 + DNS直连解析 + 完整bypass自恢复 + 握手保活 + 日志持久化) ===
-cat > /usr/bin/wg-watchdog.sh << 'WDSCRIPT'
+# === WireGuard 看门狗 (fake-ip检测 + DNS直连解析 + 完整bypass自恢复 + 握手保活 + 安全日志) ===
+WG_WATCHDOG_TMP="$(mktemp /usr/bin/.wg-watchdog.XXXXXX 2>/dev/null)" || die_restore "创建 wg-watchdog 临时文件失败"
+if ! cat > "$WG_WATCHDOG_TMP" << 'WDSCRIPT'
 #!/bin/sh
-LOG_FILE="/tmp/wg-watchdog.log"
+LOG_DIR="/var/run/server-manage"
+LOG_FILE="$LOG_DIR/wg-watchdog.log"
 MAX_LOG_SIZE=32768
 
 wdlog() {
+    size=0
+    tmp=""
     logger -t wg-watchdog "$1"
-    echo "$(date '+%m-%d %H:%M:%S') $1" >> "$LOG_FILE"
-    if [ -f "$LOG_FILE" ] && [ $(wc -c < "$LOG_FILE" 2>/dev/null || echo 0) -gt $MAX_LOG_SIZE ]; then
-        tail -n 50 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+    if [ -L "$LOG_DIR" ] || { [ -e "$LOG_DIR" ] && [ ! -d "$LOG_DIR" ]; }; then
+        return 0
+    fi
+    mkdir -p "$LOG_DIR" 2>/dev/null || return 0
+    chmod 0700 "$LOG_DIR" 2>/dev/null || true
+    [ -L "$LOG_FILE" ] && return 0
+    echo "$(date '+%m-%d %H:%M:%S') $1" >> "$LOG_FILE" 2>/dev/null || return 0
+    if [ -f "$LOG_FILE" ]; then
+        size=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+        case "$size" in *[!0-9]*|"") size=0 ;; esac
+    fi
+    if [ "$size" -gt "$MAX_LOG_SIZE" ]; then
+        tmp=$(mktemp "$LOG_DIR/.wg-watchdog-log.XXXXXX" 2>/dev/null) || tmp=""
+        if [ -n "$tmp" ]; then
+            tail -n 50 "$LOG_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$LOG_FILE"
+            rm -f "$tmp" 2>/dev/null || true
+        fi
     fi
 }
 
 resolve_real() {
     local host="$1" ip=""
     for dns in 223.5.5.5 119.29.29.29 8.8.8.8; do
-        ip=$(nslookup "$host" $dns 2>/dev/null | awk '/^Address:/{a=$2} END{if(a) print a}')
+        ip=$(nslookup "$host" "$dns" 2>/dev/null | awk '
+            /^Name:/ { seen_name=1; next }
+            seen_name && /^Address[[:space:]][0-9]+:/ {
+                ip=$3
+                if (ip !~ /^(198\.18\.|198\.19\.)/) { print ip; exit }
+                next
+            }
+            seen_name && /^Address:/ {
+                ip=$2
+                sub(/#.*/, "", ip)
+                if (ip !~ /^(198\.18\.|198\.19\.)/) { print ip; exit }
+                next
+            }
+        ')
         [ -n "$ip" ] || continue
-        case "$ip" in 198.18.*|198.19.*) ip=""; continue ;; esac
         echo "$ip"; return 0
     done
     return 1
 }
 
-if ! ifstatus wg0 &>/dev/null; then
-    wdlog "wg0 down, restarting"; ifup wg0; exit 0
+wg_endpoint_host() {
+    local endpoint="$1"
+    case "$endpoint" in
+        \[*\]:*) echo "$endpoint" | sed -n 's/^\[\(.*\)\]:[0-9][0-9]*$/\1/p' ;;
+        *:*)     echo "$endpoint" | sed 's/:[0-9][0-9]*$//' ;;
+        *)       echo "$endpoint" ;;
+    esac
+}
+
+wg_format_endpoint() {
+    local host="$1" port="$2"
+    case "$host" in
+        *:*) echo "[${host}]:${port}" ;;
+        *)   echo "${host}:${port}" ;;
+    esac
+}
+
+wg_nft_addr_family() {
+    case "$1" in
+        *:*) echo "ip6" ;;
+        *)   echo "ip" ;;
+    esac
+}
+
+wg_ip_rule_show() {
+    case "$1" in
+        *:*) ip -6 rule show 2>/dev/null ;;
+        *)   ip rule show 2>/dev/null ;;
+    esac
+}
+
+wg_ip_rule_del() {
+    case "$1" in
+        *:*) ip -6 rule del to "$1" lookup main prio 100 2>/dev/null ;;
+        *)   ip rule del to "$1" lookup main prio 100 2>/dev/null ;;
+    esac
+}
+
+wg_ip_rule_add() {
+    case "$1" in
+        *:*) ip -6 rule add to "$1" lookup main prio 100 2>/dev/null ;;
+        *)   ip rule add to "$1" lookup main prio 100 2>/dev/null ;;
+    esac
+}
+
+wg_is_up() {
+    ifstatus wg0 2>/dev/null | grep -q '"up": true'
+}
+
+wg_proto_registered() {
+    ubus call network get_proto_handlers 2>/dev/null | grep -q '"wireguard"'
+}
+
+if ! wg_is_up; then
+    wdlog "wg0 not up, restarting"
+    if ! wg_proto_registered; then
+        wdlog "wireguard proto missing, restarting network"
+        /etc/init.d/network restart >/dev/null 2>&1 || true
+        sleep 5
+    fi
+    ifup wg0 >/dev/null 2>&1 || true
+    exit 0
 fi
 
 # resolve endpoint (always set RESOLVED for bypass self-heal)
@@ -9594,32 +12809,37 @@ EP_HOST=$(uci get network.wg_server.endpoint_host 2>/dev/null)
 RESOLVED=""
 if echo "$EP_HOST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
     RESOLVED="$EP_HOST"
+elif echo "$EP_HOST" | grep -q ':'; then
+    RESOLVED="$EP_HOST"
 elif [ -n "$EP_HOST" ]; then
     RESOLVED=$(resolve_real "$EP_HOST")
 fi
 
 # DNS re-resolve + endpoint update (only for domain endpoints)
-if [ -n "$EP_HOST" ] && ! echo "$EP_HOST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
-    CURRENT=$(wg show wg0 endpoints 2>/dev/null | awk '{print $2}' | cut -d: -f1 | head -1)
+if [ -n "$EP_HOST" ] && ! echo "$EP_HOST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && ! echo "$EP_HOST" | grep -q ':'; then
+    CURRENT_EP=$(wg show wg0 endpoints 2>/dev/null | awk '{print $2}' | head -1)
+    CURRENT=$(wg_endpoint_host "$CURRENT_EP")
     FAKE_IP=0
     case "$CURRENT" in 198.18.*|198.19.*) FAKE_IP=1 ;; esac
     if [ -n "$RESOLVED" ] && { [ "$RESOLVED" != "$CURRENT" ] || [ "$FAKE_IP" = "1" ]; }; then
         wdlog "endpoint update: $CURRENT -> $RESOLVED (fake=$FAKE_IP)"
         PUB=$(wg show wg0 endpoints | awk '{print $1}' | head -1)
         PORT=$(uci get network.wg_server.endpoint_port 2>/dev/null)
-        wg set wg0 peer "$PUB" endpoint "${RESOLVED}:${PORT}"
+        WG_ENDPOINT=$(wg_format_endpoint "$RESOLVED" "$PORT")
+        NFT_FAMILY=$(wg_nft_addr_family "$RESOLVED")
+        wg set wg0 peer "$PUB" endpoint "$WG_ENDPOINT"
         for h in $(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | grep -v 'iface' | awk '{print $NF}'); do
             nft delete rule inet fw4 mangle_prerouting handle "$h" 2>/dev/null; true
         done
-        nft insert rule inet fw4 mangle_prerouting ip daddr "$RESOLVED" udp dport "$PORT" counter return comment "wg_bypass" 2>/dev/null; true
-        ip rule del to "$RESOLVED" lookup main prio 100 2>/dev/null; true
-        ip rule add to "$RESOLVED" lookup main prio 100 2>/dev/null; true
+        nft insert rule inet fw4 mangle_prerouting "$NFT_FAMILY" daddr "$RESOLVED" udp dport "$PORT" counter return comment "wg_bypass" 2>/dev/null; true
+        wg_ip_rule_del "$RESOLVED"; true
+        wg_ip_rule_add "$RESOLVED"; true
         wdlog "bypass updated -> $RESOLVED"
     fi
 fi
 
 # bypass rule self-heal (complete: iface + IP + ip rule)
-if nft list chain inet fw4 mangle_prerouting &>/dev/null; then
+if nft list chain inet fw4 mangle_prerouting >/dev/null 2>&1; then
     if ! nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep -q 'wg_bypass_iface'; then
         nft insert rule inet fw4 mangle_prerouting iifname "wg0" counter return comment "wg_bypass_iface" 2>/dev/null; true
         wdlog "restored wg_bypass_iface rule"
@@ -9627,13 +12847,14 @@ if nft list chain inet fw4 mangle_prerouting &>/dev/null; then
     if [ -n "$RESOLVED" ]; then
         if ! nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep -q "daddr $RESOLVED"; then
             PORT=$(uci get network.wg_server.endpoint_port 2>/dev/null)
-            nft insert rule inet fw4 mangle_prerouting ip daddr "$RESOLVED" udp dport "$PORT" counter return comment "wg_bypass" 2>/dev/null; true
+            NFT_FAMILY=$(wg_nft_addr_family "$RESOLVED")
+            nft insert rule inet fw4 mangle_prerouting "$NFT_FAMILY" daddr "$RESOLVED" udp dport "$PORT" counter return comment "wg_bypass" 2>/dev/null; true
             wdlog "restored IP bypass -> $RESOLVED"
         fi
     fi
 fi
-if [ -n "$RESOLVED" ] && ! ip rule show 2>/dev/null | grep -q "$RESOLVED"; then
-    ip rule add to "$RESOLVED" lookup main prio 100 2>/dev/null; true
+if [ -n "$RESOLVED" ] && ! wg_ip_rule_show "$RESOLVED" | grep -q "$RESOLVED"; then
+    wg_ip_rule_add "$RESOLVED"; true
     wdlog "restored ip rule -> $RESOLVED"
 fi
 
@@ -9643,17 +12864,33 @@ NOW=$(date +%s)
 if [ -n "$LAST_HS" ] && [ "$LAST_HS" != "0" ] && [ $((NOW - LAST_HS)) -gt 180 ]; then
     VIP=$(uci get network.wg0.addresses 2>/dev/null | awk '{print $1}' | cut -d/ -f1)
     VIP=$(echo "$VIP" | awk -F. '{printf "%s.%s.%s.1",$1,$2,$3}')
-    if [ -n "$VIP" ] && ! ping -c 2 -W 3 "$VIP" &>/dev/null; then
+    if [ -n "$VIP" ] && ! ping -c 2 -W 3 "$VIP" >/dev/null 2>&1; then
         wdlog "no handshake for $((NOW - LAST_HS))s + ping failed, restarting"
         ifdown wg0; sleep 2; ifup wg0
     fi
 fi
 WDSCRIPT
-chmod +x /usr/bin/wg-watchdog.sh
-(crontab -l 2>/dev/null | grep -v wg-watchdog; echo '* * * * * /usr/bin/wg-watchdog.sh') | crontab -
-/etc/init.d/cron restart
+then
+    rm -f "$WG_WATCHDOG_TMP"
+    die_restore "写入 wg-watchdog 失败"
+fi
+chmod 0700 "$WG_WATCHDOG_TMP" && mv "$WG_WATCHDOG_TMP" /usr/bin/wg-watchdog.sh || { rm -f "$WG_WATCHDOG_TMP"; die_restore "安装 wg-watchdog 失败"; }
+rm -f "$WG_WATCHDOG_TMP"
+WG_CRON_TMP="$(mktemp /tmp/.wg-watchdog-cron.XXXXXX 2>/dev/null)" || die_restore "创建 wg-watchdog cron 临时文件失败"
+(crontab -l 2>/dev/null | awk '$6 != "/usr/bin/wg-watchdog.sh"'; echo '* * * * * /usr/bin/wg-watchdog.sh') > "$WG_CRON_TMP" || { rm -f "$WG_CRON_TMP"; die_restore "生成 wg-watchdog cron 失败"; }
+mkdir -p /etc/crontabs 2>/dev/null || { rm -f "$WG_CRON_TMP"; die_restore "创建 OpenWrt cron 目录失败"; }
+cp "$WG_CRON_TMP" /etc/crontabs/root 2>/dev/null || { rm -f "$WG_CRON_TMP"; die_restore "写入 OpenWrt cron 文件失败"; }
+chmod 600 /etc/crontabs/root 2>/dev/null || true
+rm -f "$WG_CRON_TMP"
+awk '$6 == "/usr/bin/wg-watchdog.sh" { found=1 } END { exit !found }' /etc/crontabs/root || die_restore "安装 wg-watchdog cron 失败"
+/etc/init.d/cron restart || die_restore "重启 cron 失败"
+cleanup_uci_snapshots
 echo '[+] 看门狗已安装 (DNS直连 + fake-ip检测 + 完整bypass自恢复 + 握手保活 + 日志持久化)'
 WDEOF
+    else
+        cat << 'NO_WATCHDOG_EOF'
+cleanup_uci_snapshots
+NO_WATCHDOG_EOF
     fi
 
     draw_line
@@ -9856,13 +13093,23 @@ _wg_generate_clash_config_impl() {
                 print_error "YAML 中未找到 'proxies:' 段"
                 pause; return
             fi
-            local output_file="/tmp/clash-wg-${peer_name}-$(date +%s).yaml"
+            local output_dir output_file
+            local old_umask inject_rc
+            old_umask=$(umask)
+            umask 077
+            if ! output_dir=$(mktemp -d "${TMPDIR:-/tmp}/clash-wg.XXXXXX" 2>/dev/null); then
+                umask "$old_umask"
+                print_error "无法创建安全临时目录"
+                pause; return
+            fi
+            umask "$old_umask"
+            chmod 700 "$output_dir" 2>/dev/null || true
+            output_file="${output_dir}/clash-config.yaml"
             local has_proxy_groups=false
             echo "$original_yaml" | grep -qE '^[[:space:]]*proxy-groups:' && has_proxy_groups=true
 
             # 用 Python/jq 辅助或简单 awk 注入
             # 改进: 追踪缩进层级判断段结束
-            local old_umask inject_rc
             old_umask=$(umask)
             umask 077
             awk \
@@ -9929,7 +13176,7 @@ _wg_generate_clash_config_impl() {
             chmod 600 "$output_file" 2>/dev/null || true
             if [[ $inject_rc -ne 0 ]]; then
                 print_error "YAML 注入失败"
-                rm -f "$output_file"
+                rm -rf "$output_dir"
                 pause; return
             fi
 
@@ -9961,17 +13208,46 @@ _wg_generate_clash_config_impl() {
                 done < <(echo "$_prov_block" | grep -oE "https?://[^\"' ]+" | sort -u)
                 if [[ -n "$_inject_ns" ]]; then
                     local _tmpf
-                    _tmpf=$(mktemp)
+                    _tmpf=$(mktemp "${output_dir}/.clash-config.yaml.policy.XXXXXX") || {
+                        print_error "创建 nameserver-policy 临时文件失败"
+                        rm -rf "$output_dir"
+                        pause; return
+                    }
+                    chmod 600 "$_tmpf" 2>/dev/null || true
                     if grep -q 'nameserver-policy:' "$output_file"; then
-                        awk -v ns="$_inject_ns" '
+                        if awk -v ns="$_inject_ns" '
                             /nameserver-policy:/ { print; printf "%s", ns; next }
                             { print }
-                        ' "$output_file" > "$_tmpf" && mv "$_tmpf" "$output_file"
+                        ' "$output_file" > "$_tmpf"; then
+                            mv "$_tmpf" "$output_file" || {
+                                rm -f "$_tmpf"
+                                print_error "nameserver-policy 注入失败"
+                                rm -rf "$output_dir"
+                                pause; return
+                            }
+                        else
+                            rm -f "$_tmpf"
+                            print_error "nameserver-policy 注入失败"
+                            rm -rf "$output_dir"
+                            pause; return
+                        fi
                     elif grep -q '^dns:' "$output_file"; then
-                        awk -v ns="$_inject_ns" '
+                        if awk -v ns="$_inject_ns" '
                             /^dns:/ { print; print "  nameserver-policy:"; printf "%s", ns; next }
                             { print }
-                        ' "$output_file" > "$_tmpf" && mv "$_tmpf" "$output_file"
+                        ' "$output_file" > "$_tmpf"; then
+                            mv "$_tmpf" "$output_file" || {
+                                rm -f "$_tmpf"
+                                print_error "nameserver-policy 注入失败"
+                                rm -rf "$output_dir"
+                                pause; return
+                            }
+                        else
+                            rm -f "$_tmpf"
+                            print_error "nameserver-policy 注入失败"
+                            rm -rf "$output_dir"
+                            pause; return
+                        fi
                     else
                         rm -f "$_tmpf"
                     fi
@@ -10024,7 +13300,7 @@ wg_setup_watchdog() {
     local auto_mode="${1:-}"
 
     # 已启用时的管理界面
-    if [[ -z "$auto_mode" ]] && crontab -l 2>/dev/null | grep -q "wg-watchdog.sh"; then
+    if [[ -z "$auto_mode" ]] && cron_has_job_command "$watchdog_script"; then
         print_title "WireGuard 看门狗"
         echo -e "  状态: ${C_GREEN}已启用${C_RESET}"
         echo -e "  脚本: ${C_CYAN}${watchdog_script}${C_RESET}"
@@ -10036,7 +13312,7 @@ wg_setup_watchdog() {
         read -e -r -p "选择: " c
         case $c in
             1)
-                cron_remove_job "wg-watchdog.sh"
+                cron_remove_job_command "$watchdog_script"
                 rm -f "$watchdog_script"
                 print_success "看门狗已禁用"
                 log_action "WireGuard watchdog disabled"
@@ -10044,7 +13320,7 @@ wg_setup_watchdog() {
             2) echo ""; tail -n 30 "$watchdog_log" 2>/dev/null || print_warn "无日志" ;;
             3)
                 if [[ -x "$watchdog_script" ]]; then
-                    bash "$watchdog_script"
+                    sh "$watchdog_script"
                     print_success "检测完成"
                     echo ""; tail -n 5 "$watchdog_log" 2>/dev/null
                 else
@@ -10064,28 +13340,44 @@ wg_setup_watchdog() {
         if ! confirm "启用看门狗?"; then pause; return; fi
     fi
 
+    mkdir -p "$(dirname "$watchdog_script")" || { print_error "创建看门狗目录失败"; [[ -z "$auto_mode" ]] && pause; return 1; }
+    local watchdog_tmp
+    watchdog_tmp=$(mktemp "$(dirname "$watchdog_script")/.tmp.server-manage.wg-watchdog.XXXXXX") || {
+        print_error "创建看门狗临时脚本失败"
+        [[ -z "$auto_mode" ]] && pause
+        return 1
+    }
+    _tmp_register "$watchdog_tmp"
+
     # ── OpenWrt 看门狗 (#!/bin/sh + ifup/ifdown + Mihomo bypass + 路由检查) ──
-    cat > "$watchdog_script" << 'WDEOF_OPENWRT'
+    if ! cat > "$watchdog_tmp" << 'WDEOF_OPENWRT'
 #!/bin/sh
 LOG="logger -t wg-watchdog"
 DB="/etc/wireguard/db/wg-data.json"
 
+wg_nft_addr_family_for_cidr() {
+    case "$1" in
+        *:*) echo "ip6" ;;
+        *)   echo "ip" ;;
+    esac
+}
+
 # 检测接口存活
-if ! ifstatus wg0 &>/dev/null; then
+if ! ifstatus wg0 >/dev/null 2>&1; then
     $LOG "wg0 down, restarting"
     ifup wg0
     sleep 2
 fi
 
 # 检测 wg show 是否正常
-if ! wg show wg0 &>/dev/null; then
+if ! wg show wg0 >/dev/null 2>&1; then
     $LOG "wg show failed, restarting"
     ifdown wg0; sleep 1; ifup wg0
     sleep 2
 fi
 
 # 检测 Mihomo bypass 规则是否存在
-if nft list chain inet fw4 mangle_prerouting &>/dev/null; then
+if nft list chain inet fw4 mangle_prerouting >/dev/null 2>&1; then
     NFT_RULES=$(nft list chain inet fw4 mangle_prerouting 2>/dev/null)
     if ! echo "$NFT_RULES" | grep -q "wg_bypass_iface"; then
         nft insert rule inet fw4 mangle_prerouting iifname "wg0" counter return comment "wg_bypass_iface" 2>/dev/null || true
@@ -10097,7 +13389,8 @@ if nft list chain inet fw4 mangle_prerouting &>/dev/null; then
             sub=$(echo "$sub" | xargs)
             [ -z "$sub" ] && continue
             if ! echo "$NFT_RULES" | grep -q "daddr $sub"; then
-                nft insert rule inet fw4 mangle_prerouting ip daddr "$sub" counter return comment "wg_bypass_subnet" 2>/dev/null || true
+                NFT_FAMILY=$(wg_nft_addr_family_for_cidr "$sub")
+                nft insert rule inet fw4 mangle_prerouting "$NFT_FAMILY" daddr "$sub" counter return comment "wg_bypass_subnet" 2>/dev/null || true
                 $LOG "restored wg_bypass_subnet rule: $sub"
             fi
         done
@@ -10117,8 +13410,28 @@ if [ -f "$DB" ] && command -v jq >/dev/null 2>&1; then
     done
 fi
 WDEOF_OPENWRT
-    chmod +x "$watchdog_script"
-    cron_add_job "wg-watchdog.sh" "* * * * * $watchdog_script >/dev/null 2>&1"
+    then
+        rm -f "$watchdog_tmp" 2>/dev/null || true
+        _tmp_unregister "$watchdog_tmp"
+        print_error "写入看门狗脚本失败"
+        [[ -z "$auto_mode" ]] && pause
+        return 1
+    fi
+    chmod 0755 "$watchdog_tmp" 2>/dev/null || true
+    if ! mv "$watchdog_tmp" "$watchdog_script"; then
+        rm -f "$watchdog_tmp" 2>/dev/null || true
+        _tmp_unregister "$watchdog_tmp"
+        print_error "安装看门狗脚本失败"
+        [[ -z "$auto_mode" ]] && pause
+        return 1
+    fi
+    _tmp_unregister "$watchdog_tmp"
+    if ! cron_add_job_command "$watchdog_script" "* * * * * $watchdog_script >/dev/null 2>&1"; then
+        rm -f "$watchdog_script" 2>/dev/null || true
+        print_error "安装看门狗 cron 任务失败"
+        [[ -z "$auto_mode" ]] && pause
+        return 1
+    fi
     echo ""
     print_success "看门狗已启用 (每分钟检测)"
     echo -e "  脚本: ${C_CYAN}${watchdog_script}${C_RESET}"
@@ -10131,14 +13444,16 @@ wg_export_peers() {
     wg_check_server || return 1
     print_title "导出 WireGuard 设备配置"
     local peer_count
-    peer_count=$(wg_db_get '.peers | length')
-    if [[ "$peer_count" -eq 0 || "$peer_count" == "null" ]]; then
+    if ! peer_count=$(wg_db_get '.peers | length') || [[ ! "$peer_count" =~ ^[0-9]+$ ]]; then
+        print_error "读取设备数量失败"
+        pause; return 1
+    fi
+    if [[ "$peer_count" -eq 0 ]]; then
         print_warn "暂无设备可导出"
         pause; return
     fi
     local export_file
-    export_file=$(mktemp "/tmp/${SCRIPT_NAME}-wg-peers.XXXXXX") || { print_error "无法创建导出文件"; pause; return 1; }
-    chmod 600 "$export_file"
+    export_file=$(wg_shared_export_file) || { print_error "无法创建导出文件"; pause; return 1; }
     if jq '{
         export_version: 2,
         export_date: (now | todate),
@@ -10159,11 +13474,38 @@ wg_export_peers() {
         echo ""
         print_warn "该文件包含私钥等敏感信息，请妥善保管！"
         echo "可使用 [导入设备配置] 在其他服务器恢复。"
+        log_action "WireGuard peers exported: count=$peer_count file=$export_file"
     else
         print_error "导出失败"
+        rm -f "$export_file" 2>/dev/null || true
+        pause; return 1
     fi
-    log_action "WireGuard peers exported: count=$peer_count file=$export_file"
     pause
+}
+
+_wg_openwrt_import_snapshot_clients() {
+    local backup_dir="$1"
+    mkdir -p "$(dirname "$backup_dir")" || return 1
+    rm -rf "$backup_dir" 2>/dev/null || true
+    if [[ -d /etc/wireguard/clients ]]; then
+        cp -a /etc/wireguard/clients "$backup_dir" || return 1
+    else
+        mkdir -p "$backup_dir" || return 1
+    fi
+}
+
+_wg_openwrt_import_restore_snapshot() {
+    local db_snapshot="${1:-}" client_backup="${2:-}"
+    [[ -n "$db_snapshot" ]] && wg_write_private_file "$WG_DB_FILE" "$db_snapshot" >/dev/null 2>&1 || true
+    if [[ -n "$client_backup" && -d "$client_backup" ]]; then
+        rm -rf /etc/wireguard/clients 2>/dev/null || true
+        mkdir -p /etc/wireguard 2>/dev/null || true
+        cp -a "$client_backup" /etc/wireguard/clients 2>/dev/null || true
+    fi
+    wg_rebuild_uci_conf "no_reload" >/dev/null 2>&1 || true
+    wg_regenerate_client_confs >/dev/null 2>&1 || true
+    wg_apply_runtime_conf >/dev/null 2>&1 || true
+    wg_mihomo_bypass_rebuild >/dev/null 2>&1 || true
 }
 
 wg_import_peers() {
@@ -10173,17 +13515,17 @@ wg_import_peers() {
     [[ -z "$import_file" ]] && return
     if [[ ! -f "$import_file" ]]; then
         print_error "文件不存在: $import_file"
-        pause; return
+        pause; return 1
     fi
     if ! jq empty "$import_file" 2>/dev/null; then
         print_error "文件不是有效的 JSON 格式"
-        pause; return
+        pause; return 1
     fi
     local import_count
     import_count=$(jq '.peers | length' "$import_file" 2>/dev/null)
     if [[ -z "$import_count" || "$import_count" -eq 0 ]]; then
         print_warn "文件中无设备数据"
-        pause; return
+        pause; return 1
     fi
     echo -e "发现 ${C_CYAN}${import_count}${C_RESET} 个设备:"
     jq -r '.peers[] | "  - \(.name) (\(.ip))"' "$import_file" 2>/dev/null
@@ -10195,7 +13537,18 @@ wg_import_peers() {
 "
     read -e -r -p "选择: " mode
     [[ "$mode" == "0" || -z "$mode" ]] && return
-    [[ "$mode" != "1" && "$mode" != "2" ]] && { print_error "无效选项"; pause; return; }
+    [[ "$mode" != "1" && "$mode" != "2" ]] && { print_error "无效选项"; pause; return 1; }
+
+    local db_snapshot client_backup
+    db_snapshot=$(_wg_openwrt_snapshot_db) || { print_error "读取 WireGuard 数据库快照失败"; pause; return 1; }
+    client_backup=$(mktemp -d "${TMPDIR:-/tmp}/${SCRIPT_NAME}-wg-import-clients.XXXXXX") || {
+        print_error "创建客户端配置快照目录失败"; pause; return 1;
+    }
+    chmod 700 "$client_backup" 2>/dev/null || true
+    if ! _wg_openwrt_import_snapshot_clients "$client_backup/clients"; then
+        rm -rf "$client_backup" 2>/dev/null || true
+        print_error "备份客户端配置失败"; pause; return 1
+    fi
 
     local existing_count
     existing_count=$(wg_db_get '.peers | length')
@@ -10207,7 +13560,10 @@ wg_import_peers() {
         read -e -r -p "选择 [1]: " merge_mode
         merge_mode=${merge_mode:-1}
         if [[ "$merge_mode" == "2" ]]; then
-            confirm "确认删除所有现有设备?" || return
+            if ! confirm "确认删除所有现有设备?"; then
+                rm -rf "$client_backup" 2>/dev/null || true
+                return
+            fi
             # 先从运行中的接口移除所有 peer
             if wg_is_running; then
                 local pc=$(wg_db_get '.peers | length') pi=0
@@ -10217,7 +13573,12 @@ wg_import_peers() {
                     pi=$((pi + 1))
                 done
             fi
-            wg_db_set '.peers = []'
+            if ! wg_db_set '.peers = []'; then
+                _wg_openwrt_import_restore_snapshot "$db_snapshot" "$client_backup/clients"
+                rm -rf "$client_backup" 2>/dev/null || true
+                print_error "清空现有设备失败，已恢复原配置"
+                pause; return 1
+            fi
             rm -f /etc/wireguard/clients/*.conf 2>/dev/null
         fi
     fi
@@ -10306,7 +13667,7 @@ wg_import_peers() {
 
         [[ -z "$created" || "$created" == "null" ]] && created=$(date '+%Y-%m-%d %H:%M:%S')
 
-        wg_db_set --arg name "$name" \
+        if ! wg_db_set --arg name "$name" \
                   --arg ip "$ip" \
                   --arg privkey "$privkey" \
                   --arg pubkey "$pubkey" \
@@ -10331,16 +13692,25 @@ wg_import_peers() {
                 lan_subnets: $lans,
                 peer_type: $ptype,
                 route_mode: $route_mode
-            }]'
+            }]'; then
+            _wg_openwrt_import_restore_snapshot "$db_snapshot" "$client_backup/clients"
+            rm -rf "$client_backup" 2>/dev/null || true
+            print_error "导入 $name 时数据库写入失败，已恢复原配置"
+            pause; return 1
+        fi
         imported=$((imported + 1))
         i=$((i + 1))
     done
 
     if [[ $imported -gt 0 ]]; then
-        wg_rebuild_uci_conf "no_reload"
-        wg_apply_runtime_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
-        wg_regenerate_client_confs
+        if ! wg_rebuild_uci_conf "no_reload" || ! wg_apply_runtime_conf || ! wg_regenerate_client_confs; then
+            _wg_openwrt_import_restore_snapshot "$db_snapshot" "$client_backup/clients"
+            rm -rf "$client_backup" 2>/dev/null || true
+            print_error "WireGuard 运行配置热应用失败，已恢复原配置"
+            pause; return 1
+        fi
     fi
+    rm -rf "$client_backup" 2>/dev/null || true
     echo ""
     print_success "导入完成: 成功 ${imported}, 跳过 ${skipped}"
     [[ "$mode" == "2" ]] && print_warn "已重新生成密钥，请重新下发所有客户端配置。"
@@ -10767,9 +14137,8 @@ wg_deb_rebuild_conf() {
     [[ -z "$def_iface" || "$def_iface" == "null" ]] && def_iface=$(wg_deb_detect_default_iface)
     [[ -z "$def_iface" ]] && def_iface="eth0"
 
-    local old_umask _rc
-    old_umask=$(umask)
-    umask 077
+    local conf_content
+    conf_content=$(
     {
         echo "[Interface]"
         echo "PrivateKey = ${priv_key}"
@@ -10806,20 +14175,19 @@ wg_deb_rebuild_conf() {
             fi
             i=$((i + 1))
         done
-    } > "$WG_DEB_CONF"
-    _rc=$?
-    umask "$old_umask"
-    [[ $_rc -eq 0 ]] || return 1
-    chmod 600 "$WG_DEB_CONF"
+    }
+)
+    wg_write_private_file "$WG_DEB_CONF" "$conf_content"
 }
 
 wg_deb_regenerate_client_confs() {
     local pc=$(wg_deb_db_get '.peers | length')
     [[ "$pc" -eq 0 ]] && return
-    local spub sep sport sdns mask mtu
+    local spub sep sport endpoint sdns mask mtu
     spub=$(wg_deb_db_get '.server.public_key')
     sep=$(wg_deb_db_get '.server.endpoint')
     sport=$(wg_deb_db_get '.server.port')
+    endpoint=$(wg_shared_format_endpoint "$sep" "$sport")
     sdns=$(wg_deb_db_get '.server.dns')
     mask=$(echo "$(wg_deb_db_get '.server.subnet')" | cut -d'/' -f2)
     mtu=$(wg_deb_db_get '.server.mtu // empty')
@@ -10838,34 +14206,124 @@ MTU = ${mtu}"
 [Peer]
 PublicKey = ${spub}
 PresharedKey = $(wg_deb_db_get ".peers[$i].preshared_key")
-Endpoint = ${sep}:${sport}
+Endpoint = ${endpoint}
 AllowedIPs = $(wg_deb_db_get ".peers[$i].client_allowed_ips")
 PersistentKeepalive = 25"
-        write_file_atomic "${WG_DEB_CLIENT_DIR}/${name}.conf" "$conf_content"
-        chmod 600 "${WG_DEB_CLIENT_DIR}/${name}.conf"
+        wg_write_private_file "${WG_DEB_CLIENT_DIR}/${name}.conf" "$conf_content" || return 1
         i=$((i + 1))
     done
 }
 
 wg_deb_apply_conf() {
     wg_deb_rebuild_conf || return 1
-    wg_deb_regenerate_client_confs
+    wg_deb_regenerate_client_confs || return 1
     wg_deb_is_running || return 0
-    local tmp
-    tmp=$(mktemp "/tmp/${SCRIPT_NAME}-wg-deb-sync.XXXXXX") || return 1
+    local tmp_dir tmp
+    tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/${SCRIPT_NAME}-wg-deb-sync.XXXXXX") || return 1
+    chmod 700 "$tmp_dir" 2>/dev/null || true
+    tmp="${tmp_dir}/sync.conf"
     awk '
         /^\[Interface\]$/ { section="interface"; print; next }
         /^\[Peer\]$/ { section="peer"; print; next }
         section=="interface" && /^(PrivateKey|ListenPort|FwMark)[[:space:]]*=/ { print; next }
         section=="peer" && /^(PublicKey|PresharedKey|AllowedIPs|Endpoint|PersistentKeepalive)[[:space:]]*=/ { print; next }
-    ' "$WG_DEB_CONF" > "$tmp"
+    ' "$WG_DEB_CONF" > "$tmp" || { rm -rf "$tmp_dir"; return 1; }
+    chmod 600 "$tmp" 2>/dev/null || true
     if wg syncconf "$WG_DEB_INTERFACE" "$tmp" >/dev/null 2>&1; then
-        rm -f "$tmp"
+        rm -rf "$tmp_dir"
+        wg_deb_sync_peer_routes || return 1
         return 0
     fi
-    rm -f "$tmp"
+    rm -rf "$tmp_dir"
     return 1
 }
+
+wg_deb_sync_peer_routes() {
+    wg_deb_is_running || return 0
+    wg_shared_sync_gateway_routes wg_deb_db_get "$WG_DEB_INTERFACE"
+}
+_wg_deb_ufw_has_udp_allow() {
+    local port="${1:-}"
+    validate_port "$port" || return 1
+    command_exists ufw || return 1
+    LANG=C ufw show added 2>/dev/null | awk -v rule="${port}/udp" '
+        $1 == "ufw" && $2 == "allow" && $3 == rule { found=1 }
+        END { exit found ? 0 : 1 }
+    '
+}
+
+_wg_deb_rollback_new_udp_allow() {
+    local port="${1:-}" added="${2:-false}" non_ufw_backends="${3:-}"
+    validate_port "$port" || return 0
+    if [[ "$added" == "true" ]] && command_exists ufw && ufw_is_active; then
+        ufw delete allow "$port"/udp >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$non_ufw_backends" ]] && declare -F firewall_rollback_udp_port >/dev/null; then
+        firewall_rollback_udp_port "$port" "$non_ufw_backends" "WireGuard-Debian"
+    fi
+}
+
+_wg_deb_rollback_server_port_change() {
+    local cur_port="${1:-}" new_port="${2:-}" added="${3:-false}" rebuild="${4:-false}" non_ufw_backends="${5:-}"
+    if validate_port "$cur_port"; then
+        if ! wg_deb_db_set --argjson p "$cur_port" '.server.port = $p' >/dev/null 2>&1; then
+            print_warn "端口回滚写入数据库失败，请手动检查 WireGuard 配置。"
+        elif [[ "$rebuild" == "true" ]]; then
+            wg_deb_rebuild_conf >/dev/null 2>&1 || print_warn "端口回滚后重建服务端配置失败，请手动检查。"
+            wg_deb_regenerate_client_confs >/dev/null 2>&1 || print_warn "端口回滚后重建客户端配置失败，请手动检查。"
+        fi
+    fi
+    _wg_deb_rollback_new_udp_allow "$new_port" "$added" "$non_ufw_backends"
+}
+
+_wg_deb_rollback_server_modify() {
+    local snapshot="${1:-}" cur_port="${2:-}" new_port="${3:-}" added="${4:-false}" rebuild="${5:-false}" non_ufw_backends="${6:-}"
+    if [[ -n "$snapshot" ]]; then
+        if ! wg_write_private_file "$WG_DEB_DB_FILE" "$snapshot" >/dev/null 2>&1; then
+            print_warn "服务端配置回滚写入数据库失败，请手动检查 WireGuard 配置。"
+        elif [[ "$rebuild" == "true" ]]; then
+            wg_deb_rebuild_conf >/dev/null 2>&1 || print_warn "服务端配置回滚后重建服务端配置失败，请手动检查。"
+            wg_deb_regenerate_client_confs >/dev/null 2>&1 || print_warn "服务端配置回滚后重建客户端配置失败，请手动检查。"
+        fi
+    else
+        _wg_deb_rollback_server_port_change "$cur_port" "$new_port" "$added" "$rebuild" "$non_ufw_backends"
+        return
+    fi
+    _wg_deb_rollback_new_udp_allow "$new_port" "$added" "$non_ufw_backends"
+}
+
+_wg_deb_rollback_server_install() {
+    local wg_port="${1:-}" wg_udp_rule_added="${2:-false}" snapshot_dir="${3:-}"
+    local db_existed="${4:-false}" role_existed="${5:-false}" conf_existed="${6:-false}"
+    local non_ufw_backends="${7:-}"
+
+    systemctl stop "wg-quick@${WG_DEB_INTERFACE}" >/dev/null 2>&1 || true
+    systemctl disable "wg-quick@${WG_DEB_INTERFACE}" >/dev/null 2>&1 || true
+
+    if [[ "$db_existed" == "true" && -n "$snapshot_dir" && -f "${snapshot_dir}/db" ]]; then
+        mkdir -p "$(dirname "$WG_DEB_DB_FILE")" 2>/dev/null || true
+        cp -p "${snapshot_dir}/db" "$WG_DEB_DB_FILE" 2>/dev/null || print_warn "恢复 WireGuard 数据库失败，请手动检查。"
+    else
+        rm -f "$WG_DEB_DB_FILE" 2>/dev/null || print_warn "删除新建 WireGuard 数据库失败，请手动检查。"
+    fi
+
+    if [[ "$role_existed" == "true" && -n "$snapshot_dir" && -f "${snapshot_dir}/role" ]]; then
+        mkdir -p "$(dirname "$WG_DEB_ROLE_FILE")" 2>/dev/null || true
+        cp -p "${snapshot_dir}/role" "$WG_DEB_ROLE_FILE" 2>/dev/null || print_warn "恢复 WireGuard 角色文件失败，请手动检查。"
+    else
+        rm -f "$WG_DEB_ROLE_FILE" 2>/dev/null || print_warn "删除新建 WireGuard 角色文件失败，请手动检查。"
+    fi
+
+    if [[ "$conf_existed" == "true" && -n "$snapshot_dir" && -f "${snapshot_dir}/conf" ]]; then
+        mkdir -p "$(dirname "$WG_DEB_CONF")" 2>/dev/null || true
+        cp -p "${snapshot_dir}/conf" "$WG_DEB_CONF" 2>/dev/null || print_warn "恢复 WireGuard 配置文件失败，请手动检查。"
+    else
+        rm -f "$WG_DEB_CONF" 2>/dev/null || print_warn "删除新建 WireGuard 配置文件失败，请手动检查。"
+    fi
+
+    _wg_deb_rollback_new_udp_allow "$wg_port" "$wg_udp_rule_added" "$non_ufw_backends"
+}
+
 wg_deb_server_install() {
     print_title "安装 WireGuard 服务端 (Debian/Ubuntu)"
     if wg_deb_is_installed && [[ "$(wg_deb_get_role)" == "server" ]]; then
@@ -10884,17 +14342,13 @@ wg_deb_server_install() {
 
     # ── [3/7] 配置 IP 转发 ──
     print_info "[3/7] 配置 IP 转发..."
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
-    if ! grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null; then
-        sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf 2>/dev/null
-        echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-    fi
+    _sysctl_enable_wireguard_forward || { print_error "IP 转发配置失败"; pause; return 1; }
     print_success "IP 转发已开启"
 
     # ── [4/7] 配置服务端参数 ──
     print_info "[4/7] 配置服务端参数..."
 
-    local wg_port listen_addr mtu wg_dns wg_endpoint
+    local wg_port listen_addr mtu wg_dns wg_endpoint=""
     local wg_subnet="10.66.66.0/24"
     listen_addr="0.0.0.0"
     mtu=$WG_MTU_DIRECT
@@ -10987,6 +14441,41 @@ wg_deb_server_install() {
             done
         fi
     fi
+    if ! wg_endpoint=$(wg_shared_normalize_endpoint_host "$wg_endpoint"); then
+        print_error "公网端点无效，仅支持 IP 或域名"
+        pause; return 1
+    fi
+
+    print_info "预检 WireGuard UDP 端口..."
+    local wg_udp_rule_added=false
+    local wg_non_ufw_open_backends=""
+    local fw_rc=0 had_wg_udp_rule=false
+    _wg_deb_ufw_has_udp_allow "$wg_port" && had_wg_udp_rule=true
+    firewall_allow_udp_port "$wg_port" "WireGuard-Debian"
+    fw_rc=$?
+    case "$fw_rc" in
+        0)
+            if [[ "$had_wg_udp_rule" != "true" ]] && _wg_deb_ufw_has_udp_allow "$wg_port"; then
+                wg_udp_rule_added=true
+            fi
+            print_info "已预先放行 ${wg_port}/udp"
+            ;;
+        2)
+            if declare -F firewall_prepare_non_ufw_udp_port >/dev/null; then
+                if ! firewall_prepare_non_ufw_udp_port "$wg_port" "WireGuard-Debian"; then
+                    print_error "本机防火墙未放行 WireGuard UDP 端口，已中止安装"
+                    pause; return 1
+                fi
+                wg_non_ufw_open_backends="$FIREWALL_UDP_OPEN_BACKENDS"
+                [[ -n "$wg_non_ufw_open_backends" ]] && print_info "已通过非 UFW 本地防火墙放行 ${wg_port}/udp"
+            fi
+            print_warn "请确认云安全组或上游防火墙已放行 ${wg_port}/udp"
+            ;;
+        *)
+            print_error "放行 WireGuard UDP 端口失败，已中止安装"
+            pause; return 1
+            ;;
+    esac
 
     # ── [5/7] 生成密钥 ──
     print_info "[5/7] 生成服务端密钥..."
@@ -11007,7 +14496,47 @@ wg_deb_server_install() {
 
     # ── [6/7] 写入数据库 + 生成配置 ──
     print_info "[6/7] 写入配置..."
-    wg_deb_db_init
+    local wg_install_snapshot_dir=""
+    local wg_db_existed=false wg_role_existed=false wg_conf_existed=false
+    wg_install_snapshot_dir=$(mktemp -d "${TMPDIR:-/tmp}/${SCRIPT_NAME}-wg-deb-install.XXXXXX") || {
+        print_error "创建安装回滚快照失败，已中止安装"
+        _wg_deb_rollback_new_udp_allow "$wg_port" "$wg_udp_rule_added" "$wg_non_ufw_open_backends"
+        pause; return 1
+    }
+    if [[ -f "$WG_DEB_DB_FILE" ]]; then
+        wg_db_existed=true
+        cp -p "$WG_DEB_DB_FILE" "${wg_install_snapshot_dir}/db" || {
+            print_error "备份 WireGuard 数据库失败，已中止安装"
+            rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+            _wg_deb_rollback_new_udp_allow "$wg_port" "$wg_udp_rule_added" "$wg_non_ufw_open_backends"
+            pause; return 1
+        }
+    fi
+    if [[ -f "$WG_DEB_ROLE_FILE" ]]; then
+        wg_role_existed=true
+        cp -p "$WG_DEB_ROLE_FILE" "${wg_install_snapshot_dir}/role" || {
+            print_error "备份 WireGuard 角色文件失败，已中止安装"
+            rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+            _wg_deb_rollback_new_udp_allow "$wg_port" "$wg_udp_rule_added" "$wg_non_ufw_open_backends"
+            pause; return 1
+        }
+    fi
+    if [[ -f "$WG_DEB_CONF" ]]; then
+        wg_conf_existed=true
+        cp -p "$WG_DEB_CONF" "${wg_install_snapshot_dir}/conf" || {
+            print_error "备份 WireGuard 配置文件失败，已中止安装"
+            rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+            _wg_deb_rollback_new_udp_allow "$wg_port" "$wg_udp_rule_added" "$wg_non_ufw_open_backends"
+            pause; return 1
+        }
+    fi
+
+    if ! wg_deb_db_init; then
+        print_error "初始化数据库失败，已中止安装"
+        _wg_deb_rollback_server_install "$wg_port" "$wg_udp_rule_added" "$wg_install_snapshot_dir" "$wg_db_existed" "$wg_role_existed" "$wg_conf_existed" "$wg_non_ufw_open_backends"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
     if ! wg_deb_db_set --arg sname "$server_name" \
               --arg pk "$server_privkey" \
               --arg pub "$server_pubkey" \
@@ -11037,38 +14566,51 @@ wg_deb_server_install() {
         default_iface: $iface
     } | .schema_version = 2'; then
         print_error "数据库写入失败，已中止安装"
+        _wg_deb_rollback_server_install "$wg_port" "$wg_udp_rule_added" "$wg_install_snapshot_dir" "$wg_db_existed" "$wg_role_existed" "$wg_conf_existed" "$wg_non_ufw_open_backends"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
         pause; return 1
     fi
-    wg_deb_set_role "server"
+    if ! wg_deb_set_role "server"; then
+        print_error "角色写入失败，已中止安装"
+        _wg_deb_rollback_server_install "$wg_port" "$wg_udp_rule_added" "$wg_install_snapshot_dir" "$wg_db_existed" "$wg_role_existed" "$wg_conf_existed" "$wg_non_ufw_open_backends"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
 
     # 生成 wg0.conf
-    wg_deb_rebuild_conf
-
-    # 持久化 IP 转发
-    if ! grep -q "^net.ipv4.ip_forward" /etc/sysctl.d/99-wireguard.conf 2>/dev/null; then
-        echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-wireguard.conf
-        sysctl --system >/dev/null 2>&1
+    if ! wg_deb_rebuild_conf; then
+        print_error "生成 WireGuard 服务端配置失败"
+        _wg_deb_rollback_server_install "$wg_port" "$wg_udp_rule_added" "$wg_install_snapshot_dir" "$wg_db_existed" "$wg_role_existed" "$wg_conf_existed" "$wg_non_ufw_open_backends"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
     fi
 
     # ── [7/7] 启动服务 ──
     print_info "[7/7] 启动 WireGuard..."
-    systemctl enable wg-quick@${WG_DEB_INTERFACE} >/dev/null 2>&1
-    systemctl start wg-quick@${WG_DEB_INTERFACE} >/dev/null 2>&1
-    sleep 2
-
-    # 放行 WG UDP 端口 (ufw 如果启用)
-    if ufw_is_active; then
-        ufw allow "$wg_port"/udp >/dev/null 2>&1
-        print_info "已在 UFW 放行 ${wg_port}/udp"
+    if ! systemctl enable "wg-quick@${WG_DEB_INTERFACE}" >/dev/null 2>&1; then
+        print_error "启用 WireGuard 服务失败，请检查 systemd 状态"
+        _wg_deb_rollback_server_install "$wg_port" "$wg_udp_rule_added" "$wg_install_snapshot_dir" "$wg_db_existed" "$wg_role_existed" "$wg_conf_existed" "$wg_non_ufw_open_backends"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
     fi
+    if ! systemctl start "wg-quick@${WG_DEB_INTERFACE}" >/dev/null 2>&1; then
+        print_error "启动 WireGuard 服务失败，请检查 journalctl -u wg-quick@${WG_DEB_INTERFACE} -n 20"
+        _wg_deb_rollback_server_install "$wg_port" "$wg_udp_rule_added" "$wg_install_snapshot_dir" "$wg_db_existed" "$wg_role_existed" "$wg_conf_existed" "$wg_non_ufw_open_backends"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
+    sleep 2
+    if ! wg_deb_is_running; then
+        print_error "WireGuard 启动后未运行，请检查 journalctl -u wg-quick@${WG_DEB_INTERFACE} -n 20"
+        _wg_deb_rollback_server_install "$wg_port" "$wg_udp_rule_added" "$wg_install_snapshot_dir" "$wg_db_existed" "$wg_role_existed" "$wg_conf_existed" "$wg_non_ufw_open_backends"
+        rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
+        pause; return 1
+    fi
+    rm -rf "$wg_install_snapshot_dir" 2>/dev/null || true
 
     # ── 安装结果展示 ──
     draw_line
-    if wg_deb_is_running; then
-        print_success "WireGuard 服务端安装并启动成功！"
-    else
-        print_warn "WireGuard 已安装，但启动可能失败，请检查: journalctl -u wg-quick@${WG_DEB_INTERFACE}"
-    fi
+    print_success "WireGuard 服务端安装并启动成功！"
     echo -e "  角色:       ${C_GREEN}服务端 (Server)${C_RESET}"
     echo -e "  监听地址:   ${C_GREEN}${listen_addr}:${wg_port}/udp${C_RESET}"
     echo -e "  MTU:        ${C_GREEN}${mtu}${C_RESET}"
@@ -11087,7 +14629,7 @@ wg_deb_server_install() {
 
     # 自动安装服务端看门狗
     echo ""
-    wg_deb_setup_watchdog "true"
+    wg_deb_setup_watchdog "true" || print_warn "WireGuard 看门狗安装失败，服务端已安装并运行，请稍后手动配置。"
 
     pause
 }
@@ -11108,17 +14650,50 @@ wg_deb_modify_server() {
     echo -e "  当前端点:   ${C_GREEN}${cur_ep}${C_RESET}"
     echo -e "  出口网卡:   ${C_GREEN}${cur_iface}${C_RESET}"
     [[ -n "$cur_lan" && "$cur_lan" != "null" ]] && echo -e "  当前 LAN:   ${C_GREEN}${cur_lan}${C_RESET}"
-    local changed=false lan_changed=false iface_changed=false
+    local changed=false lan_changed=false iface_changed=false port_changed=false
+    local new_udp_rule_added=false
+    local new_non_ufw_open_backends=""
+    local server_snapshot=""
+    [[ -f "$WG_DEB_DB_FILE" ]] && server_snapshot=$(cat "$WG_DEB_DB_FILE" 2>/dev/null || true)
 
     read -e -r -p "新监听端口 [${cur_port}]: " new_port
     new_port=${new_port:-$cur_port}
     if [[ "$new_port" != "$cur_port" ]]; then
         if validate_port "$new_port"; then
+            local fw_rc=0 had_new_udp_rule=false
+            _wg_deb_ufw_has_udp_allow "$new_port" && had_new_udp_rule=true
+            firewall_allow_udp_port "$new_port" "WireGuard-Debian"
+            fw_rc=$?
+            case "$fw_rc" in
+                0)
+                    if [[ "$had_new_udp_rule" != "true" ]] && _wg_deb_ufw_has_udp_allow "$new_port"; then
+                        new_udp_rule_added=true
+                    fi
+                    print_info "已预先放行新端口 ${new_port}/udp"
+                    ;;
+                2)
+                    if declare -F firewall_prepare_non_ufw_udp_port >/dev/null; then
+                        if ! firewall_prepare_non_ufw_udp_port "$new_port" "WireGuard-Debian"; then
+                            print_error "本机防火墙未放行新 WireGuard UDP 端口，端口未修改"
+                            pause; return 1
+                        fi
+                        new_non_ufw_open_backends="$FIREWALL_UDP_OPEN_BACKENDS"
+                        [[ -n "$new_non_ufw_open_backends" ]] && print_info "已通过非 UFW 本地防火墙放行新端口 ${new_port}/udp"
+                    fi
+                    print_warn "请确认云安全组或上游防火墙已放行 ${new_port}/udp"
+                    ;;
+                *)
+                    print_error "放行新 WireGuard UDP 端口失败，端口未修改"
+                    pause; return 1
+                    ;;
+            esac
             if ! wg_deb_db_set --argjson p "$new_port" '.server.port = $p'; then
                 print_error "数据库写入失败，端口未修改"
+                _wg_deb_rollback_new_udp_allow "$new_port" "$new_udp_rule_added" "$new_non_ufw_open_backends"
                 pause; return 1
             fi
             changed=true
+            port_changed=true
             print_info "端口将更改为 ${new_port}"
         else
             print_warn "端口无效，保持原值"
@@ -11131,6 +14706,7 @@ wg_deb_modify_server() {
     if [[ "$new_dns" != "$cur_dns" ]]; then
         if ! wg_deb_db_set --arg d "$new_dns" '.server.dns = $d'; then
             print_error "数据库写入失败，DNS 未修改"
+            _wg_deb_rollback_server_modify "$server_snapshot" "$cur_port" "$new_port" "$new_udp_rule_added" "false" "$new_non_ufw_open_backends"
             pause; return 1
         fi
         changed=true
@@ -11140,12 +14716,18 @@ wg_deb_modify_server() {
     read -e -r -p "新公网端点 [${cur_ep}]: " new_ep
     new_ep=${new_ep:-$cur_ep}
     if [[ "$new_ep" != "$cur_ep" ]]; then
+        if ! new_ep=$(wg_shared_normalize_endpoint_host "$new_ep"); then
+            print_warn "端点无效，保持原值"
+            new_ep="$cur_ep"
+        else
         if ! wg_deb_db_set --arg e "$new_ep" '.server.endpoint = $e'; then
             print_error "数据库写入失败，端点未修改"
+            _wg_deb_rollback_server_modify "$server_snapshot" "$cur_port" "$new_port" "$new_udp_rule_added" "false" "$new_non_ufw_open_backends"
             pause; return 1
         fi
         changed=true
         print_info "端点将更改为 ${new_ep}"
+        fi
     fi
 
     read -e -r -p "新服务端 LAN 子网 [${cur_lan:-无}]: " new_lan
@@ -11157,6 +14739,7 @@ wg_deb_modify_server() {
         else
             if ! wg_deb_db_set --arg l "$new_lan" '.server.server_lan_subnet = $l'; then
                 print_error "数据库写入失败，LAN 子网未修改"
+                _wg_deb_rollback_server_modify "$server_snapshot" "$cur_port" "$new_port" "$new_udp_rule_added" "false" "$new_non_ufw_open_backends"
                 pause; return 1
             fi
             changed=true
@@ -11170,6 +14753,7 @@ wg_deb_modify_server() {
     if [[ "$new_iface" != "$cur_iface" ]]; then
         if ! wg_deb_db_set --arg i "$new_iface" '.server.default_iface = $i'; then
             print_error "数据库写入失败，出口网卡未修改"
+            _wg_deb_rollback_server_modify "$server_snapshot" "$cur_port" "$new_port" "$new_udp_rule_added" "false" "$new_non_ufw_open_backends"
             pause; return 1
         fi
         changed=true
@@ -11184,21 +14768,42 @@ wg_deb_modify_server() {
 
     if [[ "$lan_changed" == "true" ]] && ! _wg_deb_update_peer_routes; then
         print_error "联动更新客户端路由失败"
+        _wg_deb_rollback_server_modify "$server_snapshot" "$cur_port" "$new_port" "$new_udp_rule_added" "false" "$new_non_ufw_open_backends"
         pause; return 1
     fi
 
-    wg_deb_rebuild_conf
-    wg_deb_regenerate_client_confs
-
-    # UFW 端口变更
-    if [[ "$new_port" != "$cur_port" ]] && ufw_is_active; then
-        ufw delete allow "$cur_port"/udp >/dev/null 2>&1
-        ufw allow "$new_port"/udp >/dev/null 2>&1
+    if ! wg_deb_rebuild_conf; then
+        print_error "重建服务端配置失败"
+        _wg_deb_rollback_server_modify "$server_snapshot" "$cur_port" "$new_port" "$new_udp_rule_added" "false" "$new_non_ufw_open_backends"
+        pause; return 1
+    fi
+    if ! wg_deb_regenerate_client_confs; then
+        print_error "重建客户端配置失败"
+        _wg_deb_rollback_server_modify "$server_snapshot" "$cur_port" "$new_port" "$new_udp_rule_added" "true" "$new_non_ufw_open_backends"
+        pause; return 1
     fi
 
     # 重启服务使配置生效
-    systemctl restart wg-quick@${WG_DEB_INTERFACE} >/dev/null 2>&1
+    if ! systemctl restart wg-quick@${WG_DEB_INTERFACE} >/dev/null 2>&1; then
+        print_error "WireGuard 重启失败，请检查: journalctl -u wg-quick@${WG_DEB_INTERFACE} -n 20"
+        _wg_deb_rollback_server_modify "$server_snapshot" "$cur_port" "$new_port" "$new_udp_rule_added" "true" "$new_non_ufw_open_backends"
+        pause; return 1
+    fi
     sleep 2
+    if ! wg_deb_is_running; then
+        print_error "WireGuard 重启后未运行，请检查: journalctl -u wg-quick@${WG_DEB_INTERFACE} -n 20"
+        _wg_deb_rollback_server_modify "$server_snapshot" "$cur_port" "$new_port" "$new_udp_rule_added" "true" "$new_non_ufw_open_backends"
+        pause; return 1
+    fi
+
+    # 新端口已放行且服务已切换后，再尽量清理旧端口规则。
+    if [[ "$port_changed" == "true" ]] && ufw_is_active; then
+        if ufw delete allow "$cur_port"/udp >/dev/null 2>&1; then
+            print_info "已清理旧 UFW 端口 ${cur_port}/udp"
+        else
+            print_warn "旧 UFW 端口 ${cur_port}/udp 删除失败或规则不存在，请手动检查"
+        fi
+    fi
     [[ "$iface_changed" == "true" ]] && _wg_deb_cleanup_nat_iface "$cur_subnet" "$cur_iface"
 
     print_success "服务端配置已更新"
@@ -11334,9 +14939,11 @@ wg_deb_start() {
     if wg_deb_is_running; then
         print_success "WireGuard 已启动"
         log_action "WireGuard(deb) started"
+        return 0
     else
         print_error "启动失败，请检查: journalctl -u wg-quick@${WG_DEB_INTERFACE} -n 20"
         log_action "WireGuard(deb) start failed"
+        return 1
     fi
 }
 
@@ -11351,8 +14958,11 @@ wg_deb_stop() {
     if ! wg_deb_is_running; then
         print_success "WireGuard 已停止"
         log_action "WireGuard(deb) stopped"
+        return 0
     else
         print_error "停止失败"
+        log_action "WireGuard(deb) stop failed"
+        return 1
     fi
 }
 
@@ -11363,9 +14973,11 @@ wg_deb_restart() {
     if wg_deb_is_running; then
         print_success "WireGuard 已重启"
         log_action "WireGuard(deb) restarted"
+        return 0
     else
         print_error "重启失败，请检查: journalctl -u wg-quick@${WG_DEB_INTERFACE} -n 20"
         log_action "WireGuard(deb) restart failed"
+        return 1
     fi
 }
 
@@ -11403,9 +15015,7 @@ wg_deb_uninstall() {
     fi
 
     print_info "[3/5] 清理看门狗和定时任务..."
-    if crontab -l 2>/dev/null | grep -q "wg-watchdog.sh"; then
-        cron_remove_job "wg-watchdog.sh"
-    fi
+    cron_remove_job_command "/usr/local/bin/wg-watchdog.sh" 2>/dev/null || true
     rm -f /usr/local/bin/wg-watchdog.sh /var/log/wg-watchdog.log 2>/dev/null || true
 
     print_info "[4/5] 删除配置文件..."
@@ -11425,8 +15035,7 @@ wg_deb_uninstall() {
 
     if [[ "$role" == "server" ]]; then
         if confirm "是否恢复 IP 转发设置? (如果其他服务需要转发请选 N)"; then
-            sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf 2>/dev/null || true
-            sysctl -w net.ipv4.ip_forward=0 >/dev/null 2>&1 || true
+            _sysctl_disable_wireguard_forward || print_warn "恢复 IP 转发设置失败，请手动检查 /etc/sysctl.conf"
         fi
     fi
 
@@ -11436,6 +15045,23 @@ wg_deb_uninstall() {
     log_action "WireGuard(deb) uninstalled: role=${role}"
     pause
 }
+_wg_deb_snapshot_db() {
+    [[ -f "$WG_DEB_DB_FILE" ]] || return 1
+    cat "$WG_DEB_DB_FILE"
+}
+
+_wg_deb_restore_peer_snapshot() {
+    local snapshot="${1:-}" cleanup_file="${2:-}"
+    [[ -n "$snapshot" ]] || return 1
+    wg_write_private_file "$WG_DEB_DB_FILE" "$snapshot" || return 1
+    wg_deb_rebuild_conf >/dev/null 2>&1 || true
+    wg_deb_regenerate_client_confs >/dev/null 2>&1 || true
+    wg_deb_is_running && wg_deb_apply_conf >/dev/null 2>&1 || true
+    if [[ -n "$cleanup_file" ]]; then
+        rm -f -- "$cleanup_file" 2>/dev/null || true
+    fi
+}
+
 wg_deb_add_peer() {
     wg_deb_check_server || return 1
     print_title "添加 WireGuard 设备 (Peer)"
@@ -11453,9 +15079,9 @@ wg_deb_add_peer() {
     peer_ip=$(wg_deb_next_ip) || { pause; return 1; }
     echo -e "  分配 IP: ${C_GREEN}${peer_ip}${C_RESET}"
     local peer_privkey peer_pubkey psk
-    peer_privkey=$(wg genkey)
-    peer_pubkey=$(echo "$peer_privkey" | wg pubkey)
-    psk=$(wg genpsk)
+    peer_privkey=$(wg genkey) || { print_error "生成 peer 私钥失败"; pause; return 1; }
+    peer_pubkey=$(printf '%s\n' "$peer_privkey" | wg pubkey) || { print_error "生成 peer 公钥失败"; pause; return 1; }
+    psk=$(wg genpsk) || { print_error "生成预共享密钥失败"; pause; return 1; }
 
     # ── 设备类型选择 ──
     local peer_type="standard"
@@ -11582,16 +15208,10 @@ wg_deb_add_peer() {
         esac
     fi
 
-    # ── 生成客户端配置文件 ──
-    local spub sep sport sdns mask
-    spub=$(wg_deb_db_get '.server.public_key')
-    sep=$(wg_deb_db_get '.server.endpoint')
-    sport=$(wg_deb_db_get '.server.port')
-    sdns=$(wg_deb_db_get '.server.dns')
-    mask=$(echo "$server_subnet" | cut -d'/' -f2)
-    local conf_file="${WG_DEB_CLIENT_DIR}/${peer_name}.conf"
-
     # ── 写入数据库 ──
+    local conf_file="${WG_DEB_CLIENT_DIR}/${peer_name}.conf"
+    local db_snapshot
+    db_snapshot=$(_wg_deb_snapshot_db) || { print_error "读取 WireGuard 数据库快照失败"; pause; return 1; }
     local now; now=$(date '+%Y-%m-%d %H:%M:%S')
     if ! wg_deb_db_set --arg name "$peer_name" \
               --arg ip "$peer_ip" \
@@ -11626,13 +15246,18 @@ wg_deb_add_peer() {
     # ── 网关设备: 联动更新其他 peer 的 allowed_ips ──
     if [[ "$is_gateway" == "true" && -n "$lan_subnets" ]]; then
         if ! _wg_deb_update_peer_routes; then
-            print_error "联动更新客户端路由失败"
+            print_error "联动更新客户端路由失败，正在回滚"
+            _wg_deb_restore_peer_snapshot "$db_snapshot" "$conf_file"
             pause; return 1
         fi
     fi
 
     # ── 重建配置并热应用 ──
-    wg_deb_apply_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
+    if ! wg_deb_apply_conf; then
+        print_error "WireGuard 运行配置热应用失败，正在回滚"
+        _wg_deb_restore_peer_snapshot "$db_snapshot" "$conf_file"
+        pause; return 1
+    fi
 
     # ── 结果展示 ──
     draw_line
@@ -11682,14 +15307,18 @@ _wg_deb_update_peer_routes() {
     _pi=0
     while [[ $_pi -lt $_pc ]]; do
         local _cur=$(wg_deb_db_get ".peers[$_pi].client_allowed_ips")
-        [[ "$_cur" == *"0.0.0.0/0"* ]] && { _pi=$((_pi + 1)); continue; }
-        [[ "$_cur" == "$server_subnet" ]] && { _pi=$((_pi + 1)); continue; }
-
         local _is_gw=$(wg_deb_db_get ".peers[$_pi].is_gateway // false")
         local _own=$(wg_deb_db_get ".peers[$_pi].lan_subnets // empty")
         local _ptype=$(wg_deb_db_get ".peers[$_pi].peer_type // \"standard\"")
         local _route_mode=$(wg_deb_db_get ".peers[$_pi].route_mode // empty")
-        [[ "$_route_mode" == "custom" ]] && { _pi=$((_pi + 1)); continue; }
+        case "$_route_mode" in
+            custom|full|vpn)
+                _pi=$((_pi + 1))
+                continue
+                ;;
+        esac
+        [[ "$_cur" == *"0.0.0.0/0"* || "$_cur" == *"::/0"* ]] && { _pi=$((_pi + 1)); continue; }
+        [[ -z "$_route_mode" && "$_cur" == "$server_subnet" ]] && { _pi=$((_pi + 1)); continue; }
 
         if [[ "$_is_gw" == "true" ]]; then
             local _other="" _IFS_BAK="$IFS"; IFS=','
@@ -11729,13 +15358,19 @@ wg_deb_toggle_peer() {
     target_name=$(wg_deb_db_get ".peers[$target_idx].name")
     target_pubkey=$(wg_deb_db_get ".peers[$target_idx].public_key")
     current_state=$(wg_deb_db_get ".peers[$target_idx].enabled")
+    local db_snapshot
+    db_snapshot=$(_wg_deb_snapshot_db) || { print_error "读取 WireGuard 数据库快照失败"; pause; return 1; }
     if [[ "$current_state" == "true" ]]; then
         if confirm "确认禁用设备 '${target_name}'？"; then
             if ! wg_deb_db_set --argjson idx "$target_idx" '.peers[$idx].enabled = false'; then
                 print_error "数据库写入失败，设备状态未修改"
                 pause; return 1
             fi
-            wg_deb_apply_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
+            if ! wg_deb_apply_conf; then
+                print_error "WireGuard 运行配置热应用失败，正在回滚"
+                _wg_deb_restore_peer_snapshot "$db_snapshot"
+                pause; return 1
+            fi
             print_success "设备 '${target_name}' 已禁用"
             log_action "WireGuard(deb) peer disabled: ${target_name}"
         fi
@@ -11745,7 +15380,11 @@ wg_deb_toggle_peer() {
                 print_error "数据库写入失败，设备状态未修改"
                 pause; return 1
             fi
-            wg_deb_apply_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
+            if ! wg_deb_apply_conf; then
+                print_error "WireGuard 运行配置热应用失败，正在回滚"
+                _wg_deb_restore_peer_snapshot "$db_snapshot"
+                pause; return 1
+            fi
             print_success "设备 '${target_name}' 已启用"
             log_action "WireGuard(deb) peer enabled: ${target_name}"
         fi
@@ -11765,6 +15404,9 @@ wg_deb_delete_peer() {
     fi
     local _del_gw=$(wg_deb_db_get ".peers[$target_idx].is_gateway // false")
     local _del_lans=$(wg_deb_db_get ".peers[$target_idx].lan_subnets // empty")
+    local conf_file="${WG_DEB_CLIENT_DIR}/${target_name}.conf"
+    local db_snapshot
+    db_snapshot=$(_wg_deb_snapshot_db) || { print_error "读取 WireGuard 数据库快照失败"; pause; return 1; }
     if ! wg_deb_db_set --argjson idx "$target_idx" 'del(.peers[$idx])'; then
         print_error "数据库写入失败，设备未删除"
         pause; return 1
@@ -11773,13 +15415,18 @@ wg_deb_delete_peer() {
     # 网关删除后联动更新其他 peer
     if [[ "$_del_gw" == "true" && -n "$_del_lans" && "$_del_lans" != "null" ]]; then
         if ! _wg_deb_update_peer_routes; then
-            print_error "联动更新客户端路由失败"
+            print_error "联动更新客户端路由失败，正在回滚"
+            _wg_deb_restore_peer_snapshot "$db_snapshot"
             pause; return 1
         fi
     fi
 
-    rm -f "${WG_DEB_CLIENT_DIR}/${target_name}.conf"
-    wg_deb_apply_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
+    if ! wg_deb_apply_conf; then
+        print_error "WireGuard 运行配置热应用失败，正在回滚"
+        _wg_deb_restore_peer_snapshot "$db_snapshot"
+        pause; return 1
+    fi
+    rm -f -- "$conf_file" 2>/dev/null || print_warn "删除客户端配置文件失败: $conf_file"
 
     print_success "设备 '${target_name}' 已删除"
     log_action "WireGuard(deb) peer deleted: ${target_name}"
@@ -11837,7 +15484,7 @@ wg_deb_setup_watchdog() {
     local auto_mode="${1:-}"
 
     # 已启用时的管理界面
-    if [[ -z "$auto_mode" ]] && crontab -l 2>/dev/null | grep -q "wg-watchdog.sh"; then
+    if [[ -z "$auto_mode" ]] && cron_has_job_command "$watchdog_script"; then
         print_title "WireGuard 看门狗"
         echo -e "  状态: ${C_GREEN}已启用${C_RESET}"
         echo -e "  脚本: ${C_CYAN}${watchdog_script}${C_RESET}"
@@ -11849,7 +15496,7 @@ wg_deb_setup_watchdog() {
         read -e -r -p "选择: " c
         case $c in
             1)
-                cron_remove_job "wg-watchdog.sh"
+                cron_remove_job_command "$watchdog_script"
                 rm -f "$watchdog_script"
                 print_success "看门狗已禁用"
                 log_action "WireGuard(deb) watchdog disabled"
@@ -11877,8 +15524,17 @@ wg_deb_setup_watchdog() {
         if ! confirm "启用看门狗?"; then pause; return; fi
     fi
 
+    mkdir -p "$(dirname "$watchdog_script")" || { print_error "创建看门狗目录失败"; [[ -z "$auto_mode" ]] && pause; return 1; }
+    local watchdog_tmp
+    watchdog_tmp=$(mktemp "$(dirname "$watchdog_script")/.tmp.server-manage.wg-watchdog.XXXXXX") || {
+        print_error "创建看门狗临时脚本失败"
+        [[ -z "$auto_mode" ]] && pause
+        return 1
+    }
+    _tmp_register "$watchdog_tmp"
+
     # ── Debian 看门狗 (systemctl 管理) ──
-    {
+    if ! {
         cat << 'WDEOF_DEB'
 #!/bin/bash
 WDEOF_DEB
@@ -11909,29 +15565,51 @@ if ! wg show "$WG_DEB_INTERFACE" &>/dev/null; then
     exit 0
 fi
 WDEOF_DEB
-    } > "$watchdog_script"
-    chmod +x "$watchdog_script"
-    cron_add_job "wg-watchdog.sh" "* * * * * $watchdog_script >/dev/null 2>&1"
+    } > "$watchdog_tmp"; then
+        rm -f "$watchdog_tmp" 2>/dev/null || true
+        _tmp_unregister "$watchdog_tmp"
+        print_error "写入看门狗脚本失败"
+        [[ -z "$auto_mode" ]] && pause
+        return 1
+    fi
+    chmod 0755 "$watchdog_tmp" 2>/dev/null || true
+    if ! mv "$watchdog_tmp" "$watchdog_script"; then
+        rm -f "$watchdog_tmp" 2>/dev/null || true
+        _tmp_unregister "$watchdog_tmp"
+        print_error "安装看门狗脚本失败"
+        [[ -z "$auto_mode" ]] && pause
+        return 1
+    fi
+    _tmp_unregister "$watchdog_tmp"
+    if ! cron_add_job_command "$watchdog_script" "* * * * * $watchdog_script >/dev/null 2>&1"; then
+        rm -f "$watchdog_script" 2>/dev/null || true
+        print_error "安装看门狗 cron 任务失败"
+        [[ -z "$auto_mode" ]] && pause
+        return 1
+    fi
     echo ""
     print_success "看门狗已启用 (每分钟检测)"
     echo -e "  脚本: ${C_CYAN}${watchdog_script}${C_RESET}"
     echo "  检测: 接口存活 → wg show"
     log_action "WireGuard(deb) watchdog enabled"
     [[ -z "$auto_mode" ]] && pause
+    return 0
 }
 
 wg_deb_export_peers() {
     wg_deb_check_server || return 1
     print_title "导出 WireGuard 设备配置"
     local peer_count
-    peer_count=$(wg_deb_db_get '.peers | length')
-    if [[ "$peer_count" -eq 0 || "$peer_count" == "null" ]]; then
+    if ! peer_count=$(wg_deb_db_get '.peers | length') || [[ ! "$peer_count" =~ ^[0-9]+$ ]]; then
+        print_error "读取设备数量失败"
+        pause; return 1
+    fi
+    if [[ "$peer_count" -eq 0 ]]; then
         print_warn "暂无设备可导出"
         pause; return
     fi
     local export_file
-    export_file=$(mktemp "/tmp/${SCRIPT_NAME}-wg-peers.XXXXXX") || { print_error "无法创建导出文件"; pause; return 1; }
-    chmod 600 "$export_file"
+    export_file=$(wg_shared_export_file) || { print_error "无法创建导出文件"; pause; return 1; }
     if jq '{
         export_version: 2,
         export_date: (now | todate),
@@ -11952,11 +15630,37 @@ wg_deb_export_peers() {
         echo ""
         print_warn "该文件包含私钥等敏感信息，请妥善保管！"
         echo "可使用 [导入设备配置] 在其他服务器恢复。"
+        log_action "WireGuard(deb) peers exported: count=$peer_count file=$export_file"
     else
         print_error "导出失败"
+        rm -f "$export_file" 2>/dev/null || true
+        pause; return 1
     fi
-    log_action "WireGuard(deb) peers exported: count=$peer_count file=$export_file"
     pause
+}
+
+_wg_deb_import_snapshot_clients() {
+    local backup_dir="$1"
+    mkdir -p "$(dirname "$backup_dir")" || return 1
+    rm -rf "$backup_dir" 2>/dev/null || true
+    if [[ -d "$WG_DEB_CLIENT_DIR" ]]; then
+        cp -a "$WG_DEB_CLIENT_DIR" "$backup_dir" || return 1
+    else
+        mkdir -p "$backup_dir" || return 1
+    fi
+}
+
+_wg_deb_import_restore_snapshot() {
+    local db_snapshot="${1:-}" client_backup="${2:-}"
+    [[ -n "$db_snapshot" ]] && wg_write_private_file "$WG_DEB_DB_FILE" "$db_snapshot" >/dev/null 2>&1 || true
+    if [[ -n "$client_backup" && -d "$client_backup" ]]; then
+        rm -rf "$WG_DEB_CLIENT_DIR" 2>/dev/null || true
+        mkdir -p "$(dirname "$WG_DEB_CLIENT_DIR")" 2>/dev/null || true
+        cp -a "$client_backup" "$WG_DEB_CLIENT_DIR" 2>/dev/null || true
+    fi
+    wg_deb_rebuild_conf >/dev/null 2>&1 || true
+    wg_deb_regenerate_client_confs >/dev/null 2>&1 || true
+    wg_deb_is_running && wg_deb_apply_conf >/dev/null 2>&1 || true
 }
 
 wg_deb_import_peers() {
@@ -11966,17 +15670,17 @@ wg_deb_import_peers() {
     [[ -z "$import_file" ]] && return
     if [[ ! -f "$import_file" ]]; then
         print_error "文件不存在: $import_file"
-        pause; return
+        pause; return 1
     fi
     if ! jq empty "$import_file" 2>/dev/null; then
         print_error "文件不是有效的 JSON 格式"
-        pause; return
+        pause; return 1
     fi
     local import_count
     import_count=$(jq '.peers | length' "$import_file" 2>/dev/null)
     if [[ -z "$import_count" || "$import_count" -eq 0 ]]; then
         print_warn "文件中无设备数据"
-        pause; return
+        pause; return 1
     fi
     echo -e "发现 ${C_CYAN}${import_count}${C_RESET} 个设备:"
     jq -r '.peers[] | "  - \(.name) (\(.ip))"' "$import_file" 2>/dev/null
@@ -11988,7 +15692,18 @@ wg_deb_import_peers() {
 "
     read -e -r -p "选择: " mode
     [[ "$mode" == "0" || -z "$mode" ]] && return
-    [[ "$mode" != "1" && "$mode" != "2" ]] && { print_error "无效选项"; pause; return; }
+    [[ "$mode" != "1" && "$mode" != "2" ]] && { print_error "无效选项"; pause; return 1; }
+
+    local db_snapshot client_backup
+    db_snapshot=$(_wg_deb_snapshot_db) || { print_error "读取 WireGuard 数据库快照失败"; pause; return 1; }
+    client_backup=$(mktemp -d "${TMPDIR:-/tmp}/${SCRIPT_NAME}-wg-deb-import-clients.XXXXXX") || {
+        print_error "创建客户端配置快照目录失败"; pause; return 1;
+    }
+    chmod 700 "$client_backup" 2>/dev/null || true
+    if ! _wg_deb_import_snapshot_clients "$client_backup/clients"; then
+        rm -rf "$client_backup" 2>/dev/null || true
+        print_error "备份客户端配置失败"; pause; return 1
+    fi
 
     local existing_count
     existing_count=$(wg_deb_db_get '.peers | length')
@@ -12000,8 +15715,16 @@ wg_deb_import_peers() {
         read -e -r -p "选择 [1]: " merge_mode
         merge_mode=${merge_mode:-1}
         if [[ "$merge_mode" == "2" ]]; then
-            confirm "确认删除所有现有设备?" || return
-            wg_deb_db_set '.peers = []'
+            if ! confirm "确认删除所有现有设备?"; then
+                rm -rf "$client_backup" 2>/dev/null || true
+                return
+            fi
+            if ! wg_deb_db_set '.peers = []'; then
+                _wg_deb_import_restore_snapshot "$db_snapshot" "$client_backup/clients"
+                rm -rf "$client_backup" 2>/dev/null || true
+                print_error "清空现有设备失败，已恢复原配置"
+                pause; return 1
+            fi
             rm -f "${WG_DEB_CLIENT_DIR}"/*.conf 2>/dev/null
         fi
     fi
@@ -12115,16 +15838,24 @@ wg_deb_import_peers() {
                 peer_type: $ptype,
                 route_mode: $route_mode
             }]'; then
-            print_error "跳过: $name (数据库写入失败)"
-            skipped=$((skipped + 1)); i=$((i + 1)); continue
+            _wg_deb_import_restore_snapshot "$db_snapshot" "$client_backup/clients"
+            rm -rf "$client_backup" 2>/dev/null || true
+            print_error "导入 $name 时数据库写入失败，已恢复原配置"
+            pause; return 1
         fi
         imported=$((imported + 1))
         i=$((i + 1))
     done
 
     if [[ $imported -gt 0 ]]; then
-        wg_deb_apply_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
+        if ! wg_deb_apply_conf; then
+            _wg_deb_import_restore_snapshot "$db_snapshot" "$client_backup/clients"
+            rm -rf "$client_backup" 2>/dev/null || true
+            print_error "WireGuard 运行配置热应用失败，已恢复原配置"
+            pause; return 1
+        fi
     fi
+    rm -rf "$client_backup" 2>/dev/null || true
     echo ""
     print_success "导入完成: 成功 ${imported}, 跳过 ${skipped}"
     [[ "$mode" == "2" ]] && print_warn "已重新生成密钥，请重新下发所有客户端配置。"
@@ -12359,6 +16090,33 @@ email_state_clear() {
     _email_state_reset_vars
 }
 
+_email_write_private_file() {
+    local file="$1" content="$2" dir tmp old_umask
+    dir="$(dirname "$file")"
+    mkdir -p "$dir" || return 1
+    old_umask="$(umask)"
+    umask 077
+    tmp=$(mktemp "${dir}/.tmp.server-manage.email.XXXXXX")
+    local mktemp_rc=$?
+    umask "$old_umask"
+    [[ "$mktemp_rc" -eq 0 ]] || return 1
+    if declare -F _tmp_register >/dev/null 2>&1; then _tmp_register "$tmp"; fi
+    if ! printf '%s\n' "$content" > "$tmp"; then
+        rm -f -- "$tmp" 2>/dev/null || true
+        if declare -F _tmp_unregister >/dev/null 2>&1; then _tmp_unregister "$tmp"; fi
+        return 1
+    fi
+    chmod 600 "$tmp" 2>/dev/null || true
+    chown root:root "$tmp" 2>/dev/null || true
+    if ! mv -f "$tmp" "$file"; then
+        rm -f -- "$tmp" 2>/dev/null || true
+        if declare -F _tmp_unregister >/dev/null 2>&1; then _tmp_unregister "$tmp"; fi
+        return 1
+    fi
+    if declare -F _tmp_unregister >/dev/null 2>&1; then _tmp_unregister "$tmp"; fi
+    return 0
+}
+
 # 把当前 state 文件备份为 .bak.<timestamp>；返回备份文件路径
 # 用于 partial → 重新部署 / upgrade 等"会覆盖 state"的操作前防丢失
 email_state_backup() {
@@ -12472,7 +16230,7 @@ email_run() {
 _email_redact_secrets() {
     sed -E \
         -e 's/("text"[[:space:]]*:[[:space:]]*)"[^"]*"/\1"<redacted>"/g' \
-        -e 's/(ADMIN_PASSWORDS|RESEND_TOKEN|CLOUDFLARE_API_TOKEN|CF_API_TOKEN)([[:space:]]*=[[:space:]]*|:[[:space:]]*)["'"'"']?[^[:space:]"'"'"']+["'"'"']?/\1\2<redacted>/g' \
+        -e 's/(ADMIN_PASSWORDS|[A-Z0-9_]*TOKEN)([[:space:]]*=[[:space:]]*|:[[:space:]]*)["'"'"']?[^[:space:]"'"'"']+["'"'"']?/\1\2<redacted>/g' \
         -e 's/(Bearer[[:space:]]+)[A-Za-z0-9._-]+/\1<redacted>/g'
 }
 
@@ -12492,7 +16250,7 @@ _email_patch_pages_service_binding() {
         return 0
     fi
     local backup tmp
-    backup=$(mktemp "/tmp/server-manage-pages-wrangler.XXXXXX") || return 1
+    backup=$(mktemp "${pages_dir}/.wrangler.toml.bak.XXXXXX") || return 1
     tmp=$(mktemp "${pages_dir}/.wrangler.toml.XXXXXX") || { rm -f "$backup"; return 1; }
     cp -a "$pages_toml" "$backup" || { rm -f "$backup" "$tmp"; return 1; }
     awk -v worker="$EMAIL_WORKER_NAME" '
@@ -12649,19 +16407,33 @@ _email_cf_dns_delete() {
 # 返回: 多行 record_id
 _email_cf_dns_find_ids() {
     local zid="$1" type="$2" name="$3"
-    local enc_type enc_name resp
+    local enc_type enc_name resp page=1 per_page=50 total_pages count
     enc_type=$(_email_cf_urlencode "$type")
     enc_name=$(_email_cf_urlencode "$name")
-    resp=$(_email_cf_api GET "zones/$zid/dns_records?type=$enc_type&name=$enc_name&per_page=50") || return 1
-    echo "$resp" | jq -r '.result[].id'
+    while true; do
+        resp=$(_email_cf_api GET "zones/$zid/dns_records?type=$enc_type&name=$enc_name&per_page=$per_page&page=$page") || return 1
+        echo "$resp" | jq -r '.result[].id'
+        total_pages=$(echo "$resp" | jq -r '.result_info.total_pages // empty' 2>/dev/null)
+        count=$(echo "$resp" | jq -r '.result | length' 2>/dev/null)
+        if [[ "$total_pages" =~ ^[0-9]+$ ]]; then
+            (( page >= total_pages )) && break
+        else
+            [[ "$count" =~ ^[0-9]+$ ]] || count=0
+            (( count < per_page )) && break
+        fi
+        page=$((page + 1))
+    done
 }
 
 # 删除 zone 下所有匹配 type+name 的记录（idempotent 清理）
 _email_cf_dns_purge() {
-    local zid="$1" type="$2" name="$3" id
+    local zid="$1" type="$2" name="$3" ids id failed=0
+    ids=$(_email_cf_dns_find_ids "$zid" "$type" "$name") || return 1
     while IFS= read -r id; do
-        [[ -n "$id" ]] && _email_cf_dns_delete "$zid" "$id" || true
-    done < <(_email_cf_dns_find_ids "$zid" "$type" "$name")
+        [[ -z "$id" ]] && continue
+        _email_cf_dns_delete "$zid" "$id" || failed=1
+    done <<< "$ids"
+    return "$failed"
 }
 
 # ── Pages ──
@@ -12787,7 +16559,7 @@ _email_cf_catch_all_to_worker() {
 _email_cf_catch_all_disable() {
     local zid="$1"
     local body='{"enabled":false,"matchers":[{"type":"all"}],"actions":[{"type":"drop"}]}'
-    _email_cf_api PUT "zones/$zid/email/routing/rules/catch_all" "$body" >/dev/null 2>&1 || true
+    _email_cf_api PUT "zones/$zid/email/routing/rules/catch_all" "$body" >/dev/null
 }
 
 # ── 高层封装：add-and-record ──
@@ -12934,9 +16706,13 @@ _email_deploy_check_env() {
     if ! command_exists node; then
         email_run "安装 Node.js LTS" bash -o pipefail -c '
             set -e
-            tmp=$(mktemp)
-            trap "rm -f \"$tmp\"" EXIT
+            tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/server-manage-email-node.XXXXXX")
+            chmod 700 "$tmp_dir" 2>/dev/null || true
+            tmp="$tmp_dir/setup_lts.x"
+            cleanup_node_tmp() { rm -rf "$tmp_dir"; }
+            trap cleanup_node_tmp EXIT
             curl -fsSL https://deb.nodesource.com/setup_lts.x -o "$tmp"
+            chmod 600 "$tmp" 2>/dev/null || true
             bash "$tmp" >/dev/null 2>&1
             apt-get install -y -qq nodejs
         ' || { print_error "Node.js 安装失败，请手动安装"; return 1; }
@@ -13187,7 +16963,8 @@ _email_deploy_setup_d1() {
 
 # 仅含 D1 binding 的最小 toml（供 d1 execute 使用）
 _email_render_min_toml() {
-    cat > "$EMAIL_INSTALL_DIR/worker/wrangler.toml" <<EOF
+    local content
+    content=$(cat <<EOF
 name = "${EMAIL_WORKER_NAME}"
 main = "src/worker.ts"
 compatibility_date = "2025-04-01"
@@ -13198,6 +16975,8 @@ binding = "DB"
 database_name = "${EMAIL_D1_NAME}"
 database_id = "${EMAIL_D1_ID}"
 EOF
+)
+    _email_write_private_file "$EMAIL_INSTALL_DIR/worker/wrangler.toml" "$content"
 }
 
 # ── 5. 完整 wrangler.toml ──
@@ -13218,7 +16997,8 @@ _email_deploy_render_toml() {
         prefix_val=""
     fi
 
-    cat > "$EMAIL_INSTALL_DIR/worker/wrangler.toml" <<EOF
+    local content
+    content=$(cat <<EOF
 name = "${EMAIL_WORKER_NAME}"
 main = "src/worker.ts"
 compatibility_date = "2025-04-01"
@@ -13256,7 +17036,8 @@ binding = "DB"
 database_name = "${EMAIL_D1_NAME}"
 database_id = "${EMAIL_D1_ID}"
 EOF
-    chmod 600 "$EMAIL_INSTALL_DIR/worker/wrangler.toml"
+)
+    _email_write_private_file "$EMAIL_INSTALL_DIR/worker/wrangler.toml" "$content" || return 1
     print_success "wrangler.toml 已生成"
 }
 
@@ -13284,7 +17065,12 @@ _email_deploy_secrets() {
         if _email_cf_worker_secret_put "$EMAIL_WORKER_NAME" "RESEND_TOKEN" "$EMAIL_RESEND_TOKEN"; then
             print_success "RESEND_TOKEN 已通过 secret 配置"
         else
-            print_warn "RESEND_TOKEN 配置失败 — 可稍后通过管理菜单重试"
+            EMAIL_RESEND_ENABLED=0
+            EMAIL_RESEND_SEND_DOMAIN=""
+            EMAIL_DNS_DKIM_ID=""; EMAIL_DNS_SPF_ID=""; EMAIL_DNS_SEND_MX_ID=""; EMAIL_DNS_DMARC_ID=""
+            email_state_write 2>/dev/null || true
+            print_error "RESEND_TOKEN 配置失败，已停止部署并保留 partial state 供卸载/重试。"
+            return 1
         fi
     fi
 }
@@ -13331,21 +17117,27 @@ _email_deploy_pages() {
     if _email_cf_pages_attach_domain "$EMAIL_PAGES_PROJECT" "$EMAIL_FRONTEND_DOMAIN" 2>/dev/null; then
         print_success "Pages 自定义域名: $EMAIL_FRONTEND_DOMAIN"
     else
-        print_warn "自定义域名绑定失败（可能已绑定或域名未配置）"
+        EMAIL_INSTALLED=0
+        email_state_write 2>/dev/null || true
+        print_error "Pages 自定义域名绑定失败，已停止部署并保留 partial state 供卸载/重试。"
+        print_info "请确认 ${EMAIL_FRONTEND_DOMAIN} 在当前 Cloudflare Zone 下，且 Pages Custom Domains 权限可用。"
+        return 1
     fi
 }
 
 # ── 10. DNS 记录 ──
 # 收信关键记录（Frontend CNAME / MX）失败时 return 1，由 email_deploy 阻断完成标记；
-# Resend 相关（DKIM/SPF/DMARC）仅 warn，因为发件是可选能力
+# 用户选择启用 Resend 时，secret/DNS 任一失败也 fail-closed，避免 state 显示已启用但链路不可用。
 _email_deploy_dns() {
     print_info "添加 DNS 记录..."
     local zid="$EMAIL_ZONE_ID"
     local _dns_fail=0
 
     # 前端 CNAME（橙云代理）— 若同名记录已存在，先清理
-    _email_cf_dns_purge "$zid" CNAME "$EMAIL_FRONTEND_DOMAIN"
-    if _email_cf_dns_create_record_into EMAIL_DNS_FRONTEND_ID "$zid" "CNAME" \
+    if ! _email_cf_dns_purge "$zid" CNAME "$EMAIL_FRONTEND_DOMAIN"; then
+        print_error "清理旧前端 CNAME 失败 — 已停止写入新的 CNAME"
+        _dns_fail=1
+    elif _email_cf_dns_create_record_into EMAIL_DNS_FRONTEND_ID "$zid" "CNAME" \
             "$EMAIL_FRONTEND_DOMAIN" "$EMAIL_PAGES_DOMAIN" "" "true"; then
         print_success "CNAME $EMAIL_FRONTEND_PREFIX → $EMAIL_PAGES_DOMAIN"
     else
@@ -13354,22 +17146,26 @@ _email_deploy_dns() {
     fi
 
     # MX 记录到 Cloudflare Email Routing（3 条任一缺失会降级路由，全失败则无法收信）
-    _email_cf_dns_purge "$zid" MX "$EMAIL_DOMAIN"
     local _mx_ok=0
-    if _email_cf_dns_create_record_into EMAIL_DNS_MX1_ID "$zid" "MX" "$EMAIL_DOMAIN" "route1.mx.cloudflare.net" "12"; then
-        print_success "MX 1 (route1)"; _mx_ok=$((_mx_ok+1))
+    if ! _email_cf_dns_purge "$zid" MX "$EMAIL_DOMAIN"; then
+        print_error "清理旧 MX 记录失败 — 已停止写入 Cloudflare Email Routing MX"
+        _dns_fail=1
     else
-        print_warn "MX 1 失败"
-    fi
-    if _email_cf_dns_create_record_into EMAIL_DNS_MX2_ID "$zid" "MX" "$EMAIL_DOMAIN" "route2.mx.cloudflare.net" "41"; then
-        print_success "MX 2 (route2)"; _mx_ok=$((_mx_ok+1))
-    else
-        print_warn "MX 2 失败"
-    fi
-    if _email_cf_dns_create_record_into EMAIL_DNS_MX3_ID "$zid" "MX" "$EMAIL_DOMAIN" "route3.mx.cloudflare.net" "69"; then
-        print_success "MX 3 (route3)"; _mx_ok=$((_mx_ok+1))
-    else
-        print_warn "MX 3 失败"
+        if _email_cf_dns_create_record_into EMAIL_DNS_MX1_ID "$zid" "MX" "$EMAIL_DOMAIN" "route1.mx.cloudflare.net" "12"; then
+            print_success "MX 1 (route1)"; _mx_ok=$((_mx_ok+1))
+        else
+            print_warn "MX 1 失败"
+        fi
+        if _email_cf_dns_create_record_into EMAIL_DNS_MX2_ID "$zid" "MX" "$EMAIL_DOMAIN" "route2.mx.cloudflare.net" "41"; then
+            print_success "MX 2 (route2)"; _mx_ok=$((_mx_ok+1))
+        else
+            print_warn "MX 2 失败"
+        fi
+        if _email_cf_dns_create_record_into EMAIL_DNS_MX3_ID "$zid" "MX" "$EMAIL_DOMAIN" "route3.mx.cloudflare.net" "69"; then
+            print_success "MX 3 (route3)"; _mx_ok=$((_mx_ok+1))
+        else
+            print_warn "MX 3 失败"
+        fi
     fi
     if [[ "$_mx_ok" -eq 0 ]]; then
         print_error "MX 记录全部添加失败 — 邮箱将无法收信"
@@ -13378,22 +17174,37 @@ _email_deploy_dns() {
         print_warn "MX 记录仅创建 ${_mx_ok}/3 — Cloudflare 推荐 3 条，建议 Dashboard 补齐"
     fi
 
-    # Resend 相关（DKIM/SPF/SEND_MX/DMARC）仅 warn — 不影响收信主链路
+    # Resend 相关（DKIM/SPF/SEND_MX/DMARC）：用户选择启用时必须全部写入成功。
     if [[ "$EMAIL_RESEND_ENABLED" == "1" ]]; then
         local send_sub="send.${EMAIL_DOMAIN}"
-        _email_cf_dns_purge "$zid" TXT "resend._domainkey.${EMAIL_DOMAIN}"
-        _email_cf_dns_purge "$zid" TXT "$send_sub"
-        _email_cf_dns_purge "$zid" MX  "$send_sub"
-        _email_cf_dns_purge "$zid" TXT "_dmarc.${EMAIL_DOMAIN}"
+        local _resend_purge_fail=0 _resend_create_fail=0
+        _email_cf_dns_purge "$zid" TXT "resend._domainkey.${EMAIL_DOMAIN}" || _resend_purge_fail=1
+        _email_cf_dns_purge "$zid" TXT "$send_sub" || _resend_purge_fail=1
+        _email_cf_dns_purge "$zid" MX  "$send_sub" || _resend_purge_fail=1
+        _email_cf_dns_purge "$zid" TXT "_dmarc.${EMAIL_DOMAIN}" || _resend_purge_fail=1
 
-        _email_cf_dns_create_record_into EMAIL_DNS_DKIM_ID "$zid" "TXT" "resend._domainkey.${EMAIL_DOMAIN}" "$EMAIL_RESEND_DKIM" \
-            && print_success "DKIM (resend._domainkey)" || print_warn "DKIM 失败（发件能力受影响，可后续 Dashboard 补）"
-        _email_cf_dns_create_record_into EMAIL_DNS_SPF_ID "$zid" "TXT" "$send_sub" "v=spf1 include:amazonses.com ~all" \
-            && print_success "SPF (send.${EMAIL_DOMAIN})" || print_warn "SPF 失败（发件能力受影响）"
-        _email_cf_dns_create_record_into EMAIL_DNS_SEND_MX_ID "$zid" "MX" "$send_sub" "feedback-smtp.us-east-1.amazonses.com" "10" \
-            && print_success "Send MX" || print_warn "Send MX 失败（发件能力受影响）"
-        _email_cf_dns_create_record_into EMAIL_DNS_DMARC_ID "$zid" "TXT" "_dmarc.${EMAIL_DOMAIN}" "v=DMARC1; p=none;" \
-            && print_success "DMARC" || print_warn "DMARC 失败（发件能力受影响）"
+        if [[ "$_resend_purge_fail" -ne 0 ]]; then
+            EMAIL_RESEND_ENABLED=0
+            EMAIL_RESEND_SEND_DOMAIN=""
+            EMAIL_DNS_DKIM_ID=""; EMAIL_DNS_SPF_ID=""; EMAIL_DNS_SEND_MX_ID=""; EMAIL_DNS_DMARC_ID=""
+            print_error "清理旧 Resend DNS 记录失败，已停止启用 Resend。"
+            _dns_fail=1
+        else
+            _email_cf_dns_create_record_into EMAIL_DNS_DKIM_ID "$zid" "TXT" "resend._domainkey.${EMAIL_DOMAIN}" "$EMAIL_RESEND_DKIM" \
+                && print_success "DKIM (resend._domainkey)" || { print_warn "DKIM 失败"; _resend_create_fail=1; }
+            _email_cf_dns_create_record_into EMAIL_DNS_SPF_ID "$zid" "TXT" "$send_sub" "v=spf1 include:amazonses.com ~all" \
+                && print_success "SPF (send.${EMAIL_DOMAIN})" || { print_warn "SPF 失败"; _resend_create_fail=1; }
+            _email_cf_dns_create_record_into EMAIL_DNS_SEND_MX_ID "$zid" "MX" "$send_sub" "feedback-smtp.us-east-1.amazonses.com" "10" \
+                && print_success "Send MX" || { print_warn "Send MX 失败"; _resend_create_fail=1; }
+            _email_cf_dns_create_record_into EMAIL_DNS_DMARC_ID "$zid" "TXT" "_dmarc.${EMAIL_DOMAIN}" "v=DMARC1; p=none;" \
+                && print_success "DMARC" || { print_warn "DMARC 失败"; _resend_create_fail=1; }
+            if [[ "$_resend_create_fail" -ne 0 ]]; then
+                EMAIL_RESEND_ENABLED=0
+                EMAIL_RESEND_SEND_DOMAIN=""
+                print_error "创建 Resend DNS 记录失败，已停止启用 Resend 并保留已创建记录 ID 供卸载/重试。"
+                _dns_fail=1
+            fi
+        fi
     fi
 
     # 失败也落盘 record_id（已创建的部分仍可被卸载回收），主流程根据 return 决定是否标 installed
@@ -13505,14 +17316,15 @@ _email_manage_update_admin_passwords_var() {
 
     cp -a "$toml" "${toml}.adminpw.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
     local line="ADMIN_PASSWORDS = ${admin_json}"
+    local content
     if grep -qE '^[[:space:]]*ADMIN_PASSWORDS[[:space:]]*=' "$toml"; then
-        ADMIN_PASSWORDS_LINE="$line" awk '
+        content=$(ADMIN_PASSWORDS_LINE="$line" awk '
             BEGIN { line = ENVIRON["ADMIN_PASSWORDS_LINE"] }
             /^[[:space:]]*ADMIN_PASSWORDS[[:space:]]*=/ { print line; next }
             { print }
-        ' "$toml" > "${toml}.tmp" && mv "${toml}.tmp" "$toml"
+        ' "$toml") || return 1
     else
-        ADMIN_PASSWORDS_LINE="$line" awk '
+        content=$(ADMIN_PASSWORDS_LINE="$line" awk '
             BEGIN { line = ENVIRON["ADMIN_PASSWORDS_LINE"]; inserted=0 }
             /^\[vars\]/ { print; print line; inserted=1; next }
             { print }
@@ -13523,9 +17335,9 @@ _email_manage_update_admin_passwords_var() {
                     print line
                 }
             }
-        ' "$toml" > "${toml}.tmp" && mv "${toml}.tmp" "$toml"
+        ' "$toml") || return 1
     fi
-    chmod 600 "$toml"
+    _email_write_private_file "$toml" "$content" || return 1
     _email_export_wrangler_env
     cd "$EMAIL_INSTALL_DIR/worker" || return 1
     email_run "Worker 依赖" pnpm install --no-frozen-lockfile || return 1
@@ -13619,20 +17431,45 @@ email_manage_domains() {
             ;;
     esac
 
-    # 替换 DOMAINS 和 DEFAULT_DOMAINS
-    sed -i.bak -E "s|^DOMAINS[[:space:]]*=.*$|DOMAINS = ${new_arr}|" "$toml"
-    sed -i -E "s|^DEFAULT_DOMAINS[[:space:]]*=.*$|DEFAULT_DOMAINS = ${new_arr}|" "$toml"
-    rm -f "${toml}.bak"
+    # 替换 DOMAINS 和 DEFAULT_DOMAINS。先备份，只有 Worker 重新部署成功才保留本地修改。
+    local backup tmp
+    backup=$(mktemp "${toml}.domains.bak.XXXXXX") || { print_error "创建备份失败"; pause; return; }
+    tmp=$(mktemp "${toml}.domains.XXXXXX") || { rm -f "$backup"; print_error "创建临时文件失败"; pause; return; }
+    cp -a "$toml" "$backup" || { rm -f "$backup" "$tmp"; print_error "备份 wrangler.toml 失败"; pause; return; }
+    if ! DOMAINS_JSON="$new_arr" awk '
+        BEGIN { value = ENVIRON["DOMAINS_JSON"]; seen_domains = 0; seen_defaults = 0 }
+        /^[[:space:]]*DEFAULT_DOMAINS[[:space:]]*=/ { print "DEFAULT_DOMAINS = " value; seen_defaults = 1; next }
+        /^[[:space:]]*DOMAINS[[:space:]]*=/ { print "DOMAINS = " value; seen_domains = 1; next }
+        { print }
+        END { if (!seen_domains || !seen_defaults) exit 2 }
+    ' "$toml" > "$tmp"; then
+        rm -f "$tmp"
+        cp -a "$backup" "$toml" 2>/dev/null || true
+        rm -f "$backup"
+        print_error "wrangler.toml 缺少 DOMAINS/DEFAULT_DOMAINS，已恢复原文件"
+        pause; return 1
+    fi
+    mv -f "$tmp" "$toml" || { cp -a "$backup" "$toml" 2>/dev/null || true; rm -f "$backup" "$tmp"; print_error "更新 wrangler.toml 失败，已恢复原文件"; pause; return; }
+    chmod 600 "$toml"
     print_success "wrangler.toml 已更新"
     echo "  DOMAINS = $new_arr"
 
     cd "$EMAIL_INSTALL_DIR/worker" || return
-    email_run "Worker 依赖" pnpm install --no-frozen-lockfile || { pause; return; }
+    email_run "Worker 依赖" pnpm install --no-frozen-lockfile || {
+        cp -a "$backup" "$toml" 2>/dev/null || true
+        rm -f "$backup"
+        print_error "依赖安装失败，wrangler.toml 已恢复"
+        pause; return 1
+    }
     if email_run "重新部署 Worker" _email_wrangler deploy; then
+        rm -f "$backup"
         print_success "Worker 已更新，新域名已生效"
         log_action "Email DOMAINS updated: $new_arr"
     else
-        print_error "部署失败，wrangler.toml 已修改但 worker 未更新"
+        cp -a "$backup" "$toml" 2>/dev/null || true
+        rm -f "$backup"
+        print_error "部署失败，wrangler.toml 已恢复"
+        pause; return 1
     fi
     pause
 }
@@ -13662,32 +17499,52 @@ email_manage_resend() {
 
 _email_manage_resend_setup() {
     local tok dkim
-    email_read_secret "Resend API Token" tok || { print_error "Token 不能为空"; return; }
+    email_read_secret "Resend API Token" tok || { print_error "Token 不能为空"; return 1; }
     print_info "已收到 Token: $(email_mask_token "$tok")"
     read -e -r -p "Resend DKIM (p=MIGfMA0...): " dkim
-    [[ -z "$dkim" ]] && { print_error "DKIM 不能为空"; return; }
+    [[ -z "$dkim" ]] && { print_error "DKIM 不能为空"; unset tok dkim; return 1; }
 
     if ! email_run "写入 RESEND_TOKEN secret" _email_cf_worker_secret_put "$EMAIL_WORKER_NAME" "RESEND_TOKEN" "$tok"; then
-        print_error "secret 写入失败"; return
+        print_error "secret 写入失败"
+        unset tok dkim
+        return 1
     fi
 
     local send_sub="send.${EMAIL_DOMAIN}"
     local zid="$EMAIL_ZONE_ID"
 
     # 清旧记录（按 type+name 全量清，避免脏数据残留）
-    _email_cf_dns_purge "$zid" TXT "resend._domainkey.${EMAIL_DOMAIN}"
-    _email_cf_dns_purge "$zid" TXT "$send_sub"
-    _email_cf_dns_purge "$zid" MX  "$send_sub"
-    _email_cf_dns_purge "$zid" TXT "_dmarc.${EMAIL_DOMAIN}"
+    local purge_failed=0
+    _email_cf_dns_purge "$zid" TXT "resend._domainkey.${EMAIL_DOMAIN}" || purge_failed=1
+    _email_cf_dns_purge "$zid" TXT "$send_sub" || purge_failed=1
+    _email_cf_dns_purge "$zid" MX  "$send_sub" || purge_failed=1
+    _email_cf_dns_purge "$zid" TXT "_dmarc.${EMAIL_DOMAIN}" || purge_failed=1
+    if [[ "$purge_failed" -ne 0 ]]; then
+        email_state_write 2>/dev/null || true
+        print_error "清理旧 Resend DNS 记录失败，已停止启用并保留当前 state。"
+        print_warn "RESEND_TOKEN secret 可能已写入；请修复 Cloudflare DNS/API 问题后重试。"
+        unset tok dkim
+        return 1
+    fi
 
+    local create_failed=0
     _email_cf_dns_create_record_into EMAIL_DNS_DKIM_ID "$zid" "TXT" "resend._domainkey.${EMAIL_DOMAIN}" "$dkim" \
-        && print_success "DKIM" || print_warn "DKIM 失败"
+        && print_success "DKIM" || { print_warn "DKIM 失败"; create_failed=1; }
     _email_cf_dns_create_record_into EMAIL_DNS_SPF_ID "$zid" "TXT" "$send_sub" "v=spf1 include:amazonses.com ~all" \
-        && print_success "SPF" || print_warn "SPF 失败"
+        && print_success "SPF" || { print_warn "SPF 失败"; create_failed=1; }
     _email_cf_dns_create_record_into EMAIL_DNS_SEND_MX_ID "$zid" "MX" "$send_sub" "feedback-smtp.us-east-1.amazonses.com" "10" \
-        && print_success "Send MX" || print_warn "Send MX 失败"
+        && print_success "Send MX" || { print_warn "Send MX 失败"; create_failed=1; }
     _email_cf_dns_create_record_into EMAIL_DNS_DMARC_ID "$zid" "TXT" "_dmarc.${EMAIL_DOMAIN}" "v=DMARC1; p=none;" \
-        && print_success "DMARC" || print_warn "DMARC 失败"
+        && print_success "DMARC" || { print_warn "DMARC 失败"; create_failed=1; }
+    if [[ "$create_failed" -ne 0 ]]; then
+        EMAIL_RESEND_ENABLED=0
+        EMAIL_RESEND_SEND_DOMAIN=""
+        email_state_write 2>/dev/null || true
+        print_error "创建 Resend DNS 记录失败，已停止启用并保留当前 state。"
+        print_warn "可能已有部分 DNS 记录创建成功；修复 Cloudflare DNS/API 问题后可重新配置。"
+        unset tok dkim
+        return 1
+    fi
 
     EMAIL_RESEND_ENABLED=1
     EMAIL_RESEND_SEND_DOMAIN="$send_sub"
@@ -13700,11 +17557,15 @@ _email_manage_resend_setup() {
 
 _email_manage_resend_token_only() {
     local tok
-    email_read_secret "新 Resend API Token" tok || return
+    email_read_secret "新 Resend API Token" tok || return 1
     print_info "已收到 Token: $(email_mask_token "$tok")"
     if email_run "更新 RESEND_TOKEN secret" _email_cf_worker_secret_put "$EMAIL_WORKER_NAME" "RESEND_TOKEN" "$tok"; then
         print_success "RESEND_TOKEN 已更新"
         log_action "Email Resend token rotated"
+    else
+        print_error "RESEND_TOKEN 更新失败"
+        unset tok
+        return 1
     fi
     unset tok
 }
@@ -13712,15 +17573,30 @@ _email_manage_resend_token_only() {
 _email_manage_resend_disable() {
     confirm "确认禁用 Resend 并删除相关 DNS 记录?" || return
     local zid="$EMAIL_ZONE_ID"
-    _email_cf_dns_delete "$zid" "$EMAIL_DNS_DKIM_ID" && print_success "已删 DKIM" || true
-    _email_cf_dns_delete "$zid" "$EMAIL_DNS_SPF_ID"  && print_success "已删 SPF" || true
-    _email_cf_dns_delete "$zid" "$EMAIL_DNS_SEND_MX_ID" && print_success "已删 Send MX" || true
-    _email_cf_dns_delete "$zid" "$EMAIL_DNS_DMARC_ID" && print_success "已删 DMARC" || true
+    local failed=0
+    if [[ -n "${EMAIL_DNS_DKIM_ID:-}" ]]; then
+        _email_cf_dns_delete "$zid" "$EMAIL_DNS_DKIM_ID" && print_success "已删 DKIM" || { print_warn "DKIM 删除失败"; failed=1; }
+    fi
+    if [[ -n "${EMAIL_DNS_SPF_ID:-}" ]]; then
+        _email_cf_dns_delete "$zid" "$EMAIL_DNS_SPF_ID" && print_success "已删 SPF" || { print_warn "SPF 删除失败"; failed=1; }
+    fi
+    if [[ -n "${EMAIL_DNS_SEND_MX_ID:-}" ]]; then
+        _email_cf_dns_delete "$zid" "$EMAIL_DNS_SEND_MX_ID" && print_success "已删 Send MX" || { print_warn "Send MX 删除失败"; failed=1; }
+    fi
+    if [[ -n "${EMAIL_DNS_DMARC_ID:-}" ]]; then
+        _email_cf_dns_delete "$zid" "$EMAIL_DNS_DMARC_ID" && print_success "已删 DMARC" || { print_warn "DMARC 删除失败"; failed=1; }
+    fi
     # 同步清掉可能的同名脏记录
-    _email_cf_dns_purge "$zid" TXT "resend._domainkey.${EMAIL_DOMAIN}"
-    _email_cf_dns_purge "$zid" TXT "send.${EMAIL_DOMAIN}"
-    _email_cf_dns_purge "$zid" MX  "send.${EMAIL_DOMAIN}"
-    _email_cf_dns_purge "$zid" TXT "_dmarc.${EMAIL_DOMAIN}"
+    _email_cf_dns_purge "$zid" TXT "resend._domainkey.${EMAIL_DOMAIN}" || failed=1
+    _email_cf_dns_purge "$zid" TXT "send.${EMAIL_DOMAIN}" || failed=1
+    _email_cf_dns_purge "$zid" MX  "send.${EMAIL_DOMAIN}" || failed=1
+    _email_cf_dns_purge "$zid" TXT "_dmarc.${EMAIL_DOMAIN}" || failed=1
+
+    if [[ "$failed" -ne 0 ]]; then
+        email_state_write 2>/dev/null || true
+        print_error "部分 Resend DNS 记录删除失败，已保留 Resend state，便于修复后重试。"
+        return 1
+    fi
 
     print_warn "RESEND_TOKEN secret 不会自动清除，如需彻底清理请在 Dashboard → Workers → Settings → Variables 删除"
     EMAIL_RESEND_ENABLED=0
@@ -13853,7 +17729,6 @@ email_manage_redeploy() {
 }
 
 email_uninstall() {
-    trap '_email_clear_sensitive_env' RETURN
     print_title "完全卸载 Cloudflare Temp Email"
 
     # 不再硬卡 EMAIL_INSTALLED=1 — 只要 state 文件能加载，即视为有可回收的远端资源（涵盖部署中途失败的场景）
@@ -13864,6 +17739,7 @@ email_uninstall() {
         source "$EMAIL_STATE_FILE"
         has_state=1
     fi
+    trap '_email_clear_sensitive_env' RETURN
 
     if [[ $has_state -eq 0 ]]; then
         print_warn "未检测到 state 文件，将仅执行本地清理"
@@ -13930,13 +17806,20 @@ email_uninstall() {
     echo ""
     print_info "开始回收远程资源..."
     local uninstall_failed=0
+    local _log_domain="${EMAIL_DOMAIN:-unknown}"
 
     # 1. 关闭 catch-all
     if [[ "${EMAIL_CATCH_ALL_ENABLED:-0}" == "1" && -n "$EMAIL_ZONE_ID" ]]; then
         if email_run "禁用 Email Routing catch-all" _email_cf_catch_all_disable "$EMAIL_ZONE_ID"; then
             EMAIL_CATCH_ALL_ENABLED=0
         else
-            uninstall_failed=1
+            email_state_write 2>/dev/null || true
+            print_error "Email Routing catch-all 禁用失败，已停止卸载并保留本地目录和 state。"
+            print_warn "请检查 Cloudflare Token/网络后重新执行卸载，避免继续删除资源后丢失回收线索。"
+            log_action "Cloudflare Temp Email uninstall incomplete: $_log_domain"
+            unset CF_API_TOKEN CLOUDFLARE_API_TOKEN
+            pause
+            return 1
         fi
     fi
 
@@ -13970,7 +17853,6 @@ email_uninstall() {
     fi
 
     # 6. 本地目录与状态（先保存日志要用到的字段，再清 state）
-    local _log_domain="${EMAIL_DOMAIN:-unknown}"
     if [[ "$uninstall_failed" -ne 0 ]]; then
         email_state_write 2>/dev/null || true
         print_error "远端资源未完全删除，已保留本地目录和 state，避免丢失资源 ID。"
@@ -14024,13 +17906,13 @@ _email_uninstall_delete_dns() {
     done
 
     # 兜底：按 type+name 清理仍可能残留的同名记录（防 state 不完整）
-    _email_cf_dns_purge "$zid" "CNAME" "$EMAIL_FRONTEND_DOMAIN" 2>/dev/null || true
-    _email_cf_dns_purge "$zid" "MX"    "$EMAIL_DOMAIN" 2>/dev/null || true
+    _email_cf_dns_purge "$zid" "CNAME" "$EMAIL_FRONTEND_DOMAIN" 2>/dev/null || failed=1
+    _email_cf_dns_purge "$zid" "MX"    "$EMAIL_DOMAIN" 2>/dev/null || failed=1
     if [[ "${EMAIL_RESEND_ENABLED:-0}" == "1" ]]; then
-        _email_cf_dns_purge "$zid" "TXT" "resend._domainkey.${EMAIL_DOMAIN}" 2>/dev/null || true
-        _email_cf_dns_purge "$zid" "TXT" "send.${EMAIL_DOMAIN}" 2>/dev/null || true
-        _email_cf_dns_purge "$zid" "MX"  "send.${EMAIL_DOMAIN}" 2>/dev/null || true
-        _email_cf_dns_purge "$zid" "TXT" "_dmarc.${EMAIL_DOMAIN}" 2>/dev/null || true
+        _email_cf_dns_purge "$zid" "TXT" "resend._domainkey.${EMAIL_DOMAIN}" 2>/dev/null || failed=1
+        _email_cf_dns_purge "$zid" "TXT" "send.${EMAIL_DOMAIN}" 2>/dev/null || failed=1
+        _email_cf_dns_purge "$zid" "MX"  "send.${EMAIL_DOMAIN}" 2>/dev/null || failed=1
+        _email_cf_dns_purge "$zid" "TXT" "_dmarc.${EMAIL_DOMAIN}" 2>/dev/null || failed=1
     fi
     return "$failed"
 }
@@ -14176,6 +18058,7 @@ BULIANGLIN_SNI_POOL_URL="https://bulianglin.com/archives/nicename.html"
 # 本地缓存文件
 REALITY_SNI_CACHE_DIR="/etc/vps-mgr/reality"
 REALITY_SNI_POOL_FILE="${REALITY_SNI_CACHE_DIR}/bulianglin-sni-pool.txt"
+REALITY_SNI_FALLBACK_POOL_FILE="${REALITY_SNI_CACHE_DIR}/fallback-sni-pool.txt"
 REALITY_SNI_CACHE_TTL=86400  # 24 小时
 
 # 三级阈值（默认值，用户可在交互菜单中选择）
@@ -14187,12 +18070,40 @@ REALITY_SNI_LATENCY_THRESHOLD_RELAXED=500
 REALITY_SNI_BATCH_SIZE=15
 REALITY_SNI_TEST_TIMEOUT=3
 
+_reality_sni_pool_count() {
+    local file="$1"
+    grep -cve '^[[:space:]]*$' "$file" 2>/dev/null || echo 0
+}
+
+_reality_sni_write_pool_file() {
+    local target="$1" min_count="${2:-1}" dir base tmp count
+    dir="$(dirname "$target")"
+    base="$(basename "$target")"
+    mkdir -p "$dir" || return 1
+    tmp=$(mktemp "${dir}/.tmp.${base}.XXXXXX") || return 1
+    if ! cat > "$tmp"; then
+        rm -f "$tmp" 2>/dev/null || true
+        return 1
+    fi
+    chmod 600 "$tmp" 2>/dev/null || true
+    count=$(_reality_sni_pool_count "$tmp")
+    if [[ ! "$count" =~ ^[0-9]+$ || "$count" -lt "$min_count" ]]; then
+        rm -f "$tmp" 2>/dev/null || true
+        return 1
+    fi
+    if ! mv -f "$tmp" "$target"; then
+        rm -f "$tmp" 2>/dev/null || true
+        return 1
+    fi
+    return 0
+}
+
 # ============================================================================
 # 核心函数：从 bulianglin.com 拉取候选池
 # ============================================================================
 
 reality_fetch_bulianglin_pool() {
-    local html_content domains_json
+    local html_content domains_json domains_content
 
     print_info "正在从 bulianglin.com 拉取最新 SNI 候选池..." >&2
 
@@ -14207,16 +18118,13 @@ reality_fetch_bulianglin_pool() {
         return 1
     fi
 
-    mkdir -p "$REALITY_SNI_CACHE_DIR"
-    echo "$domains_json" | sed 's/"//g; s/, /\n/g' | sed 's/^ *//; s/ *$//' | sort -u > "$REALITY_SNI_POOL_FILE"
-
-    local count
-    count=$(wc -l < "$REALITY_SNI_POOL_FILE")
-
-    if [[ $count -lt 10 ]]; then
+    domains_content=$(echo "$domains_json" | sed 's/"//g; s/, /\n/g' | sed 's/^ *//; s/ *$//' | sort -u)
+    if ! printf '%s\n' "$domains_content" | _reality_sni_write_pool_file "$REALITY_SNI_POOL_FILE" 10; then
         return 1
     fi
 
+    local count
+    count=$(_reality_sni_pool_count "$REALITY_SNI_POOL_FILE")
     print_success "成功拉取 $count 个 SNI 候选域名" >&2
     return 0
 }
@@ -14227,11 +18135,14 @@ reality_fetch_bulianglin_pool() {
 
 reality_fetch_v2ray_agent_pool() {
     local v2ray_agent_url="https://raw.githubusercontent.com/mack-a/v2ray-agent/master/install.sh"
-    local temp_file="/tmp/v2ray-agent-install.sh"
+    local temp_file
+
+    temp_file=$(mktemp "${TMPDIR:-/tmp}/v2ray-agent-install.XXXXXX") || return 1
 
     print_info "正在从 v2ray-agent 拉取备用候选池..." >&2
 
     if ! curl -fsSL --max-time 15 "$v2ray_agent_url" -o "$temp_file" 2>/dev/null; then
+        rm -f "$temp_file"
         return 1
     fi
 
@@ -14243,17 +18154,13 @@ reality_fetch_v2ray_agent_pool() {
         return 1
     fi
 
-    mkdir -p "$REALITY_SNI_CACHE_DIR"
-    echo "$domains_content" > "$REALITY_SNI_POOL_FILE"
-
-    local count
-    count=$(wc -l < "$REALITY_SNI_POOL_FILE")
-
-    if [[ $count -lt 10 ]]; then
+    if ! printf '%s\n' "$domains_content" | _reality_sni_write_pool_file "$REALITY_SNI_POOL_FILE" 10; then
         rm -f "$temp_file"
         return 1
     fi
 
+    local count
+    count=$(_reality_sni_pool_count "$REALITY_SNI_POOL_FILE")
     print_success "成功从 v2ray-agent 拉取 $count 个备用域名" >&2
     rm -f "$temp_file"
     return 0
@@ -14266,14 +18173,15 @@ reality_fetch_v2ray_agent_pool() {
 reality_update_sni_pool() {
     # 检查缓存
     if [[ -f "$REALITY_SNI_POOL_FILE" ]]; then
-        local age
+        local age count
         age=$(( $(date +%s) - $(stat -c %Y "$REALITY_SNI_POOL_FILE" 2>/dev/null || echo 0) ))
+        count=$(_reality_sni_pool_count "$REALITY_SNI_POOL_FILE")
 
-        if [[ $age -lt $REALITY_SNI_CACHE_TTL ]]; then
-            local count
-            count=$(wc -l < "$REALITY_SNI_POOL_FILE")
+        if [[ $age -lt $REALITY_SNI_CACHE_TTL && "$count" =~ ^[0-9]+$ && "$count" -gt 0 ]]; then
             print_info "使用缓存的候选池（$count 个域名，${age}s 前更新）" >&2
             return 0
+        elif [[ $age -lt $REALITY_SNI_CACHE_TTL ]]; then
+            print_warn "缓存候选池为空或无效，尝试重新拉取" >&2
         fi
     fi
 
@@ -14288,8 +18196,8 @@ reality_update_sni_pool() {
     fi
 
     print_warn "v2ray-agent 也不可用，使用内置列表" >&2
-    printf '%s\n' "${REALITY_CANDIDATE_SNI[@]}" > /tmp/reality-fallback-pool.txt
-    REALITY_SNI_POOL_FILE="/tmp/reality-fallback-pool.txt"
+    printf '%s\n' "${REALITY_CANDIDATE_SNI[@]}" | _reality_sni_write_pool_file "$REALITY_SNI_FALLBACK_POOL_FILE" 1 || return 1
+    REALITY_SNI_POOL_FILE="$REALITY_SNI_FALLBACK_POOL_FILE"
     return 0
 }
 
@@ -14898,6 +18806,73 @@ reality_port_in_use() {
     return 1
 }
 
+# 有界等待某端口“释放”（不再有 LISTEN）。用于消除异步 reload 竞态：
+# nginx reload 释放 443 是异步的（旧 worker 优雅退出需时间），若紧接着 restart
+# sing-box 抢绑 443，旧 worker 仍占用 → bind 失败 → systemd 重试前中断约 10 秒。
+# 默认最多等 ${2:-50} 次 × 0.1s ≈ 5s；到点即返回（不阻断流程，restart 仍会兜底重试）。
+reality_wait_port_free() {
+    local port="$1" tries="${2:-50}" i=0
+    validate_port "$port" || return 0
+    while (( i < tries )); do
+        reality_port_in_use "$port" || return 0
+        sleep 0.1
+        i=$((i+1))
+    done
+    return 1
+}
+
+# MED-4：统一“已保留端口”集合。各 feature 选内部端口时，除运行时 ss 检查外还要查此集合，
+# 避免某服务当前停止(端口空闲) → 其保留端口被另一 feature 选走 → 服务重启后 bind 冲突。
+# 汇总：落地 REALITY_PORT(_V6)、共存内部端口(reality/web)、CDN origin、所有 relay 监听端口。
+# 逐行输出端口号（可能含重复/空行，调用方用 grep -qx 精确匹配即可）。
+reality_reserved_ports() {
+    [[ -n "${REALITY_PORT:-}" ]] && echo "$REALITY_PORT"
+    [[ -n "${REALITY_PORT_V6:-}" ]] && echo "$REALITY_PORT_V6"
+    # 共存内部端口（从 coexist state 读，未启用则回退常量默认值）
+    local _cr _cw
+    _cr="$(reality_coexist_reality_port 2>/dev/null || true)"; [[ -n "$_cr" ]] && echo "$_cr"
+    _cw="$(reality_coexist_web_port 2>/dev/null || true)"; [[ -n "$_cw" ]] && echo "$_cw"
+    echo "${REALITY_COEXIST_INNER_PORT:-18443}"
+    echo "${REALITY_WEB_INNER_PORT:-12443}"
+    [[ -n "${REALITY_CDN_ORIGIN_PORT:-}" ]] && echo "$REALITY_CDN_ORIGIN_PORT"
+    [[ -n "${REALITY_CDN_INNER_PORT:-}" ]] && echo "$REALITY_CDN_INNER_PORT"
+    # 所有已配置的 relay 监听端口（realm 可能当前停止，ss 查不到，故必须从磁盘枚举）
+    local f
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        # 只读 RLY_LISTEN_PORT 行，避免 source 污染当前 RLY_* 全局
+        local _p
+        _p="$(grep -E '^RLY_LISTEN_PORT=' "$f" 2>/dev/null | head -n1 | sed -E 's/^RLY_LISTEN_PORT=["'\'']?([0-9]+)["'\'']?.*/\1/')"
+        [[ -n "$_p" ]] && echo "$_p"
+    done < <(reality_relay_route_files 2>/dev/null)
+}
+
+# 某端口是否已被本项目其他 feature 保留（逻辑占用，独立于运行时 ss 检查）。
+reality_port_reserved() {
+    local port="$1" exclude="${2:-}"
+    [[ -n "$port" ]] || return 1
+    reality_reserved_ports 2>/dev/null | grep -vxF "${exclude:-__none__}" | grep -qxF "$port"
+}
+
+reality_port_reserved_except_current_landing() {
+    local port="$1" _old_p="${REALITY_PORT:-}" _old_p6="${REALITY_PORT_V6:-}"
+    local _save_p="${REALITY_PORT:-}" _save_p6="${REALITY_PORT_V6:-}" _rc
+    if [[ "$port" == "$_old_p" ]]; then
+        REALITY_PORT=""
+    fi
+    if [[ "$port" == "$_old_p6" ]]; then
+        REALITY_PORT_V6=""
+    fi
+    if reality_port_reserved "$port"; then
+        _rc=0
+    else
+        _rc=$?
+    fi
+    REALITY_PORT="$_save_p"
+    REALITY_PORT_V6="$_save_p6"
+    return "$_rc"
+}
+
 reality_detect_local_ipv6_addr() {
     # 用于 split 双节点“IPv4/IPv6 共用 443”场景：
     #   IPv4 入站继续绑定 0.0.0.0:443；
@@ -14994,6 +18969,37 @@ reality_generate_short_id() {
     fi
 }
 
+# 随机挑一个「真实浏览器」uTLS 指纹（客户端 fp）。
+# 目的：全网节点默认都填 chrome 会形成同一特征（fp=chrome 指纹画像），改为按节点随机分散。
+# 关键取舍：不用 uTLS 的 "randomized"（每次连接换指纹反而异常——真实浏览器指纹是稳定的），
+# 而是「装机时定一个真实浏览器指纹并持久化」→ 单节点稳定像真浏览器、节点之间彼此不同。
+# 池仅取主流真实浏览器（sing-box uTLS 合法值），不含 360/q（地域性强、易反成特征）与 randomized。
+reality_random_fingerprint() {
+    local fps=(chrome firefox edge safari ios android)
+    local n=${#fps[@]} idx
+    if command_exists openssl; then
+        idx=$(( 0x$(openssl rand -hex 2) % n ))
+    else
+        idx=$(( RANDOM % n ))
+    fi
+    printf '%s' "${fps[$idx]}"
+}
+
+# 校验是否为合法 uTLS 指纹（用于导入/回读兜底）。非法或空 → 回退 chrome。
+reality_sanitize_fingerprint() {
+    local fp="${1:-}"
+    case "$fp" in
+        chrome|firefox|edge|safari|ios|android|360|q|randomized) printf '%s' "$fp" ;;
+        *) printf '%s' "chrome" ;;
+    esac
+}
+
+# 当前落地机的有效客户端指纹：读 state 的 REALITY_FINGERPRINT，经 sanitize；
+# 旧版 state 无该字段（空）→ 回退 chrome（保持老节点链接不变）。
+reality_effective_fingerprint() {
+    reality_sanitize_fingerprint "${REALITY_FINGERPRINT:-}"
+}
+
 reality_generate_uuid() {
     if command_exists sing-box; then
         sing-box generate uuid 2>/dev/null && return 0
@@ -15039,6 +19045,430 @@ reality_listen_endpoint() {
     if [[ "$host" == *:* ]]; then printf '[%s]:%s' "$host" "$port"; else printf '%s:%s' "$host" "$port"; fi
 }
 
+# ============================================================================
+# 443 共存模式（nginx stream + ssl_preread 分流）
+# 开启后：443 由 nginx stream 独占，按 SNI 分流——真站域名→web(127.0.0.1:WEB_PORT)，
+# default(借用SNI/未知/无SNI)→reality(127.0.0.1:REALITY_PORT)。sing-box reality 入站
+# 从公网 443 改绑 127.0.0.1:<内部端口>；客户端链接仍是 443（连的是 nginx stream）。
+# 关键：Reality 客户端 ClientHello 的 SNI 是借用大站域名（非节点域名），故必须 default→reality。
+# ============================================================================
+
+# 共存是否已启用（state 文件存在且 ENABLED=1、内部端口合法）
+reality_coexist_enabled() {
+    [[ -f "$REALITY_COEXIST_STATE_FILE" ]] || return 1
+    (
+        # shellcheck disable=SC1090
+        validate_conf_file "$REALITY_COEXIST_STATE_FILE" 2>/dev/null && source "$REALITY_COEXIST_STATE_FILE" 2>/dev/null || exit 1
+        [[ "${REALITY_COEXIST_ENABLED:-0}" == "1" ]] || exit 1
+        validate_port "${REALITY_COEXIST_REALITY_PORT:-}" 2>/dev/null || exit 1
+        validate_port "${REALITY_COEXIST_WEB_PORT:-}" 2>/dev/null || exit 1
+    )
+}
+
+# 加载共存 state 到全局（渲染/菜单/诊断用；渲染入站走子 shell 读取时不调它）
+reality_coexist_load_state() {
+    [[ -f "$REALITY_COEXIST_STATE_FILE" ]] || return 1
+    validate_conf_file "$REALITY_COEXIST_STATE_FILE" || return 1
+    # shellcheck disable=SC1090
+    source "$REALITY_COEXIST_STATE_FILE"
+}
+
+# 写共存 state（值经 reality_state_quote，满足 validate_conf_file 的 owner/600/字面量校验）
+reality_coexist_write_state() {
+    mkdir -p "$REALITY_CONFIG_DIR"
+    chmod 700 "$REALITY_CONFIG_DIR" 2>/dev/null || true
+    validate_port "${REALITY_COEXIST_REALITY_PORT:-}" || { print_error "共存 reality 内部端口无效: ${REALITY_COEXIST_REALITY_PORT:-空}"; return 1; }
+    validate_port "${REALITY_COEXIST_WEB_PORT:-}" || { print_error "共存 web 内部端口无效: ${REALITY_COEXIST_WEB_PORT:-空}"; return 1; }
+    local content
+    content=$(cat <<EOF
+REALITY_COEXIST_ENABLED=$(reality_state_quote "${REALITY_COEXIST_ENABLED:-0}")
+REALITY_COEXIST_REALITY_PORT=$(reality_state_quote "${REALITY_COEXIST_REALITY_PORT:-}")
+REALITY_COEXIST_WEB_PORT=$(reality_state_quote "${REALITY_COEXIST_WEB_PORT:-}")
+EOF
+)
+    reality_write_secure_file "$REALITY_COEXIST_STATE_FILE" "$content"
+}
+
+# 取共存 reality 内部端口（供 web 模块/诊断复用）；未启用返回非 0
+reality_coexist_reality_port() {
+    reality_coexist_enabled || return 1
+    (
+        # shellcheck disable=SC1090
+        validate_conf_file "$REALITY_COEXIST_STATE_FILE" 2>/dev/null && source "$REALITY_COEXIST_STATE_FILE" 2>/dev/null || exit 1
+        validate_port "${REALITY_COEXIST_REALITY_PORT:-}" 2>/dev/null || exit 1
+        printf '%s' "${REALITY_COEXIST_REALITY_PORT}"
+    )
+}
+
+# 取共存 web 内部端口（供 web 模块建站下沉复用）；未启用返回非 0
+reality_coexist_web_port() {
+    reality_coexist_enabled || return 1
+    (
+        # shellcheck disable=SC1090
+        validate_conf_file "$REALITY_COEXIST_STATE_FILE" 2>/dev/null && source "$REALITY_COEXIST_STATE_FILE" 2>/dev/null || exit 1
+        validate_port "${REALITY_COEXIST_WEB_PORT:-}" 2>/dev/null || exit 1
+        printf '%s' "${REALITY_COEXIST_WEB_PORT}"
+    )
+}
+
+# 收集需要走 443 stream SNI 白名单的真站域名。
+# 真相源：/etc/nginx/sites-available/*.conf。关键：只收录“实际监听 web 内部端口”的站点，
+# 从其 server_name 取域名——因为只有经 _web_coexist_https_port 下沉到 web_port 的站才真在该端口。
+# 09e 家宽暴露（默认 8443）、用户自定义非 443 端口的站不会下沉，故不监听 web_port，
+# 不应进白名单（否则会被 stream 路由到无人监听的 web_port 而连不上）。
+# 排除 CDN 回源站（reality-cdn-*，走 8443 橙云回源，不经 443 stream）。
+# 每域一行；无则输出空。
+reality_coexist_collect_web_domains() {
+    local f base web_port sn sites_dir="${REALITY_NGINX_SITES_DIR:-/etc/nginx/sites-available}"
+    web_port="$(reality_coexist_web_port 2>/dev/null || true)"
+    validate_port "$web_port" 2>/dev/null || return 0
+    [[ -d "$sites_dir" ]] || return 0
+    for f in "$sites_dir"/*.conf; do
+        [[ -f "$f" ]] || continue
+        base=$(basename "$f" .conf)
+        # CDN 回源站不经 443 stream（独立回源端口 + 橙云），跳过
+        [[ "$base" == reality-cdn-* ]] && continue
+        # 该站必须真实监听 web 内部端口，否则不路由到 web。
+        # 共存下真站由 _nginx_tls_http2_block 渲染成 loopback 绑定：
+        #   listen 127.0.0.1:<port> ssl;  /  listen [::1]:<port> ssl;
+        # 故 listen 行可能带 IPv4/IPv6 主机前缀（127.0.0.1: 或 [..]:），也可能是裸端口
+        # （listen <port> / listen [::]:<port>）。全部需匹配，否则真站永不入白名单，
+        # 所有 SNI 都落到 default→reality，web 侧共存静默失效。
+        grep -Eq "^\s*listen\s+([0-9.]+:|\[[0-9a-fA-F:]+\]:)?${web_port}(\s|;)" "$f" 2>/dev/null || continue
+        # 从 server_name 行取第一个域名（比文件名更准：文件名可能与 server_name 不一致）
+        sn=$(grep -E '^\s*server_name\s+' "$f" 2>/dev/null | head -n1 \
+             | sed -E 's/^\s*server_name\s+//; s/;.*$//' | awk '{print $1}')
+        [[ -n "$sn" ]] || sn="$base"
+        validate_domain "$sn" 2>/dev/null || continue
+        printf '%s\n' "$sn"
+    done | sort -u
+}
+
+# 渲染 stream 分流配置片段（写入独立文件，由 nginx.conf 的 stream{} include 引入）。
+# map $ssl_preread_server_name：真站域名 → web upstream；default → reality upstream。
+# 关键：default 必须指向 reality（Reality 客户端 SNI 是借用大站域名，非节点域名）。
+reality_coexist_render_stream_conf() {
+    local reality_port web_port
+    reality_port="$(reality_coexist_reality_port 2>/dev/null || true)"
+    web_port="$(reality_coexist_web_port 2>/dev/null || true)"
+    validate_port "$reality_port" || { print_error "共存 reality 内部端口无效"; return 1; }
+    validate_port "$web_port" || { print_error "共存 web 内部端口无效"; return 1; }
+    local -a domains=()
+    local d
+    while IFS= read -r d; do [[ -n "$d" ]] && domains+=("$d"); done < <(reality_coexist_collect_web_domains)
+    {
+        echo "# Reality 443 共存分流 (nginx stream + ssl_preread)"
+        echo "# Generated by ${SCRIPT_NAME} ${VERSION}"
+        echo "# 443 由本 stream 独占；真站域名(白名单)→127.0.0.1:${web_port}，default→127.0.0.1:${reality_port}(reality)。"
+        echo "map \$ssl_preread_server_name \$reality_coexist_backend {"
+        for d in "${domains[@]}"; do
+            printf '    %s reality_coexist_web;\n' "$d"
+        done
+        echo "    default reality_coexist_reality;"
+        echo "}"
+        echo "upstream reality_coexist_reality { server 127.0.0.1:${reality_port}; }"
+        echo "upstream reality_coexist_web { server 127.0.0.1:${web_port}; }"
+        echo "server {"
+        echo "    listen 443;"
+        echo "    listen [::]:443;"
+        echo "    proxy_pass \$reality_coexist_backend;"
+        echo "    ssl_preread on;"
+        echo "}"
+    }
+}
+
+# nginx.conf 是否已有顶层 stream{} 块（外部/发行版自带）。有则注入策略需谨慎。
+# 除 nginx.conf 正文外，还展开其中 include 引入的文件——发行版常把 stream{} 放在
+# include 进来的独立片段里（如 /etc/nginx/conf.d/*.conf、modules 等），只查正文会漏检，
+# 导致我们再注入一个 stream{} 造成两个顶层 stream 块、nginx 启动失败。
+# 排除我们自己的标记块与 stream-enabled 目录（那是本功能产物，非“外部已有”）。
+reality_coexist_nginx_has_stream_block() {
+    local main_conf="${1:-/etc/nginx/nginx.conf}"
+    [[ -f "$main_conf" ]] || return 1
+    local uncommented inc_line inc_glob g conf_dir
+    conf_dir="$(dirname "$main_conf")"
+    # 1) 正文（去注释）直接含 stream{ —— 但排除我们自己注入的标记块
+    if ! grep -q 'reality-coexist-stream-include' "$main_conf" 2>/dev/null; then
+        if grep -vE '^\s*#' "$main_conf" 2>/dev/null | grep -qE '(^|\s)stream\s*\{'; then
+            return 0
+        fi
+    fi
+    # 2) 展开 include 的文件再查（仅顶层 include；一层展开足以覆盖发行版默认布局）
+    while IFS= read -r inc_line; do
+        inc_glob=$(sed -E 's/^\s*include\s+//; s/;\s*$//' <<< "$inc_line")
+        [[ -n "$inc_glob" ]] || continue
+        # 相对路径按 nginx.conf 所在目录展开
+        [[ "$inc_glob" != /* ]] && inc_glob="${conf_dir}/${inc_glob}"
+        for g in $inc_glob; do
+            [[ -f "$g" ]] || continue
+            # 跳过我们自己的 stream-enabled 产物目录
+            [[ "$g" == "$REALITY_STREAM_ENABLED_DIR"/* ]] && continue
+            grep -vE '^\s*#' "$g" 2>/dev/null | grep -qE '(^|\s)stream\s*\{' && return 0
+        done
+    done < <(grep -vE '^\s*#' "$main_conf" 2>/dev/null | grep -E '^\s*include\s+')
+    return 1
+}
+
+# 幂等地把 stream include 注入 nginx.conf 顶层。
+# 用独立 stream{} 块 include 我们的 stream-enabled 目录；带唯一标记便于回滚移除。
+reality_coexist_inject_nginx_include() {
+    local main_conf="${1:-/etc/nginx/nginx.conf}" tmp
+    [[ -f "$main_conf" ]] || { print_error "未找到 nginx.conf: $main_conf"; return 1; }
+    mkdir -p "$REALITY_STREAM_ENABLED_DIR"
+    # 已注入过（含标记）→ 幂等返回
+    if grep -q 'reality-coexist-stream-include' "$main_conf" 2>/dev/null; then
+        return 0
+    fi
+    if reality_coexist_nginx_has_stream_block "$main_conf"; then
+        # 外部已有 stream{}：不改它，改为把 include 加进已有块——风险较高，交由调用方提示手动处理。
+        print_warn "nginx.conf 已存在 stream{} 块；为避免破坏，请手动在其中加入: include ${REALITY_STREAM_ENABLED_DIR}/*.conf;"
+        return 2
+    fi
+    reality_backup_file "$main_conf" || return 1
+    tmp=$(mktemp "$(dirname "$main_conf")/.tmp.server-manage.nginx-stream-include.XXXXXX") || return 1
+    declare -F _tmp_register >/dev/null 2>&1 && _tmp_register "$tmp"
+    # 追加独立 stream 块到文件末尾（顶层合法），先写同目录候选文件，避免中断/写满磁盘污染 nginx.conf。
+    if ! cat "$main_conf" > "$tmp"; then
+        rm -f "$tmp" 2>/dev/null || true
+        declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$tmp"
+        return 1
+    fi
+    if ! cat >> "$tmp" <<EOF
+
+# reality-coexist-stream-include (由 ${SCRIPT_NAME} 注入，可经菜单关闭共存自动移除)
+stream {
+    include ${REALITY_STREAM_ENABLED_DIR}/*.conf;
+}
+EOF
+    then
+        rm -f "$tmp" 2>/dev/null || true
+        declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$tmp"
+        return 1
+    fi
+    chmod --reference="$main_conf" "$tmp" 2>/dev/null || true
+    chown --reference="$main_conf" "$tmp" 2>/dev/null || true
+    if ! mv "$tmp" "$main_conf"; then
+        rm -f "$tmp" 2>/dev/null || true
+        declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$tmp"
+        return 1
+    fi
+    declare -F _tmp_unregister >/dev/null 2>&1 && _tmp_unregister "$tmp"
+}
+
+# 移除注入的 stream include 块（回滚用）。仅删带唯一标记的块，不动外部 stream。
+reality_coexist_remove_nginx_include() {
+    local main_conf="${1:-/etc/nginx/nginx.conf}"
+    [[ -f "$main_conf" ]] || return 0
+    grep -q 'reality-coexist-stream-include' "$main_conf" 2>/dev/null || return 0
+    reality_backup_file "$main_conf"
+    # 删除从标记注释行起、到其后第一个单独成行的 '}' 为止的整块
+    local tmp
+    tmp=$(mktemp "$(dirname "$main_conf")/.tmp.nginxconf.XXXXXX") || return 1
+    awk '
+        /# reality-coexist-stream-include/ { skip=1; next }
+        skip && /^\}/ { skip=0; next }
+        skip { next }
+        { print }
+    ' "$main_conf" > "$tmp" || { rm -f "$tmp"; return 1; }
+    chmod --reference="$main_conf" "$tmp" 2>/dev/null || true
+    mv "$tmp" "$main_conf" || { rm -f "$tmp"; return 1; }
+}
+
+# 刷新 stream 分流配置（web 模块增删域名后调用；仅在共存启用时生效）。
+# 重写 stream 片段 → nginx -t → reload。失败保留旧片段并回滚。
+reality_coexist_refresh() {
+    reality_coexist_enabled || return 0
+    command_exists nginx || return 0
+    # stream 模块必须在场：refresh 也被 web 建站路径调用，若此时 nginx 无 stream 模块
+    # （被外部改动卸载/换版本），我们注入的 stream{} 会让 nginx -t 整体失败，进而误伤
+    # 刚部署的站点配置。此时告警并跳过刷新（不动 nginx），把 stream 恢复留给用户重开共存。
+    if declare -F _check_nginx_stream >/dev/null 2>&1 && ! _check_nginx_stream; then
+        print_warn "nginx 当前无 stream 模块，跳过 443 共存分流刷新；请重新启用共存或修复 stream 模块。"
+        return 0
+    fi
+    mkdir -p "$REALITY_STREAM_ENABLED_DIR"
+    local new_conf backup=""
+    new_conf="$(reality_coexist_render_stream_conf)" || return 1
+    if [[ -f "$REALITY_STREAM_CONF" ]]; then
+        backup=$(mktemp "${REALITY_STREAM_ENABLED_DIR}/.reality-coexist.bak.XXXXXX") || return 1
+        cp -a "$REALITY_STREAM_CONF" "$backup" || { rm -f "$backup"; return 1; }
+    fi
+    write_file_atomic "$REALITY_STREAM_CONF" "$new_conf" || {
+        print_error "写入 stream 分流配置失败"
+        [[ -n "$backup" ]] && rm -f "$backup"
+        return 1
+    }
+    if nginx -t >/dev/null 2>&1 && _nginx_reload >/dev/null 2>&1; then
+        [[ -n "$backup" ]] && rm -f "$backup"
+        return 0
+    fi
+    print_error "nginx 测试/重载失败，回滚 stream 分流配置"
+    if [[ -n "$backup" && -e "$backup" ]]; then
+        mv "$backup" "$REALITY_STREAM_CONF"
+    else
+        rm -f "$REALITY_STREAM_CONF"
+    fi
+    nginx -t >/dev/null 2>&1 && _nginx_reload >/dev/null 2>&1 || true
+    return 1
+}
+
+# 选一个未占用的 loopback 内部端口：优先用建议值，被占用则回落随机高位。
+reality_coexist_pick_inner_port() {
+    local prefer="$1" forbidden="${2:-}" p
+    # 建议值(prefer)本身是共存常量，会出现在 reserved 集里，故检查保留时把 prefer 自身排除。
+    if validate_port "$prefer" && [[ "$prefer" != "$forbidden" ]] \
+        && ! reality_port_in_use "$prefer" && ! reality_port_reserved "$prefer" "$prefer"; then
+        echo "$prefer"; return 0
+    fi
+    for _ in $(seq 1 200); do
+        p=$(reality_random_port) || return 1
+        [[ "$p" == "$forbidden" || "$p" == "${REALITY_PORT:-}" || "$p" == "${REALITY_CDN_ORIGIN_PORT:-8443}" ]] && continue
+        # MED-4：除运行时占用，还要避开本项目其他 feature 已保留(可能当前停止)的端口。
+        reality_port_reserved "$p" "$forbidden" && continue
+        reality_port_in_use "$p" && continue
+        echo "$p"; return 0
+    done
+    return 1
+}
+
+# 启用 443 共存模式：sing-box reality 入站下沉到 loopback，443 交给 nginx stream 分流。
+# 顺序关键：先重渲 sing-box 释放公网 443，再让 nginx stream 抢 443，避免端口冲突。
+reality_coexist_enable() {
+    print_title "启用 Reality 443 共存模式（nginx stream + ssl_preread）"
+    reality_require_supported_os || { pause; return 1; }
+    if ! reality_load_state || [[ -z "${REALITY_UUID:-}" || -z "${REALITY_PORT:-}" || -z "${REALITY_SNI:-}" ]]; then
+        print_error "本机尚未安装 Reality 落地机，请先用菜单 1 安装落地机。"
+        pause; return 1
+    fi
+    if reality_coexist_enabled; then
+        print_warn "443 共存模式已启用。"
+        pause; return 0
+    fi
+    # split 双栈：共存分支只渲染单入站（用 REALITY_PORT），会丢掉 IPv6 节点，故明确拒绝。
+    local _mode; _mode=$(reality_normalize_dns_mode "${REALITY_DNS_MODE:-auto}" 2>/dev/null || echo auto)
+    if [[ "$_mode" == "split" ]]; then
+        print_error "IPv4/IPv6 双节点(split)模式暂不支持 443 共存：stream 分流与双入站需另行设计。"
+        print_info "如需共存，请改用单节点(auto/ipv4/ipv6)模式重装落地机后再启用。"
+        pause; return 1
+    fi
+    # 共存要求 Reality 对外走 443（由 nginx stream 持有）。若落地端口非 443，
+    # 启用后客户端链接端口(REALITY_PORT)与实际对外端口(443)不一致，且 ufw/安全组未放行 443，
+    # 会静默不可达。强制要求落地端口为 443。
+    if [[ "${REALITY_PORT:-}" != "443" ]]; then
+        print_error "当前 Reality 落地端口为 ${REALITY_PORT:-未知}，非 443。443 共存要求落地端口为 443。"
+        print_info "请用菜单 1 以「443」端口重装落地机后再启用共存。"
+        pause; return 1
+    fi
+    command_exists nginx || { print_error "Nginx 未安装。请先用 Web 菜单「添加域名」安装 nginx/certbot 依赖。"; pause; return 1; }
+    echo "  说明：开启后 443 由 nginx stream 独占，按 SNI 分流——真站域名→web 内部端口，"
+    echo "  default（Reality 借用大站 SNI/未知/无 SNI）→ sing-box reality loopback 入站。"
+    echo "  Reality 直连伪装、借 SNI 轮换保持不变；客户端链接仍是 443（连的是 nginx stream）。"
+    echo "  注意：此后每次 reload nginx（加站/改站）会让 Reality 连接瞬断重连。"
+    echo "  注意：真站经 stream 透传后，其访问日志/按 IP 的限流/geo 会看到 127.0.0.1（非真实客户端 IP）；"
+    echo "        因 stream 与 Reality 直连共用一个入口、无法只对真站启用 PROXY 协议，故不取真实 IP。"
+    echo ""
+    confirm "确认启用 443 共存模式?" || { print_info "已取消"; pause; return 0; }
+
+    # 1) 确保 nginx 具备 stream 模块（缺失则装 libnginx-mod-stream 或换官方源）
+    echo -e "\n${C_CYAN}=== [1] 检查/安装 nginx stream 模块 ===${C_RESET}"
+    if ! _ensure_nginx_stream; then
+        print_error "无法为 nginx 启用 stream 模块，已中止。可手动安装官方 nginx.org 源（含 stream）后重试。"
+        pause; return 1
+    fi
+    print_success "nginx stream 模块可用"
+
+    # 2) 选内部端口（loopback，仅本机 nginx 连接）
+    local reality_inner web_inner
+    reality_inner=$(reality_coexist_pick_inner_port "$REALITY_COEXIST_INNER_PORT") || { print_error "无法分配 reality 内部端口"; pause; return 1; }
+    web_inner=$(reality_coexist_pick_inner_port "$REALITY_WEB_INNER_PORT" "$reality_inner") || { print_error "无法分配 web 内部端口"; pause; return 1; }
+
+    # 3) 写共存 state（ENABLED=1 使 render 走 loopback 分支）
+    REALITY_COEXIST_ENABLED=1
+    REALITY_COEXIST_REALITY_PORT="$reality_inner"
+    REALITY_COEXIST_WEB_PORT="$web_inner"
+    reality_coexist_write_state || { print_error "写入共存 state 失败"; rm -f "$REALITY_COEXIST_STATE_FILE"; pause; return 1; }
+
+    # 4) 重渲 sing-box：入站改绑 127.0.0.1:reality_inner，释放公网 443
+    echo -e "\n${C_CYAN}=== [2] 重渲 sing-box（reality 入站下沉到 127.0.0.1:${reality_inner}）===${C_RESET}"
+    local new_config
+    if ! new_config=$(reality_render_singbox_config "$REALITY_UUID" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID") \
+       || ! reality_apply_singbox_config "$new_config"; then
+        print_error "sing-box 重渲失败，回滚共存 state。"
+        rm -f "$REALITY_COEXIST_STATE_FILE"
+        pause; return 1
+    fi
+    print_success "sing-box reality 入站已下沉到 loopback，公网 443 已释放"
+
+    # 5) 生成 stream 分流配置 + 注入 nginx.conf include + reload
+    echo -e "\n${C_CYAN}=== [3] 部署 nginx stream 443 分流 ===${C_RESET}"
+    local inject_rc
+    reality_coexist_inject_nginx_include; inject_rc=$?
+    # rc==0 注入成功；rc==2 外部已有 stream{} 块（我们未注入 include，若继续会导致分流配置成为
+    # 死文件、公网 443 无人监听而节点全废且误报成功）；rc==1 写入失败。非 0 一律中止回滚。
+    if [[ $inject_rc -ne 0 ]]; then
+        if [[ $inject_rc -eq 2 ]]; then
+            print_error "nginx.conf 已存在 stream{} 块，为避免破坏未自动注入。请手动在该 stream{} 内加入："
+            print_error "    include ${REALITY_STREAM_ENABLED_DIR}/*.conf;"
+            print_error "然后重新启用共存。已回滚（sing-box 改回直绑 443）。"
+        else
+            print_error "注入 nginx.conf stream include 失败，回滚。"
+        fi
+        reality_coexist_disable_internal
+        pause; return 1
+    fi
+    if ! reality_coexist_refresh; then
+        print_error "nginx stream 分流部署失败，回滚（sing-box 改回直绑 443）。"
+        reality_coexist_disable_internal
+        pause; return 1
+    fi
+    print_success "nginx stream 已接管 443 分流"
+    # 确保对外 443 已放行（nginx stream 现在持有 443；落地端口原为 443 通常已放行，此处兜底）。
+    # 内部端口 reality_inner/web_inner 仅 loopback，不放行、外部不可见。
+    firewall_apply_reality_port 443 >/dev/null 2>&1 || \
+        print_warn "未能自动放行 443/tcp，请确认 ufw/云安全组已放行 443（stream 分流对外入口）。"
+    echo ""
+    print_success "443 共存模式已启用！reality 内部端口 ${reality_inner}，web 内部端口 ${web_inner}。"
+    print_info "此后用 Web 菜单新建的站点会自动使用 ${web_inner} 端口，由 443 stream 统一对外。"
+    log_action "reality coexist enabled: reality=${reality_inner} web=${web_inner}"
+    pause
+}
+
+# 内部回滚/关闭：不含交互确认，供 enable 失败回滚与 disable 菜单共用。
+# 顺序：先移除 nginx stream（释放 443）→ 删共存 state → 重渲 sing-box 直绑 443。
+reality_coexist_disable_internal() {
+    rm -f "$REALITY_STREAM_CONF"
+    reality_coexist_remove_nginx_include
+    rm -f "$REALITY_COEXIST_STATE_FILE"
+    if command_exists nginx && nginx -t >/dev/null 2>&1; then _nginx_reload >/dev/null 2>&1 || true; fi
+    # nginx reload 释放 443 是异步的（旧 worker 优雅退出需时间）。若紧接着 restart sing-box
+    # 抢绑 443，旧 worker 可能仍持有 443 → bind 失败 → systemd 重试期间对外中断约 10s。
+    # 故先有界等待 443 真正释放（最多 ~5s），再重渲 sing-box 直绑 443，消除竞态中断。
+    reality_wait_port_free 443 50 || print_warn "443 释放等待超时，sing-box 直绑可能需 systemd 重试后生效。"
+    if reality_load_state && [[ -n "${REALITY_UUID:-}" && -n "${REALITY_PORT:-}" ]]; then
+        local cfg
+        cfg=$(reality_render_singbox_config "$REALITY_UUID" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID") \
+            && reality_apply_singbox_config "$cfg" || true
+    fi
+}
+
+# 关闭 443 共存模式（菜单入口，带确认）。
+reality_coexist_disable() {
+    print_title "关闭 Reality 443 共存模式"
+    if ! reality_coexist_enabled; then
+        print_warn "当前未启用 443 共存模式。"
+        pause; return 0
+    fi
+    echo "  关闭后：nginx stream 443 分流移除，sing-box reality 入站改回直绑公网 443。"
+    echo "  已建的真站若仍监听内部端口（如 12443），需你自行改回 443 或重建（脚本不自动改回）。"
+    echo ""
+    confirm "确认关闭 443 共存模式?" || { print_info "已取消"; pause; return 0; }
+    reality_coexist_disable_internal
+    print_success "443 共存模式已关闭，Reality 已改回直绑 443。"
+    print_info "如有站点仍监听内部端口，请手动改回 443 后 reload nginx，或用 Web 菜单重建。"
+    log_action "reality coexist disabled"
+    pause
+}
+
 reality_render_singbox_config() {
     local uuid="$1" private_key="$2" port="$3" sni="$4" short_id="$5"
     local listen_host; listen_host="${REALITY_LISTEN_HOST:-$(reality_detect_listen_host)}"
@@ -15050,6 +19480,15 @@ reality_render_singbox_config() {
     # 关键：必须在“整体重渲染”里合并（不能事后追加），否则 rotate key/user、改名、重装
     # 等任何触发重渲染的操作都会把 WS 入站冲掉。子 shell 读取，避免污染本函数全局。
     local cdn_inbound; cdn_inbound="$(reality_cdn_inbound_json)"
+    # 共存模式：sing-box reality 入站改绑 127.0.0.1:<内部端口>，443 由 nginx stream 对外分流。
+    # 共存下单入站即可（v4/v6 都由 nginx stream 统一对外），故优先于 split 分支处理。
+    local coexist_port; coexist_port="$(reality_coexist_reality_port 2>/dev/null || true)"
+    if [[ -n "$coexist_port" ]]; then
+        cat <<EOF
+{"log":{"disabled":true},"inbounds":[{"type":"vless","tag":"vless-reality-in","listen":"127.0.0.1","listen_port":${coexist_port},"users":[{"name":"main","uuid":"${uuid}","flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":"${sni}","reality":{"enabled":true,"handshake":{"server":"${sni}","server_port":443},"private_key":"${private_key}","short_id":["${short_id}"],"max_time_difference":"1m"}}}${cdn_inbound}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}
+EOF
+        return 0
+    fi
     if [[ "${REALITY_DNS_MODE:-auto}" == "split" && -n "${REALITY_PORT_V6:-}" ]]; then
         local listen_host_v4="${REALITY_LISTEN_HOST_V4:-0.0.0.0}" listen_host_v6="${REALITY_LISTEN_HOST_V6:-::}" port_v6="${REALITY_PORT_V6}"
         cat <<EOF
@@ -15135,13 +19574,15 @@ reality_cdn_inbound_json() {
 }
 
 # 生成 CDN 客户端 vless 链接（WS+TLS）。server=优选IP(默认=域名)，host/sni=真实 cdn 域名。
+# fp 复用落地机的有效指纹（CDN 与落地共用 UUID，同属一台机器的客户端身份）。
 reality_cdn_build_link() {
-    local server="$1" name="$2" encoded_name encoded_path server_uri
+    local server="$1" name="$2" encoded_name encoded_path server_uri fp
+    fp=$(reality_effective_fingerprint)
     encoded_name=$(reality_urlencode "$name")
     encoded_path=$(reality_urlencode "$REALITY_CDN_WS_PATH")
     server_uri=$(reality_uri_host "$server")
-    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&host=%s&path=%s#%s\n' \
-        "$REALITY_CDN_UUID" "$server_uri" "$REALITY_CDN_DOMAIN" "$REALITY_CDN_DOMAIN" "$encoded_path" "$encoded_name"
+    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=%s&type=ws&host=%s&path=%s#%s\n' \
+        "$REALITY_CDN_UUID" "$server_uri" "$REALITY_CDN_DOMAIN" "$fp" "$REALITY_CDN_DOMAIN" "$encoded_path" "$encoded_name"
 }
 
 # 写 CDN 客户端产物（链接 + sing-box JSON）。server 优先用优选 IP，无则回落域名。
@@ -15156,16 +19597,80 @@ reality_cdn_write_client_artifacts() {
     local json_host; json_host=$(reality_json_escape "$REALITY_CDN_DOMAIN")
     local json_server; json_server=$(reality_json_escape "$server")
     local json_uuid; json_uuid=$(reality_json_escape "$REALITY_CDN_UUID")
-    reality_cdn_build_link "$server" "$name" > "$REALITY_CDN_LINK_FILE"
-    cat > "$REALITY_CDN_CLIENT_JSON" <<EOF
-{"type":"vless","tag":"${json_name}","server":"${json_server}","server_port":443,"uuid":"${json_uuid}","tls":{"enabled":true,"server_name":"${json_host}","utls":{"enabled":true,"fingerprint":"chrome"}},"transport":{"type":"ws","path":"${json_path}","headers":{"Host":"${json_host}"}}}
+    local cdn_fp; cdn_fp=$(reality_effective_fingerprint)
+    local link_content json_content
+    link_content="$(reality_cdn_build_link "$server" "$name")" || return 1
+    json_content=$(cat <<EOF
+{"type":"vless","tag":"${json_name}","server":"${json_server}","server_port":443,"uuid":"${json_uuid}","tls":{"enabled":true,"server_name":"${json_host}","utls":{"enabled":true,"fingerprint":"${cdn_fp}"}},"transport":{"type":"ws","path":"${json_path}","headers":{"Host":"${json_host}"}}}
 EOF
-    chmod 600 "$REALITY_CDN_LINK_FILE" "$REALITY_CDN_CLIENT_JSON"
+)
+    reality_write_secure_file "$REALITY_CDN_LINK_FILE" "$link_content" || return 1
+    reality_write_secure_file "$REALITY_CDN_CLIENT_JSON" "$json_content" || return 1
 }
 
 reality_cdn_nginx_site_name() {
     local domain="${1:-}"
     printf 'reality-cdn-%s' "$domain"
+}
+
+reality_cdn_cf_cred_path() {
+    local domain="${1:-}" dir="${REALITY_CDN_CF_CRED_DIR:-/root}"
+    [[ -n "$domain" ]] || return 1
+    printf '%s/.cloudflare-%s.ini' "${dir%/}" "$domain"
+}
+
+reality_cdn_le_live_dir() {
+    local domain="${1:-}" dir="${REALITY_CDN_LE_LIVE_DIR:-/etc/letsencrypt/live}"
+    [[ -n "$domain" ]] || return 1
+    printf '%s/%s' "${dir%/}" "$domain"
+}
+
+reality_cdn_cleanup_cert_resources() {
+    local domain="$1" clean_cert_dir="${2:-0}" clean_cred="${3:-0}" clean_hook="${4:-0}" clean_cron="${5:-0}" clean_le="${6:-0}" snapshot_dir="${7:-}"
+    [[ -n "$domain" ]] || return 0
+    validate_domain "$domain" || return 1
+    local cert_prefix="${CERT_PATH_PREFIX%/}" cert_dir="" cred_path="" hook_path="${CERT_HOOKS_DIR}/renew-${domain}.sh" le_dir=""
+    [[ -n "$cert_prefix" && "$cert_prefix" != "/" ]] && cert_dir="${cert_prefix}/${domain}"
+    cred_path="$(reality_cdn_cf_cred_path "$domain")" || cred_path=""
+    le_dir="$(reality_cdn_le_live_dir "$domain")" || le_dir=""
+
+    if [[ "$clean_cron" -eq 1 ]]; then
+        if [[ -n "$snapshot_dir" && -f "$snapshot_dir/crontab" ]] && command_exists crontab; then
+            crontab "$snapshot_dir/crontab" 2>/dev/null || cron_remove_job "CertRenew_${domain}" 2>/dev/null || true
+        else
+            cron_remove_job "CertRenew_${domain}" 2>/dev/null || true
+        fi
+    fi
+    if [[ -n "$snapshot_dir" && -e "$snapshot_dir/hook" && -n "$hook_path" ]]; then
+        mkdir -p "$(dirname "$hook_path")" 2>/dev/null || true
+        rm -f "$hook_path" 2>/dev/null || true
+        cp -a "$snapshot_dir/hook" "$hook_path" 2>/dev/null || true
+    elif [[ "$clean_hook" -eq 1 ]]; then
+        rm -f "$hook_path" 2>/dev/null || true
+    fi
+    if [[ -n "$snapshot_dir" && -e "$snapshot_dir/cf-cred" && -n "$cred_path" ]]; then
+        mkdir -p "$(dirname "$cred_path")" 2>/dev/null || true
+        rm -f "$cred_path" 2>/dev/null || true
+        cp -a "$snapshot_dir/cf-cred" "$cred_path" 2>/dev/null || true
+    elif [[ "$clean_cred" -eq 1 && -n "$cred_path" ]]; then
+        rm -f "$cred_path" 2>/dev/null || true
+    fi
+    if [[ -n "$snapshot_dir" && -e "$snapshot_dir/cert-dir" && -n "$cert_dir" ]]; then
+        rm -rf "$cert_dir" 2>/dev/null || true
+        mkdir -p "$(dirname "$cert_dir")" 2>/dev/null || true
+        cp -a "$snapshot_dir/cert-dir" "$cert_dir" 2>/dev/null || true
+    elif [[ "$clean_cert_dir" -eq 1 && -n "$cert_dir" ]]; then
+        rm -rf "$cert_dir" 2>/dev/null || true
+    fi
+    if [[ -n "$snapshot_dir" && -e "$snapshot_dir/le-live" && -n "$le_dir" ]]; then
+        rm -rf "$le_dir" 2>/dev/null || true
+        mkdir -p "$(dirname "$le_dir")" 2>/dev/null || true
+        cp -a "$snapshot_dir/le-live" "$le_dir" 2>/dev/null || true
+    elif [[ "$clean_le" -eq 1 && -n "$le_dir" ]]; then
+        command_exists certbot && certbot delete --cert-name "$domain" --non-interactive 2>/dev/null || true
+        rm -rf "$le_dir" 2>/dev/null || true
+    fi
+    [[ -n "$snapshot_dir" ]] && rm -rf -- "$snapshot_dir" 2>/dev/null || true
 }
 
 reality_cdn_remove_nginx_conf() {
@@ -15183,6 +19688,62 @@ reality_cdn_remove_nginx_conf() {
             rm -f "$f"
         fi
     done
+}
+
+reality_cdn_restore_state_snapshot() {
+    local had_state="${1:-0}" state_snapshot="${2:-}"
+    if [[ "$had_state" -eq 1 ]]; then
+        reality_write_secure_file "$REALITY_CDN_STATE_FILE" "$state_snapshot" || return 1
+    else
+        rm -f "$REALITY_CDN_STATE_FILE"
+    fi
+}
+
+reality_cdn_reapply_current_singbox() {
+    reality_load_state || return 1
+    [[ -n "${REALITY_UUID:-}" && -n "${REALITY_PRIVATE_KEY:-}" && -n "${REALITY_PORT:-}" && -n "${REALITY_SNI:-}" && -n "${REALITY_SHORT_ID:-}" ]] || return 1
+    local rollback_config
+    rollback_config=$(reality_render_singbox_config "$REALITY_UUID" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID") || return 1
+    reality_apply_singbox_config "$rollback_config"
+}
+
+reality_cdn_install_rollback() {
+    local had_state="${1:-0}" state_snapshot="${2:-}" cdn_domain="${3:-}" nginx_deployed="${4:-0}" reapply_singbox="${5:-0}"
+    local had_link="${6:-0}" link_snapshot="${7-}" had_client_json="${8:-0}" client_json_snapshot="${9-}"
+    local clean_cert_dir="${10:-0}" clean_cred="${11:-0}" clean_hook="${12:-0}" clean_cron="${13:-0}" clean_le="${14:-0}" cert_snapshot_dir="${15:-}"
+    if ! reality_cdn_restore_state_snapshot "$had_state" "$state_snapshot"; then
+        print_warn "恢复安装前 CDN state 失败，请手动检查 ${REALITY_CDN_STATE_FILE}"
+    fi
+    if [[ "$had_link" -eq 1 ]]; then
+        reality_write_secure_file "$REALITY_CDN_LINK_FILE" "$link_snapshot" || print_warn "恢复旧 CDN 链接产物失败，请手动检查 ${REALITY_CDN_LINK_FILE}"
+    else
+        rm -f "$REALITY_CDN_LINK_FILE"
+    fi
+    if [[ "$had_client_json" -eq 1 ]]; then
+        reality_write_secure_file "$REALITY_CDN_CLIENT_JSON" "$client_json_snapshot" || print_warn "恢复旧 CDN JSON 产物失败，请手动检查 ${REALITY_CDN_CLIENT_JSON}"
+    else
+        rm -f "$REALITY_CDN_CLIENT_JSON"
+    fi
+    if [[ "$nginx_deployed" -eq 1 && -n "$cdn_domain" ]]; then
+        local restored_old_nginx=0 old_nginx_conf old_cert_dir
+        if [[ "$had_state" -eq 1 ]] && reality_cdn_load_state 2>/dev/null && [[ "${REALITY_CDN_DOMAIN:-}" == "$cdn_domain" ]]; then
+            old_cert_dir="${CERT_PATH_PREFIX}/${REALITY_CDN_DOMAIN}"
+            if old_nginx_conf=$(reality_cdn_render_nginx_conf "$REALITY_CDN_DOMAIN" "${REALITY_CDN_ORIGIN_PORT:-8443}" "$REALITY_CDN_WS_PATH" "$REALITY_CDN_INNER_PORT" "$old_cert_dir") \
+                && _nginx_deploy_conf "$(reality_cdn_nginx_site_name "$REALITY_CDN_DOMAIN")" "$old_nginx_conf"; then
+                restored_old_nginx=1
+            else
+                print_warn "恢复旧 CDN nginx 回源站失败，请手动检查 ${cdn_domain}"
+            fi
+        fi
+        if [[ "$restored_old_nginx" -ne 1 ]]; then
+            reality_cdn_remove_nginx_conf "$cdn_domain"
+            if command_exists nginx && nginx -t >/dev/null 2>&1; then _nginx_reload >/dev/null 2>&1 || true; fi
+        fi
+    fi
+    if [[ "$reapply_singbox" -eq 1 ]]; then
+        reality_cdn_reapply_current_singbox >/dev/null 2>&1 || print_warn "回滚后重载 sing-box 失败，请手动检查 ${REALITY_SINGBOX_CONFIG}"
+    fi
+    reality_cdn_cleanup_cert_resources "$cdn_domain" "$clean_cert_dir" "$clean_cred" "$clean_hook" "$clean_cron" "$clean_le" "$cert_snapshot_dir"
 }
 
 # 渲染 CDN 回源 nginx 站点：TLS 终止 + 隐秘 WS path 反代到内部端口；其余路径 444 断开。
@@ -15235,8 +19796,16 @@ reality_cdn_sync_dns_orange() {
     reality_detect_ips
     ipv4="$REALITY_IPV4"; ipv6="$REALITY_IPV6"
     [[ -n "$ipv4" || -n "$ipv6" ]] || { print_error "未检测到本机公网 IP，无法同步 CDN 域名"; return 1; }
-    [[ -n "$ipv4" ]] && { _cf_update_dns_record "$zone_id" "$token" "$domain" "A" "$ipv4" "true" || return 1; }
-    [[ -n "$ipv6" ]] && { _cf_update_dns_record "$zone_id" "$token" "$domain" "AAAA" "$ipv6" "true" || return 1; }
+    if [[ -n "$ipv4" ]]; then
+        _cf_update_dns_record "$zone_id" "$token" "$domain" "A" "$ipv4" "true" || return 1
+    else
+        reality_cf_delete_dns_type "$domain" "$token" "A" "$zone_id" || { print_error "清理 ${domain} 的旧 A 记录失败"; return 1; }
+    fi
+    if [[ -n "$ipv6" ]]; then
+        _cf_update_dns_record "$zone_id" "$token" "$domain" "AAAA" "$ipv6" "true" || return 1
+    else
+        reality_cf_delete_dns_type "$domain" "$token" "AAAA" "$zone_id" || { print_error "清理 ${domain} 的旧 AAAA 记录失败"; return 1; }
+    fi
     log_action "CDN orange-cloud DNS synced: $domain proxied=true"
 }
 
@@ -15248,13 +19817,31 @@ reality_cdn_apply_origin_rule() {
     validate_port "$origin_port" || { print_error "Origin Rule: 回源端口无效"; return 1; }
     zone_id=$(_cf_get_zone_id "$domain" "$token") || return 1
     [[ -n "$zone_id" ]] || { print_error "Origin Rule: 无法获取 Zone ID"; return 1; }
-    existing=$(_cf_get_origin_ruleset "$token" "$zone_id") || true
-    existing_rules="[]"
-    [[ -n "$existing" ]] && existing_rules=$(jq '.result.rules // []' <<< "$existing" 2>/dev/null || echo "[]")
-    filtered=$(jq --arg d "$domain" '[.[] | select(.expression != ("http.host eq \"" + $d + "\""))]' <<< "$existing_rules")
+    if ! existing=$(_cf_get_origin_ruleset "$token" "$zone_id"); then
+        print_error "Origin Rule: 读取现有规则失败，已中止以避免覆盖既有规则。"
+        return 1
+    fi
+    if [[ -n "$existing" ]]; then
+        existing_rules=$(jq '.result.rules // []' <<< "$existing" 2>/dev/null) || {
+            print_error "Origin Rule: 解析现有规则失败，已中止。"
+            return 1
+        }
+    else
+        existing_rules="[]"
+    fi
+    filtered=$(jq --arg d "$domain" '[.[] | select(.expression != ("http.host eq \"" + $d + "\""))]' <<< "$existing_rules") || {
+        print_error "Origin Rule: 过滤现有规则失败，已中止。"
+        return 1
+    }
     new_rule=$(jq -n --arg expr "http.host eq \"${domain}\"" --arg desc "Script-CDN-${domain}-${origin_port}" --argjson port "$origin_port" \
-        '{action:"route", action_parameters:{origin:{port:$port}}, expression:$expr, description:$desc, enabled:true}')
-    final=$(jq --argjson new "$new_rule" '. + [$new]' <<< "$filtered")
+        '{action:"route", action_parameters:{origin:{port:$port}}, expression:$expr, description:$desc, enabled:true}') || {
+        print_error "Origin Rule: 构造新规则失败。"
+        return 1
+    }
+    final=$(jq --argjson new "$new_rule" '. + [$new]' <<< "$filtered") || {
+        print_error "Origin Rule: 合并规则失败。"
+        return 1
+    }
     if ! err=$(_cf_put_origin_ruleset "$token" "$zone_id" "$final"); then
         print_error "Origin Rule 写入失败: $err"; return 1
     fi
@@ -15262,12 +19849,14 @@ reality_cdn_apply_origin_rule() {
 }
 
 reality_build_vless_link() {
-    local uuid="$1" node="$2" port="$3" sni="$4" public_key="$5" short_id="$6" name="${7:-singbox-reality}"
+    local uuid="$1" node="$2" port="$3" sni="$4" public_key="$5" short_id="$6" name="${7:-singbox-reality}" fp="${8:-}"
     local encoded_name node_uri
     encoded_name=$(reality_urlencode "$name")
     node_uri=$(reality_uri_host "$node")
-    printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&flow=xtls-rprx-vision#%s\n' \
-        "$uuid" "$node_uri" "$port" "$sni" "$public_key" "$short_id" "$encoded_name"
+    # fp 未显式传入时回退 chrome（保持旧调用/旧节点链接不变）；经 sanitize 防非法值。
+    fp=$(reality_sanitize_fingerprint "${fp:-chrome}")
+    printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=%s&pbk=%s&sid=%s&type=tcp&flow=xtls-rprx-vision#%s\n' \
+        "$uuid" "$node_uri" "$port" "$sni" "$fp" "$public_key" "$short_id" "$encoded_name"
 }
 
 reality_parse_vless_link() {
@@ -15290,6 +19879,11 @@ reality_parse_vless_link() {
     fi
     REALITY_NODE_DOMAIN="$host"
     REALITY_PORT="$port"
+    # 关键：先把可选字段清空，再逐项解析。否则调用前若 reality_load_state 已把本机
+    # 落地身份写进这些全局，链接里缺失的参数会"继承"本机旧值 —— 缺 sni 会用本机 sni
+    # 通过非空守卫（烘进错误 SNI → 下游握手不匹配、静默不通）；缺 fp 会用本机指纹（破坏
+    # 每节点 fp 分散设计）。清空后，缺失即为空，末尾的非空守卫才能真正拦住残缺链接。
+    REALITY_SNI=""; REALITY_PUBLIC_KEY=""; REALITY_SHORT_ID=""; REALITY_FLOW=""; REALITY_FINGERPRINT=""
     while IFS= read -r param; do
         key="${param%%=*}"
         value="${param#*=}"
@@ -15298,6 +19892,7 @@ reality_parse_vless_link() {
             pbk|publicKey) REALITY_PUBLIC_KEY="$value" ;;
             sid|shortId) REALITY_SHORT_ID="$value" ;;
             flow) REALITY_FLOW="$value" ;;
+            fp|fingerprint) REALITY_FINGERPRINT="$value" ;;
         esac
     done < <(tr '&' '\n' <<< "$query")
     [[ -n "${REALITY_UUID:-}" && -n "${REALITY_SNI:-}" && -n "${REALITY_PUBLIC_KEY:-}" && -n "${REALITY_SHORT_ID:-}" ]]
@@ -15354,31 +19949,43 @@ reality_local_client_self_test() {
     reality_load_state || return 1
     command_exists sing-box || { print_warn "sing-box 不存在，跳过本机协议自测"; return 1; }
     command_exists curl || { print_warn "curl 不存在，跳过本机协议自测"; return 1; }
-    local test_port="${REALITY_SELFTEST_PORT:-19090}" cfg log curl_log pid i
-    cfg=$(mktemp /tmp/reality-client-test.XXXXXX.json) || return 1
-    log=$(mktemp /tmp/reality-client-test.XXXXXX.log) || { rm -f "$cfg"; return 1; }
-    curl_log=$(mktemp /tmp/reality-selftest-curl.XXXXXX.log) || { rm -f "$cfg" "$log"; return 1; }
-    chmod 600 "$cfg" "$log" "$curl_log" 2>/dev/null || true
-    cat > "$cfg" <<EOF
-{"log":{"level":"info","timestamp":true},"inbounds":[{"type":"mixed","listen":"127.0.0.1","listen_port":${test_port}}],"outbounds":[{"type":"vless","tag":"self-test","server":"127.0.0.1","server_port":${REALITY_PORT},"uuid":"${REALITY_UUID}","flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":"${REALITY_SNI}","utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":"${REALITY_PUBLIC_KEY}","short_id":"${REALITY_SHORT_ID}"}}}],"route":{"final":"self-test"}}
+    local test_port="${REALITY_SELFTEST_PORT:-19090}" tmp_dir cfg log curl_log pid_file pid i
+    local old_umask
+    tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/reality-client-test.XXXXXX") || return 1
+    chmod 700 "$tmp_dir" 2>/dev/null || true
+    cfg="$tmp_dir/client.json"
+    log="$tmp_dir/sing-box.log"
+    curl_log="$tmp_dir/curl.log"
+    pid_file="$tmp_dir/sing-box.pid"
+    local st_fp; st_fp=$(reality_effective_fingerprint)
+    old_umask=$(umask)
+    umask 077
+    if ! cat > "$cfg" <<EOF
+{"log":{"level":"info","timestamp":true},"inbounds":[{"type":"mixed","listen":"127.0.0.1","listen_port":${test_port}}],"outbounds":[{"type":"vless","tag":"self-test","server":"127.0.0.1","server_port":${REALITY_PORT},"uuid":"${REALITY_UUID}","flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":"${REALITY_SNI}","utls":{"enabled":true,"fingerprint":"${st_fp}"},"reality":{"enabled":true,"public_key":"${REALITY_PUBLIC_KEY}","short_id":"${REALITY_SHORT_ID}"}}}],"route":{"final":"self-test"}}
 EOF
-    ( sing-box run -c "$cfg" > "$log" 2>&1 & echo $! > "${cfg}.pid" )
-    pid=$(cat "${cfg}.pid" 2>/dev/null || true)
+    then
+        umask "$old_umask"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    umask "$old_umask"
+    ( sing-box run -c "$cfg" > "$log" 2>&1 & echo $! > "$pid_file" )
+    pid=$(cat "$pid_file" 2>/dev/null || true)
     for i in $(seq 1 30); do
         ss -ltn 2>/dev/null | grep -q ":${test_port} " && break
         sleep 0.2
     done
     if curl -x "socks5h://127.0.0.1:${test_port}" -fsS --max-time 15 https://www.cloudflare.com/cdn-cgi/trace >"$curl_log" 2>&1; then
         print_success "本机协议自测通过: sing-box client -> 127.0.0.1:${REALITY_PORT} -> 外网"
-        rm -f "$cfg" "$log" "$curl_log" "${cfg}.pid"
         [[ -n "$pid" ]] && kill "$pid" >/dev/null 2>&1 || true
+        rm -rf "$tmp_dir"
         return 0
     fi
     print_warn "本机协议自测失败，最近日志:"
     tail -n 20 "$curl_log" 2>/dev/null || true
     sed -E 's/[0-9a-fA-F-]{36}/<uuid>/g' "$log" 2>/dev/null | tail -n 20 || true
     [[ -n "$pid" ]] && kill "$pid" >/dev/null 2>&1 || true
-    rm -f "$cfg" "$log" "$curl_log" "${cfg}.pid"
+    rm -rf "$tmp_dir"
     return 1
 }
 
@@ -15400,6 +20007,141 @@ reality_require_supported_os() {
     esac
 }
 
+_reality_abs_system_path() {
+    local path="${1:-}"
+    [[ -n "$path" && "$path" == /* ]] || return 1
+    [[ "$path" != *[[:space:]]* ]]
+}
+
+_reality_sagernet_keyring_path() {
+    printf '%s' "${REALITY_SAGERNET_KEYRING_FILE:-/etc/apt/keyrings/sagernet.asc}"
+}
+
+_reality_sagernet_source_path() {
+    printf '%s' "${REALITY_SAGERNET_SOURCE_FILE:-/etc/apt/sources.list.d/sagernet.sources}"
+}
+
+_reality_realm_service_path() {
+    printf '%s' "${REALITY_REALM_SERVICE_FILE:-/etc/systemd/system/realm.service}"
+}
+
+_reality_realm_bin_path() {
+    if [[ -n "${REALITY_REALM_BIN:-}" ]]; then
+        printf '%s' "$REALITY_REALM_BIN"
+        return 0
+    fi
+    local bin
+    bin="$(type -P realm 2>/dev/null || true)"
+    printf '%s' "${bin:-/usr/local/bin/realm}"
+}
+
+_reality_realm_config_path() {
+    printf '%s' "${REALITY_REALM_CONFIG:-/etc/realm/config.toml}"
+}
+
+_reality_render_sagernet_source() {
+    local keyring="$1"
+    _reality_abs_system_path "$keyring" || return 1
+    cat <<EOF
+Types: deb
+URIs: https://deb.sagernet.org/
+Suites: *
+Components: *
+Enabled: yes
+Signed-By: $keyring
+EOF
+}
+
+_reality_install_sagernet_keyring() {
+    local keyring dir tmp_key
+    command_exists curl || return 1
+    keyring="$(_reality_sagernet_keyring_path)"
+    _reality_abs_system_path "$keyring" || return 1
+    dir="$(dirname "$keyring")"
+    mkdir -p "$dir" || return 1
+    tmp_key=$(mktemp "${dir}/.tmp.server-manage.sagernet-key.XXXXXX") || return 1
+    _tmp_register "$tmp_key"
+    if ! curl -fsSL https://sing-box.app/gpg.key -o "$tmp_key"; then
+        rm -f "$tmp_key" 2>/dev/null || true
+        _tmp_unregister "$tmp_key"
+        return 1
+    fi
+    chmod 644 "$tmp_key" 2>/dev/null || true
+    chown root:root "$tmp_key" 2>/dev/null || true
+    if ! mv "$tmp_key" "$keyring"; then
+        rm -f "$tmp_key" 2>/dev/null || true
+        _tmp_unregister "$tmp_key"
+        return 1
+    fi
+    _tmp_unregister "$tmp_key"
+    return 0
+}
+
+_reality_write_sagernet_source() {
+    local keyring source_file content
+    keyring="$(_reality_sagernet_keyring_path)"
+    source_file="$(_reality_sagernet_source_path)"
+    _reality_abs_system_path "$source_file" || return 1
+    content="$(_reality_render_sagernet_source "$keyring")" || return 1
+    write_file_atomic "$source_file" "$content" || return 1
+    chmod 644 "$source_file" 2>/dev/null || true
+}
+
+_reality_render_realm_service_unit() {
+    local realm_bin="${1:-$(_reality_realm_bin_path)}" realm_config="${2:-$(_reality_realm_config_path)}"
+    _reality_abs_system_path "$realm_bin" || return 1
+    _reality_abs_system_path "$realm_config" || return 1
+    cat <<EOF
+[Unit]
+Description=Realm TCP Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$realm_bin -c $realm_config
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+_reality_install_realm_service_unit() {
+    local service_file content
+    service_file="$(_reality_realm_service_path)"
+    _reality_abs_system_path "$service_file" || return 1
+    content="$(_reality_render_realm_service_unit)" || return 1
+    write_file_atomic "$service_file" "$content" || return 1
+    chmod 644 "$service_file" 2>/dev/null || true
+}
+
+_reality_install_realm_binary_file() {
+    local src="$1" target="${2:-$(_reality_realm_bin_path)}" dir tmp_bin
+    [[ -f "$src" ]] || return 1
+    _reality_abs_system_path "$target" || return 1
+    dir="$(dirname "$target")"
+    mkdir -p "$dir" || return 1
+    tmp_bin=$(mktemp "${dir}/.tmp.server-manage.realm.XXXXXX") || return 1
+    _tmp_register "$tmp_bin"
+    if ! cp "$src" "$tmp_bin"; then
+        rm -f "$tmp_bin" 2>/dev/null || true
+        _tmp_unregister "$tmp_bin"
+        return 1
+    fi
+    chmod 0755 "$tmp_bin" 2>/dev/null || true
+    chown root:root "$tmp_bin" 2>/dev/null || true
+    if ! mv "$tmp_bin" "$target"; then
+        rm -f "$tmp_bin" 2>/dev/null || true
+        _tmp_unregister "$tmp_bin"
+        return 1
+    fi
+    _tmp_unregister "$tmp_bin"
+    return 0
+}
+
 reality_install_singbox_official() {
     reality_require_supported_os || return 1
     install_package "curl" "silent" || return 1
@@ -15409,17 +20151,8 @@ reality_install_singbox_official() {
     install_package "jq" "silent" || true
     if ! command_exists sing-box; then
         print_info "添加 sing-box 官方 APT 源..."
-        mkdir -p /etc/apt/keyrings
-        curl -fsSL https://sing-box.app/gpg.key -o /etc/apt/keyrings/sagernet.asc || return 1
-        chmod a+r /etc/apt/keyrings/sagernet.asc
-        cat > /etc/apt/sources.list.d/sagernet.sources <<'EOF'
-Types: deb
-URIs: https://deb.sagernet.org/
-Suites: *
-Components: *
-Enabled: yes
-Signed-By: /etc/apt/keyrings/sagernet.asc
-EOF
+        _reality_install_sagernet_keyring || return 1
+        _reality_write_sagernet_source || return 1
         APT_UPDATED=0
         update_apt_cache
         DEBIAN_FRONTEND=noninteractive apt-get install -y sing-box >/dev/null || return 1
@@ -15431,11 +20164,31 @@ reality_verify_sni() {
     local domain="$1"
     validate_domain "$domain" || return 1
     command_exists openssl || install_package "openssl" "silent" || return 1
-    local timeout_cmd=""
+    local timeout_cmd="" tmp_dir old_umask rc
     command_exists timeout && timeout_cmd="timeout 12"
-    REALITY_SNI_CHECK_LOG=$(mktemp /tmp/reality-sni-check.XXXXXX.log) || return 1
+    reality_cleanup_sni_check_log
+    old_umask=$(umask)
+    umask 077
+    tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/reality-sni-check.XXXXXX")
+    rc=$?
+    umask "$old_umask"
+    [[ "$rc" -eq 0 ]] || return 1
+    chmod 700 "$tmp_dir" 2>/dev/null || true
+    REALITY_SNI_CHECK_DIR="$tmp_dir"
+    REALITY_SNI_CHECK_LOG="$tmp_dir/sni-check.log"
+    : > "$REALITY_SNI_CHECK_LOG" || { reality_cleanup_sni_check_log; return 1; }
     chmod 600 "$REALITY_SNI_CHECK_LOG" 2>/dev/null || true
     $timeout_cmd openssl s_client -connect "${domain}:443" -servername "$domain" -verify_hostname "$domain" -verify_return_error -brief </dev/null >"$REALITY_SNI_CHECK_LOG" 2>&1
+}
+
+reality_cleanup_sni_check_log() {
+    if [[ -n "${REALITY_SNI_CHECK_DIR:-}" ]]; then
+        rm -rf -- "$REALITY_SNI_CHECK_DIR" 2>/dev/null || true
+    elif [[ -n "${REALITY_SNI_CHECK_LOG:-}" ]]; then
+        rm -f -- "$REALITY_SNI_CHECK_LOG" 2>/dev/null || true
+    fi
+    REALITY_SNI_CHECK_DIR=""
+    REALITY_SNI_CHECK_LOG=""
 }
 
 reality_pick_sni_candidates() {
@@ -15475,10 +20228,12 @@ reality_prompt_sni_legacy() {
         print_info "校验 TLS/SAN: $sni" >&2
         if reality_verify_sni "$sni"; then
             print_success "SNI 校验通过: $sni" >&2
+            reality_cleanup_sni_check_log
             echo "$sni"; return 0
         fi
         print_warn "SNI 校验未通过或网络不可达: $sni" >&2
         tail -n 3 "${REALITY_SNI_CHECK_LOG:-/dev/null}" >&2 2>/dev/null || true
+        reality_cleanup_sni_check_log
         confirm "仍然使用该 SNI?" && { echo "$sni"; return 0; }
     done
 }
@@ -15604,6 +20359,7 @@ REALITY_UUID=$(reality_state_quote "${REALITY_UUID:-}")
 REALITY_PRIVATE_KEY=$(reality_state_quote "${REALITY_PRIVATE_KEY:-}")
 REALITY_PUBLIC_KEY=$(reality_state_quote "${REALITY_PUBLIC_KEY:-}")
 REALITY_SHORT_ID=$(reality_state_quote "${REALITY_SHORT_ID:-}")
+REALITY_FINGERPRINT=$(reality_state_quote "${REALITY_FINGERPRINT:-}")
 REALITY_LISTEN_HOST=$(reality_state_quote "${REALITY_LISTEN_HOST:-}")
 REALITY_LISTEN_HOST_V4=$(reality_state_quote "${REALITY_LISTEN_HOST_V4:-}")
 REALITY_LISTEN_HOST_V6=$(reality_state_quote "${REALITY_LISTEN_HOST_V6:-}")
@@ -15699,11 +20455,15 @@ reality_write_one_client_artifact() {
     local json_sni; json_sni=$(reality_json_escape "$REALITY_SNI")
     local json_public_key; json_public_key=$(reality_json_escape "$REALITY_PUBLIC_KEY")
     local json_short_id; json_short_id=$(reality_json_escape "$REALITY_SHORT_ID")
-    reality_build_vless_link "$REALITY_UUID" "$link_host" "$link_port" "$REALITY_SNI" "$REALITY_PUBLIC_KEY" "$REALITY_SHORT_ID" "$name" > "$link_path"
-    cat > "$json_path" <<EOF
-{"type":"vless","tag":"${json_name}","server":"${json_host}","server_port":${link_port},"uuid":"${json_uuid}","flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":"${json_sni}","utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":"${json_public_key}","short_id":"${json_short_id}"}}}
+    local fp; fp=$(reality_effective_fingerprint)
+    local link_content json_content
+    link_content="$(reality_build_vless_link "$REALITY_UUID" "$link_host" "$link_port" "$REALITY_SNI" "$REALITY_PUBLIC_KEY" "$REALITY_SHORT_ID" "$name" "$fp")" || return 1
+    json_content=$(cat <<EOF
+{"type":"vless","tag":"${json_name}","server":"${json_host}","server_port":${link_port},"uuid":"${json_uuid}","flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":"${json_sni}","utls":{"enabled":true,"fingerprint":"${fp}"},"reality":{"enabled":true,"public_key":"${json_public_key}","short_id":"${json_short_id}"}}}
 EOF
-    chmod 600 "$link_path" "$json_path"
+)
+    reality_write_secure_file "$link_path" "$link_content" || return 1
+    reality_write_secure_file "$json_path" "$json_content" || return 1
 }
 
 reality_write_client_artifacts() {
@@ -15719,9 +20479,11 @@ reality_write_client_artifacts() {
         [[ -n "$name_v6" ]] || name_v6="$(reality_node_name_with_suffix "$(reality_effective_node_name)" "-ipv6")"
         reality_write_one_client_artifact "$REALITY_LINK_FILE_V4" "$REALITY_CLIENT_JSON_V4" "$host_v4" "$port_v4" "$name_v4" || return 1
         reality_write_one_client_artifact "$REALITY_LINK_FILE_V6" "$REALITY_CLIENT_JSON_V6" "$host_v6" "$port_v6" "$name_v6" || return 1
-        cat "$REALITY_LINK_FILE_V4" "$REALITY_LINK_FILE_V6" > "$REALITY_LINK_FILE"
-        cp -f "$REALITY_CLIENT_JSON_V4" "$REALITY_CLIENT_JSON"
-        chmod 600 "$REALITY_LINK_FILE" "$REALITY_CLIENT_JSON"
+        local combined_links combined_json
+        combined_links="$(cat "$REALITY_LINK_FILE_V4" "$REALITY_LINK_FILE_V6")" || return 1
+        combined_json="$(cat "$REALITY_CLIENT_JSON_V4")" || return 1
+        reality_write_secure_file "$REALITY_LINK_FILE" "$combined_links" || return 1
+        reality_write_secure_file "$REALITY_CLIENT_JSON" "$combined_json" || return 1
         return 0
     fi
 
@@ -15785,17 +20547,31 @@ reality_detect_ips() {
 }
 
 reality_cf_delete_dns_type() {
-    local domain="$1" token="$2" type="$3" zone_id resp id ids=()
+    local domain="$1" token="$2" type="$3" zone_id="${4:-}" resp id ids=() page=1 per_page=100 total_pages count del_resp
     [[ -z "$domain" || -z "$token" || -z "$type" ]] && return 1
     command_exists jq || install_package "jq" "silent" || return 1
-    zone_id=$(_cf_get_zone_id "$domain" "$token") || return 1
+    [[ -n "$zone_id" ]] || zone_id=$(_cf_get_zone_id "$domain" "$token") || return 1
     [[ -n "$zone_id" ]] || return 1
-    resp=$(_cf_api GET "/zones/$zone_id/dns_records?type=$type&name=$domain&per_page=100" "$token") || return 1
-    _cf_api_ok "$resp" || return 1
-    mapfile -t ids < <(jq -r '.result[].id // empty' <<< "$resp" 2>/dev/null)
+    while true; do
+        resp=$(_cf_api GET "/zones/$zone_id/dns_records?type=$type&name=$domain&per_page=$per_page&page=$page" "$token") || return 1
+        _cf_api_ok "$resp" || return 1
+        while IFS= read -r id; do
+            [[ -n "$id" ]] && ids+=("$id")
+        done < <(jq -r '.result[].id // empty' <<< "$resp" 2>/dev/null)
+        total_pages=$(jq -r '.result_info.total_pages // empty' <<< "$resp" 2>/dev/null)
+        count=$(jq -r '.result | length' <<< "$resp" 2>/dev/null)
+        if [[ "$total_pages" =~ ^[0-9]+$ ]]; then
+            (( page >= total_pages )) && break
+        else
+            [[ "$count" =~ ^[0-9]+$ ]] || count=0
+            (( count < per_page )) && break
+        fi
+        page=$((page + 1))
+    done
     for id in "${ids[@]}"; do
         [[ -n "$id" ]] || continue
-        _cf_api DELETE "/zones/$zone_id/dns_records/$id" "$token" >/dev/null || return 1
+        del_resp=$(_cf_api DELETE "/zones/$zone_id/dns_records/$id" "$token") || return 1
+        _cf_api_ok "$del_resp" || return 1
     done
 }
 
@@ -15845,10 +20621,29 @@ reality_cf_zone_names_from_json() {
 }
 
 reality_cf_list_zones() {
-    local token="$1" resp
+    local token="$1" resp page=1 per_page=50 all='[]' total_pages count
     [[ -z "$token" ]] && return 1
-    resp=$(_cf_api GET "/zones?per_page=50" "$token") || return 1
-    _cf_api_ok "$resp" || return 1
+    if declare -F _cf_list_zones >/dev/null 2>&1; then
+        resp=$(_cf_list_zones "$token") || return 1
+        _cf_api_ok "$resp" || return 1
+        reality_cf_zone_names_from_json "$resp"
+        return 0
+    fi
+    while true; do
+        resp=$(_cf_api GET "/zones?per_page=$per_page&page=$page" "$token") || return 1
+        _cf_api_ok "$resp" || return 1
+        all=$(jq -c --argjson acc "$all" '$acc + (.result // [])' <<< "$resp" 2>/dev/null) || return 1
+        total_pages=$(jq -r '.result_info.total_pages // empty' <<< "$resp" 2>/dev/null)
+        count=$(jq -r '.result | length' <<< "$resp" 2>/dev/null)
+        if [[ "$total_pages" =~ ^[0-9]+$ ]]; then
+            (( page >= total_pages )) && break
+        else
+            [[ "$count" =~ ^[0-9]+$ ]] || count=0
+            (( count < per_page )) && break
+        fi
+        page=$((page + 1))
+    done
+    resp=$(jq -n --argjson result "$all" '{success:true, errors:[], messages:[], result:$result}') || return 1
     reality_cf_zone_names_from_json "$resp"
 }
 
@@ -15917,6 +20712,21 @@ reality_install_landing() {
     reality_warn_sni_risk "$sni"
     reality_warn_port_risk "$port" "Reality"
     [[ -z "$node_name" ]] || reality_validate_node_name "$node_name" || { print_error "节点名称无效"; return 1; }
+    # 443 共存已开时的重装防护：render 会走 loopback 分支（reality_coexist_reality_port 有值即触发），
+    # 此时若本次端口非 443，客户端链接会指向一个既不监听、也不被 stream 覆盖的端口 → 静默不可达；
+    # 若本次是 split，coexist 分支优先于 split 分支渲染，只出单入站会丢掉 IPv6 节点。故一律拦下。
+    if reality_coexist_enabled 2>/dev/null; then
+        if [[ "$dns_mode" == "split" ]]; then
+            print_error "当前已启用 443 共存模式，暂不支持以 split 双节点模式重装落地机。"
+            print_info "请先用菜单「关闭 443 共存模式」再重装，或改用单节点模式。"
+            return 1
+        fi
+        if [[ "$port" != "443" ]]; then
+            print_error "当前已启用 443 共存模式，重装落地机的端口必须为 443（对外由 nginx stream 持有）。"
+            print_info "本次端口为 ${port}，非 443。请以 443 重装，或先关闭 443 共存模式再用其他端口。"
+            return 1
+        fi
+    fi
     if [[ "$dns_mode" == "split" ]]; then
         node_domain_v4="${node_domain_v4:-$node_domain}"
         validate_domain "$node_domain_v4" || { print_error "IPv4 节点域名无效"; return 1; }
@@ -15930,6 +20740,16 @@ reality_install_landing() {
         validate_domain "$node_domain" || { print_error "节点域名无效"; return 1; }
     fi
     reality_load_state || true
+    if reality_port_reserved_except_current_landing "$port"; then
+        print_error "Reality 端口已被本项目其他功能保留: ${port}"
+        return 1
+    fi
+    if [[ "$dns_mode" == "split" ]]; then
+        if reality_port_reserved_except_current_landing "$port_v6"; then
+            print_error "IPv6 Reality 端口已被本项目其他功能保留: ${port_v6}"
+            return 1
+        fi
+    fi
     local had_relay=0
     [[ "${REALITY_ROLE:-}" == *"relay"* ]] && had_relay=1
     reality_install_singbox_official || return 1
@@ -15939,6 +20759,13 @@ reality_install_landing() {
     REALITY_PRIVATE_KEY=$(sed -n '1p' <<< "$keys")
     REALITY_PUBLIC_KEY=$(sed -n '2p' <<< "$keys")
     REALITY_SHORT_ID=$(reality_generate_short_id)
+    # 客户端指纹：重装保留旧节点已定的指纹（reality_load_state 已回读），
+    # 全新安装则随机挑一个真实浏览器指纹并持久化（分散全网 fp=chrome 特征）。
+    if [[ -z "${REALITY_FINGERPRINT:-}" ]]; then
+        REALITY_FINGERPRINT=$(reality_random_fingerprint)
+    else
+        REALITY_FINGERPRINT=$(reality_sanitize_fingerprint "$REALITY_FINGERPRINT")
+    fi
     if [[ "$had_relay" -eq 1 ]]; then
         REALITY_ROLE="landing+relay"
     else
@@ -16041,7 +20868,8 @@ reality_select_realm_checksum_url() {
 }
 
 reality_verify_sha256_file() {
-    local file="$1" checksum_file="$2" asset_name="${3:-$(basename "$file")}" hash line
+    local file="$1" checksum_file="$2" asset_name hash line
+    asset_name="${3:-$(basename "$file")}"
     command_exists sha256sum || { print_error "缺少 sha256sum，无法校验下载文件"; return 1; }
     line=$(grep -F "$asset_name" "$checksum_file" 2>/dev/null | head -n 1 || true)
     if [[ -n "$line" ]]; then
@@ -16081,12 +20909,18 @@ reality_install_realm_binary() {
     command_exists curl || install_package "curl" "silent" || return 1
     command_exists tar || install_package "tar" "silent" || true
     if command_exists realm; then return 0; fi
-    local arch expected url tmp bin asset_name
+    local arch expected url tmp bin asset_name old_umask rc
     arch=$(reality_realm_arch) || { print_error "Realm 不支持当前架构"; return 1; }
     expected=$(reality_realm_pinned_sha256 "$arch") || { print_error "无内置 Realm ${arch} 校验值，已拒绝安装"; return 1; }
     asset_name="realm-${arch}.tar.gz"
     url="https://github.com/zhboner/realm/releases/download/${REALITY_REALM_VERSION}/${asset_name}"
-    tmp=$(mktemp -d)
+    old_umask=$(umask)
+    umask 077
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/server-manage-realm.XXXXXX")
+    rc=$?
+    umask "$old_umask"
+    [[ "$rc" -eq 0 ]] || return 1
+    chmod 700 "$tmp" 2>/dev/null || true
     curl -fsSL "$url" -o "$tmp/realm.tgz" || { print_error "Realm 发布包下载失败"; rm -rf "$tmp"; return 1; }
     # 用内置校验值生成本地 checksum 文件，复用统一校验 helper（含 sha256sum -c）。
     printf '%s  %s\n' "$expected" "$asset_name" > "$tmp/realm.sha256"
@@ -16095,7 +20929,7 @@ reality_install_realm_binary() {
     }
     tar -xzf "$tmp/realm.tgz" -C "$tmp" || { rm -rf "$tmp"; return 1; }
     bin=$(reality_find_realm_binary "$tmp") || { print_error "Realm 发布包中未找到可安装二进制"; rm -rf "$tmp"; return 1; }
-    install -m 0755 "$bin" /usr/local/bin/realm || { rm -rf "$tmp"; return 1; }
+    _reality_install_realm_binary_file "$bin" "$(_reality_realm_bin_path)" || { rm -rf "$tmp"; return 1; }
     rm -rf "$tmp"
 }
 
@@ -16117,7 +20951,7 @@ reality_relay_load_route() {
     [[ -f "$file" ]] || return 1
     validate_conf_file "$file" || { print_warn "中转线路文件校验失败，已跳过: $file"; return 1; }
     RLY_NAME=""; RLY_LISTEN_PORT=""; RLY_CONNECT_HOST=""; RLY_TARGET_HOST=""; RLY_TARGET_PORT=""
-    RLY_UUID=""; RLY_SNI=""; RLY_PUBLIC_KEY=""; RLY_SHORT_ID=""; RLY_FLOW=""
+    RLY_UUID=""; RLY_SNI=""; RLY_PUBLIC_KEY=""; RLY_SHORT_ID=""; RLY_FLOW=""; RLY_FINGERPRINT=""
     # shellcheck disable=SC1090
     source "$file"
 }
@@ -16140,6 +20974,7 @@ RLY_SNI=$(reality_state_quote "${RLY_SNI:-}")
 RLY_PUBLIC_KEY=$(reality_state_quote "${RLY_PUBLIC_KEY:-}")
 RLY_SHORT_ID=$(reality_state_quote "${RLY_SHORT_ID:-}")
 RLY_FLOW=$(reality_state_quote "${RLY_FLOW:-}")
+RLY_FINGERPRINT=$(reality_state_quote "${RLY_FINGERPRINT:-}")
 EOF
 )
     reality_write_secure_file "$file" "$content"
@@ -16158,11 +20993,17 @@ reality_relay_write_client_artifacts() {
     local json_sni; json_sni=$(reality_json_escape "$RLY_SNI")
     local json_public_key; json_public_key=$(reality_json_escape "$RLY_PUBLIC_KEY")
     local json_short_id; json_short_id=$(reality_json_escape "$RLY_SHORT_ID")
-    reality_build_vless_link "$RLY_UUID" "$host" "$port" "$RLY_SNI" "$RLY_PUBLIC_KEY" "$RLY_SHORT_ID" "$name" > "$REALITY_RELAY_DIR/relay-${port}.link.txt"
-    cat > "$REALITY_RELAY_DIR/relay-${port}.client.json" <<EOF
-{"type":"vless","tag":"${json_name}","server":"${json_host}","server_port":${port},"uuid":"${json_uuid}","flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":"${json_sni}","utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":"${json_public_key}","short_id":"${json_short_id}"}}}
+    local rly_fp; rly_fp=$(reality_sanitize_fingerprint "${RLY_FINGERPRINT:-}")
+    local link_path="${REALITY_RELAY_DIR}/relay-${port}.link.txt"
+    local json_path="${REALITY_RELAY_DIR}/relay-${port}.client.json"
+    local link_content json_content
+    link_content="$(reality_build_vless_link "$RLY_UUID" "$host" "$port" "$RLY_SNI" "$RLY_PUBLIC_KEY" "$RLY_SHORT_ID" "$name" "$rly_fp")" || return 1
+    json_content=$(cat <<EOF
+{"type":"vless","tag":"${json_name}","server":"${json_host}","server_port":${port},"uuid":"${json_uuid}","flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":"${json_sni}","utls":{"enabled":true,"fingerprint":"${rly_fp}"},"reality":{"enabled":true,"public_key":"${json_public_key}","short_id":"${json_short_id}"}}}
 EOF
-    chmod 600 "$REALITY_RELAY_DIR/relay-${port}.link.txt" "$REALITY_RELAY_DIR/relay-${port}.client.json"
+)
+    reality_write_secure_file "$link_path" "$link_content" || return 1
+    reality_write_secure_file "$json_path" "$json_content" || return 1
 }
 
 # 由全部线路渲染 realm 多端点配置（保持单端点格式：log.level + [[endpoints]]）
@@ -16187,22 +21028,7 @@ EOF
 
 # 写 realm systemd 单元
 reality_relay_ensure_service() {
-    cat > /etc/systemd/system/realm.service <<'EOF'
-[Unit]
-Description=Realm TCP Relay
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/realm -c /etc/realm/config.toml
-Restart=on-failure
-RestartSec=3
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    _reality_install_realm_service_unit || return 1
     systemctl daemon-reload
 }
 
@@ -16219,6 +21045,7 @@ reality_relay_migrate_legacy() {
     RLY_UUID="${REALITY_UUID:-}"; RLY_SNI="${REALITY_SNI:-}"
     RLY_PUBLIC_KEY="${REALITY_PUBLIC_KEY:-}"; RLY_SHORT_ID="${REALITY_SHORT_ID:-}"
     RLY_FLOW="${REALITY_FLOW:-xtls-rprx-vision}"
+    RLY_FINGERPRINT="${REALITY_FINGERPRINT:-}"
     reality_relay_write_route "$RLY_LISTEN_PORT"
     reality_relay_write_client_artifacts || true
     REALITY_RELAY_DOMAIN=""; REALITY_RELAY_PORT=""
@@ -16228,17 +21055,35 @@ reality_relay_migrate_legacy() {
 
 # 根据 relays 目录重建 realm 配置、放行端口、刷新各线路客户端产物并重启 realm
 reality_relay_regenerate() {
-    mkdir -p /etc/realm "$REALITY_CONFIG_DIR" "$REALITY_RELAY_DIR"
+    local realm_config
+    realm_config="$(_reality_realm_config_path)"
+    _reality_abs_system_path "$realm_config" || return 1
+    mkdir -p "$(dirname "$realm_config")" "$REALITY_CONFIG_DIR" "$REALITY_RELAY_DIR"
     reality_relay_migrate_legacy
     if [[ -z "$(reality_relay_route_files)" ]]; then
         systemctl disable --now realm >/dev/null 2>&1 || true
-        rm -f "$REALITY_REALM_CONFIG"
+        rm -f "$realm_config"
         return 0
     fi
     reality_install_realm_binary || return 1
-    reality_backup_file "$REALITY_REALM_CONFIG"
-    reality_render_realm_config_multi > "$REALITY_REALM_CONFIG"
-    chmod 600 "$REALITY_REALM_CONFIG"
+    reality_backup_file "$realm_config"
+    # 临时文件落在目标目录(/etc/realm)内，确保下方 mv 是同文件系统的原子 rename
+    # （mktemp 默认落 /tmp 会跨文件系统退化为 copy+delete 且受目标 umask 影响）。
+    mkdir -p "$(dirname "$realm_config")"
+    local _tmp_cfg; _tmp_cfg="$(mktemp "$(dirname "$realm_config")/.realm.XXXXXX")" || return 1
+    reality_render_realm_config_multi > "$_tmp_cfg"
+    # LOW-1：只数有效端点。若路由文件都校验失败→0 端点，不能拿空配置 restart realm
+    # （会启动一个空转/或静默“成功”的服务，且旧转发被静默丢弃）。此时保留旧配置并报错。
+    # grep -c 匹配 0 次时输出 "0" 但退出码为 1；不要在后面追加 echo 0（会变成 "0\n0"
+    # 触发算术比较语法错误）。改用 grep -o | wc -l，始终单行数字、退出码无关。
+    local _ep_count; _ep_count="$(grep -o '^\[\[endpoints\]\]' "$_tmp_cfg" 2>/dev/null | wc -l | tr -d '[:space:]')"
+    if [[ "${_ep_count:-0}" -eq 0 ]]; then
+        rm -f "$_tmp_cfg"
+        print_error "所有中转线路文件校验失败，渲染出 0 个端点；已保留原 realm 配置，未重启。"
+        return 1
+    fi
+    mv -f "$_tmp_cfg" "$realm_config"
+    chmod 600 "$realm_config"
     reality_relay_ensure_service
     local f
     while IFS= read -r f; do
@@ -16249,7 +21094,18 @@ reality_relay_regenerate() {
         reality_relay_write_client_artifacts || true
     done < <(reality_relay_route_files)
     systemctl enable realm >/dev/null 2>&1 || true
-    systemctl restart realm || return 1
+    if ! systemctl restart realm; then
+        # restart 失败：恢复最近一次备份配置（若有），避免留下坏配置继续对外。
+        local _bak
+        _bak="$(ls -1t "$REALITY_BACKUP_DIR/$(basename "$realm_config")".*.bak 2>/dev/null | head -n1)"
+        if [[ -n "$_bak" && -f "$_bak" ]]; then
+            cp -a "$_bak" "$realm_config" 2>/dev/null || true
+            systemctl restart realm >/dev/null 2>&1 || true
+        fi
+        print_error "realm 重启失败，已尝试恢复上一版配置。"
+        return 1
+    fi
+    return 0
 }
 
 # 交互：添加一条中转线路（导入下游落地 vless 链接）
@@ -16262,14 +21118,18 @@ reality_relay_add() {
     [[ -n "$link" ]] || { print_info "已取消"; pause; return 0; }
     # 快照本机落地身份，避免被链接解析覆盖
     local _s_uuid="${REALITY_UUID:-}" _s_node="${REALITY_NODE_DOMAIN:-}" _s_port="${REALITY_PORT:-}" \
-          _s_sni="${REALITY_SNI:-}" _s_pbk="${REALITY_PUBLIC_KEY:-}" _s_sid="${REALITY_SHORT_ID:-}" _s_flow="${REALITY_FLOW:-}"
+          _s_sni="${REALITY_SNI:-}" _s_pbk="${REALITY_PUBLIC_KEY:-}" _s_sid="${REALITY_SHORT_ID:-}" _s_flow="${REALITY_FLOW:-}" \
+          _s_fp="${REALITY_FINGERPRINT:-}"
     reality_parse_vless_link "$link" || { print_error "落地机 vless 链接解析失败"; pause; return 1; }
     RLY_TARGET_HOST="$REALITY_NODE_DOMAIN"; RLY_TARGET_PORT="$REALITY_PORT"
     RLY_UUID="$REALITY_UUID"; RLY_SNI="$REALITY_SNI"; RLY_PUBLIC_KEY="$REALITY_PUBLIC_KEY"
     RLY_SHORT_ID="$REALITY_SHORT_ID"; RLY_FLOW="${REALITY_FLOW:-xtls-rprx-vision}"
+    # 中转客户端指纹沿用导入链接里的 fp（真实落地机身份的一部分）；链接无 fp 时留空→回退 chrome。
+    RLY_FINGERPRINT="${REALITY_FINGERPRINT:-}"
     # 恢复本机落地身份
     REALITY_UUID="$_s_uuid"; REALITY_NODE_DOMAIN="$_s_node"; REALITY_PORT="$_s_port"
     REALITY_SNI="$_s_sni"; REALITY_PUBLIC_KEY="$_s_pbk"; REALITY_SHORT_ID="$_s_sid"; REALITY_FLOW="$_s_flow"
+    REALITY_FINGERPRINT="$_s_fp"
     validate_domain "$RLY_TARGET_HOST" || validate_ip "$RLY_TARGET_HOST" || { print_error "落地地址无效"; pause; return 1; }
     validate_port "$RLY_TARGET_PORT" || { print_error "落地端口无效"; pause; return 1; }
     [[ -n "$RLY_PUBLIC_KEY" && -n "$RLY_UUID" && -n "$RLY_SHORT_ID" ]] || { print_error "链接缺少 Reality 参数(pbk/uuid/sid)"; pause; return 1; }
@@ -16296,8 +21156,18 @@ reality_relay_add() {
     [[ "$RLY_CONNECT_HOST" == "$connect_default" && -n "$connect_default" ]] && echo "（复用本机域名，按端口区分线路）"
     # 监听端口：唯一、未占用、不等于本机落地端口；优先推荐 443，无法使用时再回落随机端口。
     local def_port="443"
-    if [[ "${REALITY_PORT:-}" == "443" || -f "$REALITY_RELAY_DIR/relay-443.conf" ]] || reality_port_in_use 443; then
-        def_port=$(reality_random_port 2>/dev/null || echo "")
+    if [[ "${REALITY_PORT:-}" == "443" || -f "$REALITY_RELAY_DIR/relay-443.conf" ]] || reality_port_in_use 443 || reality_port_reserved 443; then
+        local candidate_port=""
+        def_port=""
+        for _ in $(seq 1 200); do
+            candidate_port=$(reality_random_port 2>/dev/null || echo "")
+            [[ -n "$candidate_port" ]] || continue
+            reality_port_reserved "$candidate_port" && continue
+            reality_port_in_use "$candidate_port" && continue
+            def_port="$candidate_port"
+            break
+        done
+        [[ -n "$def_port" ]] || { print_error "无法生成可用随机端口"; pause; return 1; }
         print_warn "本机 443/tcp 已被占用或已用于落地/其他中转，本条线路默认回落到随机端口；非 443 入口伪装弱于 443。"
     fi
     RLY_LISTEN_PORT=""
@@ -16308,6 +21178,7 @@ reality_relay_add() {
         validate_port "$RLY_LISTEN_PORT" || { print_error "端口无效"; continue; }
         if [[ -n "${REALITY_PORT:-}" && "$RLY_LISTEN_PORT" == "${REALITY_PORT}" ]]; then print_error "不能与本机落地端口相同"; continue; fi
         [[ -f "$REALITY_RELAY_DIR/relay-${RLY_LISTEN_PORT}.conf" ]] && { print_error "该端口已有中转线路"; continue; }
+        if reality_port_reserved "$RLY_LISTEN_PORT"; then print_error "端口已被本项目其他功能保留"; continue; fi
         if reality_port_in_use "$RLY_LISTEN_PORT"; then print_error "端口已被占用"; continue; fi
         reality_warn_port_risk "$RLY_LISTEN_PORT" "Realm 中转入口"
         if [[ "$RLY_LISTEN_PORT" != "443" && -t 0 ]] && ! confirm "确认使用非 443 中转入口端口?"; then
@@ -16451,39 +21322,59 @@ reality_install_relay() {
     validate_port "$target_port" || { print_error "落地端口无效"; return 1; }
     reality_warn_port_risk "$listen_port" "Realm 中转入口"
     [[ -z "$node_name" ]] || reality_validate_node_name "$node_name" || { print_error "节点名称无效"; return 1; }
-    # 同机若已有落地机 state，先加载以保留既有落地参数（纯重装中转、不导入链接的场景）。
-    # 但本次若通过导入落地 vless 链接带入了客户端 Reality 身份(公钥/UUID/SNI/ShortID)，
-    # 这些导入值必须覆盖磁盘旧值——否则中转客户端链接会错误地沿用本机旧落地身份，
-    # 与真实落地机的 Reality 握手参数不匹配，导致节点不通。
+    # 导入落地 vless 链接带入的客户端 Reality 身份(公钥/UUID/SNI/ShortID/flow/fp)只进 RLY_*
+    # （中转线路的独立身份），绝不写入会被 reality_write_state 持久化的 REALITY_*。
+    # 教训(HIGH-1)：曾把导入值经 REALITY_* 中转再赋给 RLY_*，导致本机 state.conf 被下游身份污染、
+    # 甚至私钥被抹空(链接无私钥)——本机落地节点不可逆损坏。故此处快照后不再触碰 REALITY_*。
     local _imp_uuid="${REALITY_UUID:-}" _imp_sni="${REALITY_SNI:-}" \
           _imp_pbk="${REALITY_PUBLIC_KEY:-}" _imp_sid="${REALITY_SHORT_ID:-}" \
           _imp_node="${REALITY_NODE_DOMAIN:-}" _imp_port="${REALITY_PORT:-}" \
-          _imp_pkey="${REALITY_PRIVATE_KEY:-}" _imp_flow="${REALITY_FLOW:-}"
+          _imp_flow="${REALITY_FLOW:-}" _imp_fp="${REALITY_FINGERPRINT:-}"
+    # 先清空 REALITY_* 身份字段：否则 relay-only 全新机上 reality_load_state 失败时，
+    # 这些字段会残留上面 parse 出的下游值，被 reality_write_state 误持久化成"伪落地"state
+    # （UUID=下游、私钥空），日后误跑 rotate-key 会崩。清空后 load_state 只会填回本机真落地身份。
+    REALITY_UUID=""; REALITY_SNI=""; REALITY_PUBLIC_KEY=""; REALITY_SHORT_ID=""
+    REALITY_NODE_DOMAIN=""; REALITY_PORT=""; REALITY_PRIVATE_KEY=""; REALITY_FLOW=""; REALITY_FINGERPRINT=""
+    # 加载本机落地 state（若有）以便保留本机落地身份 + 判断 landing 角色；导入值不覆盖它。
     reality_load_state || true
-    if [[ -n "$_imp_pbk" ]]; then
-        REALITY_UUID="$_imp_uuid"
-        REALITY_SNI="$_imp_sni"
-        REALITY_PUBLIC_KEY="$_imp_pbk"
-        REALITY_SHORT_ID="$_imp_sid"
-        REALITY_NODE_DOMAIN="$_imp_node"
-        REALITY_PORT="$_imp_port"
-        REALITY_PRIVATE_KEY="$_imp_pkey"
-        REALITY_FLOW="$_imp_flow"
+    if reality_port_reserved "$listen_port"; then
+        print_error "中转端口已被本项目其他功能保留: ${listen_port}"
+        return 1
     fi
-    reality_warn_sni_risk "${REALITY_SNI:-}"
+    reality_warn_sni_risk "${_imp_sni:-${REALITY_SNI:-}}"
     reality_require_supported_os || return 1
     # 写为一条独立身份的中转线路（relays 目录是 realm 配置的唯一真相源）。
+    # RLY_* 优先取导入的下游身份(_imp_*)；未导入链接时回退本机落地身份(REALITY_*)。
     RLY_NAME="${node_name:-$(reality_effective_node_name)}"
     RLY_LISTEN_PORT="$listen_port"
     RLY_CONNECT_HOST="$relay_domain"
     RLY_TARGET_HOST="$target_host"
     RLY_TARGET_PORT="$target_port"
-    RLY_UUID="${REALITY_UUID:-}"; RLY_SNI="${REALITY_SNI:-}"
-    RLY_PUBLIC_KEY="${REALITY_PUBLIC_KEY:-}"; RLY_SHORT_ID="${REALITY_SHORT_ID:-}"
-    RLY_FLOW="${REALITY_FLOW:-xtls-rprx-vision}"
+    if [[ -n "$_imp_pbk" ]]; then
+        RLY_UUID="$_imp_uuid"; RLY_SNI="$_imp_sni"
+        RLY_PUBLIC_KEY="$_imp_pbk"; RLY_SHORT_ID="$_imp_sid"
+        RLY_FLOW="${_imp_flow:-xtls-rprx-vision}"; RLY_FINGERPRINT="$_imp_fp"
+    else
+        RLY_UUID="${REALITY_UUID:-}"; RLY_SNI="${REALITY_SNI:-}"
+        RLY_PUBLIC_KEY="${REALITY_PUBLIC_KEY:-}"; RLY_SHORT_ID="${REALITY_SHORT_ID:-}"
+        RLY_FLOW="${REALITY_FLOW:-xtls-rprx-vision}"; RLY_FINGERPRINT="${REALITY_FINGERPRINT:-}"
+    fi
+    # MED-2：先迁移老版单中转字段（REALITY_RELAY_*）为一条独立线路，再写本次新线路。
+    # 否则本次 write_route 会让 relays 目录非空 → regenerate 里的 migrate 提前 return →
+    # 老线路永远不被渲染，升级用户原有中转静默失效。菜单路径已先迁移，这里对齐。
+    reality_relay_migrate_legacy
     reality_relay_write_route "$listen_port"
     if [[ -n "$cf_token" ]]; then reality_sync_cloudflare_dns "$relay_domain" "$cf_token"; fi
-    reality_relay_regenerate || return 1
+    # MED-3：regenerate 失败时回滚本次新写的线路文件并重建，避免残留半配置线路
+    # （下次 regenerate 会把它渲染进 realm，复活一条坏线路）。对齐 reality_relay_add 的回滚。
+    if ! reality_relay_regenerate; then
+        rm -f "${REALITY_RELAY_DIR}/relay-${listen_port}.conf" \
+              "${REALITY_RELAY_DIR}/relay-${listen_port}.link.txt" \
+              "${REALITY_RELAY_DIR}/relay-${listen_port}.client.json" 2>/dev/null || true
+        reality_relay_regenerate || true
+        print_error "Realm 中转重建失败，已回滚本次新增线路"
+        return 1
+    fi
     firewall_apply_realm_port "$listen_port"
     local _fw_rc=$?
     if [[ $_fw_rc -eq 1 ]]; then
@@ -16509,7 +21400,7 @@ reality_install_relay() {
 }
 
 reality_prompt_port() {
-    local prompt="$1" forbidden="${2:-}" choice port input_port
+    local prompt="$1" forbidden="${2:-}" allow_current_landing="${3:-0}" choice port input_port
     while true; do
         echo -e "${C_CYAN}${prompt} 端口策略:${C_RESET}" >&2
         echo "  1. 使用 443（推荐：最符合正常 HTTPS/REALITY 伪装）" >&2
@@ -16524,18 +21415,34 @@ reality_prompt_port() {
                 read -e -r -p "${prompt} 自定义端口: " input_port
                 ;;
             3)
-                while true; do
+                input_port=""
+                for _ in $(seq 1 200); do
                     port=$(reality_random_port) || { print_error "无法生成可用随机端口"; return 1; }
                     [[ -n "$forbidden" && "$port" == "$forbidden" ]] && continue
+                    if [[ "$allow_current_landing" == "1" ]]; then
+                        reality_port_reserved_except_current_landing "$port" && continue
+                    else
+                        reality_port_reserved "$port" && continue
+                    fi
                     input_port="$port"
                     break
                 done
+                [[ -n "$input_port" ]] || { print_error "无法生成可用随机端口"; return 1; }
                 ;;
             *) print_error "无效选择"; continue ;;
         esac
         validate_port "$input_port" || { print_error "端口无效"; continue; }
         if [[ -n "$forbidden" && "$input_port" == "$forbidden" ]]; then
             print_error "端口不能与 ${forbidden} 相同"
+            continue
+        fi
+        if [[ "$allow_current_landing" == "1" ]]; then
+            if reality_port_reserved_except_current_landing "$input_port"; then
+                print_error "端口 ${input_port} 已被本项目其他功能保留"
+                continue
+            fi
+        elif reality_port_reserved "$input_port"; then
+            print_error "端口 ${input_port} 已被本项目其他功能保留"
             continue
         fi
         if reality_port_in_use "$input_port"; then
@@ -16564,11 +21471,11 @@ reality_prompt_split_ports() {
         read -e -r -p "请选择端口策略 [1]: " choice
         case "${choice:-1}" in
             1) p4="443"; p6="443" ;;
-            2) p4="443"; p6=$(reality_prompt_port "IPv6 Reality 监听") || return 1 ;;
-            3) p6="443"; p4=$(reality_prompt_port "IPv4 Reality 监听") || return 1 ;;
+            2) p4="443"; p6=$(reality_prompt_port "IPv6 Reality 监听" "" 1) || return 1 ;;
+            3) p6="443"; p4=$(reality_prompt_port "IPv4 Reality 监听" "" 1) || return 1 ;;
             4)
-                p4=$(reality_prompt_port "IPv4 Reality 监听") || return 1
-                p6=$(reality_prompt_port "IPv6 Reality 监听") || return 1
+                p4=$(reality_prompt_port "IPv4 Reality 监听" "" 1) || return 1
+                p6=$(reality_prompt_port "IPv6 Reality 监听" "" 1) || return 1
                 ;;
             *) print_error "无效选择"; continue ;;
         esac
@@ -16694,11 +21601,11 @@ reality_install_wizard() {
             elif [[ -z "$port_v6" && "$port" == "443" ]]; then
                 port_v6="443"
             else
-                [[ -z "$port" ]] && port=$(reality_prompt_port "IPv4 Reality 监听")
-                [[ -z "$port_v6" ]] && port_v6=$(reality_prompt_port "IPv6 Reality 监听")
+                [[ -z "$port" ]] && port=$(reality_prompt_port "IPv4 Reality 监听" "" 1)
+                [[ -z "$port_v6" ]] && port_v6=$(reality_prompt_port "IPv6 Reality 监听" "" 1)
             fi
         else
-            [[ -z "$port" ]] && port=$(reality_prompt_port "Reality 监听")
+            [[ -z "$port" ]] && port=$(reality_prompt_port "Reality 监听" "" 1)
         fi
         reality_install_landing "$node" "$sni" "$port" "$cf_token" "$node_name" "$dns_mode" "$node_v4" "$node_v6" "$port_v6" "$node_name_v4" "$node_name_v6" || return 1
     fi
@@ -16853,15 +21760,26 @@ reality_diagnose() {
         fi
 
         if command_exists ss; then
-            local _rp
-            for _rp in "${REALITY_PORT:-}" "${REALITY_PORT_V6:-}"; do
-                validate_port "$_rp" || continue
-                if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${_rp}$"; then
-                    print_success "本机正在监听 Reality 端口: ${_rp}/tcp"
+            local _co_rport=""
+            _co_rport="$(reality_coexist_reality_port 2>/dev/null || true)"
+            if [[ -n "$_co_rport" ]]; then
+                # 共存模式：sing-box 绑 127.0.0.1:<内部端口>，公网 443 由 nginx stream 持有。
+                if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${_co_rport}$"; then
+                    print_success "本机正在监听 Reality 内部端口(loopback): ${_co_rport}/tcp（443 共存模式）"
                 else
-                    print_error "本机未监听 Reality 端口: ${_rp}/tcp"
+                    print_error "本机未监听 Reality 内部端口: ${_co_rport}/tcp（443 共存模式，sing-box 可能未起）"
                 fi
-            done
+            else
+                local _rp
+                for _rp in "${REALITY_PORT:-}" "${REALITY_PORT_V6:-}"; do
+                    validate_port "$_rp" || continue
+                    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${_rp}$"; then
+                        print_success "本机正在监听 Reality 端口: ${_rp}/tcp"
+                    else
+                        print_error "本机未监听 Reality 端口: ${_rp}/tcp"
+                    fi
+                done
+            fi
         fi
 
         if command_exists ufw; then
@@ -16874,6 +21792,41 @@ reality_diagnose() {
                     print_warn "UFW 状态中未看到 ${_up}/tcp 放行规则"
                 fi
             done
+        fi
+    fi
+
+    # 443 共存模式诊断：stream 模块 / 443 归属 / 内部端口 / SNI 白名单
+    if reality_coexist_enabled 2>/dev/null; then
+        echo ""
+        print_info "443 共存模式（nginx stream + ssl_preread）诊断:"
+        local _co_rport _co_wport
+        _co_rport="$(reality_coexist_reality_port 2>/dev/null || true)"
+        _co_wport="$(reality_coexist_web_port 2>/dev/null || true)"
+        echo "  reality 内部端口: ${_co_rport:-未知}   web 内部端口: ${_co_wport:-未知}"
+        if declare -F _check_nginx_stream >/dev/null && _check_nginx_stream; then
+            print_success "nginx stream 模块可用"
+        else
+            print_error "nginx stream 模块不可用（443 分流无法工作）"
+        fi
+        if command_exists ss; then
+            if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)443$"; then
+                print_success "本机正在监听 443/tcp（应为 nginx stream 持有）"
+            else
+                print_error "本机未监听 443/tcp（nginx stream 未接管，Reality 对外不可达）"
+            fi
+        fi
+        if [[ -f "$REALITY_STREAM_CONF" ]]; then
+            print_success "stream 分流配置存在: $REALITY_STREAM_CONF"
+            local _wl_count
+            _wl_count=$(reality_coexist_collect_web_domains 2>/dev/null | wc -l | tr -d ' ')
+            echo "  真站 SNI 白名单: ${_wl_count} 个域名 → web(${_co_wport:-?})，其余 default → reality(${_co_rport:-?})"
+        else
+            print_error "stream 分流配置缺失: $REALITY_STREAM_CONF"
+        fi
+        if command_exists nginx; then
+            nginx -t >/dev/null 2>&1 \
+                && print_success "nginx 配置校验通过" \
+                || print_error "nginx 配置校验失败（run: nginx -t 查看详情）"
         fi
     fi
 
@@ -16954,9 +21907,11 @@ reality_diagnose() {
     if [[ -n "${REALITY_SNI:-}" ]]; then
         if reality_verify_sni "$REALITY_SNI"; then
             print_success "SNI TLS/SAN 校验通过: $REALITY_SNI"
+            reality_cleanup_sni_check_log
         else
             print_warn "SNI TLS/SAN 校验失败或当前网络不可达: $REALITY_SNI"
             tail -n 5 "${REALITY_SNI_CHECK_LOG:-/dev/null}" 2>/dev/null || true
+            reality_cleanup_sni_check_log
         fi
     fi
 
@@ -17072,6 +22027,9 @@ reality_cdn_pick_inner_port() {
         p=$(reality_random_port) || return 1
         [[ "$p" == "${REALITY_PORT:-}" || "$p" == "${REALITY_PORT_V6:-}" ]] && continue
         [[ "$p" == "${REALITY_CDN_ORIGIN_PORT:-8443}" ]] && continue
+        # MED-4：避开本项目其他 feature 已保留(含当前停止的 relay/共存)的端口，避免重启后 bind 冲突。
+        reality_port_reserved "$p" && continue
+        reality_port_in_use "$p" && continue
         echo "$p"; return 0
     done
     return 1
@@ -17109,6 +22067,15 @@ reality_cdn_install() {
             print_warn "检测到旧 CDN state 但校验失败；继续会覆盖它。"
             confirm "是否覆盖旧 CDN state?" || { print_info "已取消"; pause; return 0; }
         fi
+    fi
+    local had_cdn_link=0 old_cdn_link="" had_cdn_client_json=0 old_cdn_client_json=""
+    if [[ -f "$REALITY_CDN_LINK_FILE" ]]; then
+        had_cdn_link=1
+        old_cdn_link=$(cat "$REALITY_CDN_LINK_FILE" 2>/dev/null || true)
+    fi
+    if [[ -f "$REALITY_CDN_CLIENT_JSON" ]]; then
+        had_cdn_client_json=1
+        old_cdn_client_json=$(cat "$REALITY_CDN_CLIENT_JSON" 2>/dev/null || true)
     fi
 
     echo "  说明：Reality 直连链路（灰云）原样保留；这里新增一条 CDN 链路并存。"
@@ -17154,10 +22121,41 @@ reality_cdn_install() {
     # 1) DNS-01 签证书（橙云后面必须 DNS-01，HTTP-01 被橙云拦）
     echo -e "\n${C_CYAN}=== [1] 签发证书 (DNS-01) ===${C_RESET}"
     local cert_dir="${CERT_PATH_PREFIX}/${cdn_domain}"
-    mkdir -p "$cert_dir"
-    local cf_cred="/root/.cloudflare-${cdn_domain}.ini"
-    write_file_atomic "$cf_cred" "dns_cloudflare_api_token = $cf_token"
-    chmod 600 "$cf_cred"
+    local cert_snapshot_dir
+    cert_snapshot_dir=$(mktemp -d "${REALITY_CONFIG_DIR%/}/.cdn-cert-rollback.XXXXXX") || { print_error "创建证书回滚快照目录失败"; pause; return 1; }
+    chmod 700 "$cert_snapshot_dir" 2>/dev/null || true
+    local cert_dir_preexisting=0 cf_cred_preexisting=0 hook_preexisting=0 le_live_preexisting=0 cron_preexisting=0
+    if [[ -e "$cert_dir" || -L "$cert_dir" ]]; then
+        cert_dir_preexisting=1
+        cp -a "$cert_dir" "$cert_snapshot_dir/cert-dir" 2>/dev/null || true
+    fi
+    local cf_cred hook le_live_dir
+    cf_cred="$(reality_cdn_cf_cred_path "$cdn_domain")"
+    hook="${CERT_HOOKS_DIR}/renew-${cdn_domain}.sh"
+    le_live_dir="$(reality_cdn_le_live_dir "$cdn_domain")"
+    if [[ -e "$cf_cred" || -L "$cf_cred" ]]; then
+        cf_cred_preexisting=1
+        cp -a "$cf_cred" "$cert_snapshot_dir/cf-cred" 2>/dev/null || true
+    fi
+    if [[ -e "$hook" || -L "$hook" ]]; then
+        hook_preexisting=1
+        cp -a "$hook" "$cert_snapshot_dir/hook" 2>/dev/null || true
+    fi
+    if [[ -e "$le_live_dir" || -L "$le_live_dir" ]]; then
+        le_live_preexisting=1
+        cp -a "$le_live_dir" "$cert_snapshot_dir/le-live" 2>/dev/null || true
+    fi
+    if command_exists crontab && crontab -l 2>/dev/null | grep -Fq "CertRenew_${cdn_domain}"; then
+        cron_preexisting=1
+        crontab -l 2>/dev/null > "$cert_snapshot_dir/crontab" || true
+    fi
+    local cleanup_cert_dir=0 cleanup_cred=0 cleanup_hook=0 cleanup_cron=0 cleanup_le=0
+    [[ "$cert_dir_preexisting" -eq 0 ]] && cleanup_cert_dir=1
+    [[ "$cf_cred_preexisting" -eq 0 ]] && cleanup_cred=1
+    [[ "$hook_preexisting" -eq 0 ]] && cleanup_hook=1
+    [[ "$le_live_preexisting" -eq 0 ]] && cleanup_le=1
+    mkdir -p "$cert_dir" || { print_error "证书目录创建失败"; pause; return 1; }
+    write_private_file_atomic "$cf_cred" "dns_cloudflare_api_token = $cf_token" || { print_error "Cloudflare 凭据写入失败"; reality_cdn_cleanup_cert_resources "$cdn_domain" "$cleanup_cert_dir" 0 0 0 0 "$cert_snapshot_dir"; pause; return 1; }
     if [[ -f "${cert_dir}/fullchain.pem" && -f "${cert_dir}/privkey.pem" ]]; then
         print_info "检测到已有证书，复用: ${cert_dir}"
     else
@@ -17165,26 +22163,32 @@ reality_cdn_install() {
         if certbot certonly --dns-cloudflare --dns-cloudflare-credentials "$cf_cred" \
             --dns-cloudflare-propagation-seconds 60 -d "$cdn_domain" \
             --email "$EMAIL" --agree-tos --no-eff-email --non-interactive; then
-            cp -L "/etc/letsencrypt/live/${cdn_domain}/fullchain.pem" "$cert_dir/fullchain.pem"
-            cp -L "/etc/letsencrypt/live/${cdn_domain}/privkey.pem" "$cert_dir/privkey.pem"
-            chmod 644 "$cert_dir/fullchain.pem"; chmod 600 "$cert_dir/privkey.pem"
+            copy_cert_pair_atomic "${le_live_dir}/fullchain.pem" "${le_live_dir}/privkey.pem" "$cert_dir" || {
+                print_error "证书复制失败"
+                reality_cdn_cleanup_cert_resources "$cdn_domain" "$cleanup_cert_dir" "$cleanup_cred" 0 0 "$cleanup_le" "$cert_snapshot_dir"
+                pause; return 1
+            }
             print_success "证书签发成功"
             # 续签 hook：复制证书 + reload nginx
-            mkdir -p "$CERT_HOOKS_DIR"
-            local hook="${CERT_HOOKS_DIR}/renew-${cdn_domain}.sh"
+            mkdir -p "$CERT_HOOKS_DIR" || { print_error "续签 Hook 目录创建失败"; reality_cdn_cleanup_cert_resources "$cdn_domain" "$cleanup_cert_dir" "$cleanup_cred" 0 0 "$cleanup_le" "$cert_snapshot_dir"; pause; return 1; }
             write_file_atomic "$hook" "#!/bin/bash
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-LIVE=/etc/letsencrypt/live/${cdn_domain}
-cp -L \"\$LIVE/fullchain.pem\" \"${cert_dir}/fullchain.pem\"
-cp -L \"\$LIVE/privkey.pem\" \"${cert_dir}/privkey.pem\"
-chmod 644 \"${cert_dir}/fullchain.pem\"; chmod 600 \"${cert_dir}/privkey.pem\"
+LIVE=${le_live_dir}
+CERT_DIR=\"${cert_dir}\"
+$(render_cert_pair_hook_helper)
+copy_cert_pair_atomic \"\$LIVE/fullchain.pem\" \"\$LIVE/privkey.pem\" \"\$CERT_DIR\" || exit 1
 systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || true
 "
-            chmod +x "$hook"
-            cron_add_job "CertRenew_${cdn_domain}" "$(( $(echo "$cdn_domain" | cksum | cut -d' ' -f1) % 60 )) 3 * * * certbot renew --quiet --cert-name '${cdn_domain}' --deploy-hook '${hook}' # CertRenew_${cdn_domain}"
+            chmod +x "$hook" || { print_error "续签 Hook 授权失败"; reality_cdn_cleanup_cert_resources "$cdn_domain" "$cleanup_cert_dir" "$cleanup_cred" "$cleanup_hook" 0 "$cleanup_le" "$cert_snapshot_dir"; pause; return 1; }
+            cron_add_job "CertRenew_${cdn_domain}" "$(( $(echo "$cdn_domain" | cksum | cut -d' ' -f1) % 60 )) 3 * * * certbot renew --quiet --cert-name '${cdn_domain}' --deploy-hook '${hook}' # CertRenew_${cdn_domain}" || {
+                print_error "自动续签 cron 配置失败"
+                reality_cdn_cleanup_cert_resources "$cdn_domain" "$cleanup_cert_dir" "$cleanup_cred" "$cleanup_hook" "$cleanup_cron" "$cleanup_le" "$cert_snapshot_dir"
+                pause; return 1
+            }
+            cleanup_cron=1
         else
             print_error "证书申请失败，已中止 CDN 安装。请检查 Token 权限(Zone:DNS Edit)与域名。"
-            rm -f "$cf_cred"
+            reality_cdn_cleanup_cert_resources "$cdn_domain" "$cleanup_cert_dir" "$cleanup_cred" 0 0 "$cleanup_le" "$cert_snapshot_dir"
             pause; return 1
         fi
     fi
@@ -17195,14 +22199,17 @@ systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || true
     local nginx_conf
     nginx_conf=$(reality_cdn_render_nginx_conf "$cdn_domain" "$origin_port" "$ws_path" "$inner_port" "$cert_dir") || {
         print_error "渲染 nginx 回源站失败，请检查域名/端口/path。"
+        reality_cdn_cleanup_cert_resources "$cdn_domain" "$cleanup_cert_dir" "$cleanup_cred" "$cleanup_hook" "$cleanup_cron" "$cleanup_le" "$cert_snapshot_dir"
         pause; return 1
     }
     local nginx_site
     nginx_site="$(reality_cdn_nginx_site_name "$cdn_domain")"
     if ! _nginx_deploy_conf "$nginx_site" "$nginx_conf"; then
         print_error "nginx 回源站部署失败，已中止。"
+        reality_cdn_cleanup_cert_resources "$cdn_domain" "$cleanup_cert_dir" "$cleanup_cred" "$cleanup_hook" "$cleanup_cron" "$cleanup_le" "$cert_snapshot_dir"
         pause; return 1
     fi
+    local nginx_deployed=1
     print_success "nginx 回源站已生效"
 
     # 3) 写 CDN state 并合并重渲 sing-box（WS 入站随 Reality 一并渲染）
@@ -17216,16 +22223,17 @@ systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || true
     REALITY_CDN_NODE_NAME="$cdn_name"
     if ! reality_cdn_write_state; then
         print_error "写入 CDN state 失败，已中止。"
+        reality_cdn_install_rollback "$had_cdn_state" "$old_cdn_state" "$cdn_domain" "$nginx_deployed" 0 "$had_cdn_link" "$old_cdn_link" "$had_cdn_client_json" "$old_cdn_client_json" "$cleanup_cert_dir" "$cleanup_cred" "$cleanup_hook" "$cleanup_cron" "$cleanup_le" "$cert_snapshot_dir"
         pause; return 1
     fi
     local new_config
-    new_config=$(reality_render_singbox_config "$REALITY_UUID" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID") || { print_error "渲染失败"; pause; return 1; }
+    if ! new_config=$(reality_render_singbox_config "$REALITY_UUID" "$REALITY_PRIVATE_KEY" "$REALITY_PORT" "$REALITY_SNI" "$REALITY_SHORT_ID"); then
+        print_error "渲染 sing-box 配置失败，已回滚 CDN state/nginx。"
+        reality_cdn_install_rollback "$had_cdn_state" "$old_cdn_state" "$cdn_domain" "$nginx_deployed" 1 "$had_cdn_link" "$old_cdn_link" "$had_cdn_client_json" "$old_cdn_client_json" "$cleanup_cert_dir" "$cleanup_cred" "$cleanup_hook" "$cleanup_cron" "$cleanup_le" "$cert_snapshot_dir"
+        pause; return 1
+    fi
     if ! reality_apply_singbox_config "$new_config"; then
-        if [[ "$had_cdn_state" -eq 1 ]]; then
-            reality_write_secure_file "$REALITY_CDN_STATE_FILE" "$old_cdn_state" || print_warn "恢复旧 CDN state 失败，请手动检查 ${REALITY_CDN_STATE_FILE}"
-        else
-            rm -f "$REALITY_CDN_STATE_FILE"
-        fi
+        reality_cdn_install_rollback "$had_cdn_state" "$old_cdn_state" "$cdn_domain" "$nginx_deployed" 1 "$had_cdn_link" "$old_cdn_link" "$had_cdn_client_json" "$old_cdn_client_json" "$cleanup_cert_dir" "$cleanup_cred" "$cleanup_hook" "$cleanup_cron" "$cleanup_le" "$cert_snapshot_dir"
         print_error "sing-box 应用失败（已回滚原配置）。已恢复安装前 CDN state，避免后续重渲染误带半成品 WS 入站。"
         pause; return 1
     fi
@@ -17233,25 +22241,52 @@ systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || true
 
     # 4) 橙云 DNS
     echo -e "\n${C_CYAN}=== [4] 同步 CF 橙云 DNS ===${C_RESET}"
-    reality_cdn_sync_dns_orange "$cdn_domain" "$cf_token" || print_warn "橙云 DNS 同步失败，可稍后用 CF 后台手动设 A/AAAA + 开小云朵。"
+    if ! reality_cdn_sync_dns_orange "$cdn_domain" "$cf_token"; then
+        reality_cdn_install_rollback "$had_cdn_state" "$old_cdn_state" "$cdn_domain" "$nginx_deployed" 1 "$had_cdn_link" "$old_cdn_link" "$had_cdn_client_json" "$old_cdn_client_json" "$cleanup_cert_dir" "$cleanup_cred" "$cleanup_hook" "$cleanup_cron" "$cleanup_le" "$cert_snapshot_dir"
+        print_error "橙云 DNS 同步失败，已回滚 CDN 本机配置。请修复 Cloudflare DNS 权限或网络后重试。"
+        pause; return 1
+    fi
 
     # 5) Origin Rule：回源端口改写到 origin_port
     echo -e "\n${C_CYAN}=== [5] 设置 CF Origin Rule（回源端口 ${origin_port}）===${C_RESET}"
-    reality_cdn_apply_origin_rule "$cdn_domain" "$cf_token" "$origin_port" || \
-        print_warn "Origin Rule 设置失败：若不设置，CF 默认回源 443 会撞到 Reality。请手动在 CF 规则→Origin Rules 把 ${cdn_domain} 回源端口改为 ${origin_port}。"
+    if ! reality_cdn_apply_origin_rule "$cdn_domain" "$cf_token" "$origin_port"; then
+        reality_cdn_install_rollback "$had_cdn_state" "$old_cdn_state" "$cdn_domain" "$nginx_deployed" 1 "$had_cdn_link" "$old_cdn_link" "$had_cdn_client_json" "$old_cdn_client_json" "$cleanup_cert_dir" "$cleanup_cred" "$cleanup_hook" "$cleanup_cron" "$cleanup_le" "$cert_snapshot_dir"
+        print_error "Origin Rule 设置失败，已回滚 CDN 本机配置。未设置时 CF 默认回源 443 会撞到 Reality。"
+        pause; return 1
+    fi
 
     # 6) 放行回源端口
     echo -e "\n${C_CYAN}=== [6] 防火墙放行 ${origin_port}/tcp ===${C_RESET}"
-    if command_exists ufw && ufw_is_active; then
-        ufw allow "${origin_port}/tcp" comment "CDN-origin" >/dev/null 2>&1 || true
-        print_success "已放行 ${origin_port}/tcp"
+    local fw_rc=0
+    if declare -F firewall_allow_tcp_port >/dev/null 2>&1; then
+        firewall_allow_tcp_port "$origin_port" "CDN-origin"
+        fw_rc=$?
+        case "$fw_rc" in
+            0)
+                print_success "已放行 ${origin_port}/tcp"
+                ;;
+            2)
+                print_warn "请确认云安全组已放行 ${origin_port}/tcp（CF 回源需要）。"
+                ;;
+            *)
+                reality_cdn_install_rollback "$had_cdn_state" "$old_cdn_state" "$cdn_domain" "$nginx_deployed" 1 "$had_cdn_link" "$old_cdn_link" "$had_cdn_client_json" "$old_cdn_client_json" "$cleanup_cert_dir" "$cleanup_cred" "$cleanup_hook" "$cleanup_cron" "$cleanup_le" "$cert_snapshot_dir"
+                print_error "防火墙放行 ${origin_port}/tcp 失败，已回滚 CDN 本机配置。"
+                print_info "请修复 UFW 后重新执行 CDN 安装。"
+                pause; return 1
+                ;;
+        esac
     else
-        print_warn "UFW 未启用：请确认云安全组已放行 ${origin_port}/tcp（CF 回源需要）。"
+        print_warn "未找到防火墙放行 helper，请手动确认 ${origin_port}/tcp 已放行。"
     fi
 
-    reality_cdn_write_client_artifacts || true
+    if ! reality_cdn_write_client_artifacts; then
+        reality_cdn_install_rollback "$had_cdn_state" "$old_cdn_state" "$cdn_domain" "$nginx_deployed" 1 "$had_cdn_link" "$old_cdn_link" "$had_cdn_client_json" "$old_cdn_client_json" "$cleanup_cert_dir" "$cleanup_cred" "$cleanup_hook" "$cleanup_cron" "$cleanup_le" "$cert_snapshot_dir"
+        print_error "写入 CDN 客户端产物失败，已回滚 CDN 本机配置。"
+        pause; return 1
+    fi
     # 不要删 $cf_cred —— certbot 续签(renewal conf 的 dns_cloudflare_credentials)长期依赖它;
     # 它已 chmod 600。仅签发失败分支才删,成功后必须保留,否则证书到期无法自动续签。
+    rm -rf -- "$cert_snapshot_dir" 2>/dev/null || true
     draw_line
     print_success "CDN 链路加挂完成！"
     echo "  客户端链接（server 暂为域名，优选后由国内机 B+C 自动替换为优选 IP）:"
@@ -17305,14 +22340,23 @@ reality_delete_node_info() {
     reality_load_state || true
     firewall_remove_reality_ports
     systemctl disable --now realm 2>/dev/null || true
-    rm -f /etc/systemd/system/realm.service
+    rm -f "$(_reality_realm_service_path)"
     systemctl daemon-reload 2>/dev/null || true
     reality_backup_file "$REALITY_SINGBOX_CONFIG"
-    rm -f "$REALITY_REALM_CONFIG"
+    if [[ -f "$REALITY_SINGBOX_CONFIG" ]]; then
+        systemctl disable --now sing-box 2>/dev/null || true
+        rm -f "$REALITY_SINGBOX_CONFIG"
+    fi
+    rm -f "$(_reality_realm_config_path)"
     rm -f "$REALITY_STATE_FILE" "$REALITY_LINK_FILE" "$REALITY_CLIENT_JSON" \
           "$REALITY_LINK_FILE_V4" "$REALITY_LINK_FILE_V6" "$REALITY_CLIENT_JSON_V4" "$REALITY_CLIENT_JSON_V6"
     # CDN 链路 state/产物（nginx 回源站与 CF 规则由 reality_cdn_uninstall 处理；此处只清本机管理信息）
     rm -f "$REALITY_CDN_STATE_FILE" "$REALITY_CDN_LINK_FILE" "$REALITY_CDN_CLIENT_JSON"
+    # 443 共存：移除 stream 分流配置 + nginx.conf include + coexist state，并 reload nginx 释放 443。
+    # 复用 disable_internal（它还会尝试把 sing-box 改回直绑，但下面随即删 state/停服，无副作用）。
+    if reality_coexist_enabled 2>/dev/null; then
+        reality_coexist_disable_internal
+    fi
     # 清理多路中转线路（保留 backups 目录，不 rm -rf 整个配置目录）
     rm -f "$REALITY_RELAY_DIR"/relay-*.conf "$REALITY_RELAY_DIR"/relay-*.link.txt "$REALITY_RELAY_DIR"/relay-*.client.json 2>/dev/null || true
     rmdir "$REALITY_RELAY_DIR" 2>/dev/null || true
@@ -17358,6 +22402,11 @@ reality_menu() {
         echo "9. 诊断/自检"
         echo "10. 加挂 CDN 链路（橙云+优选IP，治晚高峰）"
         echo "11. 卸载 CDN 链路"
+        if reality_coexist_enabled 2>/dev/null; then
+            echo "12. 关闭 443 共存模式（nginx stream 分流）★ 已启用"
+        else
+            echo "12. 启用 443 共存模式（nginx stream 分流，Reality 与真站共用 443）"
+        fi
         echo "0. 返回"
         read -e -r -p "请选择: " c
         case "$c" in
@@ -17372,6 +22421,7 @@ reality_menu() {
             9) reality_diagnose ;;
             10) reality_cdn_install ;;
             11) reality_cdn_uninstall ;;
+            12) if reality_coexist_enabled 2>/dev/null; then reality_coexist_disable; else reality_coexist_enable; fi ;;
             0|q|Q) break ;;
             *) print_error "无效选项"; sleep 1 ;;
         esac
@@ -17391,6 +22441,8 @@ reality_cli() {
         rotate-key) reality_rotate_key ;;
         cdn-install|cdn) reality_cdn_install ;;
         cdn-uninstall) reality_cdn_uninstall ;;
+        coexist-enable|coexist-on) reality_coexist_enable ;;
+        coexist-disable|coexist-off) reality_coexist_disable ;;
         delete|uninstall) reality_delete_node_info ;;
         *) print_error "未知 Reality 命令: $cmd"; return 1 ;;
     esac

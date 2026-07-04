@@ -113,6 +113,33 @@ email_state_clear() {
     _email_state_reset_vars
 }
 
+_email_write_private_file() {
+    local file="$1" content="$2" dir tmp old_umask
+    dir="$(dirname "$file")"
+    mkdir -p "$dir" || return 1
+    old_umask="$(umask)"
+    umask 077
+    tmp=$(mktemp "${dir}/.tmp.server-manage.email.XXXXXX")
+    local mktemp_rc=$?
+    umask "$old_umask"
+    [[ "$mktemp_rc" -eq 0 ]] || return 1
+    if declare -F _tmp_register >/dev/null 2>&1; then _tmp_register "$tmp"; fi
+    if ! printf '%s\n' "$content" > "$tmp"; then
+        rm -f -- "$tmp" 2>/dev/null || true
+        if declare -F _tmp_unregister >/dev/null 2>&1; then _tmp_unregister "$tmp"; fi
+        return 1
+    fi
+    chmod 600 "$tmp" 2>/dev/null || true
+    chown root:root "$tmp" 2>/dev/null || true
+    if ! mv -f "$tmp" "$file"; then
+        rm -f -- "$tmp" 2>/dev/null || true
+        if declare -F _tmp_unregister >/dev/null 2>&1; then _tmp_unregister "$tmp"; fi
+        return 1
+    fi
+    if declare -F _tmp_unregister >/dev/null 2>&1; then _tmp_unregister "$tmp"; fi
+    return 0
+}
+
 # 把当前 state 文件备份为 .bak.<timestamp>；返回备份文件路径
 # 用于 partial → 重新部署 / upgrade 等"会覆盖 state"的操作前防丢失
 email_state_backup() {
@@ -226,7 +253,7 @@ email_run() {
 _email_redact_secrets() {
     sed -E \
         -e 's/("text"[[:space:]]*:[[:space:]]*)"[^"]*"/\1"<redacted>"/g' \
-        -e 's/(ADMIN_PASSWORDS|RESEND_TOKEN|CLOUDFLARE_API_TOKEN|CF_API_TOKEN)([[:space:]]*=[[:space:]]*|:[[:space:]]*)["'"'"']?[^[:space:]"'"'"']+["'"'"']?/\1\2<redacted>/g' \
+        -e 's/(ADMIN_PASSWORDS|[A-Z0-9_]*TOKEN)([[:space:]]*=[[:space:]]*|:[[:space:]]*)["'"'"']?[^[:space:]"'"'"']+["'"'"']?/\1\2<redacted>/g' \
         -e 's/(Bearer[[:space:]]+)[A-Za-z0-9._-]+/\1<redacted>/g'
 }
 
@@ -246,7 +273,7 @@ _email_patch_pages_service_binding() {
         return 0
     fi
     local backup tmp
-    backup=$(mktemp "/tmp/server-manage-pages-wrangler.XXXXXX") || return 1
+    backup=$(mktemp "${pages_dir}/.wrangler.toml.bak.XXXXXX") || return 1
     tmp=$(mktemp "${pages_dir}/.wrangler.toml.XXXXXX") || { rm -f "$backup"; return 1; }
     cp -a "$pages_toml" "$backup" || { rm -f "$backup" "$tmp"; return 1; }
     awk -v worker="$EMAIL_WORKER_NAME" '

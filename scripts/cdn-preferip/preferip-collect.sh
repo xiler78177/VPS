@@ -71,8 +71,28 @@ cfst_ipfile_for_version() {
     fi
 }
 
-tmp_files=()
-cleanup(){ rm -f "${tmp_files[@]}" 2>/dev/null || true; }
+preferip_tmp_dir=""
+preferip_tmp_create() {
+    local old_umask rc
+    [[ -n "$preferip_tmp_dir" ]] && return 0
+    old_umask="$(umask)"
+    umask 077
+    preferip_tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/cdn-preferip-collect.XXXXXX")"
+    rc=$?
+    umask "$old_umask"
+    [[ "$rc" -eq 0 ]] || { preferip_tmp_dir=""; return "$rc"; }
+    chmod 700 "$preferip_tmp_dir" 2>/dev/null || true
+}
+preferip_tmp_file() {
+    local __var="$1" label="${2:-tmp}" file
+    [[ "$__var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    label="${label//[^A-Za-z0-9_.-]/_}"
+    preferip_tmp_create || return 1
+    file="$(mktemp "${preferip_tmp_dir}/${label}.XXXXXX")" || return 1
+    chmod 600 "$file" 2>/dev/null || true
+    printf -v "$__var" '%s' "$file"
+}
+cleanup(){ [[ -z "$preferip_tmp_dir" ]] || rm -rf "$preferip_tmp_dir" 2>/dev/null || true; }
 trap cleanup EXIT
 
 append_history() {
@@ -87,9 +107,7 @@ append_history() {
 
 rank_rows() {
     local rows="$1" mode="${2:-$CFST_PICK_MODE}" ranked
-    local -a sort_args=()
-    ranked="$(mktemp)"
-    tmp_files+=("$ranked")
+    preferip_tmp_file ranked ranked || return 1
     awk -F, -v mode="$mode" '
         {
             ip=$1; lat=$2+0; speed=$3+0; rank=$6+0
@@ -121,23 +139,22 @@ rank_rows() {
     ' "$rows" > "$ranked"
 
     case "$mode" in
-        speed) sort_args=(-t, -k1,1nr -k2,2n -k3,3nr) ;;
-        latency) sort_args=(-t, -k1,1n -k2,2nr -k3,3nr) ;;
-        balanced) sort_args=(-t, -k1,1nr -k2,2n -k3,3nr) ;;
-        *) sort_args=(-t, -k1,1n -k2,2n -k3,3nr) ;;
-    esac
-    sort "${sort_args[@]}" "$ranked" | awk -F, '{
+        speed) sort -t, -k1,1nr -k2,2n -k3,3nr "$ranked" ;;
+        latency) sort -t, -k1,1n -k2,2nr -k3,3nr "$ranked" ;;
+        balanced) sort -t, -k1,1nr -k2,2n -k3,3nr "$ranked" ;;
+        *) sort -t, -k1,1n -k2,2n -k3,3nr "$ranked" ;;
+    esac | awk -F, '{
         ip=$4; lat=$5; speed=$6; count=$7
         if (ip != "") printf "%s|%s|%s|%s\n", ip, lat, speed, count
     }'
 }
 
 collect_one_group() {
-    local key="$1" csv out rows stage2_rows stage2_ipfile entry ip avg_lat avg_speed count round ok=0 stage2_ok=0 picked=0
+    local key="$1" csv out rows stage2_rows stage2_ipfile ip avg_lat avg_speed count round ok=0 stage2_ok=0 picked=0
     local colo ip_version ip_file label cfcolo_args=()
     local -a ipfile_args=() stage2_ipfile_args=()
-    rows="$(mktemp)"; stage2_rows="$(mktemp)"
-    tmp_files+=("$rows" "$stage2_rows")
+    preferip_tmp_file rows rows || return 1
+    preferip_tmp_file stage2_rows stage2-rows || return 1
     colo="$(result_key_colo "$key")" || return 1
     ip_version="$(result_key_ip_version "$key")" || return 1
     ip_file="$(cfst_ipfile_for_version "$ip_version")"
@@ -149,8 +166,8 @@ collect_one_group() {
     fi
 
     for ((round=1; round<=CFST_ROUNDS; round++)); do
-        csv="$(mktemp)"; out="$(mktemp)"
-        tmp_files+=("$csv" "$out")
+        preferip_tmp_file csv cfst-csv || return 1
+        preferip_tmp_file out cfst-log || return 1
         if [[ "$colo" == "GLOBAL" ]]; then
             log "开始全局优选 ${label}（$CFST_BIN），轮次 ${round}/${CFST_ROUNDS}；输出 CSV → $csv"
             # shellcheck disable=SC2086
@@ -185,8 +202,7 @@ collect_one_group() {
 
     # 二阶段复测：先用第一阶段筛出候选 IP，再只对候选 IP 做更长/更严格复测。
     if [[ "${CFST_STAGE2_ENABLE,,}" == "true" ]]; then
-        stage2_ipfile="$(mktemp)"
-        tmp_files+=("$stage2_ipfile")
+        preferip_tmp_file stage2_ipfile stage2-ipfile || return 1
         while IFS='|' read -r ip _lat _speed _count; do
             is_ip_literal "$ip" || continue
             printf '%s\n' "$ip" >> "$stage2_ipfile"
@@ -196,8 +212,8 @@ collect_one_group() {
             stage2_ipfile_args=(-f "$stage2_ipfile")
             log "地区 ${key} 启用二阶段复测：候选 $(wc -l < "$stage2_ipfile") 个，轮次 ${CFST_STAGE2_ROUNDS}，候选文件 ${stage2_ipfile}"
             for ((round=1; round<=CFST_STAGE2_ROUNDS; round++)); do
-                csv="$(mktemp)"; out="$(mktemp)"
-                tmp_files+=("$csv" "$out")
+                preferip_tmp_file csv stage2-csv || return 1
+                preferip_tmp_file out stage2-log || return 1
                 if [[ "$colo" == "GLOBAL" ]]; then
                     # shellcheck disable=SC2086
                     "$CFST_BIN" $CFST_STAGE2_EXTRA_ARGS "${stage2_ipfile_args[@]}" -o "$csv" >"$out" 2>&1 || {
@@ -246,6 +262,8 @@ collect_one_group() {
 }
 
 groups=()
+tmp_result=""
+group_out=""
 add_group() {
     local key="$1" g
     for g in "${groups[@]}"; do [[ "$g" == "$key" ]] && return 0; done
@@ -270,10 +288,9 @@ if [[ "${CFST_COLO_MODE,,}" != "off" && -f "$NODES_FILE" ]]; then
 fi
 [[ ${#groups[@]} -gt 0 ]] || groups=("GLOBAL")
 
-tmp_result="$(mktemp)"
-tmp_files+=("$tmp_result")
+preferip_tmp_file tmp_result result || die "创建优选结果临时文件失败"
 if [[ ${#groups[@]} -eq 1 && "${groups[0]}" == "GLOBAL" ]]; then
-    group_out="$(mktemp)"; tmp_files+=("$group_out")
+    preferip_tmp_file group_out group || die "创建分组临时文件失败"
     collect_group_or_fail "GLOBAL" "$group_out" || {
         [[ "${KEEP_ON_EMPTY}" == "true" ]] && log "保留旧结果文件 $RESULT_FILE，不写空。"
         exit 1
@@ -284,7 +301,7 @@ else
     printf '# cdn-preferip result v3: colo|ip|avg_latency_ms|avg_speed_mbps|rounds_hit\n' > "$tmp_result"
     success_groups=0
     for key in "${groups[@]}"; do
-        group_out="$(mktemp)"; tmp_files+=("$group_out")
+        preferip_tmp_file group_out group || die "创建分组临时文件失败"
         if ! collect_group_or_fail "$key" "$group_out"; then
             if [[ "$MISSING_COLO_POLICY" == "keep" ]]; then
                 log "分组 ${key} 无结果；MISSING_COLO_POLICY=keep：本次结果跳过该组，回写阶段将保留对应节点原 server。"
@@ -306,6 +323,7 @@ else
     fi
 fi
 
-mv "$tmp_result" "$RESULT_FILE"
+preferip_atomic_write "$RESULT_FILE" 600 < "$tmp_result" || die "写入优选结果文件失败: $RESULT_FILE"
+rm -f "$tmp_result" 2>/dev/null || true
 log "优选完成，分组=${groups[*]}，TopN=$CFST_TOP_N，写入 $RESULT_FILE:"
 sed -n '1,40p' "$RESULT_FILE" >&2

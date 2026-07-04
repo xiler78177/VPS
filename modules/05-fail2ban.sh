@@ -1,4 +1,51 @@
 # modules/05-fail2ban.sh - Fail2ban 管理
+_f2b_rollback_jail_local() {
+    local target="${1:-}" backup="${2:-}" had_target="${3:-0}"
+    if [[ "$had_target" -eq 1 && -n "$backup" && -f "$backup" ]]; then
+        mv "$backup" "$target" 2>/dev/null || true
+    else
+        rm -f -- "$target" 2>/dev/null || true
+    fi
+    [[ -n "$backup" ]] && _tmp_unregister "$backup"
+}
+
+_f2b_apply_jail_local() {
+    local conf_content="${1:-}" banaction="${2:-}"
+    local target="${FAIL2BAN_JAIL_LOCAL}" backup="" had_target=0
+    [[ -n "$target" && -n "$conf_content" ]] || return 1
+    if [[ -f "$target" ]]; then
+        had_target=1
+        backup=$(mktemp "$(dirname "$target")/.bak.server-manage.fail2ban.XXXXXX") || return 1
+        _tmp_register "$backup"
+        if ! cp -a "$target" "$backup"; then
+            rm -f -- "$backup" 2>/dev/null || true
+            _tmp_unregister "$backup"
+            return 1
+        fi
+    fi
+    if ! write_file_atomic "$target" "$conf_content"; then
+        _f2b_rollback_jail_local "$target" "$backup" "$had_target"
+        return 1
+    fi
+    if command_exists fail2ban-client && ! fail2ban-client -d >/dev/null 2>&1; then
+        _f2b_rollback_jail_local "$target" "$backup" "$had_target"
+        return 1
+    fi
+    if is_systemd; then
+        systemctl enable fail2ban >/dev/null || true
+        if ! systemctl restart fail2ban; then
+            _f2b_rollback_jail_local "$target" "$backup" "$had_target"
+            return 1
+        fi
+    fi
+    rm -f -- "$backup" 2>/dev/null || true
+    [[ -n "$backup" ]] && _tmp_unregister "$backup"
+    print_success "配置已写入: $target (banaction=$banaction)"
+    command_exists fail2ban-client && print_success "配置校验通过"
+    is_systemd && print_success "Fail2ban 已启动 (banaction=$banaction)。"
+    return 0
+}
+
 f2b_setup() {
     print_title "Fail2ban 安装与配置"
     install_package "fail2ban" "silent"
@@ -186,7 +233,8 @@ f2b_setup() {
 
     # 迁移：清理旧的 UFW 封禁规则
     if ufw_is_active; then
-        local old_f2b_rules=$(ufw status numbered 2>/dev/null | grep -ciE "f2b|fail2ban")
+        local old_f2b_rules
+        old_f2b_rules=$(ufw status numbered 2>/dev/null | grep -ciE "f2b|fail2ban")
         if [[ "$old_f2b_rules" -gt 0 ]]; then
             print_warn "检测到 UFW 中有 ${old_f2b_rules} 条 Fail2ban 旧规则"
             print_info "新配置使用 ipset 替代 UFW 封禁，旧规则已无用且拖慢系统"
@@ -223,28 +271,14 @@ port = http,https
 maxretry = 5
 logpath = /var/log/nginx/access.log"
     fi
-    write_file_atomic "$FAIL2BAN_JAIL_LOCAL" "$conf_content"
-    print_success "配置已写入: $FAIL2BAN_JAIL_LOCAL (banaction=$banaction)"
-    
-    # 配置预检
-    if command_exists fail2ban-client; then
-        if ! fail2ban-client -d >/dev/null 2>&1; then
-            print_error "Fail2ban 配置校验失败！请检查配置。"
-            echo "运行 fail2ban-client -d 查看详情"
-            pause; return
-        fi
-        print_success "配置校验通过"
-    fi
-    if is_systemd; then
-        systemctl enable fail2ban >/dev/null || true
-        if systemctl restart fail2ban; then
-            print_success "Fail2ban 已启动 (banaction=$banaction)。"
-            log_action "Fail2ban configured: port=$port, maxretry=$maxretry, bantime=$bantime, banaction=$banaction"
-        else
-            print_error "Fail2ban 启动失败！"
-            echo "请检查日志: journalctl -u fail2ban -n 20"
-            log_action "Fail2ban configuration failed" "ERROR"
-        fi
+    if _f2b_apply_jail_local "$conf_content" "$banaction"; then
+        log_action "Fail2ban configured: port=$port, maxretry=$maxretry, bantime=$bantime, banaction=$banaction"
+    else
+        print_error "Fail2ban 配置应用失败，已回滚。"
+        echo "运行 fail2ban-client -d 或 journalctl -u fail2ban -n 20 查看详情"
+        log_action "Fail2ban configuration failed and rolled back" "ERROR"
+        pause
+        return 1
     fi
     pause
 }
@@ -294,7 +328,7 @@ _f2b_active_jails() {
 
 _f2b_banned_ips_for_jail() {
     local jail="$1"
-    fail2ban-client status "$jail" 2>/dev/null | awk -F: '/Banned IP/ {print $2}' | xargs
+    fail2ban-client status "$jail" 2>/dev/null | sed -n 's/^[[:space:]|`-]*Banned IP list:[[:space:]]*//p' | xargs
 }
 
 f2b_status() {
@@ -309,7 +343,8 @@ f2b_status() {
         systemctl status fail2ban --no-pager -l 2>/dev/null | head -n 5 || echo "服务未运行"
     fi
     # Show all active jails
-    local jails=$(fail2ban-client status 2>/dev/null | grep "Jail list" | cut -d: -f2 | tr -d ' ')
+    local jails
+    jails=$(fail2ban-client status 2>/dev/null | grep "Jail list" | cut -d: -f2 | tr -d ' ')
     if [[ -z "$jails" ]]; then
         print_warn "没有活跃的 jail"
         pause; return
@@ -320,10 +355,11 @@ f2b_status() {
     for jail in $jails; do
         unset IFS
         echo -e "${C_CYAN}[$jail]${C_RESET}"
-        local status_out=$(fail2ban-client status "$jail" 2>/dev/null)
-        local cur_banned=$(echo "$status_out" | grep "Currently banned" | awk '{print $NF}')
-        local total_banned=$(echo "$status_out" | grep "Total banned" | awk '{print $NF}')
-        local banned_ips=$(echo "$status_out" | grep "Banned IP" | cut -d: -f2 | xargs)
+        local status_out cur_banned total_banned banned_ips
+        status_out=$(fail2ban-client status "$jail" 2>/dev/null)
+        cur_banned=$(echo "$status_out" | grep "Currently banned" | awk '{print $NF}')
+        total_banned=$(echo "$status_out" | grep "Total banned" | awk '{print $NF}')
+        banned_ips=$(echo "$status_out" | sed -n 's/^[[:space:]|`-]*Banned IP list:[[:space:]]*//p' | xargs)
         echo "  当前封禁: ${cur_banned:-0} | 累计封禁: ${total_banned:-0}"
         if [[ -n "$banned_ips" && "$banned_ips" != " " ]]; then
             echo "  封禁 IP: $banned_ips"
@@ -332,7 +368,8 @@ f2b_status() {
     unset IFS
     # Show ignoreip if configured
     if [[ -f "$FAIL2BAN_JAIL_LOCAL" ]]; then
-        local ignore=$(grep '^ignoreip' "$FAIL2BAN_JAIL_LOCAL" | cut -d= -f2 | xargs)
+        local ignore
+        ignore=$(grep '^ignoreip' "$FAIL2BAN_JAIL_LOCAL" | cut -d= -f2 | xargs)
         [[ -n "$ignore" ]] && echo -e "\n${C_CYAN}[白名单]${C_RESET} $ignore"
     fi
     pause
@@ -419,7 +456,8 @@ f2b_ban() {
         pause; return
     fi
     # List active jails for selection
-    local jails_raw=$(fail2ban-client status 2>/dev/null | grep "Jail list" | cut -d: -f2 | tr -d ' ')
+    local jails_raw
+    jails_raw=$(fail2ban-client status 2>/dev/null | grep "Jail list" | cut -d: -f2 | tr -d ' ')
     if [[ -z "$jails_raw" ]]; then
         print_warn "没有活跃的 jail"; pause; return
     fi
@@ -513,7 +551,8 @@ menu_f2b() {
         print_title "Fail2ban 入侵防御"
         if command_exists fail2ban-client; then
             if systemctl is-active fail2ban &>/dev/null; then
-                local banned_count=$(fail2ban-client status sshd 2>/dev/null | grep "Currently banned" | awk '{print $NF}')
+                local banned_count
+                banned_count=$(fail2ban-client status sshd 2>/dev/null | grep "Currently banned" | awk '{print $NF}')
                 echo -e "${C_GREEN}状态: 运行中${C_RESET} | 当前封禁: ${banned_count:-0} 个 IP"
             else
                 echo -e "${C_YELLOW}状态: 已安装但未运行${C_RESET}"

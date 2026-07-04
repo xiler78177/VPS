@@ -1,11 +1,19 @@
 # modules/02-network.sh - 公网IP获取、DDNS管理
 _extract_ipv4_from_text() {
-    local raw="$1" ip=""
+    local raw="$1" ip="" octet _o1 _o2 _o3 _o4 _extra
     [[ -z "$raw" ]] && return 1
-    ip=$(printf '%s' "$raw" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1)
-    [[ -n "$ip" && "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-    echo "$ip"
-    return 0
+    while IFS= read -r ip; do
+        local valid=1
+        IFS='.' read -r _o1 _o2 _o3 _o4 _extra <<< "$ip"
+        [[ -z "${_extra:-}" ]] || continue
+        for octet in "$_o1" "$_o2" "$_o3" "$_o4"; do
+            [[ "$octet" =~ ^[0-9]+$ ]] && [ "$octet" -le 255 ] || { valid=0; break; }
+        done
+        [[ "$valid" -eq 1 ]] || continue
+        echo "$ip"
+        return 0
+    done < <(printf '%s' "$raw" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}')
+    return 1
 }
 
 # 统一公网 IP 获取函数（使用国内可达的 API）
@@ -47,31 +55,44 @@ ddns_rebuild_cron() {
 ddns_create_script() {
     mkdir -p "$DDNS_CONFIG_DIR"
     mkdir -p "$(dirname "$DDNS_UPDATE_SCRIPT")"
-        cat > "$DDNS_UPDATE_SCRIPT" << 'EOF'
+    local ddns_script_tmp
+    ddns_script_tmp=$(mktemp "$(dirname "$DDNS_UPDATE_SCRIPT")/.tmp.server-manage.ddns-update.XXXXXX") || return 1
+    _tmp_register "$ddns_script_tmp"
+if ! cat > "$ddns_script_tmp" << 'EOF'
 #!/bin/bash
-if command -v flock >/dev/null 2>&1; then
-    exec 200>/var/lock/ddns-update.lock
-    flock -n 200 || exit 0
-else
-    mkdir /tmp/ddns-update.lock 2>/dev/null || exit 0
-    trap 'rmdir /tmp/ddns-update.lock 2>/dev/null' EXIT
-fi
 DDNS_CONFIG_DIR="/etc/ddns"
 DDNS_LOG="/var/log/ddns.log"
-DDNS_STAMP_DIR="/var/lib/ddns"
-mkdir -p "$DDNS_STAMP_DIR" 2>/dev/null || {
-    DDNS_STAMP_DIR="/tmp/ddns-state"
-    mkdir -p "$DDNS_STAMP_DIR" 2>/dev/null || true
-}
+DDNS_RUNTIME_DIR="/var/lib/server-manage/ddns"
+DDNS_STAMP_DIR="$DDNS_RUNTIME_DIR/stamps"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$DDNS_LOG"; }
+mkdir -p "$DDNS_RUNTIME_DIR" "$DDNS_STAMP_DIR" 2>/dev/null || {
+    log "无法创建 DDNS 状态目录: $DDNS_RUNTIME_DIR"
+    exit 1
+}
+chmod 700 /var/lib/server-manage "$DDNS_RUNTIME_DIR" "$DDNS_STAMP_DIR" 2>/dev/null || true
+if command -v flock >/dev/null 2>&1; then
+    exec 200>"$DDNS_RUNTIME_DIR/update.lock"
+    flock -n 200 || exit 0
+else
+    mkdir "$DDNS_RUNTIME_DIR/update.lock.d" 2>/dev/null || exit 0
+    trap 'rmdir "$DDNS_RUNTIME_DIR/update.lock.d" 2>/dev/null' EXIT
+fi
 
 extract_ipv4() {
-    local raw="$1" ip=""
+    local raw="$1" ip="" octet _o1 _o2 _o3 _o4 _extra
     [[ -z "$raw" ]] && return 1
-    ip=$(printf '%s' "$raw" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1)
-    [[ -n "$ip" && "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-    echo "$ip"
-    return 0
+    while IFS= read -r ip; do
+        local valid=1
+        IFS='.' read -r _o1 _o2 _o3 _o4 _extra <<< "$ip"
+        [[ -z "${_extra:-}" ]] || continue
+        for octet in "$_o1" "$_o2" "$_o3" "$_o4"; do
+            [[ "$octet" =~ ^[0-9]+$ ]] && [ "$octet" -le 255 ] || { valid=0; break; }
+        done
+        [[ "$valid" -eq 1 ]] || continue
+        echo "$ip"
+        return 0
+    done < <(printf '%s' "$raw" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}')
+    return 1
 }
 
 get_ip() {
@@ -190,15 +211,45 @@ ddns_should_run() {
     return 0
 }
 
-for conf in "$DDNS_CONFIG_DIR"/*.conf; do
-    [ -f "$conf" ] || continue
-    parse_ddns_conf "$conf" || continue
-    ddns_should_run "$conf" || continue
-    [[ "$DDNS_IPV4" == "true" ]] && { ip=$(get_ip 4); [[ -n "$ip" ]] && update_cf "$DDNS_DOMAIN" A "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED"; }
-    [[ "$DDNS_IPV6" == "true" ]] && { ip=$(get_ip 6); [[ -n "$ip" ]] && update_cf "$DDNS_DOMAIN" AAAA "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED"; }
-done
+failed=0
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    failed=0
+    for conf in "$DDNS_CONFIG_DIR"/*.conf; do
+        [ -f "$conf" ] || continue
+        parse_ddns_conf "$conf" || continue
+        ddns_should_run "$conf" || continue
+        if [[ "$DDNS_IPV4" == "true" ]]; then
+            if ip=$(get_ip 4) && [[ -n "$ip" ]]; then
+                update_cf "$DDNS_DOMAIN" A "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED" || failed=1
+            else
+                log "[$DDNS_DOMAIN] A 获取公网 IPv4 失败"
+                failed=1
+            fi
+        fi
+        if [[ "$DDNS_IPV6" == "true" ]]; then
+            if ip=$(get_ip 6) && [[ -n "$ip" ]]; then
+                update_cf "$DDNS_DOMAIN" AAAA "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED" || failed=1
+            else
+                log "[$DDNS_DOMAIN] AAAA 获取公网 IPv6 失败"
+                failed=1
+            fi
+        fi
+    done
+    exit "$failed"
+fi
 EOF
-    chmod +x "$DDNS_UPDATE_SCRIPT"
+    then
+        rm -f -- "$ddns_script_tmp" 2>/dev/null || true
+        _tmp_unregister "$ddns_script_tmp"
+        return 1
+    fi
+    chmod 0755 "$ddns_script_tmp" 2>/dev/null || true
+    if ! mv "$ddns_script_tmp" "$DDNS_UPDATE_SCRIPT"; then
+        rm -f -- "$ddns_script_tmp" 2>/dev/null || true
+        _tmp_unregister "$ddns_script_tmp"
+        return 1
+    fi
+    _tmp_unregister "$ddns_script_tmp"
 }
 
 ddns_setup() {
@@ -221,10 +272,9 @@ DDNS_IPV4=\"$ipv4\"
 DDNS_IPV6=\"$ipv6\"
 DDNS_PROXIED=\"$proxied\"
 DDNS_INTERVAL=\"$interval\""
-    write_file_atomic "$DDNS_CONFIG_DIR/${domain}.conf" "$ddns_conf_content" || { print_error "DDNS 配置写入失败"; return 1; }
-    chmod 600 "$DDNS_CONFIG_DIR/${domain}.conf"
-    ddns_create_script
-    ddns_rebuild_cron
+    write_private_file_atomic "$DDNS_CONFIG_DIR/${domain}.conf" "$ddns_conf_content" || { print_error "DDNS 配置写入失败"; return 1; }
+    ddns_create_script || { print_error "DDNS 更新脚本生成失败"; return 1; }
+    ddns_rebuild_cron || { print_error "DDNS cron 更新失败"; return 1; }
     print_success "DDNS 已启用 (每 ${interval} 分钟检测)"
     log_action "DDNS enabled: $domain interval=${interval}m"
     return 0
@@ -244,10 +294,9 @@ DDNS_IPV4=\"$ipv4\"
 DDNS_IPV6=\"$ipv6\"
 DDNS_PROXIED=\"$proxied\"
 DDNS_INTERVAL=\"$interval\""
-    write_file_atomic "$DDNS_CONFIG_DIR/${domain}.conf" "$ddns_conf_content" || { print_error "DDNS 配置写入失败"; return 1; }
-    chmod 600 "$DDNS_CONFIG_DIR/${domain}.conf"
-    ddns_create_script
-    ddns_rebuild_cron
+    write_private_file_atomic "$DDNS_CONFIG_DIR/${domain}.conf" "$ddns_conf_content" || { print_error "DDNS 配置写入失败"; return 1; }
+    ddns_create_script || { print_error "DDNS 更新脚本生成失败"; return 1; }
+    ddns_rebuild_cron || { print_error "DDNS cron 更新失败"; return 1; }
     log_action "DDNS enabled: $domain interval=${interval}m"
     return 0
 }
@@ -354,8 +403,15 @@ ddns_delete() {
 ddns_force_update() {
     if [[ -x "$DDNS_UPDATE_SCRIPT" ]]; then
         print_info "正在更新..."
-        "$DDNS_UPDATE_SCRIPT"
-        print_success "更新完成"
+        if "$DDNS_UPDATE_SCRIPT"; then
+            print_success "更新完成"
+        else
+            local rc=$?
+            print_error "DDNS 更新失败 (rc=$rc)，请查看日志"
+            tail -n 10 "$DDNS_LOG" 2>/dev/null || echo "暂无日志"
+            pause
+            return "$rc"
+        fi
         tail -n 10 "$DDNS_LOG" 2>/dev/null || echo "暂无日志"
     else
         print_warn "DDNS 未配置"

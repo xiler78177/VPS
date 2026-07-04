@@ -128,7 +128,8 @@ _ip_location_cache_path() {
 }
 
 _ip_location_refresh_background() {
-    local ip="$1" cache_file="$2" lock_file="${cache_file}.lock"
+    local ip="$1" cache_file="$2" lock_file
+    lock_file="${cache_file}.lock"
     mkdir -p "$CACHE_DIR" 2>/dev/null || return 0
     if command_exists flock; then
         (

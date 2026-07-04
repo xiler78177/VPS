@@ -132,9 +132,13 @@ _email_deploy_check_env() {
     if ! command_exists node; then
         email_run "安装 Node.js LTS" bash -o pipefail -c '
             set -e
-            tmp=$(mktemp)
-            trap "rm -f \"$tmp\"" EXIT
+            tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/server-manage-email-node.XXXXXX")
+            chmod 700 "$tmp_dir" 2>/dev/null || true
+            tmp="$tmp_dir/setup_lts.x"
+            cleanup_node_tmp() { rm -rf "$tmp_dir"; }
+            trap cleanup_node_tmp EXIT
             curl -fsSL https://deb.nodesource.com/setup_lts.x -o "$tmp"
+            chmod 600 "$tmp" 2>/dev/null || true
             bash "$tmp" >/dev/null 2>&1
             apt-get install -y -qq nodejs
         ' || { print_error "Node.js 安装失败，请手动安装"; return 1; }
@@ -385,7 +389,8 @@ _email_deploy_setup_d1() {
 
 # 仅含 D1 binding 的最小 toml（供 d1 execute 使用）
 _email_render_min_toml() {
-    cat > "$EMAIL_INSTALL_DIR/worker/wrangler.toml" <<EOF
+    local content
+    content=$(cat <<EOF
 name = "${EMAIL_WORKER_NAME}"
 main = "src/worker.ts"
 compatibility_date = "2025-04-01"
@@ -396,6 +401,8 @@ binding = "DB"
 database_name = "${EMAIL_D1_NAME}"
 database_id = "${EMAIL_D1_ID}"
 EOF
+)
+    _email_write_private_file "$EMAIL_INSTALL_DIR/worker/wrangler.toml" "$content"
 }
 
 # ── 5. 完整 wrangler.toml ──
@@ -416,7 +423,8 @@ _email_deploy_render_toml() {
         prefix_val=""
     fi
 
-    cat > "$EMAIL_INSTALL_DIR/worker/wrangler.toml" <<EOF
+    local content
+    content=$(cat <<EOF
 name = "${EMAIL_WORKER_NAME}"
 main = "src/worker.ts"
 compatibility_date = "2025-04-01"
@@ -454,7 +462,8 @@ binding = "DB"
 database_name = "${EMAIL_D1_NAME}"
 database_id = "${EMAIL_D1_ID}"
 EOF
-    chmod 600 "$EMAIL_INSTALL_DIR/worker/wrangler.toml"
+)
+    _email_write_private_file "$EMAIL_INSTALL_DIR/worker/wrangler.toml" "$content" || return 1
     print_success "wrangler.toml 已生成"
 }
 
@@ -482,7 +491,12 @@ _email_deploy_secrets() {
         if _email_cf_worker_secret_put "$EMAIL_WORKER_NAME" "RESEND_TOKEN" "$EMAIL_RESEND_TOKEN"; then
             print_success "RESEND_TOKEN 已通过 secret 配置"
         else
-            print_warn "RESEND_TOKEN 配置失败 — 可稍后通过管理菜单重试"
+            EMAIL_RESEND_ENABLED=0
+            EMAIL_RESEND_SEND_DOMAIN=""
+            EMAIL_DNS_DKIM_ID=""; EMAIL_DNS_SPF_ID=""; EMAIL_DNS_SEND_MX_ID=""; EMAIL_DNS_DMARC_ID=""
+            email_state_write 2>/dev/null || true
+            print_error "RESEND_TOKEN 配置失败，已停止部署并保留 partial state 供卸载/重试。"
+            return 1
         fi
     fi
 }
@@ -529,21 +543,27 @@ _email_deploy_pages() {
     if _email_cf_pages_attach_domain "$EMAIL_PAGES_PROJECT" "$EMAIL_FRONTEND_DOMAIN" 2>/dev/null; then
         print_success "Pages 自定义域名: $EMAIL_FRONTEND_DOMAIN"
     else
-        print_warn "自定义域名绑定失败（可能已绑定或域名未配置）"
+        EMAIL_INSTALLED=0
+        email_state_write 2>/dev/null || true
+        print_error "Pages 自定义域名绑定失败，已停止部署并保留 partial state 供卸载/重试。"
+        print_info "请确认 ${EMAIL_FRONTEND_DOMAIN} 在当前 Cloudflare Zone 下，且 Pages Custom Domains 权限可用。"
+        return 1
     fi
 }
 
 # ── 10. DNS 记录 ──
 # 收信关键记录（Frontend CNAME / MX）失败时 return 1，由 email_deploy 阻断完成标记；
-# Resend 相关（DKIM/SPF/DMARC）仅 warn，因为发件是可选能力
+# 用户选择启用 Resend 时，secret/DNS 任一失败也 fail-closed，避免 state 显示已启用但链路不可用。
 _email_deploy_dns() {
     print_info "添加 DNS 记录..."
     local zid="$EMAIL_ZONE_ID"
     local _dns_fail=0
 
     # 前端 CNAME（橙云代理）— 若同名记录已存在，先清理
-    _email_cf_dns_purge "$zid" CNAME "$EMAIL_FRONTEND_DOMAIN"
-    if _email_cf_dns_create_record_into EMAIL_DNS_FRONTEND_ID "$zid" "CNAME" \
+    if ! _email_cf_dns_purge "$zid" CNAME "$EMAIL_FRONTEND_DOMAIN"; then
+        print_error "清理旧前端 CNAME 失败 — 已停止写入新的 CNAME"
+        _dns_fail=1
+    elif _email_cf_dns_create_record_into EMAIL_DNS_FRONTEND_ID "$zid" "CNAME" \
             "$EMAIL_FRONTEND_DOMAIN" "$EMAIL_PAGES_DOMAIN" "" "true"; then
         print_success "CNAME $EMAIL_FRONTEND_PREFIX → $EMAIL_PAGES_DOMAIN"
     else
@@ -552,22 +572,26 @@ _email_deploy_dns() {
     fi
 
     # MX 记录到 Cloudflare Email Routing（3 条任一缺失会降级路由，全失败则无法收信）
-    _email_cf_dns_purge "$zid" MX "$EMAIL_DOMAIN"
     local _mx_ok=0
-    if _email_cf_dns_create_record_into EMAIL_DNS_MX1_ID "$zid" "MX" "$EMAIL_DOMAIN" "route1.mx.cloudflare.net" "12"; then
-        print_success "MX 1 (route1)"; _mx_ok=$((_mx_ok+1))
+    if ! _email_cf_dns_purge "$zid" MX "$EMAIL_DOMAIN"; then
+        print_error "清理旧 MX 记录失败 — 已停止写入 Cloudflare Email Routing MX"
+        _dns_fail=1
     else
-        print_warn "MX 1 失败"
-    fi
-    if _email_cf_dns_create_record_into EMAIL_DNS_MX2_ID "$zid" "MX" "$EMAIL_DOMAIN" "route2.mx.cloudflare.net" "41"; then
-        print_success "MX 2 (route2)"; _mx_ok=$((_mx_ok+1))
-    else
-        print_warn "MX 2 失败"
-    fi
-    if _email_cf_dns_create_record_into EMAIL_DNS_MX3_ID "$zid" "MX" "$EMAIL_DOMAIN" "route3.mx.cloudflare.net" "69"; then
-        print_success "MX 3 (route3)"; _mx_ok=$((_mx_ok+1))
-    else
-        print_warn "MX 3 失败"
+        if _email_cf_dns_create_record_into EMAIL_DNS_MX1_ID "$zid" "MX" "$EMAIL_DOMAIN" "route1.mx.cloudflare.net" "12"; then
+            print_success "MX 1 (route1)"; _mx_ok=$((_mx_ok+1))
+        else
+            print_warn "MX 1 失败"
+        fi
+        if _email_cf_dns_create_record_into EMAIL_DNS_MX2_ID "$zid" "MX" "$EMAIL_DOMAIN" "route2.mx.cloudflare.net" "41"; then
+            print_success "MX 2 (route2)"; _mx_ok=$((_mx_ok+1))
+        else
+            print_warn "MX 2 失败"
+        fi
+        if _email_cf_dns_create_record_into EMAIL_DNS_MX3_ID "$zid" "MX" "$EMAIL_DOMAIN" "route3.mx.cloudflare.net" "69"; then
+            print_success "MX 3 (route3)"; _mx_ok=$((_mx_ok+1))
+        else
+            print_warn "MX 3 失败"
+        fi
     fi
     if [[ "$_mx_ok" -eq 0 ]]; then
         print_error "MX 记录全部添加失败 — 邮箱将无法收信"
@@ -576,22 +600,37 @@ _email_deploy_dns() {
         print_warn "MX 记录仅创建 ${_mx_ok}/3 — Cloudflare 推荐 3 条，建议 Dashboard 补齐"
     fi
 
-    # Resend 相关（DKIM/SPF/SEND_MX/DMARC）仅 warn — 不影响收信主链路
+    # Resend 相关（DKIM/SPF/SEND_MX/DMARC）：用户选择启用时必须全部写入成功。
     if [[ "$EMAIL_RESEND_ENABLED" == "1" ]]; then
         local send_sub="send.${EMAIL_DOMAIN}"
-        _email_cf_dns_purge "$zid" TXT "resend._domainkey.${EMAIL_DOMAIN}"
-        _email_cf_dns_purge "$zid" TXT "$send_sub"
-        _email_cf_dns_purge "$zid" MX  "$send_sub"
-        _email_cf_dns_purge "$zid" TXT "_dmarc.${EMAIL_DOMAIN}"
+        local _resend_purge_fail=0 _resend_create_fail=0
+        _email_cf_dns_purge "$zid" TXT "resend._domainkey.${EMAIL_DOMAIN}" || _resend_purge_fail=1
+        _email_cf_dns_purge "$zid" TXT "$send_sub" || _resend_purge_fail=1
+        _email_cf_dns_purge "$zid" MX  "$send_sub" || _resend_purge_fail=1
+        _email_cf_dns_purge "$zid" TXT "_dmarc.${EMAIL_DOMAIN}" || _resend_purge_fail=1
 
-        _email_cf_dns_create_record_into EMAIL_DNS_DKIM_ID "$zid" "TXT" "resend._domainkey.${EMAIL_DOMAIN}" "$EMAIL_RESEND_DKIM" \
-            && print_success "DKIM (resend._domainkey)" || print_warn "DKIM 失败（发件能力受影响，可后续 Dashboard 补）"
-        _email_cf_dns_create_record_into EMAIL_DNS_SPF_ID "$zid" "TXT" "$send_sub" "v=spf1 include:amazonses.com ~all" \
-            && print_success "SPF (send.${EMAIL_DOMAIN})" || print_warn "SPF 失败（发件能力受影响）"
-        _email_cf_dns_create_record_into EMAIL_DNS_SEND_MX_ID "$zid" "MX" "$send_sub" "feedback-smtp.us-east-1.amazonses.com" "10" \
-            && print_success "Send MX" || print_warn "Send MX 失败（发件能力受影响）"
-        _email_cf_dns_create_record_into EMAIL_DNS_DMARC_ID "$zid" "TXT" "_dmarc.${EMAIL_DOMAIN}" "v=DMARC1; p=none;" \
-            && print_success "DMARC" || print_warn "DMARC 失败（发件能力受影响）"
+        if [[ "$_resend_purge_fail" -ne 0 ]]; then
+            EMAIL_RESEND_ENABLED=0
+            EMAIL_RESEND_SEND_DOMAIN=""
+            EMAIL_DNS_DKIM_ID=""; EMAIL_DNS_SPF_ID=""; EMAIL_DNS_SEND_MX_ID=""; EMAIL_DNS_DMARC_ID=""
+            print_error "清理旧 Resend DNS 记录失败，已停止启用 Resend。"
+            _dns_fail=1
+        else
+            _email_cf_dns_create_record_into EMAIL_DNS_DKIM_ID "$zid" "TXT" "resend._domainkey.${EMAIL_DOMAIN}" "$EMAIL_RESEND_DKIM" \
+                && print_success "DKIM (resend._domainkey)" || { print_warn "DKIM 失败"; _resend_create_fail=1; }
+            _email_cf_dns_create_record_into EMAIL_DNS_SPF_ID "$zid" "TXT" "$send_sub" "v=spf1 include:amazonses.com ~all" \
+                && print_success "SPF (send.${EMAIL_DOMAIN})" || { print_warn "SPF 失败"; _resend_create_fail=1; }
+            _email_cf_dns_create_record_into EMAIL_DNS_SEND_MX_ID "$zid" "MX" "$send_sub" "feedback-smtp.us-east-1.amazonses.com" "10" \
+                && print_success "Send MX" || { print_warn "Send MX 失败"; _resend_create_fail=1; }
+            _email_cf_dns_create_record_into EMAIL_DNS_DMARC_ID "$zid" "TXT" "_dmarc.${EMAIL_DOMAIN}" "v=DMARC1; p=none;" \
+                && print_success "DMARC" || { print_warn "DMARC 失败"; _resend_create_fail=1; }
+            if [[ "$_resend_create_fail" -ne 0 ]]; then
+                EMAIL_RESEND_ENABLED=0
+                EMAIL_RESEND_SEND_DOMAIN=""
+                print_error "创建 Resend DNS 记录失败，已停止启用 Resend 并保留已创建记录 ID 供卸载/重试。"
+                _dns_fail=1
+            fi
+        fi
     fi
 
     # 失败也落盘 record_id（已创建的部分仍可被卸载回收），主流程根据 return 决定是否标 installed

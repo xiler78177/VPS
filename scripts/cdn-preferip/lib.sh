@@ -13,10 +13,148 @@ die() { log "ERROR: $*"; exit 1; }
 
 require_cmd() { command -v "$1" >/dev/null 2>&1 || die "缺少依赖命令: $1"; }
 
+preferip_atomic_write() {
+    local target="$1" mode="${2:-600}" tmp dir old_umask rc
+    [[ -n "$target" ]] || return 1
+    case "$target" in
+        /*) ;;
+        *) target="$PWD/$target" ;;
+    esac
+    dir="$(dirname "$target")"
+    mkdir -p "$dir" 2>/dev/null || return 1
+    old_umask=$(umask)
+    umask 077
+    tmp=$(mktemp "${dir}/.tmp.cdn-preferip.XXXXXX")
+    rc=$?
+    umask "$old_umask"
+    [[ "$rc" -eq 0 ]] || return 1
+    if ! cat > "$tmp"; then
+        rm -f -- "$tmp" 2>/dev/null || true
+        return 1
+    fi
+    chmod "$mode" "$tmp" 2>/dev/null || true
+    if ! mv "$tmp" "$target"; then
+        rm -f -- "$tmp" 2>/dev/null || true
+        return 1
+    fi
+}
+
+_conf_trim() {
+    local s="${1:-}"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+_conf_expand_simple_vars() {
+    local s="${1:-}" out="" i=0 c next rest name val end inner
+    while (( i < ${#s} )); do
+        c="${s:i:1}"
+        if [[ "$c" == "\\" ]]; then
+            if (( i + 1 < ${#s} )); then
+                out+="${s:i+1:1}"
+                i=$((i + 2))
+            else
+                out+="\\"
+                i=$((i + 1))
+            fi
+            continue
+        fi
+        if [[ "$c" == '`' ]]; then
+            return 1
+        fi
+        if [[ "$c" == '$' ]]; then
+            next="${s:i+1:1}"
+            if [[ "$next" == '(' ]]; then
+                return 1
+            fi
+            if [[ "$next" == '{' ]]; then
+                rest="${s:i+2}"
+                if [[ "$rest" != *"}"* ]]; then
+                    return 1
+                fi
+                inner="${rest%%\}*}"
+                end=$((i + 2 + ${#inner} + 1))
+                [[ "$inner" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+                val="${!inner-}"
+                out+="$val"
+                i="$end"
+                continue
+            fi
+            rest="${s:i+1}"
+            if [[ "$rest" =~ ^([A-Za-z_][A-Za-z0-9_]*) ]]; then
+                name="${BASH_REMATCH[1]}"
+                val="${!name-}"
+                out+="$val"
+                i=$((i + 1 + ${#name}))
+                continue
+            fi
+        fi
+        out+="$c"
+        i=$((i + 1))
+    done
+    printf '%s' "$out"
+}
+
+_conf_parse_value() {
+    local raw="$1" value
+    raw="$(_conf_trim "$raw")"
+    [[ -z "$raw" ]] && { printf ''; return 0; }
+    if [[ "$raw" == \'* ]]; then
+        [[ "$raw" =~ ^\'([^\']*)\'([[:space:]]*(#.*)?)$ ]] || return 1
+        printf '%s' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    if [[ "$raw" == \"* ]]; then
+        [[ "$raw" =~ ^\"(.*)\"([[:space:]]*(#.*)?)$ ]] || return 1
+        value="${BASH_REMATCH[1]}"
+        _conf_expand_simple_vars "$value"
+        return $?
+    fi
+    value="${raw%%#*}"
+    value="$(_conf_trim "$value")"
+    [[ "$value" =~ ^[A-Za-z0-9_./@:+,=-]*$ ]] || return 1
+    printf '%s' "$value"
+}
+
+_conf_check_file_safety() {
+    local conf="$1" mode owner current
+    command -v stat >/dev/null 2>&1 || return 0
+    mode="$(stat -c '%a' "$conf" 2>/dev/null || true)"
+    if [[ "$mode" =~ ^[0-7]+$ ]] && (( 8#$mode & 022 )); then
+        die "配置文件权限过宽，已拒绝: $conf (mode=$mode，需 group/other 不可写)"
+    fi
+    owner="$(stat -c '%U' "$conf" 2>/dev/null || true)"
+    current="$(id -un 2>/dev/null || true)"
+    if [[ -n "$owner" && -n "$current" && "$owner" != "$current" && "$owner" != "root" ]]; then
+        die "配置文件 owner 异常，已拒绝: $conf (owner=$owner current=$current)"
+    fi
+}
+
+_conf_load_safe() {
+    local conf="$1" line key raw value lineno=0
+    _conf_check_file_safety "$conf"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$((lineno + 1))
+        line="${line%$'\r'}"
+        line="$(_conf_trim "$line")"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        [[ "$line" == export[[:space:]]* ]] && line="$(_conf_trim "${line#export}")"
+        if [[ ! "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]]; then
+            die "配置文件格式异常: $conf (行${lineno}: 非 KEY=value)"
+        fi
+        key="${BASH_REMATCH[1]}"
+        raw="${BASH_REMATCH[2]}"
+        if ! value="$(_conf_parse_value "$raw")"; then
+            die "配置文件包含不安全或不支持的 value: $conf (行${lineno}: $key)"
+        fi
+        printf -v "$key" '%s' "$value"
+    done < "$conf"
+}
+
 load_conf() {
     [[ -f "$CDN_PREFERIP_CONF" ]] || die "配置文件不存在: $CDN_PREFERIP_CONF（请 cp cdn-preferip.conf.example cdn-preferip.conf 后填写）"
-    # shellcheck disable=SC1090
-    source "$CDN_PREFERIP_CONF"
+    _conf_load_safe "$CDN_PREFERIP_CONF"
     # CDN_UUID/DOMAIN/WS_PATH 仅旧「单节点」模式需要;新「多节点」(nodes.txt)模式从链接里读,故改可选
     CDN_UUID="${CDN_UUID:-}"; CDN_DOMAIN="${CDN_DOMAIN:-}"; CDN_WS_PATH="${CDN_WS_PATH:-}"
     CDN_NODE_NAME="${CDN_NODE_NAME:-cdn-${CDN_DOMAIN%%.*}}"
@@ -236,6 +374,7 @@ parse_node_line() {
                 ;;
             *)
                 cv="$(split_colo_version "$token")" || return 1
+                # shellcheck disable=SC2034 # exported parser state consumed by preferip-collect.sh/preferip-push.sh
                 NODE_COLO="${cv%%|*}"
                 value="${cv#*|}"
                 [[ -n "$value" && "$value" != "$cv" ]] && NODE_IP_VERSION="$value"
@@ -473,6 +612,42 @@ cf_dns_delete_records() {
     done <<< "$ids"
 }
 
+cf_dns_snapshot_entry_records() {
+    local zone_id="$1" token="$2" name="$3" type resp a='[]' aaaa='[]'
+    for type in A AAAA; do
+        resp="$(cf_api GET "/zones/$zone_id/dns_records?type=$type&name=$name" "$token")" || return 1
+        if ! cf_api_ok "$resp"; then
+            log "读取 DNS 快照失败: $type $(cf_api_err "$resp")"
+            return 1
+        fi
+        case "$type" in
+            A) a="$(jq -c '.result // []' <<< "$resp" 2>/dev/null)" || return 1 ;;
+            AAAA) aaaa="$(jq -c '.result // []' <<< "$resp" 2>/dev/null)" || return 1 ;;
+        esac
+    done
+    jq -n --argjson A "$a" --argjson AAAA "$aaaa" '{A:$A, AAAA:$AAAA}'
+}
+
+cf_dns_restore_entry_records() {
+    local zone_id="$1" token="$2" name="$3" snapshot="$4" type records ids id resp payload
+    [[ -n "$snapshot" ]] || return 1
+    for type in A AAAA; do
+        records="$(cf_api GET "/zones/$zone_id/dns_records?type=$type&name=$name" "$token")" || return 1
+        if cf_api_ok "$records"; then
+            ids="$(jq -r '.result[].id // empty' <<< "$records" 2>/dev/null || true)"
+            while IFS= read -r id; do
+                [[ -n "$id" ]] || continue
+                cf_api DELETE "/zones/$zone_id/dns_records/$id" "$token" >/dev/null 2>&1 || true
+            done <<< "$ids"
+        fi
+        while IFS= read -r payload; do
+            [[ -n "$payload" ]] || continue
+            resp="$(cf_api POST "/zones/$zone_id/dns_records" "$token" --data "$payload")" || return 1
+            cf_api_ok "$resp" || return 1
+        done < <(jq -c --arg t "$type" '.[$t][] | {type:.type, name:.name, content:.content, ttl:(.ttl // 1), proxied:(.proxied // false)}' <<< "$snapshot" 2>/dev/null)
+    done
+}
+
 cf_ip_family() {
     local ip="${1:-}"
     if [[ "$ip" == *:* ]]; then
@@ -483,7 +658,7 @@ cf_ip_family() {
 }
 
 cf_dns_sync_entry_domain() {
-    local domain="$1" ip="$2" token="${3:-$PREFERIP_CF_API_TOKEN}" zone_id="${4:-$PREFERIP_CF_ZONE_ID}" delete_stale_override="${5:-}" family delete_stale proxied
+    local domain="$1" ip="$2" token="${3:-$PREFERIP_CF_API_TOKEN}" zone_id="${4:-$PREFERIP_CF_ZONE_ID}" delete_stale_override="${5:-}" family delete_stale proxied snapshot
     [[ -n "$domain" && -n "$ip" ]] || return 1
     is_ip_literal "$ip" || return 1
     [[ -n "$token" ]] || die "DNS 模式需要 Cloudflare API Token（PREFERIP_CF_API_TOKEN / CF_API_TOKEN / CLOUDFLARE_API_TOKEN）"
@@ -495,11 +670,28 @@ cf_dns_sync_entry_domain() {
         zone_id="$(cf_get_zone_id "$domain" "$token")" || return 1
         [[ -n "$zone_id" ]] || return 1
     fi
-    cf_dns_upsert_record "$zone_id" "$token" "$family" "$domain" "$ip" "$proxied" >/dev/null || return 1
+    snapshot="$(cf_dns_snapshot_entry_records "$zone_id" "$token" "$domain")" || return 1
+    if ! cf_dns_upsert_record "$zone_id" "$token" "$family" "$domain" "$ip" "$proxied" >/dev/null; then
+        log "DNS 记录同步失败，正在恢复 ${domain} 的 A/AAAA 快照"
+        cf_dns_restore_entry_records "$zone_id" "$token" "$domain" "$snapshot" || log "警告: DNS 快照恢复失败，请人工核查 ${domain}"
+        return 1
+    fi
     if [[ "$delete_stale" == "true" ]]; then
         case "$family" in
-            A) cf_dns_delete_records "$zone_id" "$token" AAAA "$domain" || return 1 ;;
-            AAAA) cf_dns_delete_records "$zone_id" "$token" A "$domain" || return 1 ;;
+            A)
+                if ! cf_dns_delete_records "$zone_id" "$token" AAAA "$domain"; then
+                    log "DNS stale family 清理失败，正在恢复 ${domain} 的 A/AAAA 快照"
+                    cf_dns_restore_entry_records "$zone_id" "$token" "$domain" "$snapshot" || log "警告: DNS 快照恢复失败，请人工核查 ${domain}"
+                    return 1
+                fi
+                ;;
+            AAAA)
+                if ! cf_dns_delete_records "$zone_id" "$token" A "$domain"; then
+                    log "DNS stale family 清理失败，正在恢复 ${domain} 的 A/AAAA 快照"
+                    cf_dns_restore_entry_records "$zone_id" "$token" "$domain" "$snapshot" || log "警告: DNS 快照恢复失败，请人工核查 ${domain}"
+                    return 1
+                fi
+                ;;
         esac
     fi
     printf '%s|%s|%s' "$zone_id" "$family" "$ip"
@@ -524,7 +716,9 @@ rewrite_vless() {
     local after="${body#*@}"                     # HOST:PORT?QUERY
     local query=""; [[ "$after" == *\?* ]] && query="${after#*\?}"
     local port; port="$(vless_port "$link")" || port="443"
-    local out="vless://${uuid}@$(uri_host "$newip"):${port}"
+    local server_host out
+    server_host="$(uri_host "$newip")"
+    out="vless://${uuid}@${server_host}:${port}"
     [[ -n "$query" ]] && out="${out}?${query}"
     printf '%s#%s' "$out" "$(urlencode "$newname")"
 }

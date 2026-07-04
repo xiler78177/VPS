@@ -50,14 +50,15 @@ _email_manage_update_admin_passwords_var() {
 
     cp -a "$toml" "${toml}.adminpw.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
     local line="ADMIN_PASSWORDS = ${admin_json}"
+    local content
     if grep -qE '^[[:space:]]*ADMIN_PASSWORDS[[:space:]]*=' "$toml"; then
-        ADMIN_PASSWORDS_LINE="$line" awk '
+        content=$(ADMIN_PASSWORDS_LINE="$line" awk '
             BEGIN { line = ENVIRON["ADMIN_PASSWORDS_LINE"] }
             /^[[:space:]]*ADMIN_PASSWORDS[[:space:]]*=/ { print line; next }
             { print }
-        ' "$toml" > "${toml}.tmp" && mv "${toml}.tmp" "$toml"
+        ' "$toml") || return 1
     else
-        ADMIN_PASSWORDS_LINE="$line" awk '
+        content=$(ADMIN_PASSWORDS_LINE="$line" awk '
             BEGIN { line = ENVIRON["ADMIN_PASSWORDS_LINE"]; inserted=0 }
             /^\[vars\]/ { print; print line; inserted=1; next }
             { print }
@@ -68,9 +69,9 @@ _email_manage_update_admin_passwords_var() {
                     print line
                 }
             }
-        ' "$toml" > "${toml}.tmp" && mv "${toml}.tmp" "$toml"
+        ' "$toml") || return 1
     fi
-    chmod 600 "$toml"
+    _email_write_private_file "$toml" "$content" || return 1
     _email_export_wrangler_env
     cd "$EMAIL_INSTALL_DIR/worker" || return 1
     email_run "Worker 依赖" pnpm install --no-frozen-lockfile || return 1
@@ -164,20 +165,45 @@ email_manage_domains() {
             ;;
     esac
 
-    # 替换 DOMAINS 和 DEFAULT_DOMAINS
-    sed -i.bak -E "s|^DOMAINS[[:space:]]*=.*$|DOMAINS = ${new_arr}|" "$toml"
-    sed -i -E "s|^DEFAULT_DOMAINS[[:space:]]*=.*$|DEFAULT_DOMAINS = ${new_arr}|" "$toml"
-    rm -f "${toml}.bak"
+    # 替换 DOMAINS 和 DEFAULT_DOMAINS。先备份，只有 Worker 重新部署成功才保留本地修改。
+    local backup tmp
+    backup=$(mktemp "${toml}.domains.bak.XXXXXX") || { print_error "创建备份失败"; pause; return; }
+    tmp=$(mktemp "${toml}.domains.XXXXXX") || { rm -f "$backup"; print_error "创建临时文件失败"; pause; return; }
+    cp -a "$toml" "$backup" || { rm -f "$backup" "$tmp"; print_error "备份 wrangler.toml 失败"; pause; return; }
+    if ! DOMAINS_JSON="$new_arr" awk '
+        BEGIN { value = ENVIRON["DOMAINS_JSON"]; seen_domains = 0; seen_defaults = 0 }
+        /^[[:space:]]*DEFAULT_DOMAINS[[:space:]]*=/ { print "DEFAULT_DOMAINS = " value; seen_defaults = 1; next }
+        /^[[:space:]]*DOMAINS[[:space:]]*=/ { print "DOMAINS = " value; seen_domains = 1; next }
+        { print }
+        END { if (!seen_domains || !seen_defaults) exit 2 }
+    ' "$toml" > "$tmp"; then
+        rm -f "$tmp"
+        cp -a "$backup" "$toml" 2>/dev/null || true
+        rm -f "$backup"
+        print_error "wrangler.toml 缺少 DOMAINS/DEFAULT_DOMAINS，已恢复原文件"
+        pause; return 1
+    fi
+    mv -f "$tmp" "$toml" || { cp -a "$backup" "$toml" 2>/dev/null || true; rm -f "$backup" "$tmp"; print_error "更新 wrangler.toml 失败，已恢复原文件"; pause; return; }
+    chmod 600 "$toml"
     print_success "wrangler.toml 已更新"
     echo "  DOMAINS = $new_arr"
 
     cd "$EMAIL_INSTALL_DIR/worker" || return
-    email_run "Worker 依赖" pnpm install --no-frozen-lockfile || { pause; return; }
+    email_run "Worker 依赖" pnpm install --no-frozen-lockfile || {
+        cp -a "$backup" "$toml" 2>/dev/null || true
+        rm -f "$backup"
+        print_error "依赖安装失败，wrangler.toml 已恢复"
+        pause; return 1
+    }
     if email_run "重新部署 Worker" _email_wrangler deploy; then
+        rm -f "$backup"
         print_success "Worker 已更新，新域名已生效"
         log_action "Email DOMAINS updated: $new_arr"
     else
-        print_error "部署失败，wrangler.toml 已修改但 worker 未更新"
+        cp -a "$backup" "$toml" 2>/dev/null || true
+        rm -f "$backup"
+        print_error "部署失败，wrangler.toml 已恢复"
+        pause; return 1
     fi
     pause
 }
@@ -207,32 +233,52 @@ email_manage_resend() {
 
 _email_manage_resend_setup() {
     local tok dkim
-    email_read_secret "Resend API Token" tok || { print_error "Token 不能为空"; return; }
+    email_read_secret "Resend API Token" tok || { print_error "Token 不能为空"; return 1; }
     print_info "已收到 Token: $(email_mask_token "$tok")"
     read -e -r -p "Resend DKIM (p=MIGfMA0...): " dkim
-    [[ -z "$dkim" ]] && { print_error "DKIM 不能为空"; return; }
+    [[ -z "$dkim" ]] && { print_error "DKIM 不能为空"; unset tok dkim; return 1; }
 
     if ! email_run "写入 RESEND_TOKEN secret" _email_cf_worker_secret_put "$EMAIL_WORKER_NAME" "RESEND_TOKEN" "$tok"; then
-        print_error "secret 写入失败"; return
+        print_error "secret 写入失败"
+        unset tok dkim
+        return 1
     fi
 
     local send_sub="send.${EMAIL_DOMAIN}"
     local zid="$EMAIL_ZONE_ID"
 
     # 清旧记录（按 type+name 全量清，避免脏数据残留）
-    _email_cf_dns_purge "$zid" TXT "resend._domainkey.${EMAIL_DOMAIN}"
-    _email_cf_dns_purge "$zid" TXT "$send_sub"
-    _email_cf_dns_purge "$zid" MX  "$send_sub"
-    _email_cf_dns_purge "$zid" TXT "_dmarc.${EMAIL_DOMAIN}"
+    local purge_failed=0
+    _email_cf_dns_purge "$zid" TXT "resend._domainkey.${EMAIL_DOMAIN}" || purge_failed=1
+    _email_cf_dns_purge "$zid" TXT "$send_sub" || purge_failed=1
+    _email_cf_dns_purge "$zid" MX  "$send_sub" || purge_failed=1
+    _email_cf_dns_purge "$zid" TXT "_dmarc.${EMAIL_DOMAIN}" || purge_failed=1
+    if [[ "$purge_failed" -ne 0 ]]; then
+        email_state_write 2>/dev/null || true
+        print_error "清理旧 Resend DNS 记录失败，已停止启用并保留当前 state。"
+        print_warn "RESEND_TOKEN secret 可能已写入；请修复 Cloudflare DNS/API 问题后重试。"
+        unset tok dkim
+        return 1
+    fi
 
+    local create_failed=0
     _email_cf_dns_create_record_into EMAIL_DNS_DKIM_ID "$zid" "TXT" "resend._domainkey.${EMAIL_DOMAIN}" "$dkim" \
-        && print_success "DKIM" || print_warn "DKIM 失败"
+        && print_success "DKIM" || { print_warn "DKIM 失败"; create_failed=1; }
     _email_cf_dns_create_record_into EMAIL_DNS_SPF_ID "$zid" "TXT" "$send_sub" "v=spf1 include:amazonses.com ~all" \
-        && print_success "SPF" || print_warn "SPF 失败"
+        && print_success "SPF" || { print_warn "SPF 失败"; create_failed=1; }
     _email_cf_dns_create_record_into EMAIL_DNS_SEND_MX_ID "$zid" "MX" "$send_sub" "feedback-smtp.us-east-1.amazonses.com" "10" \
-        && print_success "Send MX" || print_warn "Send MX 失败"
+        && print_success "Send MX" || { print_warn "Send MX 失败"; create_failed=1; }
     _email_cf_dns_create_record_into EMAIL_DNS_DMARC_ID "$zid" "TXT" "_dmarc.${EMAIL_DOMAIN}" "v=DMARC1; p=none;" \
-        && print_success "DMARC" || print_warn "DMARC 失败"
+        && print_success "DMARC" || { print_warn "DMARC 失败"; create_failed=1; }
+    if [[ "$create_failed" -ne 0 ]]; then
+        EMAIL_RESEND_ENABLED=0
+        EMAIL_RESEND_SEND_DOMAIN=""
+        email_state_write 2>/dev/null || true
+        print_error "创建 Resend DNS 记录失败，已停止启用并保留当前 state。"
+        print_warn "可能已有部分 DNS 记录创建成功；修复 Cloudflare DNS/API 问题后可重新配置。"
+        unset tok dkim
+        return 1
+    fi
 
     EMAIL_RESEND_ENABLED=1
     EMAIL_RESEND_SEND_DOMAIN="$send_sub"
@@ -245,11 +291,15 @@ _email_manage_resend_setup() {
 
 _email_manage_resend_token_only() {
     local tok
-    email_read_secret "新 Resend API Token" tok || return
+    email_read_secret "新 Resend API Token" tok || return 1
     print_info "已收到 Token: $(email_mask_token "$tok")"
     if email_run "更新 RESEND_TOKEN secret" _email_cf_worker_secret_put "$EMAIL_WORKER_NAME" "RESEND_TOKEN" "$tok"; then
         print_success "RESEND_TOKEN 已更新"
         log_action "Email Resend token rotated"
+    else
+        print_error "RESEND_TOKEN 更新失败"
+        unset tok
+        return 1
     fi
     unset tok
 }
@@ -257,15 +307,30 @@ _email_manage_resend_token_only() {
 _email_manage_resend_disable() {
     confirm "确认禁用 Resend 并删除相关 DNS 记录?" || return
     local zid="$EMAIL_ZONE_ID"
-    _email_cf_dns_delete "$zid" "$EMAIL_DNS_DKIM_ID" && print_success "已删 DKIM" || true
-    _email_cf_dns_delete "$zid" "$EMAIL_DNS_SPF_ID"  && print_success "已删 SPF" || true
-    _email_cf_dns_delete "$zid" "$EMAIL_DNS_SEND_MX_ID" && print_success "已删 Send MX" || true
-    _email_cf_dns_delete "$zid" "$EMAIL_DNS_DMARC_ID" && print_success "已删 DMARC" || true
+    local failed=0
+    if [[ -n "${EMAIL_DNS_DKIM_ID:-}" ]]; then
+        _email_cf_dns_delete "$zid" "$EMAIL_DNS_DKIM_ID" && print_success "已删 DKIM" || { print_warn "DKIM 删除失败"; failed=1; }
+    fi
+    if [[ -n "${EMAIL_DNS_SPF_ID:-}" ]]; then
+        _email_cf_dns_delete "$zid" "$EMAIL_DNS_SPF_ID" && print_success "已删 SPF" || { print_warn "SPF 删除失败"; failed=1; }
+    fi
+    if [[ -n "${EMAIL_DNS_SEND_MX_ID:-}" ]]; then
+        _email_cf_dns_delete "$zid" "$EMAIL_DNS_SEND_MX_ID" && print_success "已删 Send MX" || { print_warn "Send MX 删除失败"; failed=1; }
+    fi
+    if [[ -n "${EMAIL_DNS_DMARC_ID:-}" ]]; then
+        _email_cf_dns_delete "$zid" "$EMAIL_DNS_DMARC_ID" && print_success "已删 DMARC" || { print_warn "DMARC 删除失败"; failed=1; }
+    fi
     # 同步清掉可能的同名脏记录
-    _email_cf_dns_purge "$zid" TXT "resend._domainkey.${EMAIL_DOMAIN}"
-    _email_cf_dns_purge "$zid" TXT "send.${EMAIL_DOMAIN}"
-    _email_cf_dns_purge "$zid" MX  "send.${EMAIL_DOMAIN}"
-    _email_cf_dns_purge "$zid" TXT "_dmarc.${EMAIL_DOMAIN}"
+    _email_cf_dns_purge "$zid" TXT "resend._domainkey.${EMAIL_DOMAIN}" || failed=1
+    _email_cf_dns_purge "$zid" TXT "send.${EMAIL_DOMAIN}" || failed=1
+    _email_cf_dns_purge "$zid" MX  "send.${EMAIL_DOMAIN}" || failed=1
+    _email_cf_dns_purge "$zid" TXT "_dmarc.${EMAIL_DOMAIN}" || failed=1
+
+    if [[ "$failed" -ne 0 ]]; then
+        email_state_write 2>/dev/null || true
+        print_error "部分 Resend DNS 记录删除失败，已保留 Resend state，便于修复后重试。"
+        return 1
+    fi
 
     print_warn "RESEND_TOKEN secret 不会自动清除，如需彻底清理请在 Dashboard → Workers → Settings → Variables 删除"
     EMAIL_RESEND_ENABLED=0

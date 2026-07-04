@@ -167,7 +167,7 @@ wg_check_openwrt_compat() {
 
     # ── [信息] br-lan 网段 ──
     local br_lan_addr
-    br_lan_addr=$(ip -4 addr show br-lan 2>/dev/null | grep -oP 'inet \K[0-9.]+/[0-9]+' | head -1)
+    br_lan_addr=$(ip -4 addr show br-lan 2>/dev/null | awk '/^[[:space:]]*inet[[:space:]]/ { print $2; exit }')
     if [[ -n "$br_lan_addr" ]]; then
         echo -e "  ${C_CYAN}[INFO]${C_RESET} br-lan 网段: ${br_lan_addr}"
     else

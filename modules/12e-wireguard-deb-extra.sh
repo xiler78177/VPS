@@ -6,7 +6,7 @@ wg_deb_setup_watchdog() {
     local auto_mode="${1:-}"
 
     # 已启用时的管理界面
-    if [[ -z "$auto_mode" ]] && crontab -l 2>/dev/null | grep -q "wg-watchdog.sh"; then
+    if [[ -z "$auto_mode" ]] && cron_has_job_command "$watchdog_script"; then
         print_title "WireGuard 看门狗"
         echo -e "  状态: ${C_GREEN}已启用${C_RESET}"
         echo -e "  脚本: ${C_CYAN}${watchdog_script}${C_RESET}"
@@ -18,7 +18,7 @@ wg_deb_setup_watchdog() {
         read -e -r -p "选择: " c
         case $c in
             1)
-                cron_remove_job "wg-watchdog.sh"
+                cron_remove_job_command "$watchdog_script"
                 rm -f "$watchdog_script"
                 print_success "看门狗已禁用"
                 log_action "WireGuard(deb) watchdog disabled"
@@ -46,8 +46,17 @@ wg_deb_setup_watchdog() {
         if ! confirm "启用看门狗?"; then pause; return; fi
     fi
 
+    mkdir -p "$(dirname "$watchdog_script")" || { print_error "创建看门狗目录失败"; [[ -z "$auto_mode" ]] && pause; return 1; }
+    local watchdog_tmp
+    watchdog_tmp=$(mktemp "$(dirname "$watchdog_script")/.tmp.server-manage.wg-watchdog.XXXXXX") || {
+        print_error "创建看门狗临时脚本失败"
+        [[ -z "$auto_mode" ]] && pause
+        return 1
+    }
+    _tmp_register "$watchdog_tmp"
+
     # ── Debian 看门狗 (systemctl 管理) ──
-    {
+    if ! {
         cat << 'WDEOF_DEB'
 #!/bin/bash
 WDEOF_DEB
@@ -78,29 +87,51 @@ if ! wg show "$WG_DEB_INTERFACE" &>/dev/null; then
     exit 0
 fi
 WDEOF_DEB
-    } > "$watchdog_script"
-    chmod +x "$watchdog_script"
-    cron_add_job "wg-watchdog.sh" "* * * * * $watchdog_script >/dev/null 2>&1"
+    } > "$watchdog_tmp"; then
+        rm -f "$watchdog_tmp" 2>/dev/null || true
+        _tmp_unregister "$watchdog_tmp"
+        print_error "写入看门狗脚本失败"
+        [[ -z "$auto_mode" ]] && pause
+        return 1
+    fi
+    chmod 0755 "$watchdog_tmp" 2>/dev/null || true
+    if ! mv "$watchdog_tmp" "$watchdog_script"; then
+        rm -f "$watchdog_tmp" 2>/dev/null || true
+        _tmp_unregister "$watchdog_tmp"
+        print_error "安装看门狗脚本失败"
+        [[ -z "$auto_mode" ]] && pause
+        return 1
+    fi
+    _tmp_unregister "$watchdog_tmp"
+    if ! cron_add_job_command "$watchdog_script" "* * * * * $watchdog_script >/dev/null 2>&1"; then
+        rm -f "$watchdog_script" 2>/dev/null || true
+        print_error "安装看门狗 cron 任务失败"
+        [[ -z "$auto_mode" ]] && pause
+        return 1
+    fi
     echo ""
     print_success "看门狗已启用 (每分钟检测)"
     echo -e "  脚本: ${C_CYAN}${watchdog_script}${C_RESET}"
     echo "  检测: 接口存活 → wg show"
     log_action "WireGuard(deb) watchdog enabled"
     [[ -z "$auto_mode" ]] && pause
+    return 0
 }
 
 wg_deb_export_peers() {
     wg_deb_check_server || return 1
     print_title "导出 WireGuard 设备配置"
     local peer_count
-    peer_count=$(wg_deb_db_get '.peers | length')
-    if [[ "$peer_count" -eq 0 || "$peer_count" == "null" ]]; then
+    if ! peer_count=$(wg_deb_db_get '.peers | length') || [[ ! "$peer_count" =~ ^[0-9]+$ ]]; then
+        print_error "读取设备数量失败"
+        pause; return 1
+    fi
+    if [[ "$peer_count" -eq 0 ]]; then
         print_warn "暂无设备可导出"
         pause; return
     fi
     local export_file
-    export_file=$(mktemp "/tmp/${SCRIPT_NAME}-wg-peers.XXXXXX") || { print_error "无法创建导出文件"; pause; return 1; }
-    chmod 600 "$export_file"
+    export_file=$(wg_shared_export_file) || { print_error "无法创建导出文件"; pause; return 1; }
     if jq '{
         export_version: 2,
         export_date: (now | todate),
@@ -121,11 +152,37 @@ wg_deb_export_peers() {
         echo ""
         print_warn "该文件包含私钥等敏感信息，请妥善保管！"
         echo "可使用 [导入设备配置] 在其他服务器恢复。"
+        log_action "WireGuard(deb) peers exported: count=$peer_count file=$export_file"
     else
         print_error "导出失败"
+        rm -f "$export_file" 2>/dev/null || true
+        pause; return 1
     fi
-    log_action "WireGuard(deb) peers exported: count=$peer_count file=$export_file"
     pause
+}
+
+_wg_deb_import_snapshot_clients() {
+    local backup_dir="$1"
+    mkdir -p "$(dirname "$backup_dir")" || return 1
+    rm -rf "$backup_dir" 2>/dev/null || true
+    if [[ -d "$WG_DEB_CLIENT_DIR" ]]; then
+        cp -a "$WG_DEB_CLIENT_DIR" "$backup_dir" || return 1
+    else
+        mkdir -p "$backup_dir" || return 1
+    fi
+}
+
+_wg_deb_import_restore_snapshot() {
+    local db_snapshot="${1:-}" client_backup="${2:-}"
+    [[ -n "$db_snapshot" ]] && wg_write_private_file "$WG_DEB_DB_FILE" "$db_snapshot" >/dev/null 2>&1 || true
+    if [[ -n "$client_backup" && -d "$client_backup" ]]; then
+        rm -rf "$WG_DEB_CLIENT_DIR" 2>/dev/null || true
+        mkdir -p "$(dirname "$WG_DEB_CLIENT_DIR")" 2>/dev/null || true
+        cp -a "$client_backup" "$WG_DEB_CLIENT_DIR" 2>/dev/null || true
+    fi
+    wg_deb_rebuild_conf >/dev/null 2>&1 || true
+    wg_deb_regenerate_client_confs >/dev/null 2>&1 || true
+    wg_deb_is_running && wg_deb_apply_conf >/dev/null 2>&1 || true
 }
 
 wg_deb_import_peers() {
@@ -135,17 +192,17 @@ wg_deb_import_peers() {
     [[ -z "$import_file" ]] && return
     if [[ ! -f "$import_file" ]]; then
         print_error "文件不存在: $import_file"
-        pause; return
+        pause; return 1
     fi
     if ! jq empty "$import_file" 2>/dev/null; then
         print_error "文件不是有效的 JSON 格式"
-        pause; return
+        pause; return 1
     fi
     local import_count
     import_count=$(jq '.peers | length' "$import_file" 2>/dev/null)
     if [[ -z "$import_count" || "$import_count" -eq 0 ]]; then
         print_warn "文件中无设备数据"
-        pause; return
+        pause; return 1
     fi
     echo -e "发现 ${C_CYAN}${import_count}${C_RESET} 个设备:"
     jq -r '.peers[] | "  - \(.name) (\(.ip))"' "$import_file" 2>/dev/null
@@ -157,7 +214,18 @@ wg_deb_import_peers() {
 "
     read -e -r -p "选择: " mode
     [[ "$mode" == "0" || -z "$mode" ]] && return
-    [[ "$mode" != "1" && "$mode" != "2" ]] && { print_error "无效选项"; pause; return; }
+    [[ "$mode" != "1" && "$mode" != "2" ]] && { print_error "无效选项"; pause; return 1; }
+
+    local db_snapshot client_backup
+    db_snapshot=$(_wg_deb_snapshot_db) || { print_error "读取 WireGuard 数据库快照失败"; pause; return 1; }
+    client_backup=$(mktemp -d "${TMPDIR:-/tmp}/${SCRIPT_NAME}-wg-deb-import-clients.XXXXXX") || {
+        print_error "创建客户端配置快照目录失败"; pause; return 1;
+    }
+    chmod 700 "$client_backup" 2>/dev/null || true
+    if ! _wg_deb_import_snapshot_clients "$client_backup/clients"; then
+        rm -rf "$client_backup" 2>/dev/null || true
+        print_error "备份客户端配置失败"; pause; return 1
+    fi
 
     local existing_count
     existing_count=$(wg_deb_db_get '.peers | length')
@@ -169,8 +237,16 @@ wg_deb_import_peers() {
         read -e -r -p "选择 [1]: " merge_mode
         merge_mode=${merge_mode:-1}
         if [[ "$merge_mode" == "2" ]]; then
-            confirm "确认删除所有现有设备?" || return
-            wg_deb_db_set '.peers = []'
+            if ! confirm "确认删除所有现有设备?"; then
+                rm -rf "$client_backup" 2>/dev/null || true
+                return
+            fi
+            if ! wg_deb_db_set '.peers = []'; then
+                _wg_deb_import_restore_snapshot "$db_snapshot" "$client_backup/clients"
+                rm -rf "$client_backup" 2>/dev/null || true
+                print_error "清空现有设备失败，已恢复原配置"
+                pause; return 1
+            fi
             rm -f "${WG_DEB_CLIENT_DIR}"/*.conf 2>/dev/null
         fi
     fi
@@ -284,16 +360,24 @@ wg_deb_import_peers() {
                 peer_type: $ptype,
                 route_mode: $route_mode
             }]'; then
-            print_error "跳过: $name (数据库写入失败)"
-            skipped=$((skipped + 1)); i=$((i + 1)); continue
+            _wg_deb_import_restore_snapshot "$db_snapshot" "$client_backup/clients"
+            rm -rf "$client_backup" 2>/dev/null || true
+            print_error "导入 $name 时数据库写入失败，已恢复原配置"
+            pause; return 1
         fi
         imported=$((imported + 1))
         i=$((i + 1))
     done
 
     if [[ $imported -gt 0 ]]; then
-        wg_deb_apply_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
+        if ! wg_deb_apply_conf; then
+            _wg_deb_import_restore_snapshot "$db_snapshot" "$client_backup/clients"
+            rm -rf "$client_backup" 2>/dev/null || true
+            print_error "WireGuard 运行配置热应用失败，已恢复原配置"
+            pause; return 1
+        fi
     fi
+    rm -rf "$client_backup" 2>/dev/null || true
     echo ""
     print_success "导入完成: 成功 ${imported}, 跳过 ${skipped}"
     [[ "$mode" == "2" ]] && print_warn "已重新生成密钥，请重新下发所有客户端配置。"

@@ -1,4 +1,24 @@
 # modules/11d-wireguard-peers.sh - WireGuard peer management (OpenWrt)
+_wg_openwrt_snapshot_db() {
+    [[ -f "$WG_DB_FILE" ]] || return 1
+    cat "$WG_DB_FILE"
+}
+
+_wg_openwrt_restore_peer_snapshot() {
+    local snapshot="${1:-}" cleanup_file="${2:-}" rebuild_bypass="${3:-false}"
+    [[ -n "$snapshot" ]] || return 1
+    wg_write_private_file "$WG_DB_FILE" "$snapshot" || return 1
+    wg_rebuild_uci_conf "no_reload" >/dev/null 2>&1 || true
+    wg_apply_runtime_conf >/dev/null 2>&1 || true
+    wg_regenerate_client_confs >/dev/null 2>&1 || true
+    if [[ -n "$cleanup_file" ]]; then
+        rm -f -- "$cleanup_file" 2>/dev/null || true
+    fi
+    if [[ "$rebuild_bypass" == "true" ]]; then
+        wg_mihomo_bypass_rebuild >/dev/null 2>&1 || true
+    fi
+}
+
 wg_add_peer() {
     wg_check_server || return 1
     print_title "添加 WireGuard 设备 (Peer)"
@@ -16,9 +36,9 @@ wg_add_peer() {
     peer_ip=$(wg_next_ip) || { pause; return 1; }
     echo -e "  分配 IP: ${C_GREEN}${peer_ip}${C_RESET}"
     local peer_privkey peer_pubkey psk
-    peer_privkey=$(wg genkey)
-    peer_pubkey=$(echo "$peer_privkey" | wg pubkey)
-    psk=$(wg genpsk)
+    peer_privkey=$(wg genkey) || { print_error "生成 peer 私钥失败"; pause; return 1; }
+    peer_pubkey=$(printf '%s\n' "$peer_privkey" | wg pubkey) || { print_error "生成 peer 公钥失败"; pause; return 1; }
+    psk=$(wg genpsk) || { print_error "生成预共享密钥失败"; pause; return 1; }
 
     # ── 设备类型选择 (三种) ──
     local peer_type="standard"
@@ -149,44 +169,23 @@ wg_add_peer() {
         esac
     fi
 
-    # ── 生成客户端配置文件 ──
-    local spub sep sport sdns mask
-    spub=$(wg_db_get '.server.public_key')
-    sep=$(wg_db_get '.server.endpoint')
-    sport=$(wg_db_get '.server.port')
-    sdns=$(wg_db_get '.server.dns')
-    mask=$(echo "$server_subnet" | cut -d'/' -f2)
-    local dns_line=""
-    [[ "$is_gateway" != "true" ]] && dns_line="DNS = ${sdns}"
-    local client_conf="[Interface]
-PrivateKey = ${peer_privkey}
-Address = ${peer_ip}/${mask}
-${dns_line}
-[Peer]
-PublicKey = ${spub}
-PresharedKey = ${psk}
-Endpoint = ${sep}:${sport}
-AllowedIPs = ${client_allowed_ips}
-PersistentKeepalive = 25"
-    client_conf=$(echo "$client_conf" | sed '/^$/N;/^\n$/d')
-    mkdir -p /etc/wireguard/clients
     local conf_file="/etc/wireguard/clients/${peer_name}.conf"
-    write_file_atomic "$conf_file" "$client_conf"
-    chmod 600 "$conf_file"
+    local db_snapshot
+    db_snapshot=$(_wg_openwrt_snapshot_db) || { print_error "读取 WireGuard 数据库快照失败"; pause; return 1; }
 
     # ── 写入数据库 ──
     local now; now=$(date '+%Y-%m-%d %H:%M:%S')
-    wg_db_set --arg name "$peer_name" \
-              --arg ip "$peer_ip" \
-              --arg privkey "$peer_privkey" \
-              --arg pubkey "$peer_pubkey" \
-              --arg psk "$psk" \
-              --arg allowed "$client_allowed_ips" \
-              --arg created "$now" \
-              --arg gw "$is_gateway" \
-              --arg lans "$lan_subnets" \
-              --arg ptype "$peer_type" \
-              --arg route_mode "$route_mode" \
+    if ! wg_db_set --arg name "$peer_name" \
+                   --arg ip "$peer_ip" \
+                   --arg privkey "$peer_privkey" \
+                   --arg pubkey "$peer_pubkey" \
+                   --arg psk "$psk" \
+                   --arg allowed "$client_allowed_ips" \
+                   --arg created "$now" \
+                   --arg gw "$is_gateway" \
+                   --arg lans "$lan_subnets" \
+                   --arg ptype "$peer_type" \
+                   --arg route_mode "$route_mode" \
     '.peers += [{
         name: $name,
         ip: $ip,
@@ -200,21 +199,44 @@ PersistentKeepalive = 25"
         lan_subnets: $lans,
         peer_type: $ptype,
         route_mode: $route_mode
-    }]'
+    }]'; then
+        print_error "数据库写入失败，设备未添加"
+        pause; return 1
+    fi
 
     # ── 网关设备: 联动更新其他 peer 的 allowed_ips ──
     if [[ "$is_gateway" == "true" && -n "$lan_subnets" ]]; then
-        _wg_update_peer_routes
+        if ! _wg_update_peer_routes; then
+            print_error "联动更新客户端路由失败，正在回滚"
+            _wg_openwrt_restore_peer_snapshot "$db_snapshot" "$conf_file" true
+            pause; return 1
+        fi
     fi
 
     # ── 重建配置并应用 ──
-    wg_rebuild_uci_conf "no_reload"
-    wg_apply_runtime_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
-    wg_regenerate_client_confs
+    if ! wg_rebuild_uci_conf "no_reload"; then
+        print_error "重建 OpenWrt WireGuard UCI 配置失败，正在回滚"
+        _wg_openwrt_restore_peer_snapshot "$db_snapshot" "$conf_file" "$is_gateway"
+        pause; return 1
+    fi
+    if ! wg_apply_runtime_conf; then
+        print_error "WireGuard 运行配置热应用失败，正在回滚"
+        _wg_openwrt_restore_peer_snapshot "$db_snapshot" "$conf_file" "$is_gateway"
+        pause; return 1
+    fi
+    if ! wg_regenerate_client_confs; then
+        print_error "重生成客户端配置失败，正在回滚"
+        _wg_openwrt_restore_peer_snapshot "$db_snapshot" "$conf_file" "$is_gateway"
+        pause; return 1
+    fi
 
     # 网关 peer 添加/删除会改变 LAN 子网列表，需重建 Mihomo bypass
     if [[ "$is_gateway" == "true" ]]; then
-        wg_mihomo_bypass_rebuild 2>/dev/null
+        if ! wg_mihomo_bypass_rebuild; then
+            print_error "重建 Mihomo bypass/端口规则失败，正在回滚"
+            _wg_openwrt_restore_peer_snapshot "$db_snapshot" "$conf_file" true
+            pause; return 1
+        fi
     fi
 
     # ── 结果展示 ──
@@ -292,22 +314,23 @@ _wg_update_peer_routes() {
             local _new="$server_subnet"
             [[ -n "$server_lan" && "$server_lan" != "null" ]] && _new="${_new}, ${server_lan}"
             [[ -n "$_other" ]] && _new="${_new}, ${_other}"
-            wg_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a'
+            wg_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a' || return 1
         elif [[ "$_ptype" == "clash" ]]; then
             # Clash: VPN 子网 + 服务端 LAN + 所有网关 LAN
             local _new="$server_subnet"
             [[ -n "$server_lan" && "$server_lan" != "null" ]] && _new="${_new}, ${server_lan}"
             [[ -n "$_all_lans" ]] && _new="${_new}, ${_all_lans}"
-            wg_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a'
+            wg_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a' || return 1
         else
             # 标准: VPN 子网 + 服务端 LAN + 所有网关 LAN
             local _new="$server_subnet"
             [[ -n "$server_lan" && "$server_lan" != "null" ]] && _new="${_new}, ${server_lan}"
             [[ -n "$_all_lans" ]] && _new="${_new}, ${_all_lans}"
-            wg_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a'
+            wg_db_set --argjson idx "$_pi" --arg a "$_new" '.peers[$idx].client_allowed_ips = $a' || return 1
         fi
         _pi=$((_pi + 1))
     done
+    return 0
 }
 
 wg_toggle_peer() {
@@ -315,26 +338,46 @@ wg_toggle_peer() {
     print_title "启用/禁用 WireGuard 设备"
     wg_select_peer "选择要切换状态的设备序号" true || return
     local target_idx=$REPLY
-    local target_name target_pubkey current_state
+    local target_name current_state
     target_name=$(wg_db_get ".peers[$target_idx].name")
-    target_pubkey=$(wg_db_get ".peers[$target_idx].public_key")
     current_state=$(wg_db_get ".peers[$target_idx].enabled")
+    local db_snapshot
+    db_snapshot=$(_wg_openwrt_snapshot_db) || { print_error "读取 WireGuard 数据库快照失败"; pause; return 1; }
     if [[ "$current_state" == "true" ]]; then
         if confirm "确认禁用设备 '${target_name}'？"; then
-            wg_db_set --argjson idx "$target_idx" '.peers[$idx].enabled = false'
-            if wg_is_running; then
-                wg set "$WG_INTERFACE" peer "$target_pubkey" remove 2>/dev/null || true
+            if ! wg_db_set --argjson idx "$target_idx" '.peers[$idx].enabled = false'; then
+                print_error "数据库写入失败，设备状态未修改"
+                pause; return 1
             fi
-            wg_rebuild_uci_conf "no_reload"
-            wg_apply_runtime_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
+            if ! wg_rebuild_uci_conf "no_reload"; then
+                print_error "重建 OpenWrt WireGuard UCI 配置失败，正在回滚"
+                _wg_openwrt_restore_peer_snapshot "$db_snapshot"
+                pause; return 1
+            fi
+            if ! wg_apply_runtime_conf; then
+                print_error "WireGuard 运行配置热应用失败，正在回滚"
+                _wg_openwrt_restore_peer_snapshot "$db_snapshot"
+                pause; return 1
+            fi
             print_success "设备 '${target_name}' 已禁用"
             log_action "WireGuard peer disabled: ${target_name}"
         fi
     else
         if confirm "确认启用设备 '${target_name}'？"; then
-            wg_db_set --argjson idx "$target_idx" '.peers[$idx].enabled = true'
-            wg_rebuild_uci_conf "no_reload"
-            wg_apply_runtime_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
+            if ! wg_db_set --argjson idx "$target_idx" '.peers[$idx].enabled = true'; then
+                print_error "数据库写入失败，设备状态未修改"
+                pause; return 1
+            fi
+            if ! wg_rebuild_uci_conf "no_reload"; then
+                print_error "重建 OpenWrt WireGuard UCI 配置失败，正在回滚"
+                _wg_openwrt_restore_peer_snapshot "$db_snapshot"
+                pause; return 1
+            fi
+            if ! wg_apply_runtime_conf; then
+                print_error "WireGuard 运行配置热应用失败，正在回滚"
+                _wg_openwrt_restore_peer_snapshot "$db_snapshot"
+                pause; return 1
+            fi
             print_success "设备 '${target_name}' 已启用"
             log_action "WireGuard peer enabled: ${target_name}"
         fi
@@ -347,32 +390,54 @@ wg_delete_peer() {
     print_title "删除 WireGuard 设备"
     wg_select_peer "选择要删除的设备序号" true || return
     local target_idx=$REPLY
-    local target_name target_pubkey
+    local target_name
     target_name=$(wg_db_get ".peers[$target_idx].name")
-    target_pubkey=$(wg_db_get ".peers[$target_idx].public_key")
     if ! confirm "确认删除设备 '${target_name}'？"; then
         return
     fi
-    if wg_is_running; then
-        wg set "$WG_INTERFACE" peer "$target_pubkey" remove 2>/dev/null || true
-    fi
     local _del_gw=$(wg_db_get ".peers[$target_idx].is_gateway // false")
     local _del_lans=$(wg_db_get ".peers[$target_idx].lan_subnets // empty")
-    wg_db_set --argjson idx "$target_idx" 'del(.peers[$idx])'
+    local conf_file="/etc/wireguard/clients/${target_name}.conf"
+    local db_snapshot
+    db_snapshot=$(_wg_openwrt_snapshot_db) || { print_error "读取 WireGuard 数据库快照失败"; pause; return 1; }
+    if ! wg_db_set --argjson idx "$target_idx" 'del(.peers[$idx])'; then
+        print_error "数据库写入失败，设备未删除"
+        pause; return 1
+    fi
 
     # 网关删除后联动更新其他 peer
     if [[ "$_del_gw" == "true" && -n "$_del_lans" && "$_del_lans" != "null" ]]; then
-        _wg_update_peer_routes
+        if ! _wg_update_peer_routes; then
+            print_error "联动更新客户端路由失败，正在回滚"
+            _wg_openwrt_restore_peer_snapshot "$db_snapshot" "" true
+            pause; return 1
+        fi
     fi
 
-    rm -f "/etc/wireguard/clients/${target_name}.conf"
-    wg_rebuild_uci_conf "no_reload"
-    wg_apply_runtime_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
-    wg_regenerate_client_confs
+    if ! wg_rebuild_uci_conf "no_reload"; then
+        print_error "重建 OpenWrt WireGuard UCI 配置失败，正在回滚"
+        _wg_openwrt_restore_peer_snapshot "$db_snapshot" "" "$_del_gw"
+        pause; return 1
+    fi
+    if ! wg_apply_runtime_conf; then
+        print_error "WireGuard 运行配置热应用失败，正在回滚"
+        _wg_openwrt_restore_peer_snapshot "$db_snapshot" "" "$_del_gw"
+        pause; return 1
+    fi
+    rm -f -- "$conf_file" 2>/dev/null || print_warn "删除客户端配置文件失败: $conf_file"
+    if ! wg_regenerate_client_confs; then
+        print_error "重生成客户端配置失败，正在回滚"
+        _wg_openwrt_restore_peer_snapshot "$db_snapshot" "" "$_del_gw"
+        pause; return 1
+    fi
 
     # 网关 peer 删除后 LAN 子网列表变化，需重建 Mihomo bypass
     if [[ "$_del_gw" == "true" ]]; then
-        wg_mihomo_bypass_rebuild 2>/dev/null
+        if ! wg_mihomo_bypass_rebuild; then
+            print_error "重建 Mihomo bypass/端口规则失败，正在回滚"
+            _wg_openwrt_restore_peer_snapshot "$db_snapshot" "" true
+            pause; return 1
+        fi
     fi
 
     print_success "设备 '${target_name}' 已删除"
@@ -455,13 +520,14 @@ _wg_show_openwrt_deploy() {
     sport=$(wg_db_get '.server.port')
     ssub=$(wg_db_get '.server.subnet')
     mask=$(echo "$ssub" | cut -d'/' -f2)
-    local ep_host="$sep"
+    local ep_host
+    ep_host=$(wg_shared_endpoint_host "$sep")
 
     local uci_allowed_lines=""
     local IFS_BAK="$IFS"; IFS=','
     for cidr in $client_allowed_ips; do
         cidr=$(echo "$cidr" | xargs)
-        [[ -n "$cidr" ]] && uci_allowed_lines="${uci_allowed_lines}uci add_list network.wg_server.allowed_ips='${cidr}'
+        [[ -n "$cidr" ]] && uci_allowed_lines="${uci_allowed_lines}uci add_list network.wg_server.allowed_ips='${cidr}' || return 1
 "
     done
     IFS="$IFS_BAK"
@@ -473,16 +539,84 @@ _wg_show_openwrt_deploy() {
     cat << OPENWRT_EOF
 
 # === 清理旧配置 ===
+die() { echo "[!] \$*" >&2; exit 1; }
+WG_UCI_SNAPSHOT_DIR=""
+restore_uci_snapshots() {
+    [ -n "\$WG_UCI_SNAPSHOT_DIR" ] || return 0
+    if [ -s "\$WG_UCI_SNAPSHOT_DIR/network.uci" ]; then
+        uci revert network >/dev/null 2>&1 || true
+        uci import network < "\$WG_UCI_SNAPSHOT_DIR/network.uci" >/dev/null 2>&1 || true
+        uci commit network >/dev/null 2>&1 || true
+    fi
+    if [ -s "\$WG_UCI_SNAPSHOT_DIR/firewall.uci" ]; then
+        uci revert firewall >/dev/null 2>&1 || true
+        uci import firewall < "\$WG_UCI_SNAPSHOT_DIR/firewall.uci" >/dev/null 2>&1 || true
+        uci commit firewall >/dev/null 2>&1 || true
+    fi
+}
+cleanup_uci_snapshots() {
+    [ -n "\$WG_UCI_SNAPSHOT_DIR" ] && rm -rf "\$WG_UCI_SNAPSHOT_DIR" 2>/dev/null; true
+}
+die_restore() {
+    msg="\$1"
+    restore_uci_snapshots
+    cleanup_uci_snapshots
+    die "\$msg"
+}
+WG_UCI_SNAPSHOT_DIR="\$(mktemp -d /tmp/server-manage-wg-deploy-uci.XXXXXX 2>/dev/null)" || die "创建 UCI 回滚快照目录失败"
+chmod 700 "\$WG_UCI_SNAPSHOT_DIR" 2>/dev/null || true
+uci export network > "\$WG_UCI_SNAPSHOT_DIR/network.uci" 2>/dev/null || die_restore "备份 network UCI 失败"
+uci export firewall > "\$WG_UCI_SNAPSHOT_DIR/firewall.uci" 2>/dev/null || die_restore "备份 firewall UCI 失败"
+list_wg_ifaces() {
+    ip link show type wireguard 2>/dev/null | awk '
+        /^[0-9]+:/ {
+            name=\$0
+            sub(/^[0-9]+:[[:space:]]*/, "", name)
+            sub(/:.*/, "", name)
+            sub(/@.*/, "", name)
+            current=name
+            next
+        }
+        /link\\/none/ && current != "" {
+            print current
+            current=""
+        }
+    '
+}
+wg_resolve_real() {
+    WG_RESOLVE_HOST="\$1"
+    WG_RESOLVE_DNS="\$2"
+    nslookup "\$WG_RESOLVE_HOST" "\$WG_RESOLVE_DNS" 2>/dev/null | awk '
+        /^Name:/ { seen_name=1; next }
+        seen_name && /^Address[[:space:]][0-9]+:/ {
+            ip=\$3
+            if (ip !~ /^(198\\.18\\.|198\\.19\\.)/) { print ip; exit }
+            next
+        }
+        seen_name && /^Address:/ {
+            ip=\$2
+            sub(/#.*/, "", ip)
+            if (ip !~ /^(198\\.18\\.|198\\.19\\.)/) { print ip; exit }
+            next
+        }
+    '
+}
 ifdown wg0 2>/dev/null; true
-for iface in \$(ip -o link show type wireguard 2>/dev/null | awk -F': ' '{print \$2}'); do
+for iface in \$(list_wg_ifaces); do
     ip link set "\$iface" down 2>/dev/null; true
     ip link delete "\$iface" 2>/dev/null; true
 done
 for iface in wg0 wg_mesh wg-mesh; do
     ip link show "\$iface" >/dev/null 2>&1 && { ip link set "\$iface" down; ip link delete "\$iface"; } 2>/dev/null; true
 done
-rm -f /usr/bin/wg-watchdog.sh 2>/dev/null; true
-(crontab -l 2>/dev/null | grep -v wg-watchdog) | crontab - 2>/dev/null; true
+rm -f /usr/bin/wg-watchdog.sh /var/run/server-manage/wg-watchdog.log /var/run/server-manage/.wg-watchdog-log.* /tmp/wg-watchdog.log /tmp/wg-watchdog.log.tmp 2>/dev/null; true
+WG_CRON_TMP="\$(mktemp /tmp/.wg-watchdog-cron.XXXXXX 2>/dev/null)" && {
+    crontab -l 2>/dev/null | awk '\$6 != "/usr/bin/wg-watchdog.sh"' > "\$WG_CRON_TMP"
+    mkdir -p /etc/crontabs 2>/dev/null
+    cp "\$WG_CRON_TMP" /etc/crontabs/root 2>/dev/null
+    chmod 600 /etc/crontabs/root 2>/dev/null
+    rm -f "\$WG_CRON_TMP"
+}; true
 /etc/init.d/wg-client disable 2>/dev/null; true
 rm -f /etc/init.d/wg-client 2>/dev/null; true
 while uci -q get network.@wireguard_wg0[0] >/dev/null 2>&1; do uci delete network.@wireguard_wg0[0]; done
@@ -500,9 +634,40 @@ done
 for h in \$(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | awk '{print \$NF}'); do
     nft delete rule inet fw4 mangle_prerouting handle "\$h" 2>/dev/null; true
 done
-sed -i '/wg_bypass/d; /WireGuard bypass/d; /ip rule.*prio 100/d' /etc/rc.local 2>/dev/null; true
-uci commit network 2>/dev/null; true
-uci commit firewall 2>/dev/null; true
+wg_rc_local_cleanup_managed() {
+    WG_RC_KIND="\${1:-all}"
+    [ -f /etc/rc.local ] || return 0
+    WG_RC_CLEAN_TMP="\$(mktemp /etc/.rc.local.clean.XXXXXX 2>/dev/null)" || { echo '[!] 创建 rc.local 清理临时文件失败' >&2; return 1; }
+    if awk -v kind="\$WG_RC_KIND" '
+        function marker_matches(line) {
+            if (kind == "all") return 1
+            return index(line, " " kind) > 0
+        }
+        /^# BEGIN server-manage wireguard / {
+            if (marker_matches(\$0)) { skip=1; next }
+        }
+        /^# END server-manage wireguard / {
+            if (skip) { skip=0; next }
+        }
+        skip { next }
+        kind != "allow-port" && /^# WireGuard bypass Mihomo/ { next }
+        kind != "allow-port" && /# wg_bypass[[:space:]]*$/ { next }
+        kind != "allow-port" && /# wg_peer_route[[:space:]]*$/ { next }
+        kind != "allow-port" && /# wg_ep_resolve[[:space:]]*$/ { next }
+        kind != "bypass" && /# wg_allow_port[[:space:]]*$/ { next }
+        kind != "bypass" && /nft insert rule inet fw4 input_wan udp dport .*comment .*wg_allow_port/ { next }
+        { print }
+    ' /etc/rc.local > "\$WG_RC_CLEAN_TMP"; then
+        chmod +x "\$WG_RC_CLEAN_TMP" 2>/dev/null && mv "\$WG_RC_CLEAN_TMP" /etc/rc.local || { rm -f "\$WG_RC_CLEAN_TMP"; return 1; }
+        rm -f "\$WG_RC_CLEAN_TMP"
+        return 0
+    fi
+    rm -f "\$WG_RC_CLEAN_TMP"
+    return 1
+}
+wg_rc_local_cleanup_managed all || die_restore "清理 /etc/rc.local 旧 WireGuard 片段失败"
+uci commit network >/dev/null 2>&1 || die_restore "提交清理后的 network 配置失败"
+uci commit firewall >/dev/null 2>&1 || die_restore "提交清理后的 firewall 配置失败"
 
 # === 安装 WireGuard 组件 ===
 WG_KERNEL=0
@@ -517,140 +682,252 @@ opkg install wireguard-tools 2>/dev/null || echo '[!] wireguard-tools 安装失�
 opkg install luci-proto-wireguard 2>/dev/null || echo '[!] luci-proto-wireguard 安装失败'
 /etc/init.d/rpcd restart 2>/dev/null; true
 sleep 1
+wg_proto_registered() {
+    ubus call network get_proto_handlers 2>/dev/null | grep -q '"wireguard"'
+}
+wg_ensure_wireguard_proto() {
+    wg_proto_registered && return 0
+    echo '[*] 重启 network/netifd 以加载 WireGuard 协议处理器...'
+    /etc/init.d/network restart >/dev/null 2>&1 || return 1
+    sleep 5
+    wg_proto_registered
+}
+wg_ensure_wireguard_proto || die_restore "netifd 未注册 wireguard 协议"
 
 # === 配置 WireGuard 接口 ===
-uci set network.wg0=interface
-uci set network.wg0.proto='wireguard'
-uci set network.wg0.private_key='${peer_privkey}'
-uci delete network.wg0.addresses 2>/dev/null; true
-uci add_list network.wg0.addresses='${peer_ip}/${mask}'
-uci set network.wg0.mtu='1420'
-uci set network.wg_server=wireguard_wg0
-uci set network.wg_server.public_key='${spub}'
-uci set network.wg_server.preshared_key='${psk}'
-uci set network.wg_server.endpoint_host='${ep_host}'
-uci set network.wg_server.endpoint_port='${sport}'
-uci set network.wg_server.persistent_keepalive='25'
-uci set network.wg_server.route_allowed_ips='1'
+write_wg_uci() {
+    uci set network.wg0=interface || return 1
+    uci set network.wg0.proto='wireguard' || return 1
+    uci set network.wg0.private_key='${peer_privkey}' || return 1
+    uci delete network.wg0.addresses 2>/dev/null; true
+    uci add_list network.wg0.addresses='${peer_ip}/${mask}' || return 1
+    uci set network.wg0.mtu='1420' || return 1
+    uci set network.wg_server=wireguard_wg0 || return 1
+    uci set network.wg_server.public_key='${spub}' || return 1
+    uci set network.wg_server.preshared_key='${psk}' || return 1
+    uci set network.wg_server.endpoint_host='${ep_host}' || return 1
+    uci set network.wg_server.endpoint_port='${sport}' || return 1
+    uci set network.wg_server.persistent_keepalive='25' || return 1
+    uci set network.wg_server.route_allowed_ips='1' || return 1
 ${uci_allowed_lines}
-# === 配置防火墙 ===
-uci set firewall.wg_zone=zone
-uci set firewall.wg_zone.name='wg'
-uci set firewall.wg_zone.input='ACCEPT'
-uci set firewall.wg_zone.output='ACCEPT'
-uci set firewall.wg_zone.forward='ACCEPT'
-uci set firewall.wg_zone.masq='1'
-uci add_list firewall.wg_zone.network='wg0'
-uci set firewall.wg_fwd_lan=forwarding
-uci set firewall.wg_fwd_lan.src='lan'
-uci set firewall.wg_fwd_lan.dest='wg'
-uci set firewall.wg_fwd_wg=forwarding
-uci set firewall.wg_fwd_wg.src='wg'
-uci set firewall.wg_fwd_wg.dest='lan'
-uci commit network
-uci commit firewall
+    # === 配置防火墙 ===
+    uci set firewall.wg_zone=zone || return 1
+    uci set firewall.wg_zone.name='wg' || return 1
+    uci set firewall.wg_zone.input='ACCEPT' || return 1
+    uci set firewall.wg_zone.output='ACCEPT' || return 1
+    uci set firewall.wg_zone.forward='ACCEPT' || return 1
+    uci set firewall.wg_zone.masq='1' || return 1
+    uci add_list firewall.wg_zone.network='wg0' || return 1
+    uci set firewall.wg_fwd_lan=forwarding || return 1
+    uci set firewall.wg_fwd_lan.src='lan' || return 1
+    uci set firewall.wg_fwd_lan.dest='wg' || return 1
+    uci set firewall.wg_fwd_wg=forwarding || return 1
+    uci set firewall.wg_fwd_wg.src='wg' || return 1
+    uci set firewall.wg_fwd_wg.dest='lan' || return 1
+    uci commit network || return 1
+    uci commit firewall || return 1
+}
+write_wg_uci || die_restore "写入 WireGuard UCI 配置失败"
+ubus call network reload >/dev/null 2>&1 || true
+sleep 1
 
 # === Mihomo/OpenClash bypass: WG endpoint 流量直连 ===
 # 关键: 使用外部 DNS 直连解析, 绕过 OpenClash fake-ip 劫持
 EP_IP='${ep_host}'
+case "\${EP_IP}" in
+    *:*) ;;
+    *)
 if ! echo "\${EP_IP}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\$'; then
     # 依次尝试多个外部 DNS 直连解析 (绕过本地 Clash/Mihomo fake-ip)
     for DNS_SRV in 223.5.5.5 119.29.29.29 8.8.8.8; do
-        EP_IP=\$(nslookup '${ep_host}' \$DNS_SRV 2>/dev/null | awk '/^Address:/{a=\$2} END{if(a) print a}')
-        # 验证不是 fake-ip (198.18.0.0/15)
+        EP_IP=\$(wg_resolve_real '${ep_host}' "\$DNS_SRV")
         if [ -n "\$EP_IP" ]; then
-            case "\$EP_IP" in 198.18.*|198.19.*) EP_IP=""; continue ;; esac
             echo "[+] endpoint 解析: ${ep_host} -> \$EP_IP (via \$DNS_SRV)"
             break
         fi
     done
 fi
+        ;;
+esac
 if [ -z "\${EP_IP}" ]; then
     echo '[!] 警告: 无法解析 endpoint 真实 IP, bypass 规则可能无效!'
 fi
 if [ -n "\${EP_IP}" ]; then
-    ip rule del to "\${EP_IP}" lookup main prio 100 2>/dev/null; true
-    ip rule add to "\${EP_IP}" lookup main prio 100
-    nft list chain inet fw4 mangle_prerouting &>/dev/null && {
-        nft insert rule inet fw4 mangle_prerouting ip daddr "\${EP_IP}" udp dport ${sport} counter return comment \"wg_bypass\" 2>/dev/null; true
+    case "\${EP_IP}" in
+        *:*)
+            NFT_FAMILY="ip6"
+            ip -6 rule del to "\${EP_IP}" lookup main prio 100 2>/dev/null; true
+            ip -6 rule add to "\${EP_IP}" lookup main prio 100
+            ;;
+        *)
+            NFT_FAMILY="ip"
+            ip rule del to "\${EP_IP}" lookup main prio 100 2>/dev/null; true
+            ip rule add to "\${EP_IP}" lookup main prio 100
+            ;;
+    esac
+    nft list chain inet fw4 mangle_prerouting >/dev/null 2>&1 && {
+        nft insert rule inet fw4 mangle_prerouting "\${NFT_FAMILY}" daddr "\${EP_IP}" udp dport ${sport} counter return comment \"wg_bypass\" 2>/dev/null; true
         nft insert rule inet fw4 mangle_prerouting iifname \"wg0\" counter return comment \"wg_bypass_iface\" 2>/dev/null; true
     }
     echo "[+] Mihomo bypass 规则已添加: \${EP_IP}"
 fi
 
 # 持久化: rc.local 中使用外部 DNS 动态解析 (每次开机重新解析)
-sed -i '/wg_bypass/d; /WireGuard bypass/d; /wg_ep_resolve/d; /ip rule.*prio 100/d' /etc/rc.local 2>/dev/null; true
-WG_RC_BLOCK="/tmp/wg-rc-block.\$\$"
-WG_RC_TMP="\$(mktemp /tmp/rc.local.XXXXXX 2>/dev/null || echo /tmp/rc.local.\$\$)"
-cat > "\$WG_RC_BLOCK" << 'WG_RC_EOF'
+wg_rc_local_cleanup_managed bypass || die_restore "清理 rc.local 旧 bypass 片段失败"
+WG_RC_BLOCK="\$(mktemp /etc/.wg-rc-block.XXXXXX 2>/dev/null)" || die_restore "创建 rc.local 片段临时文件失败"
+WG_RC_TMP="\$(mktemp /etc/.rc.local.XXXXXX 2>/dev/null)" || { rm -f "\$WG_RC_BLOCK"; die_restore "创建 rc.local 临时文件失败"; }
+if ! cat > "\$WG_RC_BLOCK" << 'WG_RC_EOF'
+# BEGIN server-manage wireguard bypass
 # WireGuard bypass Mihomo (dynamic resolve, bypass fake-ip) # wg_bypass
-WG_EP=\$(nslookup '${ep_host}' 223.5.5.5 2>/dev/null | awk '/^Address:/{a=\$2} END{if(a) print a}') # wg_ep_resolve
-[ -n "\$WG_EP" ] && { ip rule add to "\$WG_EP" lookup main prio 100 2>/dev/null; true; } # wg_bypass
-[ -n "\$WG_EP" ] && nft insert rule inet fw4 mangle_prerouting ip daddr "\$WG_EP" udp dport ${sport} counter return comment "wg_bypass" 2>/dev/null; true # wg_bypass
+wg_resolve_real() {
+    WG_RESOLVE_HOST="\$1"
+    WG_RESOLVE_DNS="\$2"
+    nslookup "\$WG_RESOLVE_HOST" "\$WG_RESOLVE_DNS" 2>/dev/null | awk '
+        /^Name:/ { seen_name=1; next }
+        seen_name && /^Address[[:space:]][0-9]+:/ {
+            ip=\$3
+            if (ip !~ /^(198\\.18\\.|198\\.19\\.)/) { print ip; exit }
+            next
+        }
+        seen_name && /^Address:/ {
+            ip=\$2
+            sub(/#.*/, "", ip)
+            if (ip !~ /^(198\\.18\\.|198\\.19\\.)/) { print ip; exit }
+            next
+        }
+    '
+}
+case '${ep_host}' in
+    *:*) WG_EP='${ep_host}' ;;
+    *)
+        WG_EP=""
+        for WG_DNS_SRV in 223.5.5.5 119.29.29.29 8.8.8.8; do
+            WG_EP=\$(wg_resolve_real '${ep_host}' "\$WG_DNS_SRV")
+            [ -n "\$WG_EP" ] && break
+        done
+        ;;
+esac # wg_ep_resolve
+[ -n "\$WG_EP" ] && case "\$WG_EP" in *:*) WG_NFT_FAMILY=ip6; ip -6 rule add to "\$WG_EP" lookup main prio 100 2>/dev/null; true ;; *) WG_NFT_FAMILY=ip; ip rule add to "\$WG_EP" lookup main prio 100 2>/dev/null; true ;; esac # wg_bypass
+[ -n "\$WG_EP" ] && nft insert rule inet fw4 mangle_prerouting "\$WG_NFT_FAMILY" daddr "\$WG_EP" udp dport ${sport} counter return comment "wg_bypass" 2>/dev/null; true # wg_bypass
 nft insert rule inet fw4 mangle_prerouting iifname "wg0" counter return comment "wg_bypass_iface" 2>/dev/null; true # wg_bypass
+# END server-manage wireguard bypass
 WG_RC_EOF
-[ -f /etc/rc.local ] || { printf '#!/bin/sh\nexit 0\n' > /etc/rc.local; chmod +x /etc/rc.local 2>/dev/null; }
-awk '
+then
+    rm -f "\$WG_RC_BLOCK" "\$WG_RC_TMP"
+    die_restore "写入 rc.local 片段失败"
+fi
+if [ ! -f /etc/rc.local ]; then
+    WG_RC_NEW="\$(mktemp /etc/.rc.local.new.XXXXXX 2>/dev/null)" || { rm -f "\$WG_RC_BLOCK" "\$WG_RC_TMP"; die_restore "创建 rc.local 初始化临时文件失败"; }
+    printf '#!/bin/sh\nexit 0\n' > "\$WG_RC_NEW" || { rm -f "\$WG_RC_BLOCK" "\$WG_RC_TMP" "\$WG_RC_NEW"; die_restore "写入 rc.local 初始化文件失败"; }
+    chmod +x "\$WG_RC_NEW" 2>/dev/null && mv "\$WG_RC_NEW" /etc/rc.local || { rm -f "\$WG_RC_BLOCK" "\$WG_RC_TMP" "\$WG_RC_NEW"; die_restore "安装 /etc/rc.local 失败"; }
+fi
+if awk '
     FNR == NR { block = block \$0 ORS; next }
     /^[[:space:]]*exit[[:space:]]+0([[:space:]]*(#.*)?)?\$/ && !inserted { printf "%s", block; inserted=1 }
     { print }
     END { if (!inserted) printf "%s", block }
-' "\$WG_RC_BLOCK" /etc/rc.local > "\$WG_RC_TMP" && cat "\$WG_RC_TMP" > /etc/rc.local
+	' "\$WG_RC_BLOCK" /etc/rc.local > "\$WG_RC_TMP"; then
+    chmod +x "\$WG_RC_TMP" 2>/dev/null && mv "\$WG_RC_TMP" /etc/rc.local || { rm -f "\$WG_RC_BLOCK" "\$WG_RC_TMP"; die_restore "安装 /etc/rc.local 失败"; }
+else
+    rm -f "\$WG_RC_BLOCK" "\$WG_RC_TMP"
+    die_restore "生成 /etc/rc.local 失败"
+fi
 chmod +x /etc/rc.local 2>/dev/null; true
 rm -f "\$WG_RC_BLOCK" "\$WG_RC_TMP"
 
 # === 开机自恢复服务 ===
-cat > /etc/init.d/wg-client << 'INITEOF'
+WG_CLIENT_TMP="\$(mktemp /etc/init.d/.wg-client.XXXXXX 2>/dev/null)" || die_restore "创建 wg-client init 临时文件失败"
+if ! cat > "\$WG_CLIENT_TMP" << 'INITEOF'
 #!/bin/sh /etc/rc.common
 START=99
 USE_PROCD=0
 boot() { start; }
+wg_is_up() {
+    ifstatus wg0 2>/dev/null | grep -q '"up": true'
+}
+wg_proto_registered() {
+    ubus call network get_proto_handlers 2>/dev/null | grep -q '"wireguard"'
+}
+wg_ensure_wireguard_proto() {
+    wg_proto_registered && return 0
+    logger -t wg-client "wireguard proto missing, restarting network"
+    /etc/init.d/network restart >/dev/null 2>&1 || true
+    sleep 5
+    wg_proto_registered
+}
 start() {
     if command -v wg >/dev/null 2>&1 && uci -q get network.wg0.proto >/dev/null 2>&1; then
-        ifup wg0 2>/dev/null; return 0
+        wg_ensure_wireguard_proto || logger -t wg-client "wireguard proto still missing after network restart"
+        ifup wg0 >/dev/null 2>&1 || true
+        sleep 2
+        wg_is_up && return 0
+        logger -t wg-client "WireGuard configured but not up, restoring"
+    else
+        logger -t wg-client "WireGuard missing, restoring..."
     fi
-    logger -t wg-client "WireGuard missing, restoring..."
     for _r in 1 2 3; do opkg update && break; sleep 3; done
     opkg install kmod-wireguard wireguard-tools luci-proto-wireguard 2>/dev/null
     /etc/init.d/rpcd restart 2>/dev/null; sleep 1
-    uci set network.wg0=interface
-    uci set network.wg0.proto='wireguard'
-    uci set network.wg0.private_key='${peer_privkey}'
-    uci set network.wg0.mtu='1420'
-    uci delete network.wg0.addresses 2>/dev/null; true
-    uci add_list network.wg0.addresses='${peer_ip}/${mask}'
-    uci set network.wg_server=wireguard_wg0
-    uci set network.wg_server.public_key='${spub}'
-    uci set network.wg_server.preshared_key='${psk}'
-    uci set network.wg_server.endpoint_host='${ep_host}'
-    uci set network.wg_server.endpoint_port='${sport}'
-    uci set network.wg_server.persistent_keepalive='25'
-    uci set network.wg_server.route_allowed_ips='1'
-    ${uci_allowed_lines}uci set firewall.wg_zone=zone
-    uci set firewall.wg_zone.name='wg'
-    uci set firewall.wg_zone.input='ACCEPT'
-    uci set firewall.wg_zone.output='ACCEPT'
-    uci set firewall.wg_zone.forward='ACCEPT'
-    uci set firewall.wg_zone.masq='1'
-    uci add_list firewall.wg_zone.network='wg0'
-    uci set firewall.wg_fwd_lan=forwarding
-    uci set firewall.wg_fwd_lan.src='lan'
-    uci set firewall.wg_fwd_lan.dest='wg'
-    uci set firewall.wg_fwd_wg=forwarding
-    uci set firewall.wg_fwd_wg.src='wg'
-    uci set firewall.wg_fwd_wg.dest='lan'
-    uci commit network
-    uci commit firewall
-    ifup wg0
+    restore_wg_uci() {
+        uci set network.wg0=interface || return 1
+        uci set network.wg0.proto='wireguard' || return 1
+        uci set network.wg0.private_key='${peer_privkey}' || return 1
+        uci set network.wg0.mtu='1420' || return 1
+        uci delete network.wg0.addresses 2>/dev/null; true
+        uci add_list network.wg0.addresses='${peer_ip}/${mask}' || return 1
+        uci set network.wg_server=wireguard_wg0 || return 1
+        uci set network.wg_server.public_key='${spub}' || return 1
+        uci set network.wg_server.preshared_key='${psk}' || return 1
+        uci set network.wg_server.endpoint_host='${ep_host}' || return 1
+        uci set network.wg_server.endpoint_port='${sport}' || return 1
+        uci set network.wg_server.persistent_keepalive='25' || return 1
+        uci set network.wg_server.route_allowed_ips='1' || return 1
+${uci_allowed_lines}        uci set firewall.wg_zone=zone || return 1
+        uci set firewall.wg_zone.name='wg' || return 1
+        uci set firewall.wg_zone.input='ACCEPT' || return 1
+        uci set firewall.wg_zone.output='ACCEPT' || return 1
+        uci set firewall.wg_zone.forward='ACCEPT' || return 1
+        uci set firewall.wg_zone.masq='1' || return 1
+        uci add_list firewall.wg_zone.network='wg0' || return 1
+        uci set firewall.wg_fwd_lan=forwarding || return 1
+        uci set firewall.wg_fwd_lan.src='lan' || return 1
+        uci set firewall.wg_fwd_lan.dest='wg' || return 1
+        uci set firewall.wg_fwd_wg=forwarding || return 1
+        uci set firewall.wg_fwd_wg.src='wg' || return 1
+        uci set firewall.wg_fwd_wg.dest='lan' || return 1
+        uci commit network || return 1
+        uci commit firewall || return 1
+    }
+    if ! restore_wg_uci; then
+        logger -t wg-client "WireGuard restore failed"
+        return 1
+    fi
+    wg_ensure_wireguard_proto || {
+        logger -t wg-client "wireguard proto missing before ifup"
+        return 1
+    }
+    ubus call network reload >/dev/null 2>&1 || true
+    sleep 1
+    ifup wg0 >/dev/null 2>&1 || true
+    sleep 2
+    if ! wg_is_up; then
+        logger -t wg-client "WireGuard restore failed"
+        return 1
+    fi
     logger -t wg-client "WireGuard restored"
 }
 INITEOF
-chmod 0700 /etc/init.d/wg-client
-/etc/init.d/wg-client enable
+then
+    rm -f "\$WG_CLIENT_TMP"
+    die_restore "写入 wg-client init 失败"
+fi
+chmod 0700 "\$WG_CLIENT_TMP" && mv "\$WG_CLIENT_TMP" /etc/init.d/wg-client || { rm -f "\$WG_CLIENT_TMP"; die_restore "安装 wg-client init 失败"; }
+rm -f "\$WG_CLIENT_TMP"
+/etc/init.d/wg-client enable || die_restore "启用 wg-client init 失败"
 echo '[+] 开机自恢复服务已安装'
 
 # === 启动接口 ===
-ifup wg0
+ifup wg0 || die_restore "启动 wg0 失败"
 
 # === 验证 ===
 sleep 3
@@ -670,33 +947,123 @@ OPENWRT_EOF
     if [[ ! "$ep_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         cat << 'WDEOF'
 
-# === WireGuard 看门狗 (fake-ip检测 + DNS直连解析 + 完整bypass自恢复 + 握手保活 + 日志持久化) ===
-cat > /usr/bin/wg-watchdog.sh << 'WDSCRIPT'
+# === WireGuard 看门狗 (fake-ip检测 + DNS直连解析 + 完整bypass自恢复 + 握手保活 + 安全日志) ===
+WG_WATCHDOG_TMP="$(mktemp /usr/bin/.wg-watchdog.XXXXXX 2>/dev/null)" || die_restore "创建 wg-watchdog 临时文件失败"
+if ! cat > "$WG_WATCHDOG_TMP" << 'WDSCRIPT'
 #!/bin/sh
-LOG_FILE="/tmp/wg-watchdog.log"
+LOG_DIR="/var/run/server-manage"
+LOG_FILE="$LOG_DIR/wg-watchdog.log"
 MAX_LOG_SIZE=32768
 
 wdlog() {
+    size=0
+    tmp=""
     logger -t wg-watchdog "$1"
-    echo "$(date '+%m-%d %H:%M:%S') $1" >> "$LOG_FILE"
-    if [ -f "$LOG_FILE" ] && [ $(wc -c < "$LOG_FILE" 2>/dev/null || echo 0) -gt $MAX_LOG_SIZE ]; then
-        tail -n 50 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+    if [ -L "$LOG_DIR" ] || { [ -e "$LOG_DIR" ] && [ ! -d "$LOG_DIR" ]; }; then
+        return 0
+    fi
+    mkdir -p "$LOG_DIR" 2>/dev/null || return 0
+    chmod 0700 "$LOG_DIR" 2>/dev/null || true
+    [ -L "$LOG_FILE" ] && return 0
+    echo "$(date '+%m-%d %H:%M:%S') $1" >> "$LOG_FILE" 2>/dev/null || return 0
+    if [ -f "$LOG_FILE" ]; then
+        size=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+        case "$size" in *[!0-9]*|"") size=0 ;; esac
+    fi
+    if [ "$size" -gt "$MAX_LOG_SIZE" ]; then
+        tmp=$(mktemp "$LOG_DIR/.wg-watchdog-log.XXXXXX" 2>/dev/null) || tmp=""
+        if [ -n "$tmp" ]; then
+            tail -n 50 "$LOG_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$LOG_FILE"
+            rm -f "$tmp" 2>/dev/null || true
+        fi
     fi
 }
 
 resolve_real() {
     local host="$1" ip=""
     for dns in 223.5.5.5 119.29.29.29 8.8.8.8; do
-        ip=$(nslookup "$host" $dns 2>/dev/null | awk '/^Address:/{a=$2} END{if(a) print a}')
+        ip=$(nslookup "$host" "$dns" 2>/dev/null | awk '
+            /^Name:/ { seen_name=1; next }
+            seen_name && /^Address[[:space:]][0-9]+:/ {
+                ip=$3
+                if (ip !~ /^(198\.18\.|198\.19\.)/) { print ip; exit }
+                next
+            }
+            seen_name && /^Address:/ {
+                ip=$2
+                sub(/#.*/, "", ip)
+                if (ip !~ /^(198\.18\.|198\.19\.)/) { print ip; exit }
+                next
+            }
+        ')
         [ -n "$ip" ] || continue
-        case "$ip" in 198.18.*|198.19.*) ip=""; continue ;; esac
         echo "$ip"; return 0
     done
     return 1
 }
 
-if ! ifstatus wg0 &>/dev/null; then
-    wdlog "wg0 down, restarting"; ifup wg0; exit 0
+wg_endpoint_host() {
+    local endpoint="$1"
+    case "$endpoint" in
+        \[*\]:*) echo "$endpoint" | sed -n 's/^\[\(.*\)\]:[0-9][0-9]*$/\1/p' ;;
+        *:*)     echo "$endpoint" | sed 's/:[0-9][0-9]*$//' ;;
+        *)       echo "$endpoint" ;;
+    esac
+}
+
+wg_format_endpoint() {
+    local host="$1" port="$2"
+    case "$host" in
+        *:*) echo "[${host}]:${port}" ;;
+        *)   echo "${host}:${port}" ;;
+    esac
+}
+
+wg_nft_addr_family() {
+    case "$1" in
+        *:*) echo "ip6" ;;
+        *)   echo "ip" ;;
+    esac
+}
+
+wg_ip_rule_show() {
+    case "$1" in
+        *:*) ip -6 rule show 2>/dev/null ;;
+        *)   ip rule show 2>/dev/null ;;
+    esac
+}
+
+wg_ip_rule_del() {
+    case "$1" in
+        *:*) ip -6 rule del to "$1" lookup main prio 100 2>/dev/null ;;
+        *)   ip rule del to "$1" lookup main prio 100 2>/dev/null ;;
+    esac
+}
+
+wg_ip_rule_add() {
+    case "$1" in
+        *:*) ip -6 rule add to "$1" lookup main prio 100 2>/dev/null ;;
+        *)   ip rule add to "$1" lookup main prio 100 2>/dev/null ;;
+    esac
+}
+
+wg_is_up() {
+    ifstatus wg0 2>/dev/null | grep -q '"up": true'
+}
+
+wg_proto_registered() {
+    ubus call network get_proto_handlers 2>/dev/null | grep -q '"wireguard"'
+}
+
+if ! wg_is_up; then
+    wdlog "wg0 not up, restarting"
+    if ! wg_proto_registered; then
+        wdlog "wireguard proto missing, restarting network"
+        /etc/init.d/network restart >/dev/null 2>&1 || true
+        sleep 5
+    fi
+    ifup wg0 >/dev/null 2>&1 || true
+    exit 0
 fi
 
 # resolve endpoint (always set RESOLVED for bypass self-heal)
@@ -704,32 +1071,37 @@ EP_HOST=$(uci get network.wg_server.endpoint_host 2>/dev/null)
 RESOLVED=""
 if echo "$EP_HOST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
     RESOLVED="$EP_HOST"
+elif echo "$EP_HOST" | grep -q ':'; then
+    RESOLVED="$EP_HOST"
 elif [ -n "$EP_HOST" ]; then
     RESOLVED=$(resolve_real "$EP_HOST")
 fi
 
 # DNS re-resolve + endpoint update (only for domain endpoints)
-if [ -n "$EP_HOST" ] && ! echo "$EP_HOST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
-    CURRENT=$(wg show wg0 endpoints 2>/dev/null | awk '{print $2}' | cut -d: -f1 | head -1)
+if [ -n "$EP_HOST" ] && ! echo "$EP_HOST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && ! echo "$EP_HOST" | grep -q ':'; then
+    CURRENT_EP=$(wg show wg0 endpoints 2>/dev/null | awk '{print $2}' | head -1)
+    CURRENT=$(wg_endpoint_host "$CURRENT_EP")
     FAKE_IP=0
     case "$CURRENT" in 198.18.*|198.19.*) FAKE_IP=1 ;; esac
     if [ -n "$RESOLVED" ] && { [ "$RESOLVED" != "$CURRENT" ] || [ "$FAKE_IP" = "1" ]; }; then
         wdlog "endpoint update: $CURRENT -> $RESOLVED (fake=$FAKE_IP)"
         PUB=$(wg show wg0 endpoints | awk '{print $1}' | head -1)
         PORT=$(uci get network.wg_server.endpoint_port 2>/dev/null)
-        wg set wg0 peer "$PUB" endpoint "${RESOLVED}:${PORT}"
+        WG_ENDPOINT=$(wg_format_endpoint "$RESOLVED" "$PORT")
+        NFT_FAMILY=$(wg_nft_addr_family "$RESOLVED")
+        wg set wg0 peer "$PUB" endpoint "$WG_ENDPOINT"
         for h in $(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | grep -v 'iface' | awk '{print $NF}'); do
             nft delete rule inet fw4 mangle_prerouting handle "$h" 2>/dev/null; true
         done
-        nft insert rule inet fw4 mangle_prerouting ip daddr "$RESOLVED" udp dport "$PORT" counter return comment "wg_bypass" 2>/dev/null; true
-        ip rule del to "$RESOLVED" lookup main prio 100 2>/dev/null; true
-        ip rule add to "$RESOLVED" lookup main prio 100 2>/dev/null; true
+        nft insert rule inet fw4 mangle_prerouting "$NFT_FAMILY" daddr "$RESOLVED" udp dport "$PORT" counter return comment "wg_bypass" 2>/dev/null; true
+        wg_ip_rule_del "$RESOLVED"; true
+        wg_ip_rule_add "$RESOLVED"; true
         wdlog "bypass updated -> $RESOLVED"
     fi
 fi
 
 # bypass rule self-heal (complete: iface + IP + ip rule)
-if nft list chain inet fw4 mangle_prerouting &>/dev/null; then
+if nft list chain inet fw4 mangle_prerouting >/dev/null 2>&1; then
     if ! nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep -q 'wg_bypass_iface'; then
         nft insert rule inet fw4 mangle_prerouting iifname "wg0" counter return comment "wg_bypass_iface" 2>/dev/null; true
         wdlog "restored wg_bypass_iface rule"
@@ -737,13 +1109,14 @@ if nft list chain inet fw4 mangle_prerouting &>/dev/null; then
     if [ -n "$RESOLVED" ]; then
         if ! nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep -q "daddr $RESOLVED"; then
             PORT=$(uci get network.wg_server.endpoint_port 2>/dev/null)
-            nft insert rule inet fw4 mangle_prerouting ip daddr "$RESOLVED" udp dport "$PORT" counter return comment "wg_bypass" 2>/dev/null; true
+            NFT_FAMILY=$(wg_nft_addr_family "$RESOLVED")
+            nft insert rule inet fw4 mangle_prerouting "$NFT_FAMILY" daddr "$RESOLVED" udp dport "$PORT" counter return comment "wg_bypass" 2>/dev/null; true
             wdlog "restored IP bypass -> $RESOLVED"
         fi
     fi
 fi
-if [ -n "$RESOLVED" ] && ! ip rule show 2>/dev/null | grep -q "$RESOLVED"; then
-    ip rule add to "$RESOLVED" lookup main prio 100 2>/dev/null; true
+if [ -n "$RESOLVED" ] && ! wg_ip_rule_show "$RESOLVED" | grep -q "$RESOLVED"; then
+    wg_ip_rule_add "$RESOLVED"; true
     wdlog "restored ip rule -> $RESOLVED"
 fi
 
@@ -753,17 +1126,33 @@ NOW=$(date +%s)
 if [ -n "$LAST_HS" ] && [ "$LAST_HS" != "0" ] && [ $((NOW - LAST_HS)) -gt 180 ]; then
     VIP=$(uci get network.wg0.addresses 2>/dev/null | awk '{print $1}' | cut -d/ -f1)
     VIP=$(echo "$VIP" | awk -F. '{printf "%s.%s.%s.1",$1,$2,$3}')
-    if [ -n "$VIP" ] && ! ping -c 2 -W 3 "$VIP" &>/dev/null; then
+    if [ -n "$VIP" ] && ! ping -c 2 -W 3 "$VIP" >/dev/null 2>&1; then
         wdlog "no handshake for $((NOW - LAST_HS))s + ping failed, restarting"
         ifdown wg0; sleep 2; ifup wg0
     fi
 fi
 WDSCRIPT
-chmod +x /usr/bin/wg-watchdog.sh
-(crontab -l 2>/dev/null | grep -v wg-watchdog; echo '* * * * * /usr/bin/wg-watchdog.sh') | crontab -
-/etc/init.d/cron restart
+then
+    rm -f "$WG_WATCHDOG_TMP"
+    die_restore "写入 wg-watchdog 失败"
+fi
+chmod 0700 "$WG_WATCHDOG_TMP" && mv "$WG_WATCHDOG_TMP" /usr/bin/wg-watchdog.sh || { rm -f "$WG_WATCHDOG_TMP"; die_restore "安装 wg-watchdog 失败"; }
+rm -f "$WG_WATCHDOG_TMP"
+WG_CRON_TMP="$(mktemp /tmp/.wg-watchdog-cron.XXXXXX 2>/dev/null)" || die_restore "创建 wg-watchdog cron 临时文件失败"
+(crontab -l 2>/dev/null | awk '$6 != "/usr/bin/wg-watchdog.sh"'; echo '* * * * * /usr/bin/wg-watchdog.sh') > "$WG_CRON_TMP" || { rm -f "$WG_CRON_TMP"; die_restore "生成 wg-watchdog cron 失败"; }
+mkdir -p /etc/crontabs 2>/dev/null || { rm -f "$WG_CRON_TMP"; die_restore "创建 OpenWrt cron 目录失败"; }
+cp "$WG_CRON_TMP" /etc/crontabs/root 2>/dev/null || { rm -f "$WG_CRON_TMP"; die_restore "写入 OpenWrt cron 文件失败"; }
+chmod 600 /etc/crontabs/root 2>/dev/null || true
+rm -f "$WG_CRON_TMP"
+awk '$6 == "/usr/bin/wg-watchdog.sh" { found=1 } END { exit !found }' /etc/crontabs/root || die_restore "安装 wg-watchdog cron 失败"
+/etc/init.d/cron restart || die_restore "重启 cron 失败"
+cleanup_uci_snapshots
 echo '[+] 看门狗已安装 (DNS直连 + fake-ip检测 + 完整bypass自恢复 + 握手保活 + 日志持久化)'
 WDEOF
+    else
+        cat << 'NO_WATCHDOG_EOF'
+cleanup_uci_snapshots
+NO_WATCHDOG_EOF
     fi
 
     draw_line

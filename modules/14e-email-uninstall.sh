@@ -1,7 +1,6 @@
 # modules/14e-email-uninstall.sh - 完全自动回收（Worker/Pages/D1/DNS/Catch-all）
 
 email_uninstall() {
-    trap '_email_clear_sensitive_env' RETURN
     print_title "完全卸载 Cloudflare Temp Email"
 
     # 不再硬卡 EMAIL_INSTALLED=1 — 只要 state 文件能加载，即视为有可回收的远端资源（涵盖部署中途失败的场景）
@@ -12,6 +11,7 @@ email_uninstall() {
         source "$EMAIL_STATE_FILE"
         has_state=1
     fi
+    trap '_email_clear_sensitive_env' RETURN
 
     if [[ $has_state -eq 0 ]]; then
         print_warn "未检测到 state 文件，将仅执行本地清理"
@@ -78,13 +78,20 @@ email_uninstall() {
     echo ""
     print_info "开始回收远程资源..."
     local uninstall_failed=0
+    local _log_domain="${EMAIL_DOMAIN:-unknown}"
 
     # 1. 关闭 catch-all
     if [[ "${EMAIL_CATCH_ALL_ENABLED:-0}" == "1" && -n "$EMAIL_ZONE_ID" ]]; then
         if email_run "禁用 Email Routing catch-all" _email_cf_catch_all_disable "$EMAIL_ZONE_ID"; then
             EMAIL_CATCH_ALL_ENABLED=0
         else
-            uninstall_failed=1
+            email_state_write 2>/dev/null || true
+            print_error "Email Routing catch-all 禁用失败，已停止卸载并保留本地目录和 state。"
+            print_warn "请检查 Cloudflare Token/网络后重新执行卸载，避免继续删除资源后丢失回收线索。"
+            log_action "Cloudflare Temp Email uninstall incomplete: $_log_domain"
+            unset CF_API_TOKEN CLOUDFLARE_API_TOKEN
+            pause
+            return 1
         fi
     fi
 
@@ -118,7 +125,6 @@ email_uninstall() {
     fi
 
     # 6. 本地目录与状态（先保存日志要用到的字段，再清 state）
-    local _log_domain="${EMAIL_DOMAIN:-unknown}"
     if [[ "$uninstall_failed" -ne 0 ]]; then
         email_state_write 2>/dev/null || true
         print_error "远端资源未完全删除，已保留本地目录和 state，避免丢失资源 ID。"
@@ -172,13 +178,13 @@ _email_uninstall_delete_dns() {
     done
 
     # 兜底：按 type+name 清理仍可能残留的同名记录（防 state 不完整）
-    _email_cf_dns_purge "$zid" "CNAME" "$EMAIL_FRONTEND_DOMAIN" 2>/dev/null || true
-    _email_cf_dns_purge "$zid" "MX"    "$EMAIL_DOMAIN" 2>/dev/null || true
+    _email_cf_dns_purge "$zid" "CNAME" "$EMAIL_FRONTEND_DOMAIN" 2>/dev/null || failed=1
+    _email_cf_dns_purge "$zid" "MX"    "$EMAIL_DOMAIN" 2>/dev/null || failed=1
     if [[ "${EMAIL_RESEND_ENABLED:-0}" == "1" ]]; then
-        _email_cf_dns_purge "$zid" "TXT" "resend._domainkey.${EMAIL_DOMAIN}" 2>/dev/null || true
-        _email_cf_dns_purge "$zid" "TXT" "send.${EMAIL_DOMAIN}" 2>/dev/null || true
-        _email_cf_dns_purge "$zid" "MX"  "send.${EMAIL_DOMAIN}" 2>/dev/null || true
-        _email_cf_dns_purge "$zid" "TXT" "_dmarc.${EMAIL_DOMAIN}" 2>/dev/null || true
+        _email_cf_dns_purge "$zid" "TXT" "resend._domainkey.${EMAIL_DOMAIN}" 2>/dev/null || failed=1
+        _email_cf_dns_purge "$zid" "TXT" "send.${EMAIL_DOMAIN}" 2>/dev/null || failed=1
+        _email_cf_dns_purge "$zid" "MX"  "send.${EMAIL_DOMAIN}" 2>/dev/null || failed=1
+        _email_cf_dns_purge "$zid" "TXT" "_dmarc.${EMAIL_DOMAIN}" 2>/dev/null || failed=1
     fi
     return "$failed"
 }

@@ -245,6 +245,97 @@ opt_cleanup() {
     pause
 }
 
+_hostname_file_path() {
+    printf '%s' "/etc/hostname"
+}
+
+_hosts_file_path() {
+    printf '%s' "/etc/hosts"
+}
+
+_hostname_write_file() {
+    local new_name="$1"
+    write_file_atomic "$(_hostname_file_path)" "$new_name"
+}
+
+_hostname_render_hosts_conf() {
+    local hosts_file="$1" old_name="$2" new_name="$3"
+    awk -v old="$old_name" -v new="$new_name" '
+        function first_field(text, fields, count, i) {
+            count = split(text, fields, /[[:space:]]+/)
+            for (i = 1; i <= count; i++) {
+                if (fields[i] != "") return fields[i]
+            }
+            return ""
+        }
+        function render_line(line, add_new,   hash, head, comment, leading, rest, count, i, token, out, seen, has_new) {
+            hash = index(line, "#")
+            if (hash) {
+                head = substr(line, 1, hash - 1)
+                comment = substr(line, hash)
+            } else {
+                head = line
+                comment = ""
+            }
+            if (head ~ /^[[:space:]]*$/) return line
+            match(head, /^[[:space:]]*/)
+            leading = substr(head, RSTART, RLENGTH)
+            rest = substr(head, length(leading) + 1)
+            count = split(rest, fields, /[[:space:]]+/)
+            if (count < 1 || fields[1] == "") return line
+            out = leading fields[1]
+            has_new = 0
+            delete seen
+            for (i = 2; i <= count; i++) {
+                token = fields[i]
+                if (token == "") continue
+                if (old != "" && old != new && token == old) token = new
+                if (token == new) has_new = 1
+                if (!(token in seen)) {
+                    out = out " " token
+                    seen[token] = 1
+                }
+            }
+            if (add_new && fields[1] == "127.0.0.1" && !has_new) {
+                out = out " " new
+                has_new = 1
+            }
+            if (has_new) saw_new = 1
+            return out (comment != "" ? " " comment : "")
+        }
+        { rendered[NR] = render_line($0, 0) }
+        END {
+            target = 0
+            if (!saw_new) {
+                for (i = 1; i <= NR; i++) {
+                    hash = index(rendered[i], "#")
+                    head = hash ? substr(rendered[i], 1, hash - 1) : rendered[i]
+                    if (first_field(head) == "127.0.0.1") {
+                        target = i
+                        break
+                    }
+                }
+            }
+            for (i = 1; i <= NR; i++) {
+                if (i == target) print render_line(rendered[i], 1)
+                else print rendered[i]
+            }
+            if (!saw_new && target == 0) {
+                print "127.0.0.1 localhost " new
+            }
+        }
+    ' "$hosts_file" 2>/dev/null || {
+        printf '127.0.0.1 localhost %s\n' "$new_name"
+    }
+}
+
+_hostname_update_hosts() {
+    local old_name="$1" new_name="$2" hosts_file content
+    hosts_file="$(_hosts_file_path)"
+    content="$(_hostname_render_hosts_conf "$hosts_file" "$old_name" "$new_name")" || return 1
+    write_file_atomic "$hosts_file" "$content"
+}
+
 opt_hostname() {
     print_title "修改主机名"
     echo "当前: $(hostname)"
@@ -255,7 +346,8 @@ opt_hostname() {
         pause; return
     fi
     # 先保存旧主机名，再执行修改
-    local old_name=$(hostname 2>/dev/null)
+    local old_name
+    old_name=$(hostname 2>/dev/null || true)
     if [[ "$PLATFORM" == "openwrt" ]]; then
         if ! command_exists uci; then
             print_error "OpenWrt 缺少 uci，无法持久化主机名。"
@@ -270,26 +362,107 @@ opt_hostname() {
     elif command_exists hostnamectl; then
         hostnamectl set-hostname "$new_name" || { print_error "hostnamectl 设置失败。"; pause; return 1; }
     else
-        hostname "$new_name" || { print_error "临时主机名设置失败。"; pause; return 1; }
-        echo "$new_name" > /etc/hostname || { print_error "/etc/hostname 写入失败。"; pause; return 1; }
+        local hostname_file old_hostname_file had_hostname_file=0
+        hostname_file="$(_hostname_file_path)"
+        if [[ -f "$hostname_file" ]]; then
+            old_hostname_file=$(cat "$hostname_file")
+            had_hostname_file=1
+        else
+            old_hostname_file=""
+        fi
+        _hostname_write_file "$new_name" || { print_error "/etc/hostname 写入失败。"; pause; return 1; }
+        if ! hostname "$new_name"; then
+            if [[ "$had_hostname_file" -eq 1 ]]; then
+                write_file_atomic "$hostname_file" "$old_hostname_file" >/dev/null 2>&1 || true
+            else
+                rm -f "$hostname_file" 2>/dev/null || true
+            fi
+            print_error "临时主机名设置失败。"
+            pause; return 1
+        fi
     fi
 
-    # 安全替换 /etc/hosts 中的旧主机名
-    if [[ -n "$old_name" && "$old_name" != "$new_name" ]] && grep -qF "$old_name" /etc/hosts 2>/dev/null; then
-        local escaped_old=$(printf '%s\n' "$old_name" | sed 's/[.[\*^$/]/\\&/g')
-        local escaped_new=$(printf '%s\n' "$new_name" | sed 's/[&/\]/\\&/g')
-        sed -i "s/\b${escaped_old}\b/${escaped_new}/g" /etc/hosts
-    elif ! grep -q "$new_name" /etc/hosts 2>/dev/null; then
-        sed -i "s/^127\.0\.0\.1\s\+localhost.*/127.0.0.1 localhost ${new_name}/" /etc/hosts
+    if ! _hostname_update_hosts "$old_name" "$new_name"; then
+        print_warn "主机名已设置，但 /etc/hosts 更新失败，请手动检查。"
+        pause; return 1
     fi
     print_success "主机名已修改为: $new_name"
     log_action "Hostname changed to $new_name"
     pause
 }
 
+_swap_file_path() {
+    printf '%s' "/swapfile"
+}
+
+_swap_fstab_path() {
+    printf '%s' "/etc/fstab"
+}
+
+_swap_fstab_has_swapfile() {
+    local swap_file="$(_swap_file_path)" fstab="$(_swap_fstab_path)"
+    [[ -f "$fstab" ]] || return 1
+    awk -v sf="$swap_file" '$1 == sf && $3 == "swap" { found=1 } END { exit(found ? 0 : 1) }' "$fstab"
+}
+
+_swap_fstab_add_swapfile() {
+    local swap_file="$(_swap_file_path)" fstab="$(_swap_fstab_path)" fstab_dir tmp
+    _swap_fstab_has_swapfile && return 0
+    fstab_dir="$(dirname "$fstab")"
+    mkdir -p "$fstab_dir" || return 1
+    tmp=$(mktemp "${fstab_dir}/.tmp.server-manage.fstab.XXXXXX") || return 1
+    _tmp_register "$tmp"
+    if [[ -f "$fstab" ]]; then
+        awk -v sf="$swap_file" '
+            { print; if ($1 == sf && $3 == "swap") found=1 }
+            END { if (!found) printf "%s none swap sw 0 0\n", sf }
+        ' "$fstab" > "$tmp" || {
+            rm -f "$tmp"
+            _tmp_unregister "$tmp"
+            return 1
+        }
+        chmod --reference="$fstab" "$tmp" 2>/dev/null || true
+        chown --reference="$fstab" "$tmp" 2>/dev/null || true
+    else
+        printf '%s none swap sw 0 0\n' "$swap_file" > "$tmp" || {
+            rm -f "$tmp"
+            _tmp_unregister "$tmp"
+            return 1
+        }
+        chmod 644 "$tmp" 2>/dev/null || true
+    fi
+    if ! mv "$tmp" "$fstab"; then
+        rm -f "$tmp"
+        _tmp_unregister "$tmp"
+        return 1
+    fi
+    _tmp_unregister "$tmp"
+}
+
+_swap_fstab_remove_swapfile() {
+    local swap_file="$(_swap_file_path)" fstab="$(_swap_fstab_path)" tmp
+    [[ -f "$fstab" ]] || return 0
+    tmp=$(mktemp "$(dirname "$fstab")/.tmp.server-manage.fstab.XXXXXX") || return 1
+    _tmp_register "$tmp"
+    awk -v sf="$swap_file" '!($1 == sf && $3 == "swap")' "$fstab" > "$tmp" || {
+        rm -f "$tmp"
+        _tmp_unregister "$tmp"
+        return 1
+    }
+    chmod --reference="$fstab" "$tmp" 2>/dev/null || true
+    chown --reference="$fstab" "$tmp" 2>/dev/null || true
+    if ! mv "$tmp" "$fstab"; then
+        rm -f "$tmp"
+        _tmp_unregister "$tmp"
+        return 1
+    fi
+    _tmp_unregister "$tmp"
+}
+
 opt_swap() {
     print_title "Swap 管理"
     local size=$(free -m | awk '/Swap/ {print $2}')
+    local swap_file="$(_swap_file_path)"
     echo "当前 Swap: ${size}MB"
     echo ""
     echo "1. 开启/修改 Swap
@@ -303,38 +476,36 @@ opt_swap() {
             pause; return
         fi
         print_info "正在设置 ${s}MB Swap..."
-        swapoff /swapfile 2>/dev/null || true
-        rm -f /swapfile
+        swapoff "$swap_file" 2>/dev/null || true
+        rm -f "$swap_file"
         # 检测文件系统类型，btrfs 不支持 fallocate 创建 swap
         local fs_type=$(df -T / 2>/dev/null | awk 'NR==2{print $2}')
         if [[ "$fs_type" == "btrfs" ]]; then
-            truncate -s 0 /swapfile
-            chattr +C /swapfile 2>/dev/null || true
-            if ! dd if=/dev/zero of=/swapfile bs=1M count="$s" status=progress; then
-                print_error "创建 Swap 文件失败 (磁盘空间不足?)"; rm -f /swapfile; pause; return
+            truncate -s 0 "$swap_file"
+            chattr +C "$swap_file" 2>/dev/null || true
+            if ! dd if=/dev/zero of="$swap_file" bs=1M count="$s" status=progress; then
+                print_error "创建 Swap 文件失败 (磁盘空间不足?)"; rm -f "$swap_file"; pause; return
             fi
-        elif ! fallocate -l "${s}M" /swapfile 2>/dev/null; then
-            if ! dd if=/dev/zero of=/swapfile bs=1M count="$s" status=progress; then
-                print_error "创建 Swap 文件失败 (磁盘空间不足?)"; rm -f /swapfile; pause; return
+        elif ! fallocate -l "${s}M" "$swap_file" 2>/dev/null; then
+            if ! dd if=/dev/zero of="$swap_file" bs=1M count="$s" status=progress; then
+                print_error "创建 Swap 文件失败 (磁盘空间不足?)"; rm -f "$swap_file"; pause; return
             fi
         fi
-        chmod 600 /swapfile
-        if ! mkswap /swapfile >/dev/null; then
-            print_error "mkswap 失败"; rm -f /swapfile; pause; return
+        chmod 600 "$swap_file"
+        if ! mkswap "$swap_file" >/dev/null; then
+            print_error "mkswap 失败"; rm -f "$swap_file"; pause; return
         fi
-        if ! swapon /swapfile; then
-            print_error "swapon 失败"; rm -f /swapfile; pause; return
+        if ! swapon "$swap_file"; then
+            print_error "swapon 失败"; rm -f "$swap_file"; pause; return
         fi
-        if ! grep -q "/swapfile" /etc/fstab; then
-            echo "/swapfile none swap sw 0 0" >> /etc/fstab
-        fi
+        _swap_fstab_add_swapfile || { print_error "写入 fstab 失败"; pause; return; }
         print_success "Swap 设置成功。"
         log_action "Swap configured: ${s}MB"
     elif [[ "$c" == "2" ]]; then
         if confirm "确认删除 Swap？"; then
-            swapoff -a 2>/dev/null || true
-            rm -f /swapfile
-            sed -i '/\/swapfile/d' /etc/fstab
+            swapoff "$swap_file" 2>/dev/null || true
+            rm -f "$swap_file"
+            _swap_fstab_remove_swapfile || { print_error "更新 fstab 失败"; pause; return; }
             print_success "Swap 已删除。"
             log_action "Swap removed"
         fi
@@ -354,25 +525,55 @@ opt_bbr() {
         pause; return
     fi
     if confirm "开启 BBR 加速？"; then
-        [[ ! -f /etc/sysctl.conf.bak ]] && cp /etc/sysctl.conf /etc/sysctl.conf.bak
-        sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-        sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-        if sysctl -p >/dev/null 2>&1; then
-            local verify_cc
-            verify_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
-            if [[ "$verify_cc" == "bbr" ]]; then
-                print_success "BBR 已开启。"
-                log_action "BBR enabled"
-            else
-                print_error "BBR 未实际生效 (当前: $verify_cc)，请检查内核是否支持。"
-                log_action "BBR enable failed: verify_cc=$verify_cc" "ERROR"
-            fi
-        else
-            print_error "sysctl -p 执行失败，BBR 未应用。"
-            log_action "BBR enable failed: sysctl -p" "ERROR"
+        local sysctl_conf sysctl_backup sysctl_dir tmp_candidate verify_cc
+        sysctl_conf="$(_sysctl_conf_path)"
+        sysctl_backup="$(_sysctl_bbr_backup_path)"
+        sysctl_dir="$(dirname "$sysctl_conf")"
+        mkdir -p "$sysctl_dir" || { print_error "创建 sysctl 配置目录失败"; pause; return 1; }
+        tmp_candidate=$(mktemp "${sysctl_dir}/.tmp.server-manage.bbr.XXXXXX") || { print_error "创建临时 BBR 配置失败"; pause; return 1; }
+        _tmp_register "$tmp_candidate"
+        if ! _sysctl_render_bbr_conf "$sysctl_conf" "fq" "bbr" > "$tmp_candidate"; then
+            rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
+            print_error "生成 BBR 配置失败"; pause; return 1
         fi
+        if [[ -f "$sysctl_conf" ]]; then
+            chmod --reference="$sysctl_conf" "$tmp_candidate" 2>/dev/null || true
+            chown --reference="$sysctl_conf" "$tmp_candidate" 2>/dev/null || true
+        else
+            chmod 644 "$tmp_candidate" 2>/dev/null || true
+        fi
+        if ! sysctl -p "$tmp_candidate" >/dev/null 2>&1; then
+            rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
+            print_error "sysctl -p 执行失败，BBR 未写入正式配置。"
+            log_action "BBR enable failed before commit: sysctl -p" "ERROR"
+            pause; return 1
+        fi
+        verify_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+        if [[ "$verify_cc" != "bbr" ]]; then
+            rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
+            [[ -f "$sysctl_conf" ]] && sysctl -p "$sysctl_conf" >/dev/null 2>&1 || true
+            print_error "BBR 未实际生效 (当前: $verify_cc)，未写入正式配置。"
+            log_action "BBR enable failed before commit: verify_cc=$verify_cc" "ERROR"
+            pause; return 1
+        fi
+        if [[ ! -f "$sysctl_backup" && -f "$sysctl_conf" ]]; then
+            if ! cp -a "$sysctl_conf" "$sysctl_backup"; then
+                rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
+                sysctl -p "$sysctl_conf" >/dev/null 2>&1 || true
+                print_error "备份 sysctl 配置失败，未写入正式配置。"
+                log_action "BBR enable failed before commit: backup" "ERROR"
+                pause; return 1
+            fi
+        fi
+        if ! mv "$tmp_candidate" "$sysctl_conf"; then
+            rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
+            [[ -f "$sysctl_conf" ]] && sysctl -p "$sysctl_conf" >/dev/null 2>&1 || true
+            print_error "写入 $sysctl_conf 失败"
+            pause; return 1
+        fi
+        _tmp_unregister "$tmp_candidate"
+        print_success "BBR 已开启。"
+        log_action "BBR enabled"
     fi
     pause
 }
@@ -412,6 +613,138 @@ select_timezone() {
     log_action "Timezone changed to $z"
 }
 
+_sysctl_conf_path() {
+    printf '%s' "/etc/sysctl.conf"
+}
+
+_sysctl_backup_path() {
+    printf '%s.pre-tuning' "$(_sysctl_conf_path)"
+}
+
+_sysctl_bbr_backup_path() {
+    printf '%s.bak' "$(_sysctl_conf_path)"
+}
+
+_sysctl_render_tuned_conf() {
+    local conf_file="$1" params="$2"
+    if [[ -f "$conf_file" ]]; then
+        awk '
+            /^# BEGIN server-manage sysctl tuning/ { in_new=1; next }
+            in_new {
+                if (/^# END server-manage sysctl tuning/) in_new=0
+                next
+            }
+            /^# server-manage sysctl tuning/ { in_legacy=1; next }
+            in_legacy {
+                if ($0 == "") in_legacy=0
+                next
+            }
+            { print }
+        ' "$conf_file"
+    fi
+    printf '\n%s\n' "$params"
+}
+
+_sysctl_render_bbr_conf() {
+    local conf_file="$1" qdisc="${2:-fq}" cc="${3:-bbr}"
+    if [[ -f "$conf_file" ]]; then
+        awk '
+            /^# BEGIN server-manage bbr/ { in_bbr=1; next }
+            in_bbr {
+                if (/^# END server-manage bbr/) in_bbr=0
+                next
+            }
+            /^[[:space:]]*net\.core\.default_qdisc[[:space:]=]/ { next }
+            /^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]=]/ { next }
+            { print }
+        ' "$conf_file"
+    fi
+    printf '\n# BEGIN server-manage bbr\n'
+    printf 'net.core.default_qdisc = %s\n' "$qdisc"
+    printf 'net.ipv4.tcp_congestion_control = %s\n' "$cc"
+    printf '# END server-manage bbr\n'
+}
+
+_sysctl_render_wireguard_forward_conf() {
+    local conf_file="$1" value="${2:-1}"
+    if [[ -f "$conf_file" ]]; then
+        awk '
+            /^# BEGIN server-manage wireguard ip-forward/ { in_wg=1; next }
+            in_wg {
+                if (/^# END server-manage wireguard ip-forward/) in_wg=0
+                next
+            }
+            { print }
+        ' "$conf_file"
+    fi
+    if [[ "$value" == "1" ]]; then
+        printf '\n# BEGIN server-manage wireguard ip-forward\n'
+        printf 'net.ipv4.ip_forward = 1\n'
+        printf '# END server-manage wireguard ip-forward\n'
+    fi
+}
+
+_sysctl_commit_candidate() {
+    local tmp_candidate="$1" target_conf="$2" err_prefix="$3"
+    if ! sysctl -p "$tmp_candidate" >/dev/null 2>&1; then
+        print_error "${err_prefix}: sysctl -p 校验失败"
+        return 1
+    fi
+    if ! mv "$tmp_candidate" "$target_conf"; then
+        sysctl -p "$target_conf" >/dev/null 2>&1 || true
+        print_error "${err_prefix}: 写入 $target_conf 失败"
+        return 1
+    fi
+}
+
+_sysctl_apply_wireguard_forward() {
+    local value="${1:-1}" sysctl_conf sysctl_dir tmp_candidate
+    sysctl_conf="$(_sysctl_conf_path)"
+    sysctl_dir="$(dirname "$sysctl_conf")"
+    mkdir -p "$sysctl_dir" || { print_error "创建 sysctl 配置目录失败"; return 1; }
+    tmp_candidate=$(mktemp "${sysctl_dir}/.tmp.server-manage.wg-forward.XXXXXX") || {
+        print_error "创建临时 sysctl 配置失败"
+        return 1
+    }
+    _tmp_register "$tmp_candidate"
+    if ! _sysctl_render_wireguard_forward_conf "$sysctl_conf" "$value" > "$tmp_candidate"; then
+        rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
+        print_error "生成 WireGuard IP 转发配置失败"
+        return 1
+    fi
+    if [[ -f "$sysctl_conf" ]]; then
+        chmod --reference="$sysctl_conf" "$tmp_candidate" 2>/dev/null || true
+        chown --reference="$sysctl_conf" "$tmp_candidate" 2>/dev/null || true
+    else
+        chmod 644 "$tmp_candidate" 2>/dev/null || true
+    fi
+    if ! _sysctl_commit_candidate "$tmp_candidate" "$sysctl_conf" "WireGuard IP 转发配置"; then
+        rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
+        return 1
+    fi
+    _tmp_unregister "$tmp_candidate"
+}
+
+_sysctl_enable_wireguard_forward() {
+    _sysctl_apply_wireguard_forward 1
+}
+
+_sysctl_disable_wireguard_forward() {
+    local sysctl_conf tmp_check
+    sysctl_conf="$(_sysctl_conf_path)"
+    _sysctl_apply_wireguard_forward 0 || return 1
+    tmp_check=$(mktemp) || return 0
+    _tmp_register "$tmp_check"
+    _sysctl_render_wireguard_forward_conf "$sysctl_conf" 0 > "$tmp_check" || {
+        rm -f "$tmp_check"; _tmp_unregister "$tmp_check"
+        return 0
+    }
+    if ! grep -q '^[[:space:]]*net\.ipv4\.ip_forward[[:space:]=]' "$tmp_check"; then
+        sysctl -w net.ipv4.ip_forward=0 >/dev/null 2>&1 || true
+    fi
+    rm -f "$tmp_check"; _tmp_unregister "$tmp_check"
+}
+
 opt_sysctl() {
     print_title "内核参数调优"
     echo -e "${C_CYAN}当前关键参数:${C_RESET}"
@@ -428,10 +761,13 @@ opt_sysctl() {
     echo "  0. 返回"
     read -e -r -p "选择: " sc
     [[ "$sc" == "0" || -z "$sc" ]] && return
+    local sysctl_conf sysctl_backup
+    sysctl_conf="$(_sysctl_conf_path)"
+    sysctl_backup="$(_sysctl_backup_path)"
     if [[ "$sc" == "4" ]]; then
-        if [[ -f /etc/sysctl.conf.pre-tuning ]]; then
-            cp /etc/sysctl.conf.pre-tuning /etc/sysctl.conf
-            sysctl -p >/dev/null 2>&1
+        if [[ -f "$sysctl_backup" ]]; then
+            cp "$sysctl_backup" "$sysctl_conf"
+            sysctl -p "$sysctl_conf" >/dev/null 2>&1
             print_success "已回滚到调优前的配置。"
             log_action "Sysctl tuning rolled back"
         else
@@ -439,8 +775,6 @@ opt_sysctl() {
         fi
         pause; return
     fi
-    # Backup before modifying
-    [[ ! -f /etc/sysctl.conf.pre-tuning ]] && cp /etc/sysctl.conf /etc/sysctl.conf.pre-tuning
     local params=""
     local block_start="# BEGIN server-manage sysctl tuning"
     local block_end="# END server-manage sysctl tuning"
@@ -492,14 +826,45 @@ ${block_end}"
         ;;
     *) print_error "无效选择"; pause; return ;;
     esac
-    # Remove old tuning block and append new. 旧版本没有 END 标记，保留兼容删除。
-    sed -i '/^# BEGIN server-manage sysctl tuning/,/^# END server-manage sysctl tuning/d; /^# server-manage sysctl tuning/,/^$/d' /etc/sysctl.conf
-    printf '\n%s\n' "$params" >> /etc/sysctl.conf
-    if sysctl -p >/dev/null 2>&1; then
+    local sysctl_dir tmp_candidate
+    sysctl_dir="$(dirname "$sysctl_conf")"
+    mkdir -p "$sysctl_dir" || { print_error "创建 sysctl 配置目录失败"; pause; return 1; }
+    tmp_candidate=$(mktemp "${sysctl_dir}/.tmp.server-manage.sysctl.XXXXXX") || { print_error "创建临时 sysctl 配置失败"; pause; return 1; }
+    _tmp_register "$tmp_candidate"
+    if ! _sysctl_render_tuned_conf "$sysctl_conf" "$params" > "$tmp_candidate"; then
+        rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
+        print_error "生成 sysctl 配置失败"; pause; return 1
+    fi
+    if [[ -f "$sysctl_conf" ]]; then
+        chmod --reference="$sysctl_conf" "$tmp_candidate" 2>/dev/null || true
+        chown --reference="$sysctl_conf" "$tmp_candidate" 2>/dev/null || true
+    else
+        chmod 644 "$tmp_candidate" 2>/dev/null || true
+    fi
+    if sysctl -p "$tmp_candidate" >/dev/null 2>&1; then
+        if [[ ! -f "$sysctl_backup" && -f "$sysctl_conf" ]]; then
+            if ! cp -a "$sysctl_conf" "$sysctl_backup"; then
+                rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
+                sysctl -p "$sysctl_conf" >/dev/null 2>&1 || true
+                print_error "备份 sysctl 配置失败，未写入正式配置。"
+                log_action "Sysctl tuning failed before commit: backup" "ERROR"
+                pause; return 1
+            fi
+        fi
+        if ! mv "$tmp_candidate" "$sysctl_conf"; then
+            rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
+            sysctl -p "$sysctl_conf" >/dev/null 2>&1 || true
+            print_error "写入 $sysctl_conf 失败"
+            pause; return 1
+        fi
+        _tmp_unregister "$tmp_candidate"
         print_success "内核参数已应用 (无需重启)。"
         log_action "Sysctl tuning applied: preset=$sc"
     else
-        print_error "sysctl -p 执行失败，请检查 /etc/sysctl.conf"
+        rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
+        print_error "sysctl -p 执行失败，未写入正式配置。"
+        log_action "Sysctl tuning failed before commit: preset=$sc" "ERROR"
+        pause; return 1
     fi
     pause
 }

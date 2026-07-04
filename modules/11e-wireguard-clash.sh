@@ -189,13 +189,23 @@ _wg_generate_clash_config_impl() {
                 print_error "YAML 中未找到 'proxies:' 段"
                 pause; return
             fi
-            local output_file="/tmp/clash-wg-${peer_name}-$(date +%s).yaml"
+            local output_dir output_file
+            local old_umask inject_rc
+            old_umask=$(umask)
+            umask 077
+            if ! output_dir=$(mktemp -d "${TMPDIR:-/tmp}/clash-wg.XXXXXX" 2>/dev/null); then
+                umask "$old_umask"
+                print_error "无法创建安全临时目录"
+                pause; return
+            fi
+            umask "$old_umask"
+            chmod 700 "$output_dir" 2>/dev/null || true
+            output_file="${output_dir}/clash-config.yaml"
             local has_proxy_groups=false
             echo "$original_yaml" | grep -qE '^[[:space:]]*proxy-groups:' && has_proxy_groups=true
 
             # 用 Python/jq 辅助或简单 awk 注入
             # 改进: 追踪缩进层级判断段结束
-            local old_umask inject_rc
             old_umask=$(umask)
             umask 077
             awk \
@@ -262,7 +272,7 @@ _wg_generate_clash_config_impl() {
             chmod 600 "$output_file" 2>/dev/null || true
             if [[ $inject_rc -ne 0 ]]; then
                 print_error "YAML 注入失败"
-                rm -f "$output_file"
+                rm -rf "$output_dir"
                 pause; return
             fi
 
@@ -294,17 +304,46 @@ _wg_generate_clash_config_impl() {
                 done < <(echo "$_prov_block" | grep -oE "https?://[^\"' ]+" | sort -u)
                 if [[ -n "$_inject_ns" ]]; then
                     local _tmpf
-                    _tmpf=$(mktemp)
+                    _tmpf=$(mktemp "${output_dir}/.clash-config.yaml.policy.XXXXXX") || {
+                        print_error "创建 nameserver-policy 临时文件失败"
+                        rm -rf "$output_dir"
+                        pause; return
+                    }
+                    chmod 600 "$_tmpf" 2>/dev/null || true
                     if grep -q 'nameserver-policy:' "$output_file"; then
-                        awk -v ns="$_inject_ns" '
+                        if awk -v ns="$_inject_ns" '
                             /nameserver-policy:/ { print; printf "%s", ns; next }
                             { print }
-                        ' "$output_file" > "$_tmpf" && mv "$_tmpf" "$output_file"
+                        ' "$output_file" > "$_tmpf"; then
+                            mv "$_tmpf" "$output_file" || {
+                                rm -f "$_tmpf"
+                                print_error "nameserver-policy 注入失败"
+                                rm -rf "$output_dir"
+                                pause; return
+                            }
+                        else
+                            rm -f "$_tmpf"
+                            print_error "nameserver-policy 注入失败"
+                            rm -rf "$output_dir"
+                            pause; return
+                        fi
                     elif grep -q '^dns:' "$output_file"; then
-                        awk -v ns="$_inject_ns" '
+                        if awk -v ns="$_inject_ns" '
                             /^dns:/ { print; print "  nameserver-policy:"; printf "%s", ns; next }
                             { print }
-                        ' "$output_file" > "$_tmpf" && mv "$_tmpf" "$output_file"
+                        ' "$output_file" > "$_tmpf"; then
+                            mv "$_tmpf" "$output_file" || {
+                                rm -f "$_tmpf"
+                                print_error "nameserver-policy 注入失败"
+                                rm -rf "$output_dir"
+                                pause; return
+                            }
+                        else
+                            rm -f "$_tmpf"
+                            print_error "nameserver-policy 注入失败"
+                            rm -rf "$output_dir"
+                            pause; return
+                        fi
                     else
                         rm -f "$_tmpf"
                     fi

@@ -7,6 +7,62 @@ docker_remove_conflicting_packages() {
     apt-get remove -y "${conflicts[@]}" >/dev/null 2>&1 || true
 }
 
+_docker_keyring_path() {
+    printf '%s' "${DOCKER_KEYRING_FILE:-/etc/apt/keyrings/docker.gpg}"
+}
+
+_docker_source_list_path() {
+    printf '%s' "${DOCKER_SOURCE_LIST_FILE:-/etc/apt/sources.list.d/docker.list}"
+}
+
+_docker_compose_bin_path() {
+    printf '%s' "${DOCKER_COMPOSE_BIN:-/usr/local/bin/docker-compose}"
+}
+
+_docker_render_apt_source() {
+    local arch="$1" docker_gpg="$2" docker_repo_os="$3" version_codename="$4"
+    printf 'deb [arch=%s signed-by=%s] https://download.docker.com/linux/%s %s stable\n' \
+        "$arch" "$docker_gpg" "$docker_repo_os" "$version_codename"
+}
+
+_docker_install_keyring() {
+    local docker_repo_os="$1" docker_gpg="$2" dir tmp_armored tmp_gpg
+    [[ "$docker_gpg" == /* ]] || return 1
+    dir="$(dirname "$docker_gpg")"
+    mkdir -p "$dir" || return 1
+    tmp_armored=$(mktemp "${dir}/.tmp.server-manage.docker-gpg.asc.XXXXXX") || return 1
+    _tmp_register "$tmp_armored"
+    tmp_gpg=$(mktemp "${dir}/.tmp.server-manage.docker-gpg.XXXXXX") || {
+        rm -f -- "$tmp_armored" 2>/dev/null || true
+        _tmp_unregister "$tmp_armored"
+        return 1
+    }
+    _tmp_register "$tmp_gpg"
+    if curl -fsSL "https://download.docker.com/linux/${docker_repo_os}/gpg" -o "$tmp_armored" 2>/dev/null \
+        && gpg --dearmor < "$tmp_armored" > "$tmp_gpg" 2>/dev/null; then
+        chmod 0644 "$tmp_gpg" 2>/dev/null || true
+        chown root:root "$tmp_gpg" 2>/dev/null || true
+        if mv "$tmp_gpg" "$docker_gpg"; then
+            rm -f -- "$tmp_armored" 2>/dev/null || true
+            _tmp_unregister "$tmp_armored"
+            _tmp_unregister "$tmp_gpg"
+            return 0
+        fi
+    fi
+    rm -f -- "$tmp_armored" "$tmp_gpg" 2>/dev/null || true
+    _tmp_unregister "$tmp_armored"
+    _tmp_unregister "$tmp_gpg"
+    return 1
+}
+
+_docker_write_apt_source() {
+    local docker_list="$1" arch="$2" docker_gpg="$3" docker_repo_os="$4" version_codename="$5" content
+    [[ "$docker_list" == /* && "$docker_gpg" == /* ]] || return 1
+    content="$(_docker_render_apt_source "$arch" "$docker_gpg" "$docker_repo_os" "$version_codename")"
+    write_file_atomic "$docker_list" "$content" || return 1
+    chmod 0644 "$docker_list" 2>/dev/null || true
+}
+
 docker_install() {
     print_title "Docker 安装"
     if command_exists docker; then
@@ -21,9 +77,13 @@ docker_install() {
     install_package "ca-certificates" "silent"
     install_package "curl" "silent"
     install_package "gnupg" "silent"
-    local keyring_dir="/etc/apt/keyrings"
-    mkdir -p "$keyring_dir"
-    local docker_gpg="$keyring_dir/docker.gpg"
+    local docker_gpg="$(_docker_keyring_path)"
+    local keyring_dir
+    keyring_dir="$(dirname "$docker_gpg")"
+    if ! mkdir -p "$keyring_dir"; then
+        print_error "Docker keyring 目录创建失败。"
+        pause; return 1
+    fi
     local os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
     local docker_repo_os="${os_id}"
     [[ "$docker_repo_os" != "ubuntu" && "$docker_repo_os" != "debian" ]] && docker_repo_os="debian"
@@ -31,11 +91,10 @@ docker_install() {
         print_info "添加 Docker GPG 密钥..."
         # 根据实际系统选择正确的官方仓库 OS；非 Debian/Ubuntu 系回退到 debian 时，
         # GPG URL 与 apt source 必须保持一致。
-        if ! curl -fsSL "https://download.docker.com/linux/${docker_repo_os}/gpg" | gpg --dearmor -o "$docker_gpg" 2>/dev/null; then
+        if ! _docker_install_keyring "$docker_repo_os" "$docker_gpg"; then
             print_error "GPG 密钥下载失败。"
-            pause; return
+            pause; return 1
         fi
-        chmod a+r "$docker_gpg"
     fi
     local version_codename=$(grep 'VERSION_CODENAME' /etc/os-release | cut -d= -f2)
     if [[ -z "$version_codename" ]]; then
@@ -44,24 +103,33 @@ docker_install() {
     if [[ -z "$version_codename" ]]; then
         print_error "无法检测系统版本代号，Docker 源配置可能失败。"
         print_info "请手动安装 Docker: https://docs.docker.com/engine/install/"
-        pause; return
+        pause; return 1
     fi
-    local docker_list="/etc/apt/sources.list.d/docker.list"
+    local docker_list="$(_docker_source_list_path)"
     if [[ ! -f "$docker_list" ]]; then
         print_info "添加 Docker 软件源..."
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=$docker_gpg] https://download.docker.com/linux/${docker_repo_os} $version_codename stable" > "$docker_list"
-    fi
-    apt-get update -qq 2>/dev/null || true
-    if apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null 2>&1; then
-        print_success "Docker 安装成功。"
-        if is_systemd; then
-            systemctl enable docker >/dev/null 2>&1 || true
-            systemctl start docker || true
+        if ! _docker_write_apt_source "$docker_list" "$(dpkg --print-architecture)" "$docker_gpg" "$docker_repo_os" "$version_codename"; then
+            print_error "Docker 软件源写入失败。"
+            pause; return 1
         fi
+    fi
+    if ! apt-get update -qq >/dev/null 2>&1; then
+        print_error "Docker 软件源更新失败。"
+        pause; return 1
+    fi
+    if apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null 2>&1; then
+        if is_systemd; then
+            if ! systemctl enable docker >/dev/null 2>&1 || ! systemctl start docker >/dev/null 2>&1; then
+                print_error "Docker 已安装但服务启动失败。"
+                pause; return 1
+            fi
+        fi
+        print_success "Docker 安装成功。"
         docker --version
         log_action "Docker installed"
     else
         print_error "Docker 安装失败。"
+        pause; return 1
     fi
     pause
 }
@@ -92,6 +160,7 @@ docker_uninstall() {
     fi
     rm -f /etc/apt/sources.list.d/docker.list
     rm -f /etc/apt/keyrings/docker.gpg
+    hash -r 2>/dev/null || true
     print_success "Docker 已卸载。"
     log_action "Docker uninstalled"
     pause
@@ -104,6 +173,96 @@ _docker_compose_standalone_arch() {
         armv7l|armv7*) echo "armv7" ;;
         *) uname -m ;;
     esac
+}
+
+_docker_compose_install_standalone() {
+    local compose_url="$1" target_bin="$(_docker_compose_bin_path)" target_dir tmp_bin tmp_sha hash
+    [[ "$target_bin" == /* ]] || return 1
+    target_dir="$(dirname "$target_bin")"
+    mkdir -p "$target_dir" || return 1
+    tmp_bin=$(mktemp "${target_dir}/.tmp.server-manage.docker-compose.XXXXXX") || return 1
+    _tmp_register "$tmp_bin"
+    tmp_sha=$(mktemp "${target_dir}/.tmp.server-manage.docker-compose.sha256.XXXXXX") || {
+        rm -f -- "$tmp_bin" 2>/dev/null || true
+        _tmp_unregister "$tmp_bin"
+        return 1
+    }
+    _tmp_register "$tmp_sha"
+    if curl -fL --retry 3 "$compose_url" -o "$tmp_bin" 2>/dev/null \
+        && curl -fL --retry 3 "${compose_url}.sha256" -o "$tmp_sha" 2>/dev/null \
+        && hash=$(awk '{print $1; exit}' "$tmp_sha") \
+        && [[ "$hash" =~ ^[a-fA-F0-9]{64}$ ]] \
+        && printf '%s  %s\n' "$hash" "$tmp_bin" | sha256sum -c - >/dev/null; then
+        chmod 0755 "$tmp_bin" 2>/dev/null || true
+        chown root:root "$tmp_bin" 2>/dev/null || true
+        if mv "$tmp_bin" "$target_bin"; then
+            rm -f -- "$tmp_sha" 2>/dev/null || true
+            _tmp_unregister "$tmp_bin"
+            _tmp_unregister "$tmp_sha"
+            return 0
+        fi
+    fi
+    rm -f -- "$tmp_bin" "$tmp_sha" 2>/dev/null || true
+    _tmp_unregister "$tmp_bin"
+    _tmp_unregister "$tmp_sha"
+    return 1
+}
+
+_docker_systemd_reload_restart() {
+    is_systemd || return 0
+    systemctl daemon-reload >/dev/null || return 1
+    systemctl restart docker >/dev/null || return 1
+}
+
+_docker_restore_proxy_conf() {
+    local backup="$1" had_old="$2"
+    if [[ "$had_old" -eq 1 && -f "$backup" ]]; then
+        mkdir -p "$DOCKER_PROXY_DIR" 2>/dev/null || true
+        cp -a "$backup" "$DOCKER_PROXY_CONF" 2>/dev/null || true
+    else
+        rm -f "$DOCKER_PROXY_CONF" 2>/dev/null || true
+    fi
+}
+
+_docker_apply_proxy_conf() {
+    local proxy_conf="$1" backup="" had_old=0
+    mkdir -p "$DOCKER_PROXY_DIR" || return 1
+    if [[ -f "$DOCKER_PROXY_CONF" ]]; then
+        backup=$(mktemp "${DOCKER_PROXY_DIR}/.http-proxy.conf.bak.XXXXXX") || return 1
+        cp -a "$DOCKER_PROXY_CONF" "$backup" || { rm -f "$backup"; return 1; }
+        had_old=1
+    fi
+    if ! write_file_atomic "$DOCKER_PROXY_CONF" "$proxy_conf"; then
+        rm -f "$backup" 2>/dev/null || true
+        return 1
+    fi
+    if ! _docker_systemd_reload_restart; then
+        _docker_restore_proxy_conf "$backup" "$had_old"
+        _docker_systemd_reload_restart >/dev/null 2>&1 || true
+        rm -f "$backup" 2>/dev/null || true
+        return 1
+    fi
+    rm -f "$backup" 2>/dev/null || true
+    return 0
+}
+
+_docker_clear_proxy_conf() {
+    local backup="" had_old=0
+    if [[ -f "$DOCKER_PROXY_CONF" ]]; then
+        mkdir -p "$DOCKER_PROXY_DIR" || return 1
+        backup=$(mktemp "${DOCKER_PROXY_DIR}/.http-proxy.conf.bak.XXXXXX") || return 1
+        cp -a "$DOCKER_PROXY_CONF" "$backup" || { rm -f "$backup"; return 1; }
+        had_old=1
+    fi
+    rm -f "$DOCKER_PROXY_CONF" || { rm -f "$backup" 2>/dev/null || true; return 1; }
+    if ! _docker_systemd_reload_restart; then
+        _docker_restore_proxy_conf "$backup" "$had_old"
+        _docker_systemd_reload_restart >/dev/null 2>&1 || true
+        rm -f "$backup" 2>/dev/null || true
+        return 1
+    fi
+    rm -f "$backup" 2>/dev/null || true
+    return 0
 }
 
 docker_compose_install() {
@@ -145,22 +304,14 @@ docker_compose_install() {
     local compose_arch
     compose_arch=$(_docker_compose_standalone_arch)
     local compose_url="https://github.com/docker/compose/releases/download/${compose_version}/docker-compose-linux-${compose_arch}"
-    local tmp_bin tmp_sha hash
-    tmp_bin=$(mktemp /tmp/docker-compose.XXXXXX) || { print_error "创建临时文件失败"; pause; return; }
-    tmp_sha=$(mktemp /tmp/docker-compose.sha256.XXXXXX) || { rm -f "$tmp_bin"; print_error "创建临时文件失败"; pause; return; }
-    if curl -fL --retry 3 "$compose_url" -o "$tmp_bin" 2>/dev/null \
-        && curl -fL --retry 3 "${compose_url}.sha256" -o "$tmp_sha" 2>/dev/null \
-        && hash=$(awk '{print $1; exit}' "$tmp_sha") \
-        && [[ "$hash" =~ ^[a-fA-F0-9]{64}$ ]] \
-        && printf '%s  %s\n' "$hash" "$tmp_bin" | sha256sum -c - >/dev/null; then
-        install -m 0755 "$tmp_bin" /usr/local/bin/docker-compose
+    if _docker_compose_install_standalone "$compose_url"; then
         print_success "Docker Compose Standalone 安装成功。"
         docker-compose --version
         log_action "Docker Compose standalone installed"
     else
         print_error "下载失败。"
+        pause; return 1
     fi
-    rm -f "$tmp_bin" "$tmp_sha"
     pause
 }
 
@@ -184,7 +335,6 @@ docker_proxy_config() {
                 print_error "代理地址格式无效 (应为 http(s)://host:port 或 socks5://host:port)"
                 pause; return
             fi
-            mkdir -p "$DOCKER_PROXY_DIR"
             local proxy_conf="[Service]
 Environment=\"HTTP_PROXY=$proxy\"
 Environment=\"HTTPS_PROXY=$proxy\"
@@ -192,19 +342,17 @@ Environment=\"NO_PROXY=localhost,127.0.0.1,::1\"
 Environment=\"http_proxy=$proxy\"
 Environment=\"https_proxy=$proxy\"
 Environment=\"no_proxy=localhost,127.0.0.1,::1\""
-            write_file_atomic "$DOCKER_PROXY_CONF" "$proxy_conf"
-            if is_systemd; then
-                systemctl daemon-reload || true
-                systemctl restart docker || true
+            if ! _docker_apply_proxy_conf "$proxy_conf"; then
+                print_error "Docker 代理配置失败，已回滚。"
+                pause; return 1
             fi
             print_success "Docker 代理已配置。"
             log_action "Docker proxy configured: $proxy"
             ;;
         2)
-            rm -f "$DOCKER_PROXY_CONF"
-            if is_systemd; then
-                systemctl daemon-reload || true
-                systemctl restart docker || true
+            if ! _docker_clear_proxy_conf; then
+                print_error "代理配置清除失败，已回滚。"
+                pause; return 1
             fi
             print_success "代理配置已清除。"
             log_action "Docker proxy removed"
@@ -231,18 +379,26 @@ docker_images_manage() {
             ;;
         2)
             if confirm "删除未使用的镜像？"; then
-                docker image prune -a -f
-                print_success "清理完成。"
-                log_action "Docker unused images pruned"
+                if docker image prune -a -f; then
+                    print_success "清理完成。"
+                    log_action "Docker unused images pruned"
+                else
+                    print_error "镜像清理失败。"
+                    pause; return 1
+                fi
             fi
             ;;
         3)
             if confirm "删除所有镜像？这将影响所有容器！"; then
                 local all_images=$(docker images -q)
                 if [[ -n "$all_images" ]]; then
-                    docker rmi -f $all_images
-                    print_success "所有镜像已删除。"
-                    log_action "Docker all images removed"
+                    if docker rmi -f $all_images; then
+                        print_success "所有镜像已删除。"
+                        log_action "Docker all images removed"
+                    else
+                        print_error "镜像删除失败。"
+                        pause; return 1
+                    fi
                 else
                     print_warn "没有镜像可删除。"
                 fi
@@ -317,10 +473,10 @@ docker_containers_manage() {
                     print_warn "无运行中容器"
                 elif docker stop $rq >/dev/null; then
                     print_success "已停止"
+                    log_action "Docker all containers stopped"
                 else
                     print_error "停止失败"
                 fi
-                log_action "Docker all containers stopped"
             fi
             pause; continue
         fi
@@ -331,10 +487,10 @@ docker_containers_manage() {
                     print_warn "无容器"
                 elif docker rm -f $aq >/dev/null; then
                     print_success "已删除"
+                    log_action "Docker all containers removed"
                 else
                     print_error "删除失败"
                 fi
-                log_action "Docker all containers removed"
             fi
             pause; continue
         fi
@@ -359,8 +515,12 @@ docker_containers_manage() {
                 ;;
             5)
                 if confirm "确认删除容器 $target_name?"; then
-                    docker rm -f "$target_id" && print_success "已删除: $target_name" || print_error "删除失败"
-                    log_action "Docker container removed: $target_name"
+                    if docker rm -f "$target_id"; then
+                        print_success "已删除: $target_name"
+                        log_action "Docker container removed: $target_name"
+                    else
+                        print_error "删除失败"
+                    fi
                 fi
                 ;;
             *) print_error "无效操作" ;;
@@ -402,9 +562,12 @@ menu_docker() {
             7)
                 if command_exists docker; then
                     if confirm "清理未使用的容器、网络、镜像、构建缓存？"; then
-                        docker system prune -a -f --volumes
-                        print_success "清理完成。"
-                        log_action "Docker system pruned"
+                        if docker system prune -a -f --volumes; then
+                            print_success "清理完成。"
+                            log_action "Docker system pruned"
+                        else
+                            print_error "清理失败。"
+                        fi
                     fi
                 else
                     print_error "Docker 未安装。"

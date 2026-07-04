@@ -59,6 +59,15 @@ reality_require_supported_os(){ return 0; }
 reality_relay_ensure_service(){ :; }
 reality_sync_cloudflare_dns(){ return 0; }
 validate_conf_file(){ return 0; }   # 临时目录文件非 root:600，测试中放行
+write_file_atomic(){ mkdir -p "$(dirname "$1")"; printf '%s' "$2" > "$1"; }
+copy_cert_pair_atomic(){
+    mkdir -p "$3" || return 1
+    cp "$1" "$3/fullchain.pem" || return 1
+    cp "$2" "$3/privkey.pem" || return 1
+    chmod 644 "$3/fullchain.pem" 2>/dev/null || true
+    chmod 600 "$3/privkey.pem" 2>/dev/null || true
+}
+render_cert_pair_hook_helper(){ printf 'copy_cert_pair_atomic(){ cp "$1" "$3/fullchain.pem"; cp "$2" "$3/privkey.pem"; }\n'; }
 
 echo "[T1] 两条线路各自独立身份 → 渲染多端点 + 每路链接互不串扰"
 RLY_NAME="lineB"; RLY_LISTEN_PORT="51882"; RLY_CONNECT_HOST="a.example.com"
@@ -104,14 +113,22 @@ ck "删除后剩 1 端点" '[[ $(grep -c "\[\[endpoints\]\]" "$REALITY_REALM_CON
 ck "剩余端点为 C" 'grep -q "remote = \"c.land.com:443\"" "$REALITY_REALM_CONFIG"'
 
 echo "[T4] install_relay 导入身份 → 路由用导入身份(不串本机落地身份)"
-# 模拟解析导入链接后 REALITY_* 为导入身份
+# 真实落地机：本机落地身份必已写盘（含私钥）。install_relay 会清空内存 REALITY_* 再 load_state 回填本机身份。
+REALITY_UUID="self-land-uuid"; REALITY_SNI="self.land.com"; REALITY_PUBLIC_KEY="SELF_PBK"; REALITY_SHORT_ID="SELF_SID"
+REALITY_NODE_DOMAIN="self.land.com"; REALITY_PORT="443"; REALITY_PRIVATE_KEY="self-priv"; REALITY_FLOW="xtls-rprx-vision"
+REALITY_ROLE="landing"
+reality_write_state   # 落地身份写盘（模拟真实落地机磁盘状态）
+# 模拟 wizard 解析导入链接后 REALITY_* 被覆盖为下游身份（内存态；install_relay 内部会清空再回填）
 REALITY_UUID="imp-uuid"; REALITY_SNI="imp.sni"; REALITY_PUBLIC_KEY="IMP_PBK"; REALITY_SHORT_ID="IMP_SID"
 REALITY_NODE_DOMAIN="land.imp.com"; REALITY_PORT="33964"; REALITY_PRIVATE_KEY=""; REALITY_FLOW="xtls-rprx-vision"
-REALITY_ROLE="landing"   # 本机本是落地
 reality_install_relay "a.example.com" 51999 "land.imp.com" 33964 "" "impline" >/dev/null 2>&1
 rl="$(cat "$REALITY_RELAY_DIR/relay-51999.link.txt" 2>/dev/null)"
 ck "导入线路链接用导入身份@A域名:51999" '[[ "$rl" == "vless://imp-uuid@a.example.com:51999?"*"pbk=IMP_PBK"*"sid=IMP_SID"* ]]'
 ck "install_relay 复合角色 landing+relay" 'reality_load_state && [[ "${REALITY_ROLE}" == "landing+relay" ]]'
+# HIGH-1 回归：导入下游身份绝不污染本机落地 state（私钥/UUID 必须仍是本机的）
+ck "HIGH-1 本机落地私钥未被抹掉" 'reality_load_state && [[ "${REALITY_PRIVATE_KEY}" == "self-priv" ]]'
+ck "HIGH-1 本机落地UUID未被下游覆盖" 'reality_load_state && [[ "${REALITY_UUID}" == "self-land-uuid" ]]'
+ck "HIGH-1 本机落地SNI未被下游覆盖" 'reality_load_state && [[ "${REALITY_SNI}" == "self.land.com" ]]'
 
 echo "[T5] both 场景：目标 127.0.0.1 用本机落地身份"
 RLY_NAME="self"; RLY_LISTEN_PORT="52000"; RLY_CONNECT_HOST="a.example.com"
@@ -234,6 +251,259 @@ reality_write_state
 reality_apply_singbox_config(){ return 1; }
 reality_cdn_uninstall >/dev/null 2>&1 || true
 ck "CDN 卸载失败回滚会恢复 state" '[[ -f "$REALITY_CDN_STATE_FILE" ]] && grep -q "REALITY_CDN_DOMAIN" "$REALITY_CDN_STATE_FILE"'
+
+# 安装回归：UFW active 但回源端口放行失败时不得继续报安装完成。
+# 这里把前置步骤全部 stub 成成功，只让 firewall_allow_tcp_port 失败，验证失败会被传播。
+(
+    export REALITY_CONFIG_DIR="$TMP/cdn-install-fw"
+    export REALITY_STATE_FILE="$REALITY_CONFIG_DIR/state.conf"
+    export REALITY_CDN_STATE_FILE="$REALITY_CONFIG_DIR/cdn.conf"
+    export REALITY_CDN_LINK_FILE="$REALITY_CONFIG_DIR/cdn-link.txt"
+    export REALITY_CDN_CLIENT_JSON="$REALITY_CONFIG_DIR/cdn-client.json"
+    export REALITY_CDN_ORIGIN_PORT="8443"
+	    export CERT_PATH_PREFIX="$REALITY_CONFIG_DIR/cert"
+	    export CERT_HOOKS_DIR="$REALITY_CONFIG_DIR/hooks"
+	    export REALITY_CDN_CF_CRED_DIR="$REALITY_CONFIG_DIR/root"
+	    export REALITY_CDN_LE_LIVE_DIR="$REALITY_CONFIG_DIR/le-live"
+	    export EMAIL="audit@example.com"
+	    mkdir -p "$REALITY_CONFIG_DIR" "$CERT_HOOKS_DIR" "$REALITY_CDN_CF_CRED_DIR" "$REALITY_CDN_LE_LIVE_DIR"
+    REALITY_ROLE="landing"; REALITY_UUID="uid-fw"; REALITY_PRIVATE_KEY="pk-fw"; REALITY_PUBLIC_KEY="pbk-fw"
+    REALITY_PORT="443"; REALITY_SNI="sni.example.com"; REALITY_SHORT_ID="sidfw"; REALITY_DNS_MODE="auto"
+    reality_write_state
+    command_exists(){ case "${1:-}" in nginx|certbot) return 0 ;; *) return 1 ;; esac; }
+    reality_require_supported_os(){ return 0; }
+    reality_prompt_cf_token(){ printf 'token-fw\n'; }
+    reality_prompt_domain_with_zones(){ printf 'cdn.example.com\n'; }
+    reality_prompt_node_name(){ printf 'cdn-fw\n'; }
+    reality_cdn_pick_inner_port(){ printf '58999\n'; }
+    reality_cdn_gen_ws_path(){ printf '/secretpath00\n'; }
+	    write_private_file_atomic(){ mkdir -p "$(dirname "$1")"; printf '%s\n' "$2" > "$1"; chmod 600 "$1"; return 0; }
+	    certbot(){
+	        case "$*" in
+	            certonly*) mkdir -p "$REALITY_CDN_LE_LIVE_DIR/cdn.example.com"; printf 'cert\n' > "$REALITY_CDN_LE_LIVE_DIR/cdn.example.com/fullchain.pem"; printf 'key\n' > "$REALITY_CDN_LE_LIVE_DIR/cdn.example.com/privkey.pem" ;;
+	            delete*) rm -rf "$REALITY_CDN_LE_LIVE_DIR/cdn.example.com" ;;
+	        esac
+	        return 0
+	    }
+	    cron_add_job(){ printf '%s\n' "$1" > "$REALITY_CONFIG_DIR/cron-added"; return 0; }
+	    cron_remove_job(){ printf '%s\n' "$1" > "$REALITY_CONFIG_DIR/cron-removed"; return 0; }
+    _ensure_ssl_params(){ return 0; }
+    _nginx_deploy_conf(){ return 0; }
+    reality_render_singbox_config(){ printf '{"ok":true}\n'; }
+    reality_apply_singbox_config(){ return 0; }
+    reality_cdn_sync_dns_orange(){ return 0; }
+    reality_cdn_apply_origin_rule(){ return 0; }
+    firewall_allow_tcp_port(){ return 1; }
+    reality_cdn_install >/dev/null 2>&1
+)
+	cdn_fw_rc=$?
+	ck "CDN 安装在 UFW active 放行失败时返回非 0" '[[ "$cdn_fw_rc" -ne 0 ]]'
+	ck "CDN 防火墙失败不会继续写客户端完成产物" '[[ ! -f "$TMP/cdn-install-fw/cdn-link.txt" && ! -f "$TMP/cdn-install-fw/cdn-client.json" ]]'
+
+# 安装回归：CF 橙云 DNS 同步失败时必须 fail-closed，不能留下本机 CDN 半成品。
+(
+    export REALITY_CONFIG_DIR="$TMP/cdn-install-dns"
+    export REALITY_STATE_FILE="$REALITY_CONFIG_DIR/state.conf"
+    export REALITY_CDN_STATE_FILE="$REALITY_CONFIG_DIR/cdn.conf"
+    export REALITY_CDN_LINK_FILE="$REALITY_CONFIG_DIR/cdn-link.txt"
+    export REALITY_CDN_CLIENT_JSON="$REALITY_CONFIG_DIR/cdn-client.json"
+    export REALITY_CDN_ORIGIN_PORT="8443"
+	    export CERT_PATH_PREFIX="$REALITY_CONFIG_DIR/cert"
+	    export CERT_HOOKS_DIR="$REALITY_CONFIG_DIR/hooks"
+	    export REALITY_CDN_CF_CRED_DIR="$REALITY_CONFIG_DIR/root"
+	    export REALITY_CDN_LE_LIVE_DIR="$REALITY_CONFIG_DIR/le-live"
+	    export EMAIL="audit@example.com"
+	    mkdir -p "$REALITY_CONFIG_DIR" "$CERT_HOOKS_DIR" "$REALITY_CDN_CF_CRED_DIR" "$REALITY_CDN_LE_LIVE_DIR"
+    REALITY_ROLE="landing"; REALITY_UUID="uid-dns"; REALITY_PRIVATE_KEY="pk-dns"; REALITY_PUBLIC_KEY="pbk-dns"
+    REALITY_PORT="443"; REALITY_SNI="sni.example.com"; REALITY_SHORT_ID="siddns"; REALITY_DNS_MODE="auto"
+    reality_write_state
+    command_exists(){ case "${1:-}" in nginx|certbot) return 0 ;; *) return 1 ;; esac; }
+    reality_require_supported_os(){ return 0; }
+    reality_prompt_cf_token(){ printf 'token-dns\n'; }
+    reality_prompt_domain_with_zones(){ printf 'cdn.example.com\n'; }
+    reality_prompt_node_name(){ printf 'cdn-dns\n'; }
+    reality_cdn_pick_inner_port(){ printf '58999\n'; }
+    reality_cdn_gen_ws_path(){ printf '/secretpath00\n'; }
+	    write_private_file_atomic(){ mkdir -p "$(dirname "$1")"; printf '%s\n' "$2" > "$1"; chmod 600 "$1"; return 0; }
+	    certbot(){
+	        case "$*" in
+	            certonly*) mkdir -p "$REALITY_CDN_LE_LIVE_DIR/cdn.example.com"; printf 'cert\n' > "$REALITY_CDN_LE_LIVE_DIR/cdn.example.com/fullchain.pem"; printf 'key\n' > "$REALITY_CDN_LE_LIVE_DIR/cdn.example.com/privkey.pem" ;;
+	            delete*) rm -rf "$REALITY_CDN_LE_LIVE_DIR/cdn.example.com" ;;
+	        esac
+	        return 0
+	    }
+	    cron_add_job(){ printf '%s\n' "$1" > "$REALITY_CONFIG_DIR/cron-added"; return 0; }
+	    cron_remove_job(){ printf '%s\n' "$1" > "$REALITY_CONFIG_DIR/cron-removed"; return 0; }
+    _ensure_ssl_params(){ return 0; }
+    _nginx_deploy_conf(){ mkdir -p "$REALITY_CONFIG_DIR/nginx"; : > "$REALITY_CONFIG_DIR/nginx/deployed"; return 0; }
+    reality_cdn_remove_nginx_conf(){ rm -f "$REALITY_CONFIG_DIR/nginx/deployed"; }
+    reality_render_singbox_config(){ printf '{"ok":true}\n'; }
+    reality_apply_singbox_config(){ return 0; }
+    reality_cdn_sync_dns_orange(){ return 1; }
+    reality_cdn_apply_origin_rule(){ return 0; }
+    firewall_allow_tcp_port(){ return 0; }
+    reality_cdn_install >/dev/null 2>&1
+)
+	cdn_dns_rc=$?
+	ck "CDN 安装在橙云 DNS 同步失败时返回非 0" '[[ "$cdn_dns_rc" -ne 0 ]]'
+	ck "CDN DNS 失败会回滚 state/nginx/客户端产物" '[[ ! -f "$TMP/cdn-install-dns/cdn.conf" && ! -e "$TMP/cdn-install-dns/nginx/deployed" && ! -f "$TMP/cdn-install-dns/cdn-link.txt" && ! -f "$TMP/cdn-install-dns/cdn-client.json" ]]'
+	ck "CDN DNS 失败会清理本次新建证书凭据 hook cron" '[[ ! -e "$TMP/cdn-install-dns/cert/cdn.example.com" && ! -e "$TMP/cdn-install-dns/root/.cloudflare-cdn.example.com.ini" && ! -e "$TMP/cdn-install-dns/hooks/renew-cdn.example.com.sh" && ! -e "$TMP/cdn-install-dns/le-live/cdn.example.com" && -f "$TMP/cdn-install-dns/cron-removed" ]]'
+
+# 安装回归：Origin Rule 写入失败时回滚新链路，并恢复覆盖前的旧 state/产物。
+(
+    export REALITY_CONFIG_DIR="$TMP/cdn-install-origin"
+    export REALITY_STATE_FILE="$REALITY_CONFIG_DIR/state.conf"
+    export REALITY_CDN_STATE_FILE="$REALITY_CONFIG_DIR/cdn.conf"
+    export REALITY_CDN_LINK_FILE="$REALITY_CONFIG_DIR/cdn-link.txt"
+    export REALITY_CDN_CLIENT_JSON="$REALITY_CONFIG_DIR/cdn-client.json"
+    export REALITY_CDN_ORIGIN_PORT="8443"
+	    export CERT_PATH_PREFIX="$REALITY_CONFIG_DIR/cert"
+	    export CERT_HOOKS_DIR="$REALITY_CONFIG_DIR/hooks"
+	    export REALITY_CDN_CF_CRED_DIR="$REALITY_CONFIG_DIR/root"
+	    export REALITY_CDN_LE_LIVE_DIR="$REALITY_CONFIG_DIR/le-live"
+	    export EMAIL="audit@example.com"
+	    mkdir -p "$REALITY_CONFIG_DIR" "$CERT_HOOKS_DIR" "$REALITY_CDN_CF_CRED_DIR" "$REALITY_CDN_LE_LIVE_DIR" "$CERT_PATH_PREFIX/new.example.com" "$REALITY_CDN_LE_LIVE_DIR/new.example.com"
+	    printf 'old-cert\n' > "$CERT_PATH_PREFIX/new.example.com/fullchain.pem"
+	    printf 'old-key\n' > "$CERT_PATH_PREFIX/new.example.com/privkey.pem"
+	    printf 'old-live-cert\n' > "$REALITY_CDN_LE_LIVE_DIR/new.example.com/fullchain.pem"
+	    printf 'old-live-key\n' > "$REALITY_CDN_LE_LIVE_DIR/new.example.com/privkey.pem"
+	    printf 'old-token\n' > "$REALITY_CDN_CF_CRED_DIR/.cloudflare-new.example.com.ini"
+	    printf '#!/bin/sh\nold-hook\n' > "$CERT_HOOKS_DIR/renew-new.example.com.sh"
+    REALITY_ROLE="landing"; REALITY_UUID="uid-origin"; REALITY_PRIVATE_KEY="pk-origin"; REALITY_PUBLIC_KEY="pbk-origin"
+    REALITY_PORT="443"; REALITY_SNI="sni.example.com"; REALITY_SHORT_ID="sidorigin"; REALITY_DNS_MODE="auto"
+    reality_write_state
+    REALITY_CDN_DOMAIN="old.example.com"; REALITY_CDN_UUID="old-uuid"; REALITY_CDN_WS_PATH="/oldpath00"
+    REALITY_CDN_INNER_PORT="58888"; REALITY_CDN_ORIGIN_PORT="8443"; REALITY_CDN_PREFER_IP=""; REALITY_CDN_NODE_NAME="old-cdn"
+    reality_cdn_write_state
+    reality_write_secure_file "$REALITY_CDN_LINK_FILE" "old-link"
+    reality_write_secure_file "$REALITY_CDN_CLIENT_JSON" '{"old":true}'
+    command_exists(){ case "${1:-}" in nginx|certbot) return 0 ;; *) return 1 ;; esac; }
+    reality_require_supported_os(){ return 0; }
+    reality_prompt_cf_token(){ printf 'token-origin\n'; }
+    reality_prompt_domain_with_zones(){ printf 'new.example.com\n'; }
+    reality_prompt_node_name(){ printf 'cdn-origin\n'; }
+    reality_cdn_pick_inner_port(){ printf '58999\n'; }
+    reality_cdn_gen_ws_path(){ printf '/secretpath00\n'; }
+	    write_private_file_atomic(){ mkdir -p "$(dirname "$1")"; printf '%s\n' "$2" > "$1"; chmod 600 "$1"; return 0; }
+	    certbot(){
+	        case "$*" in
+	            certonly*) printf 'new-live-cert\n' > "$REALITY_CDN_LE_LIVE_DIR/new.example.com/fullchain.pem"; printf 'new-live-key\n' > "$REALITY_CDN_LE_LIVE_DIR/new.example.com/privkey.pem" ;;
+	            delete*) rm -rf "$REALITY_CDN_LE_LIVE_DIR/new.example.com" ;;
+	        esac
+	        return 0
+	    }
+	    cron_add_job(){ printf '%s\n' "$1" > "$REALITY_CONFIG_DIR/cron-added"; return 0; }
+	    cron_remove_job(){ printf '%s\n' "$1" > "$REALITY_CONFIG_DIR/cron-removed"; return 0; }
+    _ensure_ssl_params(){ return 0; }
+    _nginx_deploy_conf(){ mkdir -p "$REALITY_CONFIG_DIR/nginx"; : > "$REALITY_CONFIG_DIR/nginx/${1:-site}"; return 0; }
+    reality_cdn_remove_nginx_conf(){ rm -f "$REALITY_CONFIG_DIR/nginx/reality-cdn-${1:-}.conf" "$REALITY_CONFIG_DIR/nginx/deployed" "$REALITY_CONFIG_DIR/nginx/reality-cdn-new.example.com"; }
+    reality_render_singbox_config(){ printf '{"ok":true}\n'; }
+    reality_apply_singbox_config(){ return 0; }
+    reality_cdn_sync_dns_orange(){ return 0; }
+    reality_cdn_apply_origin_rule(){ return 1; }
+    firewall_allow_tcp_port(){ return 0; }
+    reality_cdn_install >/dev/null 2>&1
+)
+	cdn_origin_rc=$?
+	ck "CDN 安装在 Origin Rule 写入失败时返回非 0" '[[ "$cdn_origin_rc" -ne 0 ]]'
+	ck "CDN Origin Rule 失败会恢复旧 state/产物" 'grep -q "old.example.com" "$TMP/cdn-install-origin/cdn.conf" && grep -q "old-link" "$TMP/cdn-install-origin/cdn-link.txt" && grep -q "\"old\":true" "$TMP/cdn-install-origin/cdn-client.json"'
+	ck "CDN Origin Rule 失败会恢复安装前证书凭据 hook" 'grep -q "old-cert" "$TMP/cdn-install-origin/cert/new.example.com/fullchain.pem" && grep -q "old-token" "$TMP/cdn-install-origin/root/.cloudflare-new.example.com.ini" && grep -q "old-hook" "$TMP/cdn-install-origin/hooks/renew-new.example.com.sh" && grep -q "old-live-cert" "$TMP/cdn-install-origin/le-live/new.example.com/fullchain.pem" && [[ ! -f "$TMP/cdn-install-origin/cron-removed" ]]'
+
+echo "[FP] 客户端指纹随机化（fp=chrome 特征分散）"
+# 随机指纹只落在真实浏览器池内（不含 randomized/360/q）
+fp_ok=1
+for _i in $(seq 1 30); do
+    f=$(reality_random_fingerprint)
+    case "$f" in chrome|firefox|edge|safari|ios|android) : ;; *) fp_ok=0; break ;; esac
+done
+ck "reality_random_fingerprint 只产出真实浏览器指纹池成员" '[[ "$fp_ok" == "1" ]]'
+# 30 次抽样至少见到 2 种（几乎不可能恒定单值；概率上验证「确实随机」）
+uniq_n=$(for _i in $(seq 1 30); do reality_random_fingerprint; echo; done | sort -u | wc -l)
+ck "随机指纹有分散性（≥2 种）" '[[ "$uniq_n" -ge 2 ]]'
+# sanitize：合法值透传，非法/空回退 chrome
+ck "sanitize 合法 firefox 透传" '[[ "$(reality_sanitize_fingerprint firefox)" == "firefox" ]]'
+ck "sanitize 非法值回退 chrome" '[[ "$(reality_sanitize_fingerprint bogusfp)" == "chrome" ]]'
+ck "sanitize 空值回退 chrome" '[[ "$(reality_sanitize_fingerprint "")" == "chrome" ]]'
+# effective：读 state 的 REALITY_FINGERPRINT；旧版无该字段→chrome
+REALITY_FINGERPRINT="safari"
+ck "effective 读 state 指纹" '[[ "$(reality_effective_fingerprint)" == "safari" ]]'
+REALITY_FINGERPRINT=""
+ck "effective 空 state 回退 chrome（老节点兼容）" '[[ "$(reality_effective_fingerprint)" == "chrome" ]]'
+# 链接携带 fp，且 parse 能回读为 REALITY_FINGERPRINT（中转导入沿用落地真实指纹）
+link_fp="$(reality_build_vless_link uidF nodeF.example.com 443 sniF pbkF sidF nameF edge)"
+ck "build_vless_link 写入 fp=edge" 'grep -q "fp=edge" <<< "$link_fp"'
+REALITY_FINGERPRINT=""
+reality_parse_vless_link "$link_fp"
+ck "parse 回读 fp→REALITY_FINGERPRINT" '[[ "$REALITY_FINGERPRINT" == "edge" ]]'
+# build 未传 fp → 回退 chrome（旧调用不破坏）
+link_nofp="$(reality_build_vless_link uidG nodeG.example.com 443 sniG pbkG sidG nameG)"
+ck "build_vless_link 缺省 fp 回退 chrome" 'grep -q "fp=chrome" <<< "$link_nofp"'
+# 相邻两次全新安装身份的指纹独立（分散全网特征的核心目的）——用 relay 路由持久化验证 RLY_FINGERPRINT 落盘
+RLY_NAME="r1"; RLY_LISTEN_PORT="41001"; RLY_CONNECT_HOST="h1.example.com"
+RLY_TARGET_HOST="t1.example.com"; RLY_TARGET_PORT="443"
+RLY_UUID="u1"; RLY_SNI="s1.example.com"; RLY_PUBLIC_KEY="p1"; RLY_SHORT_ID="sid1"; RLY_FLOW="xtls-rprx-vision"; RLY_FINGERPRINT="firefox"
+reality_relay_write_route 41001
+ck "RLY_FINGERPRINT 落盘到路由文件" 'grep -q "RLY_FINGERPRINT=\"firefox\"" "$REALITY_RELAY_DIR/relay-41001.conf"'
+RLY_FINGERPRINT=""
+reality_relay_load_route "$REALITY_RELAY_DIR/relay-41001.conf"
+ck "路由回读 RLY_FINGERPRINT" '[[ "$RLY_FINGERPRINT" == "firefox" ]]'
+reality_relay_write_client_artifacts
+ck "中转客户端链接用 RLY_FINGERPRINT(firefox)" 'grep -q "fp=firefox" "$REALITY_RELAY_DIR/relay-41001.link.txt"'
+ck "中转客户端 JSON 用 RLY_FINGERPRINT(firefox)" 'grep -q "\"fingerprint\":\"firefox\"" "$REALITY_RELAY_DIR/relay-41001.client.json"'
+
+echo "[T7] MED-4 统一保留端口集合：relay 监听端口即使 realm 停止也不被复用"
+# 清空 relays，写两条已知监听端口的路由；不依赖运行时 ss（command_exists→false 使 reality_port_in_use 恒 false）
+rm -rf "$REALITY_RELAY_DIR"; mkdir -p "$REALITY_RELAY_DIR"
+RLY_NAME="rA"; RLY_LISTEN_PORT="45001"; RLY_CONNECT_HOST="h.example.com"
+RLY_TARGET_HOST="t.example.com"; RLY_TARGET_PORT="443"
+RLY_UUID="uA"; RLY_SNI="sA.example.com"; RLY_PUBLIC_KEY="pA"; RLY_SHORT_ID="sidA"; RLY_FLOW="xtls-rprx-vision"; RLY_FINGERPRINT="chrome"
+reality_relay_write_route 45001
+RLY_LISTEN_PORT="45002"; RLY_UUID="uB"; RLY_SNI="sB.example.com"; RLY_PUBLIC_KEY="pB"; RLY_SHORT_ID="sidB"
+reality_relay_write_route 45002
+# 落地/共存/CDN 也各占一个逻辑端口
+REALITY_PORT="443"; REALITY_CDN_ORIGIN_PORT="8443"; REALITY_CDN_INNER_PORT="47777"
+ck "reserved 含 relay 监听 45001" 'reality_reserved_ports | grep -qx 45001'
+ck "reserved 含 relay 监听 45002" 'reality_reserved_ports | grep -qx 45002'
+ck "reserved 含落地 443" 'reality_reserved_ports | grep -qx 443'
+ck "reserved 含 CDN origin 8443" 'reality_reserved_ports | grep -qx 8443'
+ck "reserved 含 CDN inner 47777" 'reality_reserved_ports | grep -qx 47777'
+ck "reserved 含共存默认内部端口 18443" 'reality_reserved_ports | grep -qx 18443'
+ck "reserved 含 web 默认内部端口 12443" 'reality_reserved_ports | grep -qx 12443'
+ck "port_reserved 命中 relay 端口(realm 停止仍算占用)" 'reality_port_reserved 45001'
+ck "port_reserved 未命中随机空闲端口" '! reality_port_reserved 39511'
+ck "port_reserved exclude 自身可排除" '! reality_port_reserved 45001 45001'
+# 读 RLY_LISTEN_PORT 用 grep 而非 source：不得污染当前 RLY_* 全局
+RLY_LISTEN_PORT="OWNER_MARKER"
+reality_reserved_ports >/dev/null
+ck "reserved_ports 不污染 RLY_LISTEN_PORT 全局" '[[ "$RLY_LISTEN_PORT" == "OWNER_MARKER" ]]'
+prompt_port="$(printf '2\n45001\n2\n39511\n' | reality_prompt_port "Reality 监听" 2>/dev/null)"
+ck "prompt_port 拒绝已保留 relay 端口并继续读取" '[[ "$prompt_port" == "39511" ]]'
+REALITY_PORT="39511"; REALITY_PORT_V6=""
+ck "except_current_landing 允许复用当前落地端口" '! reality_port_reserved_except_current_landing 39511'
+REALITY_CDN_INNER_PORT="39511"
+ck "except_current_landing 仍拦截同号的其他保留来源" 'reality_port_reserved_except_current_landing 39511'
+REALITY_CDN_INNER_PORT="47777"
+install_reserved_rc=0
+reality_install_relay "relay.example.com" 47777 "land.example.com" 443 "" "reserved" >/dev/null 2>&1 || install_reserved_rc=$?
+ck "install_relay 拒绝 CDN inner 已保留端口" '[[ "$install_reserved_rc" -ne 0 && ! -f "$REALITY_RELAY_DIR/relay-47777.conf" ]]'
+
+echo "[T8] LOW-1 realm 0 端点守卫：全部路由文件无效时不得拿空配置重启"
+rm -rf "$REALITY_RELAY_DIR"; mkdir -p "$REALITY_RELAY_DIR"
+# 写一条“存在但无效”的路由文件：validate_conf_file 此测试恒真，但缺 RLY_TARGET_* → 渲染时被 continue
+printf 'RLY_NAME="x"\nRLY_LISTEN_PORT="46001"\nRLY_CONNECT_HOST="h.example.com"\nRLY_TARGET_HOST=""\nRLY_TARGET_PORT=""\nRLY_UUID="u"\nRLY_SNI="s.example.com"\nRLY_PUBLIC_KEY="p"\nRLY_SHORT_ID="sid"\nRLY_FLOW="xtls-rprx-vision"\n' > "$REALITY_RELAY_DIR/relay-46001.conf"
+# 预置一份“上一版好配置”，验证 0 端点时它被保留（不被空配置覆盖）
+printf 'log.level = "warn"\n\n[[endpoints]]\nlisten = "0.0.0.0:99999"\nremote = "old.good:443"\n' > "$REALITY_REALM_CONFIG"
+reality_relay_regenerate; rc_zero=$?
+ck "0 有效端点 → regenerate 返回失败(非0)" '[[ "$rc_zero" -ne 0 ]]'
+ck "0 有效端点 → 旧 realm 配置被保留(未被空配置覆盖)" 'grep -q "old.good:443" "$REALITY_REALM_CONFIG"'
+# 反证：加入一条有效路由后 regenerate 成功且配置更新
+RLY_NAME="ok"; RLY_LISTEN_PORT="46002"; RLY_CONNECT_HOST="h.example.com"
+RLY_TARGET_HOST="good.land.com"; RLY_TARGET_PORT="443"
+RLY_UUID="u2"; RLY_SNI="s2.example.com"; RLY_PUBLIC_KEY="p2"; RLY_SHORT_ID="sid2"; RLY_FLOW="xtls-rprx-vision"; RLY_FINGERPRINT="chrome"
+reality_relay_write_route 46002
+reality_relay_regenerate; rc_ok=$?
+ck "含 1 有效端点 → regenerate 成功(0)" '[[ "$rc_ok" -eq 0 ]]'
+ck "有效端点写入新配置" 'grep -q "remote = \"good.land.com:443\"" "$REALITY_REALM_CONFIG"'
 
 echo ""
 echo "==== reality_multi_relay_test: PASS=$pass FAIL=$fail ===="

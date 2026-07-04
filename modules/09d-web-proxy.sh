@@ -14,6 +14,48 @@ _replace_proxy_pass_backend() {
     ' "$conf_file"
 }
 
+_web_update_reverse_proxy_backend() {
+    local target_conf="${1:-}" new_backend="${2:-}"
+    local backup_conf tmp_conf conf_dir base
+    [[ -n "$target_conf" && -f "$target_conf" && -n "$new_backend" ]] || return 1
+    conf_dir="$(dirname "$target_conf")"
+    base="$(basename "$target_conf")"
+    backup_conf=$(mktemp "${conf_dir}/.${base}.bak.XXXXXX") || return 1
+    _tmp_register "$backup_conf"
+    tmp_conf=$(mktemp "${conf_dir}/.${base}.tmp.XXXXXX") || {
+        rm -f "$backup_conf"
+        _tmp_unregister "$backup_conf"
+        return 1
+    }
+    _tmp_register "$tmp_conf"
+    if ! cp -a "$target_conf" "$backup_conf"; then
+        rm -f "$backup_conf" "$tmp_conf"
+        _tmp_unregister "$backup_conf"; _tmp_unregister "$tmp_conf"
+        return 1
+    fi
+    if ! _replace_proxy_pass_backend "$new_backend" "$target_conf" > "$tmp_conf"; then
+        rm -f "$backup_conf" "$tmp_conf"
+        _tmp_unregister "$backup_conf"; _tmp_unregister "$tmp_conf"
+        return 1
+    fi
+    chmod --reference="$target_conf" "$tmp_conf" 2>/dev/null || true
+    chown --reference="$target_conf" "$tmp_conf" 2>/dev/null || true
+    if ! mv "$tmp_conf" "$target_conf"; then
+        rm -f "$backup_conf" "$tmp_conf"
+        _tmp_unregister "$backup_conf"; _tmp_unregister "$tmp_conf"
+        return 1
+    fi
+    _tmp_unregister "$tmp_conf"
+    if nginx -t >/dev/null 2>&1 && _nginx_reload; then
+        rm -f "$backup_conf"
+        _tmp_unregister "$backup_conf"
+        return 0
+    fi
+    mv "$backup_conf" "$target_conf" 2>/dev/null || true
+    _tmp_unregister "$backup_conf"
+    return 1
+}
+
 _cert_name_matches_domain() {
     local pattern="${1:-}" domain="${2:-}" suffix left
     pattern="${pattern%.}"
@@ -135,11 +177,10 @@ web_reverse_proxy_site() {
                 if [[ ! -f "$custom_cert" || ! -f "$custom_key" ]]; then
                     print_error "证书文件不存在"; pause; return
                 fi
-                mkdir -p "$cert_dir"
-                cp -L "$custom_cert" "$cert_dir/fullchain.pem"
-                cp -L "$custom_key" "$cert_dir/privkey.pem"
-                chmod 644 "$cert_dir/fullchain.pem"
-                chmod 600 "$cert_dir/privkey.pem"
+                copy_cert_pair_atomic "$custom_cert" "$custom_key" "$cert_dir" || {
+                    print_error "证书导入失败"
+                    pause; return
+                }
                 has_cert=1
                 ;;
             *) pause; return ;;
@@ -188,11 +229,13 @@ web_reverse_proxy_site() {
     [[ "$sp" == "0" ]] && return
     HTTPS_PORT=${sp:-443}
     validate_port "$HTTPS_PORT" || { print_error "端口无效"; pause; return; }
+    # Reality 443 共存：请求 443 时下沉到 web 内部端口，443 归 nginx stream 分流。
+    HTTPS_PORT="$(_web_coexist_https_port "$HTTPS_PORT")"
     
     # 确保 SSL 参数文件存在
     _ensure_ssl_params
-    local redir_port=""
-    [[ "$HTTPS_PORT" != "443" ]] && redir_port=":${HTTPS_PORT}"
+    local redir_port
+    redir_port="$(_web_coexist_redir_suffix "$HTTPS_PORT")"
     
     # 根据模板生成 Nginx 配置
     local nginx_conf=""
@@ -410,11 +453,18 @@ $(_nginx_tls_http2_block "$HTTPS_PORT")
         pause; return
     fi
     print_success "Nginx 反代配置已生效。"
+    # 443 共存模式：把本站域名加入 stream SNI 白名单（未启用则 no-op）
+    declare -F reality_coexist_refresh >/dev/null && reality_coexist_refresh || true
     
     # 防火墙规则
-    if ufw_is_active; then
-        ufw allow "$HTTP_PORT/tcp" comment "ReverseProxy-HTTP" >/dev/null 2>&1 || true
-        ufw allow "$HTTPS_PORT/tcp" comment "ReverseProxy-HTTPS" >/dev/null 2>&1 || true
+    _web_allow_public_tcp_port "$HTTP_PORT" "ReverseProxy-HTTP" "${HTTP_PORT}/tcp" || { pause; return 1; }
+    # 443 共存：HTTPS 端口若已下沉为 web 内部端口，仅 loopback 可达（对外走 443 stream），不放行到公网。
+    if declare -F _web_coexist_is_inner_port >/dev/null && _web_coexist_is_inner_port "$HTTPS_PORT"; then
+        print_info "共存模式：${HTTPS_PORT} 为内部端口，仅 loopback 可达，不放行到公网（对外由 443 提供）"
+    else
+        _web_allow_public_tcp_port "$HTTPS_PORT" "ReverseProxy-HTTPS" "${HTTPS_PORT}/tcp" || { pause; return 1; }
+    fi
+    if command_exists ufw && ufw_is_active; then
         print_success "防火墙规则已更新。"
     fi
     draw_line
@@ -486,22 +536,10 @@ web_edit_reverse_proxy() {
         print_warn "新地址与当前相同，无需修改。"
         pause; return
     fi
-    cp "$target_conf" "${target_conf}.bak"
-    local tmp_conf
-    tmp_conf=$(mktemp "${target_conf}.tmp.XXXXXX") || { print_error "创建临时配置失败"; pause; return; }
-    if ! _replace_proxy_pass_backend "$new_backend" "$target_conf" > "$tmp_conf"; then
-        rm -f "$tmp_conf"
-        print_error "更新配置失败"
-        pause; return
-    fi
-    mv "$tmp_conf" "$target_conf"
-    if nginx -t >/dev/null 2>&1; then
-        _nginx_reload
-        rm -f "${target_conf}.bak"
+    if _web_update_reverse_proxy_backend "$target_conf" "$new_backend"; then
         print_success "反向代理后端已更新: ${target_domain}"
         echo -e "  ${current_backend} → ${C_GREEN}${new_backend}${C_RESET}"
     else
-        mv "${target_conf}.bak" "$target_conf"
         print_error "Nginx 配置测试失败，已回滚。"
         nginx -t 2>&1 | tail -5
     fi

@@ -11,6 +11,13 @@ C_YELLOW='\033[1;33m'
 C_CYAN='\033[0;36m'
 C_RESET='\033[0m'
 
+TEST_TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/reality-sni-test.XXXXXX")
+POOL_FILE="$TEST_TMP_DIR/bulianglin-sni-pool.txt"
+cleanup() {
+    rm -rf "$TEST_TMP_DIR"
+}
+trap cleanup EXIT
+
 print_info() { echo -e "${C_CYAN}[INFO]${C_RESET} $*"; }
 print_success() { echo -e "${C_GREEN}[SUCCESS]${C_RESET} $*"; }
 print_warn() { echo -e "${C_YELLOW}[WARN]${C_RESET} $*"; }
@@ -25,7 +32,7 @@ test_fetch_pool() {
     print_title "测试 1: 拉取 bulianglin.com 候选池"
 
     local url="https://bulianglin.com/archives/nicename.html"
-    local output_file="/tmp/bulianglin-sni-pool.txt"
+    local output_file="$POOL_FILE"
 
     print_info "正在下载网页..."
     local html_content
@@ -109,7 +116,7 @@ test_single_speedtest() {
 test_batch_speedtest() {
     print_title "测试 3: 批量测速（从候选池随机选择）"
 
-    local pool_file="/tmp/bulianglin-sni-pool.txt"
+    local pool_file="$POOL_FILE"
 
     if [[ ! -f "$pool_file" ]]; then
         print_error "候选池文件不存在，请先运行测试 1"
@@ -143,7 +150,7 @@ test_batch_speedtest() {
             if [[ $latency_ms -le $threshold ]]; then
                 echo -e "${C_GREEN}${latency_ms}ms ✓${C_RESET}"
                 results+=("${latency_ms}|${domain}")
-                ((qualified_count++))
+                qualified_count=$((qualified_count + 1))
             else
                 echo -e "${C_YELLOW}${latency_ms}ms (超过阈值)${C_RESET}"
             fi
@@ -215,7 +222,7 @@ test_cloudflare_detection() {
 test_full_workflow() {
     print_title "测试 5: 完整流程模拟（多批次测速）"
 
-    local pool_file="/tmp/bulianglin-sni-pool.txt"
+    local pool_file="$POOL_FILE"
 
     if [[ ! -f "$pool_file" ]]; then
         print_error "候选池文件不存在，请先运行测试 1"
@@ -236,7 +243,7 @@ test_full_workflow() {
     local -a all_results=()
 
     while [[ $batch_num -lt $max_batches ]]; do
-        ((batch_num++))
+        batch_num=$((batch_num + 1))
 
         print_info "========== 第 ${batch_num}/${max_batches} 批测速 =========="
         echo ""
@@ -261,7 +268,7 @@ test_full_workflow() {
                 if [[ $latency_ms -le $threshold ]]; then
                     echo -e "${C_GREEN}${latency_ms}ms ✓${C_RESET}"
                     batch_results+=("${latency_ms}|${domain}")
-                    ((qualified_count++))
+                    qualified_count=$((qualified_count + 1))
                 else
                     echo -e "${C_YELLOW}${latency_ms}ms (超过阈值)${C_RESET}"
                 fi
@@ -318,7 +325,7 @@ test_full_workflow() {
 # ============================================================================
 
 main() {
-    clear
+    clear 2>/dev/null || true
     print_title "Reality SNI 测速方案完整测试"
 
     echo "本脚本将测试以下功能："
@@ -332,7 +339,11 @@ main() {
     echo "  0. 退出"
     echo ""
 
-    read -e -r -p "请选择测试项 [6]: " choice
+    if [[ -t 0 ]]; then
+        read -e -r -p "请选择测试项 [6]: " choice
+    else
+        IFS= read -r choice || choice=""
+    fi
     choice=${choice:-6}
 
     echo ""

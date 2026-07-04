@@ -12,6 +12,7 @@ BULIANGLIN_SNI_POOL_URL="https://bulianglin.com/archives/nicename.html"
 # 本地缓存文件
 REALITY_SNI_CACHE_DIR="/etc/vps-mgr/reality"
 REALITY_SNI_POOL_FILE="${REALITY_SNI_CACHE_DIR}/bulianglin-sni-pool.txt"
+REALITY_SNI_FALLBACK_POOL_FILE="${REALITY_SNI_CACHE_DIR}/fallback-sni-pool.txt"
 REALITY_SNI_CACHE_TTL=86400  # 24 小时
 
 # 三级阈值（默认值，用户可在交互菜单中选择）
@@ -23,12 +24,40 @@ REALITY_SNI_LATENCY_THRESHOLD_RELAXED=500
 REALITY_SNI_BATCH_SIZE=15
 REALITY_SNI_TEST_TIMEOUT=3
 
+_reality_sni_pool_count() {
+    local file="$1"
+    grep -cve '^[[:space:]]*$' "$file" 2>/dev/null || echo 0
+}
+
+_reality_sni_write_pool_file() {
+    local target="$1" min_count="${2:-1}" dir base tmp count
+    dir="$(dirname "$target")"
+    base="$(basename "$target")"
+    mkdir -p "$dir" || return 1
+    tmp=$(mktemp "${dir}/.tmp.${base}.XXXXXX") || return 1
+    if ! cat > "$tmp"; then
+        rm -f "$tmp" 2>/dev/null || true
+        return 1
+    fi
+    chmod 600 "$tmp" 2>/dev/null || true
+    count=$(_reality_sni_pool_count "$tmp")
+    if [[ ! "$count" =~ ^[0-9]+$ || "$count" -lt "$min_count" ]]; then
+        rm -f "$tmp" 2>/dev/null || true
+        return 1
+    fi
+    if ! mv -f "$tmp" "$target"; then
+        rm -f "$tmp" 2>/dev/null || true
+        return 1
+    fi
+    return 0
+}
+
 # ============================================================================
 # 核心函数：从 bulianglin.com 拉取候选池
 # ============================================================================
 
 reality_fetch_bulianglin_pool() {
-    local html_content domains_json
+    local html_content domains_json domains_content
 
     print_info "正在从 bulianglin.com 拉取最新 SNI 候选池..." >&2
 
@@ -43,16 +72,13 @@ reality_fetch_bulianglin_pool() {
         return 1
     fi
 
-    mkdir -p "$REALITY_SNI_CACHE_DIR"
-    echo "$domains_json" | sed 's/"//g; s/, /\n/g' | sed 's/^ *//; s/ *$//' | sort -u > "$REALITY_SNI_POOL_FILE"
-
-    local count
-    count=$(wc -l < "$REALITY_SNI_POOL_FILE")
-
-    if [[ $count -lt 10 ]]; then
+    domains_content=$(echo "$domains_json" | sed 's/"//g; s/, /\n/g' | sed 's/^ *//; s/ *$//' | sort -u)
+    if ! printf '%s\n' "$domains_content" | _reality_sni_write_pool_file "$REALITY_SNI_POOL_FILE" 10; then
         return 1
     fi
 
+    local count
+    count=$(_reality_sni_pool_count "$REALITY_SNI_POOL_FILE")
     print_success "成功拉取 $count 个 SNI 候选域名" >&2
     return 0
 }
@@ -63,11 +89,14 @@ reality_fetch_bulianglin_pool() {
 
 reality_fetch_v2ray_agent_pool() {
     local v2ray_agent_url="https://raw.githubusercontent.com/mack-a/v2ray-agent/master/install.sh"
-    local temp_file="/tmp/v2ray-agent-install.sh"
+    local temp_file
+
+    temp_file=$(mktemp "${TMPDIR:-/tmp}/v2ray-agent-install.XXXXXX") || return 1
 
     print_info "正在从 v2ray-agent 拉取备用候选池..." >&2
 
     if ! curl -fsSL --max-time 15 "$v2ray_agent_url" -o "$temp_file" 2>/dev/null; then
+        rm -f "$temp_file"
         return 1
     fi
 
@@ -79,17 +108,13 @@ reality_fetch_v2ray_agent_pool() {
         return 1
     fi
 
-    mkdir -p "$REALITY_SNI_CACHE_DIR"
-    echo "$domains_content" > "$REALITY_SNI_POOL_FILE"
-
-    local count
-    count=$(wc -l < "$REALITY_SNI_POOL_FILE")
-
-    if [[ $count -lt 10 ]]; then
+    if ! printf '%s\n' "$domains_content" | _reality_sni_write_pool_file "$REALITY_SNI_POOL_FILE" 10; then
         rm -f "$temp_file"
         return 1
     fi
 
+    local count
+    count=$(_reality_sni_pool_count "$REALITY_SNI_POOL_FILE")
     print_success "成功从 v2ray-agent 拉取 $count 个备用域名" >&2
     rm -f "$temp_file"
     return 0
@@ -102,14 +127,15 @@ reality_fetch_v2ray_agent_pool() {
 reality_update_sni_pool() {
     # 检查缓存
     if [[ -f "$REALITY_SNI_POOL_FILE" ]]; then
-        local age
+        local age count
         age=$(( $(date +%s) - $(stat -c %Y "$REALITY_SNI_POOL_FILE" 2>/dev/null || echo 0) ))
+        count=$(_reality_sni_pool_count "$REALITY_SNI_POOL_FILE")
 
-        if [[ $age -lt $REALITY_SNI_CACHE_TTL ]]; then
-            local count
-            count=$(wc -l < "$REALITY_SNI_POOL_FILE")
+        if [[ $age -lt $REALITY_SNI_CACHE_TTL && "$count" =~ ^[0-9]+$ && "$count" -gt 0 ]]; then
             print_info "使用缓存的候选池（$count 个域名，${age}s 前更新）" >&2
             return 0
+        elif [[ $age -lt $REALITY_SNI_CACHE_TTL ]]; then
+            print_warn "缓存候选池为空或无效，尝试重新拉取" >&2
         fi
     fi
 
@@ -124,8 +150,8 @@ reality_update_sni_pool() {
     fi
 
     print_warn "v2ray-agent 也不可用，使用内置列表" >&2
-    printf '%s\n' "${REALITY_CANDIDATE_SNI[@]}" > /tmp/reality-fallback-pool.txt
-    REALITY_SNI_POOL_FILE="/tmp/reality-fallback-pool.txt"
+    printf '%s\n' "${REALITY_CANDIDATE_SNI[@]}" | _reality_sni_write_pool_file "$REALITY_SNI_FALLBACK_POOL_FILE" 1 || return 1
+    REALITY_SNI_POOL_FILE="$REALITY_SNI_FALLBACK_POOL_FILE"
     return 0
 }
 

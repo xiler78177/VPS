@@ -1,4 +1,21 @@
 # modules/12d-wireguard-deb-peers.sh - Debian/Ubuntu WireGuard 设备管理
+_wg_deb_snapshot_db() {
+    [[ -f "$WG_DEB_DB_FILE" ]] || return 1
+    cat "$WG_DEB_DB_FILE"
+}
+
+_wg_deb_restore_peer_snapshot() {
+    local snapshot="${1:-}" cleanup_file="${2:-}"
+    [[ -n "$snapshot" ]] || return 1
+    wg_write_private_file "$WG_DEB_DB_FILE" "$snapshot" || return 1
+    wg_deb_rebuild_conf >/dev/null 2>&1 || true
+    wg_deb_regenerate_client_confs >/dev/null 2>&1 || true
+    wg_deb_is_running && wg_deb_apply_conf >/dev/null 2>&1 || true
+    if [[ -n "$cleanup_file" ]]; then
+        rm -f -- "$cleanup_file" 2>/dev/null || true
+    fi
+}
+
 wg_deb_add_peer() {
     wg_deb_check_server || return 1
     print_title "添加 WireGuard 设备 (Peer)"
@@ -16,9 +33,9 @@ wg_deb_add_peer() {
     peer_ip=$(wg_deb_next_ip) || { pause; return 1; }
     echo -e "  分配 IP: ${C_GREEN}${peer_ip}${C_RESET}"
     local peer_privkey peer_pubkey psk
-    peer_privkey=$(wg genkey)
-    peer_pubkey=$(echo "$peer_privkey" | wg pubkey)
-    psk=$(wg genpsk)
+    peer_privkey=$(wg genkey) || { print_error "生成 peer 私钥失败"; pause; return 1; }
+    peer_pubkey=$(printf '%s\n' "$peer_privkey" | wg pubkey) || { print_error "生成 peer 公钥失败"; pause; return 1; }
+    psk=$(wg genpsk) || { print_error "生成预共享密钥失败"; pause; return 1; }
 
     # ── 设备类型选择 ──
     local peer_type="standard"
@@ -145,16 +162,10 @@ wg_deb_add_peer() {
         esac
     fi
 
-    # ── 生成客户端配置文件 ──
-    local spub sep sport sdns mask
-    spub=$(wg_deb_db_get '.server.public_key')
-    sep=$(wg_deb_db_get '.server.endpoint')
-    sport=$(wg_deb_db_get '.server.port')
-    sdns=$(wg_deb_db_get '.server.dns')
-    mask=$(echo "$server_subnet" | cut -d'/' -f2)
-    local conf_file="${WG_DEB_CLIENT_DIR}/${peer_name}.conf"
-
     # ── 写入数据库 ──
+    local conf_file="${WG_DEB_CLIENT_DIR}/${peer_name}.conf"
+    local db_snapshot
+    db_snapshot=$(_wg_deb_snapshot_db) || { print_error "读取 WireGuard 数据库快照失败"; pause; return 1; }
     local now; now=$(date '+%Y-%m-%d %H:%M:%S')
     if ! wg_deb_db_set --arg name "$peer_name" \
               --arg ip "$peer_ip" \
@@ -189,13 +200,18 @@ wg_deb_add_peer() {
     # ── 网关设备: 联动更新其他 peer 的 allowed_ips ──
     if [[ "$is_gateway" == "true" && -n "$lan_subnets" ]]; then
         if ! _wg_deb_update_peer_routes; then
-            print_error "联动更新客户端路由失败"
+            print_error "联动更新客户端路由失败，正在回滚"
+            _wg_deb_restore_peer_snapshot "$db_snapshot" "$conf_file"
             pause; return 1
         fi
     fi
 
     # ── 重建配置并热应用 ──
-    wg_deb_apply_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
+    if ! wg_deb_apply_conf; then
+        print_error "WireGuard 运行配置热应用失败，正在回滚"
+        _wg_deb_restore_peer_snapshot "$db_snapshot" "$conf_file"
+        pause; return 1
+    fi
 
     # ── 结果展示 ──
     draw_line
@@ -245,14 +261,18 @@ _wg_deb_update_peer_routes() {
     _pi=0
     while [[ $_pi -lt $_pc ]]; do
         local _cur=$(wg_deb_db_get ".peers[$_pi].client_allowed_ips")
-        [[ "$_cur" == *"0.0.0.0/0"* ]] && { _pi=$((_pi + 1)); continue; }
-        [[ "$_cur" == "$server_subnet" ]] && { _pi=$((_pi + 1)); continue; }
-
         local _is_gw=$(wg_deb_db_get ".peers[$_pi].is_gateway // false")
         local _own=$(wg_deb_db_get ".peers[$_pi].lan_subnets // empty")
         local _ptype=$(wg_deb_db_get ".peers[$_pi].peer_type // \"standard\"")
         local _route_mode=$(wg_deb_db_get ".peers[$_pi].route_mode // empty")
-        [[ "$_route_mode" == "custom" ]] && { _pi=$((_pi + 1)); continue; }
+        case "$_route_mode" in
+            custom|full|vpn)
+                _pi=$((_pi + 1))
+                continue
+                ;;
+        esac
+        [[ "$_cur" == *"0.0.0.0/0"* || "$_cur" == *"::/0"* ]] && { _pi=$((_pi + 1)); continue; }
+        [[ -z "$_route_mode" && "$_cur" == "$server_subnet" ]] && { _pi=$((_pi + 1)); continue; }
 
         if [[ "$_is_gw" == "true" ]]; then
             local _other="" _IFS_BAK="$IFS"; IFS=','
@@ -292,13 +312,19 @@ wg_deb_toggle_peer() {
     target_name=$(wg_deb_db_get ".peers[$target_idx].name")
     target_pubkey=$(wg_deb_db_get ".peers[$target_idx].public_key")
     current_state=$(wg_deb_db_get ".peers[$target_idx].enabled")
+    local db_snapshot
+    db_snapshot=$(_wg_deb_snapshot_db) || { print_error "读取 WireGuard 数据库快照失败"; pause; return 1; }
     if [[ "$current_state" == "true" ]]; then
         if confirm "确认禁用设备 '${target_name}'？"; then
             if ! wg_deb_db_set --argjson idx "$target_idx" '.peers[$idx].enabled = false'; then
                 print_error "数据库写入失败，设备状态未修改"
                 pause; return 1
             fi
-            wg_deb_apply_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
+            if ! wg_deb_apply_conf; then
+                print_error "WireGuard 运行配置热应用失败，正在回滚"
+                _wg_deb_restore_peer_snapshot "$db_snapshot"
+                pause; return 1
+            fi
             print_success "设备 '${target_name}' 已禁用"
             log_action "WireGuard(deb) peer disabled: ${target_name}"
         fi
@@ -308,7 +334,11 @@ wg_deb_toggle_peer() {
                 print_error "数据库写入失败，设备状态未修改"
                 pause; return 1
             fi
-            wg_deb_apply_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
+            if ! wg_deb_apply_conf; then
+                print_error "WireGuard 运行配置热应用失败，正在回滚"
+                _wg_deb_restore_peer_snapshot "$db_snapshot"
+                pause; return 1
+            fi
             print_success "设备 '${target_name}' 已启用"
             log_action "WireGuard(deb) peer enabled: ${target_name}"
         fi
@@ -328,6 +358,9 @@ wg_deb_delete_peer() {
     fi
     local _del_gw=$(wg_deb_db_get ".peers[$target_idx].is_gateway // false")
     local _del_lans=$(wg_deb_db_get ".peers[$target_idx].lan_subnets // empty")
+    local conf_file="${WG_DEB_CLIENT_DIR}/${target_name}.conf"
+    local db_snapshot
+    db_snapshot=$(_wg_deb_snapshot_db) || { print_error "读取 WireGuard 数据库快照失败"; pause; return 1; }
     if ! wg_deb_db_set --argjson idx "$target_idx" 'del(.peers[$idx])'; then
         print_error "数据库写入失败，设备未删除"
         pause; return 1
@@ -336,13 +369,18 @@ wg_deb_delete_peer() {
     # 网关删除后联动更新其他 peer
     if [[ "$_del_gw" == "true" && -n "$_del_lans" && "$_del_lans" != "null" ]]; then
         if ! _wg_deb_update_peer_routes; then
-            print_error "联动更新客户端路由失败"
+            print_error "联动更新客户端路由失败，正在回滚"
+            _wg_deb_restore_peer_snapshot "$db_snapshot"
             pause; return 1
         fi
     fi
 
-    rm -f "${WG_DEB_CLIENT_DIR}/${target_name}.conf"
-    wg_deb_apply_conf || { print_error "WireGuard 运行配置热应用失败"; pause; return 1; }
+    if ! wg_deb_apply_conf; then
+        print_error "WireGuard 运行配置热应用失败，正在回滚"
+        _wg_deb_restore_peer_snapshot "$db_snapshot"
+        pause; return 1
+    fi
+    rm -f -- "$conf_file" 2>/dev/null || print_warn "删除客户端配置文件失败: $conf_file"
 
     print_success "设备 '${target_name}' 已删除"
     log_action "WireGuard(deb) peer deleted: ${target_name}"

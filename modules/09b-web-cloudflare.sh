@@ -117,20 +117,102 @@ _cf_get_zone_id() {
 
 _cf_dns_delete() {
     local zone_id=$1 token=$2 type=$3 name=$4
-    local resp=$(_cf_api GET "/zones/$zone_id/dns_records?type=$type&name=$name" "$token")
+    local resp
+    resp=$(_cf_api GET "/zones/$zone_id/dns_records?type=$type&name=$name" "$token")
     if ! _cf_api_ok "$resp"; then
         print_error "读取 DNS 记录失败: $(_cf_api_err "$resp")"
         return 1
     fi
     local rid=$(echo "$resp" | jq -r '.result[0].id // empty')
     [[ -n "$rid" ]] || return 0
-    _cf_api DELETE "/zones/$zone_id/dns_records/$rid" "$token" >/dev/null
+    resp=$(_cf_api DELETE "/zones/$zone_id/dns_records/$rid" "$token")
+    if ! _cf_api_ok "$resp"; then
+        print_error "删除 DNS 记录失败: $(_cf_api_err "$resp")"
+        return 1
+    fi
+}
+
+_cf_dns_snapshot_records() {
+    local zone_id="$1" token="$2" name="$3"
+    shift 3
+    local types=("$@")
+    [[ ${#types[@]} -gt 0 ]] || types=(A AAAA CNAME)
+
+    local type resp snapshot='[]'
+    for type in "${types[@]}"; do
+        resp=$(_cf_api GET "/zones/$zone_id/dns_records?type=$type&name=$name" "$token")
+        if ! _cf_api_ok "$resp"; then
+            print_error "读取 DNS 快照失败: $type $(_cf_api_err "$resp")"
+            return 1
+        fi
+        snapshot=$(jq -c --argjson acc "$snapshot" \
+            '$acc + [(.result // [])[] | {type,name,content,ttl,proxied,comment,tags} | with_entries(select(.value != null))]' \
+            <<< "$resp") || {
+            print_error "解析 DNS 快照失败: $type"
+            return 1
+        }
+    done
+    printf '%s\n' "$snapshot"
+}
+
+_cf_dns_restore_records() {
+    local zone_id="$1" token="$2" name="$3" snapshot="$4"
+    shift 4
+    local types=("$@")
+    [[ ${#types[@]} -gt 0 ]] || types=(A AAAA CNAME)
+
+    if ! jq -e 'type == "array"' >/dev/null 2>&1 <<< "$snapshot"; then
+        print_error "DNS 快照格式无效，无法恢复"
+        return 1
+    fi
+
+    local type resp id payload record
+    for type in "${types[@]}"; do
+        resp=$(_cf_api GET "/zones/$zone_id/dns_records?type=$type&name=$name" "$token")
+        if ! _cf_api_ok "$resp"; then
+            print_error "读取待恢复 DNS 记录失败: $type $(_cf_api_err "$resp")"
+            return 1
+        fi
+        while IFS= read -r id; do
+            [[ -n "$id" ]] || continue
+            resp=$(_cf_api DELETE "/zones/$zone_id/dns_records/$id" "$token")
+            if ! _cf_api_ok "$resp"; then
+                print_error "删除待恢复 DNS 记录失败: $type $(_cf_api_err "$resp")"
+                return 1
+            fi
+        done < <(jq -r '.result[]?.id // empty' <<< "$resp")
+    done
+
+    while IFS= read -r record; do
+        [[ -n "$record" ]] || continue
+        payload=$(jq -c '{
+            type: .type,
+            name: .name,
+            content: .content,
+            ttl: (.ttl // 1),
+            proxied: (.proxied // false)
+        }
+        + (if has("comment") then {comment: .comment} else {} end)
+        + (if has("tags") then {tags: .tags} else {} end)' <<< "$record") || {
+            print_error "构造 DNS 恢复 payload 失败"
+            return 1
+        }
+        resp=$(_cf_api POST "/zones/$zone_id/dns_records" "$token" --data "$payload")
+        if ! _cf_api_ok "$resp"; then
+            print_error "恢复 DNS 记录失败: $(_cf_api_err "$resp")"
+            return 1
+        fi
+    done < <(jq -c '.[]' <<< "$snapshot")
+    return 0
 }
 
 # 通用 DNS 记录更新
 _cf_update_dns_record() {
     local zone_id="$1" token="$2" domain="$3" type="$4" ip="$5" proxied="$6"
-    [[ -z "$ip" ]] && return 0
+    if [[ -z "$ip" ]]; then
+        print_error "$type 记录缺少目标 IP，已中止"
+        return 1
+    fi
     print_info "处理 $type 记录 -> $ip (代理: $proxied)"
     local records=$(_cf_api GET "/zones/$zone_id/dns_records?type=$type&name=$domain" "$token")
     if ! _cf_api_ok "$records"; then
@@ -139,7 +221,11 @@ _cf_update_dns_record() {
     fi
     local record_id=$(jq -r '.result[0].id // empty' <<< "$records")
     local count=$(jq -r '.result | length' <<< "$records")
-    [[ "$count" -gt 1 ]] && print_warn "警告: 存在 ${count} 条 $type 记录，仅更新第一条。建议手动清理多余记录。"
+    local extra_ids=""
+    if [[ "$count" -gt 1 ]]; then
+        print_warn "警告: 存在 ${count} 条 $type 记录，将保留第一条并清理多余记录。"
+        extra_ids=$(jq -r '.result[1:][] | .id // empty' <<< "$records")
+    fi
     local data=$(jq -n --arg type "$type" --arg name "$domain" --arg content "$ip" --argjson proxied "$proxied" \
         '{type:$type, name:$name, content:$content, ttl:1, proxied:$proxied}')
     local resp
@@ -149,6 +235,15 @@ _cf_update_dns_record() {
         resp=$(_cf_api POST "/zones/$zone_id/dns_records" "$token" --data "$data")
     fi
     if _cf_api_ok "$resp"; then
+        local extra_id delete_resp
+        while IFS= read -r extra_id; do
+            [[ -n "$extra_id" ]] || continue
+            delete_resp=$(_cf_api DELETE "/zones/$zone_id/dns_records/$extra_id" "$token")
+            if ! _cf_api_ok "$delete_resp"; then
+                print_error "删除多余 $type 记录失败: $(_cf_api_err "$delete_resp")"
+                return 1
+            fi
+        done <<< "$extra_ids"
         print_success "$([[ -n "$record_id" ]] && echo '更新' || echo '创建')成功"
         return 0
     else
@@ -166,6 +261,7 @@ cf_dns_sync_node_grey() {
     local zone_id
     zone_id=$(_cf_get_zone_id "$domain" "$token")
     [[ -z "$zone_id" ]] && { print_error "无法获取 Zone ID: $domain"; return 1; }
+    [[ -n "$ipv4" || -n "$ipv6" ]] || { print_error "未提供任何公网 IP，无法同步 DNS/DDNS"; return 1; }
     local has_v4=false has_v6=false
     if [[ -n "$ipv4" ]]; then
         _cf_update_dns_record "$zone_id" "$token" "$domain" "A" "$ipv4" "false" || return 1
@@ -228,12 +324,17 @@ web_cf_dns_update() {
         0|q|Q|"") return ;;
         *) print_error "无效选择，请输入 1/2/3，或输入 0 返回"; pause; return ;;
     esac
-    # 选择 IPv6 但未检测到时给予提示
-    if [[ ("$mode" == "2" || "$mode" == "3") && -z "$ipv6" ]]; then
-        print_warn "未检测到 IPv6 地址，AAAA 记录将跳过"
+    if [[ "$mode" == "1" && -z "$ipv4" ]]; then
+        print_error "仅 IPv4 模式未检测到 IPv4 地址，无法配置 A 记录"
+        pause; return 1
     fi
-    if [[ ("$mode" == "1" || "$mode" == "3") && -z "$ipv4" ]]; then
-        print_warn "未检测到 IPv4 地址，A 记录将跳过"
+    if [[ "$mode" == "2" && -z "$ipv6" ]]; then
+        print_error "仅 IPv6 模式未检测到 IPv6 地址，无法配置 AAAA 记录"
+        pause; return 1
+    fi
+    if [[ "$mode" == "3" && ( -z "$ipv4" || -z "$ipv6" ) ]]; then
+        print_error "双栈解析需要同时检测到 IPv4 和 IPv6 地址"
+        pause; return 1
     fi
     # 读取并验证 Token
     if ! _cf_read_token "CF_API_TOKEN"; then
@@ -262,16 +363,19 @@ web_cf_dns_update() {
 
     # 使用提取的模块级函数
     case $mode in
-        1) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "A" "$ipv4" "$proxied" ;;
-        2) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "AAAA" "$ipv6" "$proxied" ;;
-        3) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "A" "$ipv4" "$proxied"
-           _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "AAAA" "$ipv6" "$proxied" ;;
+        1) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "A" "$ipv4" "$proxied" || { pause; return 1; } ;;
+        2) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "AAAA" "$ipv6" "$proxied" || { pause; return 1; } ;;
+        3) _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "A" "$ipv4" "$proxied" || { pause; return 1; }
+           _cf_update_dns_record "$zone_id" "$CF_API_TOKEN" "$DOMAIN" "AAAA" "$ipv6" "$proxied" || { pause; return 1; } ;;
     esac
     print_success "DNS 配置完成。"
     log_action "Cloudflare DNS updated for $DOMAIN"
     local ddns_v4=$([[ "$mode" == "1" || "$mode" == "3" ]] && echo "true" || echo "false")
     local ddns_v6=$([[ "$mode" == "2" || "$mode" == "3" ]] && echo "true" || echo "false")
-    ddns_setup "$DOMAIN" "$CF_API_TOKEN" "$zone_id" "$ddns_v4" "$ddns_v6" "$proxied"
+    if ! ddns_setup "$DOMAIN" "$CF_API_TOKEN" "$zone_id" "$ddns_v4" "$ddns_v6" "$proxied"; then
+        print_error "DDNS 配置失败"
+        pause; return 1
+    fi
     _CF_RESULT_DOMAIN="$DOMAIN"
     _CF_RESULT_TOKEN="$CF_API_TOKEN"
     sleep 2
@@ -316,19 +420,60 @@ _cf_get_origin_ruleset() {
 _cf_put_origin_ruleset() {
     local token="$1" zone_id="$2" rules_json="$3"
     local url="https://api.cloudflare.com/client/v4/zones/${zone_id}/rulesets/phases/http_request_origin/entrypoint"
-    local payload=$(jq -n \
+    local payload
+    payload=$(jq -n \
         --argjson rules "$rules_json" \
-        '{ "rules": $rules }')
-    local resp=$(curl -s -X PUT "$url" \
-        -H "Authorization: Bearer $token" \
-        -H "Content-Type: application/json" \
-        --data "$payload")
-    if [[ "$(echo "$resp" | jq -r '.success')" == "true" ]]; then
-        return 0
-    else
-        echo "$resp" | jq -r '.errors[0].message // "未知错误"'
+        '{ "rules": $rules }') || { echo "构造 Origin Rules payload 失败"; return 1; }
+    local attempt resp curl_rc
+    for attempt in 1 2 3; do
+        resp=$(curl -sS --connect-timeout 10 --max-time 30 -X PUT "$url" \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json" \
+            --data "$payload" 2>/dev/null)
+        curl_rc=$?
+        [[ $curl_rc -eq 0 && -n "$resp" ]] && break
+        [[ $attempt -lt 3 ]] && sleep $((attempt * 2))
+    done
+    if [[ ${curl_rc:-1} -ne 0 || -z "${resp:-}" ]]; then
+        echo "Origin Rules 写入失败或超时"
         return 1
     fi
+    if _cf_api_ok "$resp"; then
+        return 0
+    else
+        _cf_api_err "$resp"
+        return 1
+    fi
+}
+
+_cf_origin_rules_snapshot() {
+    local token="$1" zone_id="$2" existing rules
+    if ! existing=$(_cf_get_origin_ruleset "$token" "$zone_id"); then
+        print_error "Origin Rules 快照读取失败"
+        return 1
+    fi
+    if [[ -n "$existing" ]]; then
+        rules=$(jq -c '.result.rules // []' <<< "$existing" 2>/dev/null) || {
+            print_error "Origin Rules 快照解析失败"
+            return 1
+        }
+    else
+        rules="[]"
+    fi
+    printf '%s\n' "$rules"
+}
+
+_cf_origin_rules_restore() {
+    local token="$1" zone_id="$2" rules_snapshot="$3" err
+    if ! jq -e 'type == "array"' >/dev/null 2>&1 <<< "$rules_snapshot"; then
+        print_error "Origin Rules 快照格式无效，无法恢复"
+        return 1
+    fi
+    if ! err=$(_cf_put_origin_ruleset "$token" "$zone_id" "$rules_snapshot"); then
+        print_error "Origin Rules 快照恢复失败: $err"
+        return 1
+    fi
+    return 0
 }
 
 web_cf_origin_rule_create() {
@@ -502,6 +647,9 @@ web_cf_origin_rule_delete() {
     done
     read -e -r -p "输入要删除的规则编号 (0=取消): " choice
     if [[ "$choice" == "0" || -z "$choice" ]]; then return; fi
+    if [[ ! "$choice" =~ ^[0-9]+$ ]]; then
+        print_error "编号无效"; pause; return
+    fi
     local idx=$((choice - 1))
     if [[ $idx -lt 0 || $idx -ge $count ]]; then
         print_error "编号无效"; pause; return
