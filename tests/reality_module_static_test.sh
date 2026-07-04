@@ -451,8 +451,12 @@ _cf_api() {
     printf '%s\n' '{"success":true,"result":[{"name":"example.com"},{"name":"gpt.xx.kg"}]}'
 }
 _cf_api_ok() { [[ "$(grep -o '"success":true' <<< "$1")" == '"success":true' ]]; }
+_cf_list_zones() {
+    printf '%s\n' '{"success":true,"result":[{"name":"example.com"},{"name":"gpt.xx.kg"}]}'
+}
 prompt_domain_out="$(printf '2\ntest\n' | reality_prompt_domain_with_zones '节点连接' 'secret-token' 2>"$reality_test_tmp/reality-domain-prompt.err")"
 [[ "$prompt_domain_out" == 'test.gpt.xx.kg' ]] || fail "zone-aware domain prompt should return only joined full domain on stdout, got: $prompt_domain_out"
+unset -f _cf_api _cf_api_ok _cf_list_zones
 
 prompts_text="$(grep -E '节点连接域名|SNI 域名|REALITY SNI|候选|Cloudflare 灰云|Cloudflare API Token|自动创建/更新|不是让你手动|只需要填写自定义前缀|实际连接|成品网站|校验 TLS|请选择一个 SNI' modules/15-singbox-reality.sh)"
 assert_contains 'Cloudflare 灰云' "$prompts_text" "node-domain prompt should explain Cloudflare grey-cloud requirement"

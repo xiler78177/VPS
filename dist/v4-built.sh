@@ -12935,6 +12935,32 @@ wg_deb_generate_clash_config() {
     _wg_generate_clash_config_impl "debian"
 }
 
+_wg_clash_rule_type_for_addr() {
+    case "${1:-}" in
+        *:*) printf 'IP-CIDR6' ;;
+        *)   printf 'IP-CIDR' ;;
+    esac
+}
+
+_wg_clash_endpoint_direct_rule() {
+    local endpoint="${1:-}" host
+    host=$(wg_shared_endpoint_host "$endpoint")
+    if validate_ip "$host"; then
+        if [[ "$host" == *:* ]]; then
+            printf '  - IP-CIDR6,%s/128,DIRECT\n' "$host"
+        else
+            printf '  - IP-CIDR,%s/32,DIRECT\n' "$host"
+        fi
+    else
+        printf '  - DOMAIN,%s,DIRECT\n' "$host"
+    fi
+}
+
+_wg_clash_cidr_rule() {
+    local cidr="${1:-}" group="${2:-}"
+    printf '  - %s,%s,%s\n' "$(_wg_clash_rule_type_for_addr "$cidr")" "$cidr" "$group"
+}
+
 _wg_generate_clash_config_impl() {
     local mode="${1:-openwrt}"
     _wg_clash_check_server "$mode" || return 1
@@ -13031,16 +13057,9 @@ _wg_generate_clash_config_impl() {
     # ── 构建 rules ──
     local wg_rules_yaml=""
     # 服务器 endpoint 走 DIRECT（防止死循环）
-    if [[ "$server_endpoint" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        wg_rules_yaml+="  - IP-CIDR,${server_endpoint}/32,DIRECT
-"
-    else
-        wg_rules_yaml+="  - DOMAIN,${server_endpoint},DIRECT
-"
-    fi
+    wg_rules_yaml+="$(_wg_clash_endpoint_direct_rule "$server_endpoint")"
     for cidr in "${unique_cidrs[@]}"; do
-        wg_rules_yaml+="  - IP-CIDR,${cidr},${group_name}
-"
+        wg_rules_yaml+="$(_wg_clash_cidr_rule "$cidr" "$group_name")"
     done
 
     # ── 输出 ──

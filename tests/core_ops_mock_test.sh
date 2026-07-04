@@ -2185,7 +2185,7 @@ test_openwrt_wg_watchdog_ipv6_helpers() {
     awk '
         /^resolve_real\(\)/ {capture=1}
         capture {print}
-        /^if ! ifstatus wg0/ {exit}
+        /^if ! wg_is_up/ {exit}
     ' "$ROOT/modules/11d-wireguard-peers.sh" | sed '$d' > "$helper_lib"
 
     # shellcheck disable=SC1090
@@ -3439,6 +3439,26 @@ test_wg_clash_output_uses_private_random_dir() {
     fi
 }
 
+test_wg_clash_rules_handle_ipv6_literals() {
+    local ep4 ep6 domain cidr4 cidr6
+    ep4=$(_wg_clash_endpoint_direct_rule "198.51.100.8")
+    ep6=$(_wg_clash_endpoint_direct_rule "[2001:db8::8]")
+    domain=$(_wg_clash_endpoint_direct_rule "vpn.example.com")
+    cidr4=$(_wg_clash_cidr_rule "10.66.66.0/24" "WireGuard-VPN")
+    cidr6=$(_wg_clash_cidr_rule "fd00:66::/64" "WireGuard-VPN")
+
+    if [[ "$ep4" == "  - IP-CIDR,198.51.100.8/32,DIRECT" ]] \
+       && [[ "$ep6" == "  - IP-CIDR6,2001:db8::8/128,DIRECT" ]] \
+       && [[ "$domain" == "  - DOMAIN,vpn.example.com,DIRECT" ]] \
+       && [[ "$cidr4" == "  - IP-CIDR,10.66.66.0/24,WireGuard-VPN" ]] \
+       && [[ "$cidr6" == "  - IP-CIDR6,fd00:66::/64,WireGuard-VPN" ]]; then
+        pass "WireGuard Clash rules distinguish IPv4 IPv6 and domain endpoints"
+    else
+        fail "WireGuard Clash rules mishandle IPv6/domain endpoint routing"
+        printf '    ep4=%s\n    ep6=%s\n    domain=%s\n    cidr4=%s\n    cidr6=%s\n' "$ep4" "$ep6" "$domain" "$cidr4" "$cidr6"
+    fi
+}
+
 test_openwrt_wg_deploy_generated_script_is_posix_sh() {
     local endpoint="$1" label="$2" expected_host="$3" expect_watchdog="$4" expect_ip6="${5:-0}"
     local out="$TMP_ROOT/openwrt-deploy-${label}.out"
@@ -3891,6 +3911,7 @@ test_web_reverse_proxy_backend_update_is_atomic
 test_nginx_official_source_and_stream_conf_are_atomic
 test_nginx_deploy_conf_rolls_back_on_symlink_failure
 test_wg_clash_output_uses_private_random_dir
+test_wg_clash_rules_handle_ipv6_literals
 test_openwrt_wg_watchdog_ipv6_helpers
 test_openwrt_wg_deploy_generated_script_is_posix_sh "198.51.100.8" "ipv4" "198.51.100.8" "0" "0"
 test_openwrt_wg_deploy_generated_script_is_posix_sh "vpn.example.com" "domain" "vpn.example.com" "1" "0"
