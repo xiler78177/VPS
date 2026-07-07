@@ -2539,7 +2539,11 @@ EOF
         ss -ltn 2>/dev/null | grep -q ":${test_port} " && break
         sleep 0.2
     done
-    out=$(curl -4 -sS --max-time "${REALITY_RELAY_VALIDATE_TIMEOUT:-25}" --socks5-hostname "127.0.0.1:${test_port}" "$test_url" 2>"$curl_log"); rc=$?
+    if out=$(curl -4 -sS --max-time "${REALITY_RELAY_VALIDATE_TIMEOUT:-25}" --socks5-hostname "127.0.0.1:${test_port}" "$test_url" 2>"$curl_log"); then
+        rc=0
+    else
+        rc=$?
+    fi
     [[ -n "$pid" ]] && kill "$pid" >/dev/null 2>&1 || true
     [[ -n "$pid" ]] && wait "$pid" >/dev/null 2>&1 || true
     mkdir -p "$REALITY_RELAY_DIR"

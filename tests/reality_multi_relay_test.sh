@@ -450,6 +450,38 @@ ck "路由回读 RLY_FINGERPRINT" '[[ "$RLY_FINGERPRINT" == "firefox" ]]'
 reality_relay_write_client_artifacts
 ck "中转客户端链接用 RLY_FINGERPRINT(firefox)" 'grep -q "fp=firefox" "$REALITY_RELAY_DIR/relay-41001.link.txt"'
 ck "中转客户端 JSON 用 RLY_FINGERPRINT(firefox)" 'grep -q "\"fingerprint\":\"firefox\"" "$REALITY_RELAY_DIR/relay-41001.client.json"'
+RLY_NAME="rflow"; RLY_LISTEN_PORT="41002"; RLY_CONNECT_HOST="h2.example.com"
+RLY_TARGET_HOST="t2.example.com"; RLY_TARGET_PORT="443"
+RLY_UUID="u2"; RLY_SNI="s2.example.com"; RLY_PUBLIC_KEY="p2"; RLY_SHORT_ID="sid2"; RLY_FLOW="custom-flow"; RLY_FINGERPRINT="chrome"
+reality_relay_write_route 41002; reality_relay_write_client_artifacts
+ck "中转客户端链接使用 RLY_FLOW" 'grep -q "flow=custom-flow" "$REALITY_RELAY_DIR/relay-41002.link.txt"'
+ck "中转客户端 JSON 使用 RLY_FLOW" 'grep -q "\"flow\":\"custom-flow\"" "$REALITY_RELAY_DIR/relay-41002.client.json"'
+
+echo "[T7a] 中转预检/端口推荐/公钥推导"
+command_exists(){ case "${1:-}" in openssl) return 0 ;; *) return 1 ;; esac; }
+derived_pbk="$(reality_public_key_from_private CH9KnoOy2YUXRXaQCEKWYaiA_kGSqb21PQRZlIqVBks 2>/dev/null || true)"
+ck "X25519 private_key 可推导 Reality public_key" '[[ "$derived_pbk" == "Q47d2WzwcBDO0nmRoJzVl_Gf3d1ZqK7fQYsh_47awx4" ]]'
+command_exists(){ return 1; }
+rm -rf "$REALITY_RELAY_DIR"; mkdir -p "$REALITY_RELAY_DIR"
+RLY_NAME="p1"; RLY_LISTEN_PORT="35101"; RLY_CONNECT_HOST="relay.example.com"
+RLY_TARGET_HOST="a.example.com"; RLY_TARGET_PORT="443"
+RLY_UUID="u1"; RLY_SNI="s1.example.com"; RLY_PUBLIC_KEY="p1"; RLY_SHORT_ID="sid1"; RLY_FLOW="xtls-rprx-vision"; RLY_FINGERPRINT="chrome"
+reality_relay_write_route 35101
+RLY_LISTEN_PORT="35102"; RLY_UUID="u2"; RLY_SNI="s2.example.com"; RLY_PUBLIC_KEY="p2"; RLY_SHORT_ID="sid2"
+reality_relay_write_route 35102
+ck "relay_next_port 默认接在已有最大端口后" '[[ "$(reality_relay_next_port)" == "35103" ]]'
+(
+    reality_port_in_use(){ [[ "${1:-}" == "35103" ]]; }
+    RLY_NAME="preflight"; RLY_LISTEN_PORT="35103"; RLY_CONNECT_HOST="relay.example.com"
+    RLY_TARGET_HOST="127.0.0.1"; RLY_TARGET_PORT="443"
+    RLY_UUID="u3"; RLY_SNI="s3.example.com"; RLY_PUBLIC_KEY="p3"; RLY_SHORT_ID="sid3"; RLY_FLOW="xtls-rprx-vision"; RLY_FINGERPRINT="chrome"
+    reality_relay_preflight_route new >/dev/null 2>&1
+)
+preflight_used_rc=$?
+ck "relay_preflight 拒绝运行时已占用端口" '[[ "$preflight_used_rc" -ne 0 ]]'
+printf '{"status":"ok","exit_ip":"203.0.113.9"}\n' > "$REALITY_RELAY_DIR/relay-35101.health.json"
+list_body="$(awk "/^reality_relay_list\\(\\)/,/^}/" "$MOD")"
+ck "中转线路列表会读取 health 状态" 'grep -q "health.json" <<< "$list_body" && grep -q "验证:" <<< "$list_body"'
 
 echo "[T7] MED-4 统一保留端口集合：relay 监听端口即使 realm 停止也不被复用"
 # 清空 relays，写两条已知监听端口的路由；不依赖运行时 ss（command_exists→false 使 reality_port_in_use 恒 false）
