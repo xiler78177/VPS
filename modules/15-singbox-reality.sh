@@ -2559,10 +2559,12 @@ EOF
         tail -n 10 "$curl_log" 2>/dev/null || true
         sed -E 's/[0-9a-fA-F-]{36}/<uuid>/g' "$log" 2>/dev/null | tail -n 20 || true
     fi
-    cat > "$json_path" <<EOF
+    local health_content
+    health_content=$(cat <<EOF
 {"route":"${json_name}","listen_port":${RLY_LISTEN_PORT},"connect_host":"${json_host}","target_host":"$(reality_json_escape "${RLY_TARGET_HOST:-}")","target_port":${RLY_TARGET_PORT:-0},"status":"${status}","exit_ip":"$(reality_json_escape "$out")","expected_exit_ip":"$(reality_json_escape "$expected_exit_ip")","checked_at":"$(date -Is 2>/dev/null || date)"}
 EOF
-    chmod 600 "$json_path" 2>/dev/null || true
+)
+    reality_write_secure_file "$json_path" "$health_content" || true
     rm -rf "$tmp_dir"
     [[ "$status" == "ok" ]]
 }
