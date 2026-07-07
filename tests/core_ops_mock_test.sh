@@ -3663,19 +3663,49 @@ EOF
 test_opt_sysctl_validates_before_commit() {
     local mock_sysctl_conf="$TMP_ROOT/sysctl.conf"
     local sysctl_log="$TMP_ROOT/sysctl-calls.txt"
+    local tuning_conf="$TMP_ROOT/sysctl.d/99zz-server-manage-tuning.conf"
+    local profile_file="$TMP_ROOT/sysctl.d/99zz-server-manage-tuning.profile.md"
+    local rollback_file="$TMP_ROOT/server-manage-sysctl.rollback.conf"
+    local latest_file="$TMP_ROOT/server-manage-sysctl.latest-snapshot"
+    local params params_second first_rollback first_latest
     cat > "$mock_sysctl_conf" <<'EOF'
 # keep this line
 net.ipv4.tcp_syncookies = 1
 EOF
     _sysctl_conf_path() { printf '%s' "$mock_sysctl_conf"; }
-    _sysctl_backup_path() { printf '%s.pre-tuning' "$mock_sysctl_conf"; }
+    params="$(_sysctl_build_role_params conservative 1)"
+    declare -A SYSCTL_VALUES=(
+        ["fs.file-max"]="100000"
+        ["net.core.somaxconn"]="128"
+        ["net.ipv4.tcp_max_syn_backlog"]="128"
+        ["net.ipv4.tcp_tw_reuse"]="0"
+        ["net.ipv4.tcp_syncookies"]="1"
+        ["net.ipv4.tcp_fin_timeout"]="60"
+        ["net.ipv4.tcp_available_congestion_control"]="reno cubic"
+    )
     sysctl() {
         if [[ "${1:-}" == "-n" ]]; then
-            printf '0\n'
+            if [[ "${SYSCTL_BAD_AFTER_SYSTEM:-0}" == "1" \
+               && "${SYSCTL_AFTER_SYSTEM:-0}" == "1" \
+               && "${2:-}" == "fs.file-max" ]]; then
+                printf '999999\n'
+                return 0
+            fi
+            printf '%s\n' "${SYSCTL_VALUES[${2:-}]:-0}"
             return 0
         fi
         if [[ "${1:-}" == "-p" ]]; then
             printf '%s\n' "${2:-}" >> "$sysctl_log"
+            [[ "${SYSCTL_APPLY_OK:-0}" == "1" ]] || return 1
+            while IFS= read -r line; do
+                [[ "$line" =~ ^[[:space:]]*([A-Za-z0-9_.-]+)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+                SYSCTL_VALUES["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+            done < "${2:-/dev/null}"
+            return 0
+        fi
+        if [[ "${1:-}" == "--system" ]]; then
+            printf '%s\n' "--system" >> "$sysctl_log"
+            SYSCTL_AFTER_SYSTEM=1
             [[ "${SYSCTL_APPLY_OK:-0}" == "1" ]]
             return
         fi
@@ -3683,43 +3713,158 @@ EOF
     }
 
     SYSCTL_APPLY_OK=0
-    printf '3\n' | opt_sysctl >/dev/null 2>&1
+    _sysctl_commit_tuning "$params" "conservative" "100M/small-memory" "test failure" >/dev/null 2>&1
     if grep -qF '# keep this line' "$mock_sysctl_conf" \
-       && ! grep -qF '# BEGIN server-manage sysctl tuning' "$mock_sysctl_conf" \
-       && [[ ! -f "${mock_sysctl_conf}.pre-tuning" ]]; then
+       && grep -q '^net.ipv4.tcp_syncookies = 1$' "$mock_sysctl_conf" \
+       && [[ ! -f "$tuning_conf" ]] \
+       && [[ ! -f "$rollback_file" ]]; then
         pass "opt_sysctl does not commit failed sysctl -p candidate"
     else
-        fail "opt_sysctl modified sysctl.conf despite failed validation"
+        fail "opt_sysctl modified persistent config despite failed validation"
         sed 's/^/    /' "$mock_sysctl_conf"
+        [[ -f "$tuning_conf" ]] && sed 's/^/    tuning: /' "$tuning_conf"
     fi
 
     SYSCTL_APPLY_OK=1
-    printf '3\n' | opt_sysctl >/dev/null 2>&1
+    _sysctl_commit_tuning "$params" "conservative" "100M/small-memory" "test success" >/dev/null 2>&1
     local block_count
-    block_count=$(grep -c '^# BEGIN server-manage sysctl tuning' "$mock_sysctl_conf" 2>/dev/null || echo 0)
+    block_count=$(grep -c '^# BEGIN server-manage sysctl tuning' "$tuning_conf" 2>/dev/null || echo 0)
     if [[ "$block_count" == "1" ]] \
        && grep -qF '# keep this line' "$mock_sysctl_conf" \
-       && grep -q '^fs.file-max = 262144$' "$mock_sysctl_conf" \
-       && [[ -f "${mock_sysctl_conf}.pre-tuning" ]] \
-       && grep -qF '# keep this line' "${mock_sysctl_conf}.pre-tuning"; then
-        pass "opt_sysctl commits only validated candidate and keeps pre-tuning backup"
+       && grep -q '^# server-manage moved to sysctl.d: net.ipv4.tcp_syncookies = 1$' "$mock_sysctl_conf" \
+       && grep -q '^fs.file-max = 262144$' "$tuning_conf" \
+       && [[ -f "$rollback_file" ]] \
+       && [[ -f "$latest_file" ]] \
+       && [[ -f "$profile_file" ]] \
+       && find "$TMP_ROOT/sysctl-backups" -mindepth 1 -maxdepth 1 -type d -print -quit | grep -q .; then
+        pass "opt_sysctl commits validated sysctl.d candidate with rollback/profile/backup"
     else
         fail "opt_sysctl successful commit/backup mismatch"
-        sed 's/^/    /' "$mock_sysctl_conf"
-        [[ -f "${mock_sysctl_conf}.pre-tuning" ]] && sed 's/^/    backup: /' "${mock_sysctl_conf}.pre-tuning"
+        sed 's/^/    conf: /' "$mock_sysctl_conf"
+        [[ -f "$tuning_conf" ]] && sed 's/^/    tuning: /' "$tuning_conf"
+        [[ -f "$rollback_file" ]] && sed 's/^/    rollback: /' "$rollback_file"
+        [[ -f "$profile_file" ]] && sed 's/^/    profile: /' "$profile_file"
     fi
+
+    first_rollback=$(cat "$rollback_file" 2>/dev/null || true)
+    first_latest=$(cat "$latest_file" 2>/dev/null || true)
+    params_second="$(_sysctl_build_role_params landing 1)"
+    SYSCTL_BAD_AFTER_SYSTEM=1 SYSCTL_AFTER_SYSTEM=0
+    if _sysctl_commit_tuning "$params_second" "landing" "100M/small-memory" "test failed second apply" >/dev/null 2>&1; then
+        fail "opt_sysctl second commit unexpectedly succeeded despite bad readback"
+    elif grep -q '^fs.file-max = 262144$' "$tuning_conf" \
+       && ! grep -q '^fs.file-max = 1048576$' "$tuning_conf" \
+       && [[ "$(cat "$rollback_file" 2>/dev/null || true)" == "$first_rollback" ]] \
+       && [[ "$(cat "$latest_file" 2>/dev/null || true)" == "$first_latest" ]]; then
+        pass "opt_sysctl failed second commit preserves previous rollback metadata"
+    else
+        fail "opt_sysctl failed second commit left rollback metadata inconsistent"
+        sed 's/^/    tuning: /' "$tuning_conf" 2>/dev/null || true
+        sed 's/^/    rollback: /' "$rollback_file" 2>/dev/null || true
+        sed 's/^/    latest: /' "$latest_file" 2>/dev/null || true
+    fi
+    SYSCTL_BAD_AFTER_SYSTEM=0 SYSCTL_AFTER_SYSTEM=0
+
+    _sysctl_rollback_tuning >/dev/null 2>&1
+    if grep -qF '# keep this line' "$mock_sysctl_conf" \
+       && grep -q '^net.ipv4.tcp_syncookies = 1$' "$mock_sysctl_conf" \
+       && ! grep -q '^# server-manage moved to sysctl.d:' "$mock_sysctl_conf" \
+       && [[ ! -f "$tuning_conf" ]] \
+       && [[ ! -f "$latest_file" ]] \
+       && [[ "${SYSCTL_VALUES[fs.file-max]:-}" == "100000" ]]; then
+        pass "opt_sysctl rollback restores persistent snapshot"
+    else
+        fail "opt_sysctl rollback did not restore persistent snapshot"
+        sed 's/^/    conf: /' "$mock_sysctl_conf"
+        [[ -f "$tuning_conf" ]] && sed 's/^/    tuning: /' "$tuning_conf"
+        [[ -f "$latest_file" ]] && sed 's/^/    latest: /' "$latest_file"
+    fi
+    unset SYSCTL_VALUES
+}
+
+test_opt_sysctl_latest_pointer_failure_rolls_back() {
+    local workdir="$TMP_ROOT/latest-failure"
+    local mock_sysctl_conf="$workdir/sysctl.conf"
+    local tuning_conf="$workdir/sysctl.d/99zz-server-manage-tuning.conf"
+    local rollback_file="$workdir/server-manage-sysctl.rollback.conf"
+    local latest_file="$workdir/server-manage-sysctl.latest-snapshot"
+    local params rc
+    mkdir -p "$workdir"
+    cat > "$mock_sysctl_conf" <<'EOF'
+# latest failure base
+net.ipv4.tcp_syncookies = 1
+EOF
+    _sysctl_conf_path() { printf '%s' "$mock_sysctl_conf"; }
+    params="$(_sysctl_build_role_params conservative 1)"
+    declare -A SYSCTL_VALUES=(
+        ["fs.file-max"]="100000"
+        ["net.core.somaxconn"]="128"
+        ["net.ipv4.tcp_max_syn_backlog"]="128"
+        ["net.ipv4.tcp_tw_reuse"]="0"
+        ["net.ipv4.tcp_syncookies"]="1"
+        ["net.ipv4.tcp_fin_timeout"]="60"
+        ["net.ipv4.tcp_available_congestion_control"]="reno cubic"
+    )
+    sysctl() {
+        if [[ "${1:-}" == "-n" ]]; then
+            printf '%s\n' "${SYSCTL_VALUES[${2:-}]:-0}"
+            return 0
+        fi
+        if [[ "${1:-}" == "-p" ]]; then
+            [[ "${SYSCTL_APPLY_OK:-0}" == "1" ]] || return 1
+            while IFS= read -r line; do
+                [[ "$line" =~ ^[[:space:]]*([A-Za-z0-9_.-]+)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+                SYSCTL_VALUES["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+            done < "${2:-/dev/null}"
+            return 0
+        fi
+        if [[ "${1:-}" == "--system" ]]; then
+            return 0
+        fi
+        return 0
+    }
+    mv() {
+        if [[ "${2:-}" == "$latest_file" ]]; then
+            return 1
+        fi
+        command mv "$@"
+    }
+
+    SYSCTL_APPLY_OK=1
+    _sysctl_commit_tuning "$params" "conservative" "100M/small-memory" "latest pointer failure" >/dev/null 2>&1
+    rc=$?
+    unset -f mv
+    if [[ "$rc" -ne 0 ]] \
+       && grep -q '^net.ipv4.tcp_syncookies = 1$' "$mock_sysctl_conf" \
+       && ! grep -q '^# server-manage moved to sysctl.d:' "$mock_sysctl_conf" \
+       && [[ ! -f "$tuning_conf" ]] \
+       && [[ ! -f "$rollback_file" ]] \
+       && [[ ! -f "$latest_file" ]] \
+       && [[ "${SYSCTL_VALUES[fs.file-max]:-}" == "100000" ]]; then
+        pass "opt_sysctl latest snapshot write failure rolls back persistent/runtime state"
+    else
+        fail "opt_sysctl latest snapshot write failure left committed residue"
+        sed 's/^/    conf: /' "$mock_sysctl_conf" 2>/dev/null || true
+        sed 's/^/    tuning: /' "$tuning_conf" 2>/dev/null || true
+        sed 's/^/    rollback: /' "$rollback_file" 2>/dev/null || true
+        sed 's/^/    latest: /' "$latest_file" 2>/dev/null || true
+    fi
+    unset SYSCTL_VALUES
 }
 
 test_opt_bbr_validates_before_commit() {
     local mock_sysctl_conf="$TMP_ROOT/bbr-sysctl.conf"
     local sysctl_log="$TMP_ROOT/bbr-sysctl-calls.txt"
+    local tuning_conf="$TMP_ROOT/sysctl.d/99zz-server-manage-tuning.conf"
+    local profile_file="$TMP_ROOT/sysctl.d/99zz-server-manage-tuning.profile.md"
+    local latest_file="$TMP_ROOT/server-manage-sysctl.latest-snapshot"
     cat > "$mock_sysctl_conf" <<'EOF'
 # keep bbr base
 net.core.default_qdisc = pfifo_fast
 net.ipv4.tcp_congestion_control = cubic
 EOF
     _sysctl_conf_path() { printf '%s' "$mock_sysctl_conf"; }
-    _sysctl_bbr_backup_path() { printf '%s.bak' "$mock_sysctl_conf"; }
+    SYSCTL_CURRENT_QDISC=pfifo_fast
     sysctl() {
         if [[ "${1:-}" == "-n" ]]; then
             case "${2:-}" in
@@ -3727,7 +3872,10 @@ EOF
                     printf '%s\n' "${SYSCTL_CURRENT_CC:-cubic}"
                     ;;
                 net.core.default_qdisc)
-                    printf 'pfifo_fast\n'
+                    printf '%s\n' "${SYSCTL_CURRENT_QDISC:-pfifo_fast}"
+                    ;;
+                net.ipv4.tcp_available_congestion_control)
+                    printf 'reno cubic bbr\n'
                     ;;
                 *)
                     printf '0\n'
@@ -3739,56 +3887,139 @@ EOF
             printf '%s\n' "${2:-}" >> "$sysctl_log"
             if [[ "${SYSCTL_APPLY_OK:-0}" == "1" ]]; then
                 if [[ "${SYSCTL_APPLY_EFFECTIVE:-0}" == "1" ]] \
-                   && grep -q '^net.ipv4.tcp_congestion_control = bbr$' "${2:-/dev/null}" 2>/dev/null; then
-                    SYSCTL_CURRENT_CC=bbr
+                   && [[ -f "${2:-/dev/null}" ]]; then
+                    while IFS= read -r line; do
+                        case "$line" in
+                            "net.ipv4.tcp_congestion_control = "*)
+                                SYSCTL_CURRENT_CC="${line#*= }"
+                                ;;
+                            "net.core.default_qdisc = "*)
+                                SYSCTL_CURRENT_QDISC="${line#*= }"
+                                ;;
+                        esac
+                    done < "${2:-/dev/null}"
                 fi
                 return 0
             fi
             return 1
             return
         fi
+        if [[ "${1:-}" == "--system" ]]; then
+            printf '%s\n' "--system" >> "$sysctl_log"
+            return 0
+        fi
         return 0
     }
 
-    SYSCTL_APPLY_OK=0 SYSCTL_APPLY_EFFECTIVE=0 SYSCTL_CURRENT_CC=cubic
+    SYSCTL_APPLY_OK=0 SYSCTL_APPLY_EFFECTIVE=0 SYSCTL_CURRENT_CC=cubic SYSCTL_CURRENT_QDISC=pfifo_fast
     opt_bbr >/dev/null 2>&1
     if grep -qF '# keep bbr base' "$mock_sysctl_conf" \
        && grep -q '^net.core.default_qdisc = pfifo_fast$' "$mock_sysctl_conf" \
-       && ! grep -qF '# BEGIN server-manage bbr' "$mock_sysctl_conf" \
-       && [[ ! -f "${mock_sysctl_conf}.bak" ]]; then
+       && [[ ! -f "$tuning_conf" ]] \
+       && [[ ! -f "$latest_file" ]]; then
         pass "opt_bbr does not commit failed sysctl -p candidate"
     else
-        fail "opt_bbr modified sysctl.conf despite failed validation"
+        fail "opt_bbr modified persistent config despite failed validation"
         sed 's/^/    /' "$mock_sysctl_conf"
+        [[ -f "$tuning_conf" ]] && sed 's/^/    tuning: /' "$tuning_conf"
     fi
 
-    SYSCTL_APPLY_OK=1 SYSCTL_APPLY_EFFECTIVE=0 SYSCTL_CURRENT_CC=cubic
+    SYSCTL_APPLY_OK=1 SYSCTL_APPLY_EFFECTIVE=0 SYSCTL_CURRENT_CC=cubic SYSCTL_CURRENT_QDISC=pfifo_fast
     opt_bbr >/dev/null 2>&1
     if grep -qF '# keep bbr base' "$mock_sysctl_conf" \
-       && ! grep -qF '# BEGIN server-manage bbr' "$mock_sysctl_conf" \
-       && [[ ! -f "${mock_sysctl_conf}.bak" ]]; then
+       && [[ ! -f "$tuning_conf" ]] \
+       && [[ ! -f "$latest_file" ]]; then
         pass "opt_bbr does not commit when bbr verification fails"
     else
         fail "opt_bbr committed even though verify_cc was not bbr"
         sed 's/^/    /' "$mock_sysctl_conf"
+        [[ -f "$tuning_conf" ]] && sed 's/^/    tuning: /' "$tuning_conf"
     fi
 
-    SYSCTL_APPLY_OK=1 SYSCTL_APPLY_EFFECTIVE=1 SYSCTL_CURRENT_CC=cubic
+    SYSCTL_APPLY_OK=1 SYSCTL_APPLY_EFFECTIVE=1 SYSCTL_CURRENT_CC=cubic SYSCTL_CURRENT_QDISC=pfifo_fast
     opt_bbr >/dev/null 2>&1
     if grep -qF '# keep bbr base' "$mock_sysctl_conf" \
-       && grep -q '^# BEGIN server-manage bbr$' "$mock_sysctl_conf" \
-       && grep -q '^net.core.default_qdisc = fq$' "$mock_sysctl_conf" \
-       && grep -q '^net.ipv4.tcp_congestion_control = bbr$' "$mock_sysctl_conf" \
+       && grep -q '^# server-manage moved to sysctl.d: net.core.default_qdisc = pfifo_fast$' "$mock_sysctl_conf" \
+       && grep -q '^# server-manage moved to sysctl.d: net.ipv4.tcp_congestion_control = cubic$' "$mock_sysctl_conf" \
+       && grep -q '^# BEGIN server-manage bbr$' "$tuning_conf" \
+       && grep -q '^net.core.default_qdisc = fq$' "$tuning_conf" \
+       && grep -q '^net.ipv4.tcp_congestion_control = bbr$' "$tuning_conf" \
        && ! grep -q '^net.core.default_qdisc = pfifo_fast$' "$mock_sysctl_conf" \
        && ! grep -q '^net.ipv4.tcp_congestion_control = cubic$' "$mock_sysctl_conf" \
-       && [[ -f "${mock_sysctl_conf}.bak" ]] \
-       && grep -qF '# keep bbr base' "${mock_sysctl_conf}.bak"; then
-        pass "opt_bbr commits only validated candidate and keeps backup"
+       && [[ -f "$profile_file" ]] \
+       && [[ -f "$latest_file" ]]; then
+        pass "opt_bbr commits only validated sysctl.d candidate and keeps rollback metadata"
     else
         fail "opt_bbr successful commit/backup mismatch"
-        sed 's/^/    /' "$mock_sysctl_conf"
-        [[ -f "${mock_sysctl_conf}.bak" ]] && sed 's/^/    backup: /' "${mock_sysctl_conf}.bak"
+        sed 's/^/    conf: /' "$mock_sysctl_conf"
+        [[ -f "$tuning_conf" ]] && sed 's/^/    tuning: /' "$tuning_conf"
+        [[ -f "$profile_file" ]] && sed 's/^/    profile: /' "$profile_file"
     fi
+}
+
+test_opt_bbr_preserves_existing_role_tuning() {
+    local workdir="$TMP_ROOT/bbr-preserve"
+    local mock_sysctl_conf="$workdir/sysctl.conf"
+    local tuning_conf="$workdir/sysctl.d/99zz-server-manage-tuning.conf"
+    mkdir -p "$(dirname "$tuning_conf")"
+    cat > "$mock_sysctl_conf" <<'EOF'
+# bbr preserve base
+net.core.default_qdisc = pfifo_fast
+net.ipv4.tcp_congestion_control = cubic
+EOF
+    cat > "$tuning_conf" <<'EOF'
+# BEGIN server-manage sysctl tuning: landing
+net.core.default_qdisc = fq_codel
+net.ipv4.tcp_congestion_control = cubic
+fs.file-max = 1048576
+net.core.somaxconn = 8192
+net.ipv4.tcp_max_syn_backlog = 8192
+# END server-manage sysctl tuning
+EOF
+    _sysctl_conf_path() { printf '%s' "$mock_sysctl_conf"; }
+    declare -A SYSCTL_VALUES=(
+        ["net.ipv4.tcp_congestion_control"]="cubic"
+        ["net.core.default_qdisc"]="pfifo_fast"
+        ["net.ipv4.tcp_available_congestion_control"]="reno cubic bbr"
+        ["fs.file-max"]="262144"
+        ["net.core.somaxconn"]="2048"
+        ["net.ipv4.tcp_max_syn_backlog"]="2048"
+    )
+    sysctl() {
+        if [[ "${1:-}" == "-n" ]]; then
+            printf '%s\n' "${SYSCTL_VALUES[${2:-}]:-0}"
+            return 0
+        fi
+        if [[ "${1:-}" == "-p" ]]; then
+            [[ "${SYSCTL_APPLY_OK:-0}" == "1" ]] || return 1
+            while IFS= read -r line; do
+                [[ "$line" =~ ^[[:space:]]*([A-Za-z0-9_.-]+)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+                SYSCTL_VALUES["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+            done < "${2:-/dev/null}"
+            return 0
+        fi
+        if [[ "${1:-}" == "--system" ]]; then
+            return 0
+        fi
+        return 0
+    }
+
+    SYSCTL_APPLY_OK=1
+    opt_bbr >/dev/null 2>&1
+    if grep -q '^fs.file-max = 1048576$' "$tuning_conf" \
+       && grep -q '^net.core.somaxconn = 8192$' "$tuning_conf" \
+       && grep -q '^net.ipv4.tcp_max_syn_backlog = 8192$' "$tuning_conf" \
+       && grep -q '^# BEGIN server-manage bbr$' "$tuning_conf" \
+       && grep -q '^net.core.default_qdisc = fq$' "$tuning_conf" \
+       && grep -q '^net.ipv4.tcp_congestion_control = bbr$' "$tuning_conf" \
+       && ! grep -q '^net.core.default_qdisc = fq_codel$' "$tuning_conf" \
+       && ! grep -q '^net.ipv4.tcp_congestion_control = cubic$' "$tuning_conf"; then
+        pass "opt_bbr preserves existing role tuning while replacing BBR keys"
+    else
+        fail "opt_bbr overwrote existing role tuning"
+        sed 's/^/    tuning: /' "$tuning_conf" 2>/dev/null || true
+    fi
+    unset SYSCTL_VALUES
 }
 
 test_wireguard_ip_forward_sysctl_managed_block() {
@@ -3921,7 +4152,9 @@ test_openwrt_wg_clean_generated_script_is_posix_sh
 test_ssh_change_port_inserts_global_port_before_match
 test_ssh_change_port_rolls_back_socket_dropin_when_firewall_fails
 test_opt_sysctl_validates_before_commit
+test_opt_sysctl_latest_pointer_failure_rolls_back
 test_opt_bbr_validates_before_commit
+test_opt_bbr_preserves_existing_role_tuning
 test_wireguard_ip_forward_sysctl_managed_block
 
 echo ""

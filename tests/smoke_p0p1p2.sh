@@ -1340,6 +1340,7 @@ echo "== review #18 审计报告 OpenWrt 系统优化回归 =="
 opt_hostname_body=$(awk '/^opt_hostname\(\)/,/^}/' "$BUILT")
 select_timezone_body=$(awk '/^select_timezone\(\)/,/^}/' "$BUILT")
 opt_bbr_body=$(awk '/^opt_bbr\(\)/,/^}/' "$BUILT")
+sysctl_commit_body_s10=$(awk '/^_sysctl_commit_tuning\(\)/,/^_sysctl_render_bbr_conf\(\)/' "$BUILT")
 echo "$opt_hostname_body" | grep -q 'PLATFORM.*openwrt' \
     && echo "$opt_hostname_body" | grep -q 'uci set system.@system\[0\].hostname' \
     && pass "S10: OpenWrt 主机名通过 uci 持久化" \
@@ -1364,12 +1365,14 @@ echo "$select_timezone_body" | grep -q 'uci set system.@system\[0\].zonename' \
 echo "$select_timezone_body" | grep -q '\[\[ -f "/usr/share/zoneinfo/\$z" \]\]' \
     && pass "S10: 非 OpenWrt 时区回退前检查 zoneinfo 存在" \
     || fail "S10: 非 OpenWrt 时区回退未检查 zoneinfo，可能创建悬空 symlink"
-echo "$opt_bbr_body" | grep -Fq 'if ! sysctl -p "$tmp_candidate"' \
-    && pass "S10: BBR 应用检查 sysctl -p 返回值" \
-    || fail "S10: BBR 未检查 sysctl -p 返回值"
-echo "$opt_bbr_body" | grep -q 'verify_cc' \
-    && pass "S10: BBR 应用后复验拥塞控制算法" \
-    || fail "S10: BBR 应用后未复验拥塞控制算法"
+echo "$opt_bbr_body" | grep -q '_sysctl_commit_tuning "\$params"' \
+    && grep -q '^_sysctl_commit_tuning()' "$BUILT" \
+    && pass "S10: BBR 复用 sysctl 候选验证提交 helper" \
+    || fail "S10: BBR 未复用统一 sysctl 提交 helper"
+grep -q '^_sysctl_verify_effective_params()' "$BUILT" \
+    && echo "$sysctl_commit_body_s10" | grep -q '_sysctl_verify_effective_params "\$params"' \
+    && pass "S10: BBR 应用后经统一 helper 读回复验" \
+    || fail "S10: BBR 应用后缺少读回复验"
 
 echo ""
 echo "== review #19 审计报告 GeoIP IPv6 回归 =="
@@ -3271,30 +3274,35 @@ fi
 opt_sysctl_body=$(awk '/^opt_sysctl\(\)/,/^menu_opt\(\)/' "$BUILT")
 if echo "$opt_sysctl_body" | grep -Fq "sed -i '/^# server-manage sysctl tuning/,/^$/d'"; then
     fail "07: sysctl 调优块仍按首个空行删除，重复执行会累积/误删"
-elif echo "$opt_sysctl_body" | grep -q 'BEGIN server-manage sysctl tuning' \
-     && echo "$opt_sysctl_body" | grep -q 'END server-manage sysctl tuning'; then
-    pass "07: sysctl 调优块使用显式 begin/end 标记删除"
+elif grep -q 'BEGIN server-manage sysctl tuning' "$BUILT" \
+     && grep -q 'END server-manage sysctl tuning' "$BUILT" \
+     && grep -q '^_sysctl_build_role_params()' "$BUILT"; then
+    pass "07: sysctl 调优块使用显式 begin/end 标记生成"
 else
     fail "07: sysctl 调优块缺少显式 begin/end 标记"
 fi
-if echo "$opt_sysctl_body" | grep -q 'sysctl -p "$tmp_candidate"' \
-   && echo "$opt_sysctl_body" | grep -q 'mv "$tmp_candidate" "$sysctl_conf"' \
-   && ! echo "$opt_sysctl_body" | grep -q "sed -i .*sysctl_conf" \
-   && ! echo "$opt_sysctl_body" | grep -q '>> "$sysctl_conf"'; then
-    pass "07: sysctl 调优先验证临时配置再提交"
+sysctl_commit_body=$(awk '/^_sysctl_commit_tuning\(\)/,/^_sysctl_render_bbr_conf\(\)/' "$BUILT")
+if echo "$sysctl_commit_body" | grep -q '_sysctl_apply_runtime_file "$tmp_tuning"' \
+   && echo "$sysctl_commit_body" | grep -q 'mv "$tmp_tuning" "$tuning_conf"' \
+   && echo "$sysctl_commit_body" | grep -q '_sysctl_tuning_conf_path' \
+   && echo "$sysctl_commit_body" | grep -q '_sysctl_render_conf_without_keys' \
+   && ! echo "$sysctl_commit_body" | grep -q "sed -i .*sysctl_conf" \
+   && ! echo "$sysctl_commit_body" | grep -q '>> "$conf_file"'; then
+    pass "07: sysctl 调优先验证临时配置再提交到 sysctl.d"
 else
     fail "07: sysctl 调优仍可能失败后污染正式配置"
 fi
 opt_bbr_body=$(awk '/^opt_bbr\(\)/,/^select_timezone\(\)/' "$BUILT")
-if echo "$opt_bbr_body" | grep -Fq 'sysctl -p "$tmp_candidate"' \
-   && echo "$opt_bbr_body" | grep -Fq 'mv "$tmp_candidate" "$sysctl_conf"' \
-   && grep -q '^_sysctl_render_bbr_conf()' "$BUILT" \
+if echo "$opt_bbr_body" | grep -q '_sysctl_render_bbr_conf "\$(_sysctl_tuning_conf_path)" "fq" "bbr"' \
+   && echo "$opt_bbr_body" | grep -q '_sysctl_commit_tuning "\$params"' \
+   && echo "$sysctl_commit_body" | grep -q '_sysctl_apply_runtime_file "$tmp_tuning"' \
+   && echo "$sysctl_commit_body" | grep -q 'mv "$tmp_tuning" "$tuning_conf"' \
    && ! echo "$opt_bbr_body" | grep -q 'sed -i .*sysctl.conf' \
    && ! echo "$opt_bbr_body" | grep -q '>> /etc/sysctl.conf' \
    && ! echo "$opt_bbr_body" | grep -q 'sysctl -p >/dev/null'; then
-    pass "07: BBR 先验证临时配置再提交正式 sysctl.conf"
+    pass "07: BBR 先验证临时配置再提交到托管 sysctl.d"
 else
-    fail "07: BBR 仍可能失败后污染正式 sysctl.conf"
+    fail "07: BBR 仍可能失败后污染正式 sysctl 配置"
 fi
 wg_deb_server_install_body=$(awk '/^wg_deb_server_install\(\)/,/^wg_deb_modify_server\(\)/' "$BUILT")
 wg_deb_uninstall_body=$(awk '/^wg_deb_uninstall\(\)/,/^wg_deb_main_menu\(\)/' "$BUILT")

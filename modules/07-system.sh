@@ -517,63 +517,28 @@ opt_bbr() {
     print_title "BBR 加速"
     local current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
     local current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
+    local available_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
     echo "当前配置:"
     echo "  拥塞控制: $current_cc"
     echo "  队列算法: $current_qdisc"
-    if [[ "$current_cc" == "bbr" ]]; then
-        print_success "BBR 已启用。"
+    if [[ "$current_cc" == "bbr" && "$current_qdisc" == "fq" ]]; then
+        print_success "BBR + fq 已启用。"
         pause; return
     fi
-    if confirm "开启 BBR 加速？"; then
-        local sysctl_conf sysctl_backup sysctl_dir tmp_candidate verify_cc
-        sysctl_conf="$(_sysctl_conf_path)"
-        sysctl_backup="$(_sysctl_bbr_backup_path)"
-        sysctl_dir="$(dirname "$sysctl_conf")"
-        mkdir -p "$sysctl_dir" || { print_error "创建 sysctl 配置目录失败"; pause; return 1; }
-        tmp_candidate=$(mktemp "${sysctl_dir}/.tmp.server-manage.bbr.XXXXXX") || { print_error "创建临时 BBR 配置失败"; pause; return 1; }
-        _tmp_register "$tmp_candidate"
-        if ! _sysctl_render_bbr_conf "$sysctl_conf" "fq" "bbr" > "$tmp_candidate"; then
-            rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
-            print_error "生成 BBR 配置失败"; pause; return 1
-        fi
-        if [[ -f "$sysctl_conf" ]]; then
-            chmod --reference="$sysctl_conf" "$tmp_candidate" 2>/dev/null || true
-            chown --reference="$sysctl_conf" "$tmp_candidate" 2>/dev/null || true
-        else
-            chmod 644 "$tmp_candidate" 2>/dev/null || true
-        fi
-        if ! sysctl -p "$tmp_candidate" >/dev/null 2>&1; then
-            rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
-            print_error "sysctl -p 执行失败，BBR 未写入正式配置。"
-            log_action "BBR enable failed before commit: sysctl -p" "ERROR"
+    if [[ " $available_cc " != *" bbr "* ]]; then
+        print_error "当前内核未暴露 bbr 拥塞控制算法。"
+        pause; return 1
+    fi
+    if [[ "$current_cc" == "bbr" && "$current_qdisc" != "fq" ]]; then
+        print_warn "BBR 已启用，但队列算法不是 fq，建议一并修正。"
+    fi
+    if confirm "写入 BBR + fq 到托管 sysctl.d 配置？"; then
+        local params
+        params="$(_sysctl_render_bbr_conf "$(_sysctl_tuning_conf_path)" "fq" "bbr")"
+        _sysctl_commit_tuning "$params" "bbr" "not-applicable" "BBR acceleration" || {
             pause; return 1
-        fi
-        verify_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
-        if [[ "$verify_cc" != "bbr" ]]; then
-            rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
-            [[ -f "$sysctl_conf" ]] && sysctl -p "$sysctl_conf" >/dev/null 2>&1 || true
-            print_error "BBR 未实际生效 (当前: $verify_cc)，未写入正式配置。"
-            log_action "BBR enable failed before commit: verify_cc=$verify_cc" "ERROR"
-            pause; return 1
-        fi
-        if [[ ! -f "$sysctl_backup" && -f "$sysctl_conf" ]]; then
-            if ! cp -a "$sysctl_conf" "$sysctl_backup"; then
-                rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
-                sysctl -p "$sysctl_conf" >/dev/null 2>&1 || true
-                print_error "备份 sysctl 配置失败，未写入正式配置。"
-                log_action "BBR enable failed before commit: backup" "ERROR"
-                pause; return 1
-            fi
-        fi
-        if ! mv "$tmp_candidate" "$sysctl_conf"; then
-            rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
-            [[ -f "$sysctl_conf" ]] && sysctl -p "$sysctl_conf" >/dev/null 2>&1 || true
-            print_error "写入 $sysctl_conf 失败"
-            pause; return 1
-        fi
-        _tmp_unregister "$tmp_candidate"
-        print_success "BBR 已开启。"
-        log_action "BBR enabled"
+        }
+        log_action "BBR enabled via sysctl.d"
     fi
     pause
 }
@@ -614,7 +579,63 @@ select_timezone() {
 }
 
 _sysctl_conf_path() {
-    printf '%s' "/etc/sysctl.conf"
+    printf '%s' "${SERVER_MANAGE_SYSCTL_CONF:-/etc/sysctl.conf}"
+}
+
+_sysctl_d_dir_path() {
+    if [[ -n "${SERVER_MANAGE_SYSCTL_D_DIR:-}" ]]; then
+        printf '%s' "$SERVER_MANAGE_SYSCTL_D_DIR"
+        return
+    fi
+    if [[ "$(_sysctl_conf_path)" != "/etc/sysctl.conf" ]]; then
+        printf '%s/sysctl.d' "$(dirname "$(_sysctl_conf_path)")"
+        return
+    fi
+    printf '%s' "/etc/sysctl.d"
+}
+
+_sysctl_tuning_conf_path() {
+    printf '%s/99zz-server-manage-tuning.conf' "$(_sysctl_d_dir_path)"
+}
+
+_sysctl_tuning_profile_path() {
+    printf '%s/99zz-server-manage-tuning.profile.md' "$(_sysctl_d_dir_path)"
+}
+
+_sysctl_backup_dir_path() {
+    if [[ -n "${SERVER_MANAGE_SYSCTL_BACKUP_DIR:-}" ]]; then
+        printf '%s' "$SERVER_MANAGE_SYSCTL_BACKUP_DIR"
+        return
+    fi
+    if [[ "$(_sysctl_conf_path)" != "/etc/sysctl.conf" ]]; then
+        printf '%s/sysctl-backups' "$(dirname "$(_sysctl_conf_path)")"
+        return
+    fi
+    printf '%s' "/etc/server-manage/sysctl-backups"
+}
+
+_sysctl_rollback_path() {
+    if [[ -n "${SERVER_MANAGE_SYSCTL_ROLLBACK:-}" ]]; then
+        printf '%s' "$SERVER_MANAGE_SYSCTL_ROLLBACK"
+        return
+    fi
+    if [[ "$(_sysctl_conf_path)" != "/etc/sysctl.conf" ]]; then
+        printf '%s/server-manage-sysctl.rollback.conf' "$(dirname "$(_sysctl_conf_path)")"
+        return
+    fi
+    printf '%s' "/etc/server-manage/sysctl-tuning.rollback.conf"
+}
+
+_sysctl_latest_snapshot_path() {
+    if [[ -n "${SERVER_MANAGE_SYSCTL_LATEST_SNAPSHOT:-}" ]]; then
+        printf '%s' "$SERVER_MANAGE_SYSCTL_LATEST_SNAPSHOT"
+        return
+    fi
+    if [[ "$(_sysctl_conf_path)" != "/etc/sysctl.conf" ]]; then
+        printf '%s/server-manage-sysctl.latest-snapshot' "$(dirname "$(_sysctl_conf_path)")"
+        return
+    fi
+    printf '%s' "/etc/server-manage/sysctl-tuning.latest-snapshot"
 }
 
 _sysctl_backup_path() {
@@ -643,6 +664,500 @@ _sysctl_render_tuned_conf() {
         ' "$conf_file"
     fi
     printf '\n%s\n' "$params"
+}
+
+_sysctl_normalize_value() {
+    awk '{$1=$1; print}' <<< "${1:-}"
+}
+
+_sysctl_read_value() {
+    local key="$1"
+    sysctl -n "$key" 2>/dev/null || printf 'N/A'
+}
+
+_sysctl_main_iface() {
+    local iface=""
+    if command_exists ip; then
+        iface=$(ip route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+        [[ -n "$iface" ]] || iface=$(ip route 2>/dev/null | awk '/^default/ {print $5; exit}')
+    fi
+    printf '%s' "$iface"
+}
+
+_sysctl_extract_keys_from_params() {
+    local params="$1"
+    awk -F= '
+        /^[[:space:]]*[A-Za-z0-9_.-]+[[:space:]]*=/ {
+            key=$1
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+            if (key != "") print key
+        }
+    ' <<< "$params" | awk '!seen[$0]++'
+}
+
+_sysctl_render_runtime_rollback_conf() {
+    local params="$1" label="${2:-manual}" key value
+    printf '# server-manage runtime rollback for %s\n' "$label"
+    printf '# captured_at = %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    while IFS= read -r key; do
+        [[ -n "$key" ]] || continue
+        value=$(sysctl -n "$key" 2>/dev/null || true)
+        [[ -n "$value" ]] || continue
+        printf '%s = %s\n' "$key" "$value"
+    done < <(_sysctl_extract_keys_from_params "$params")
+}
+
+_sysctl_render_conf_without_keys() {
+    local conf_file="$1" keys="$2"
+    [[ -f "$conf_file" ]] || return 0
+    awk -v keys="$keys" '
+        BEGIN {
+            n = split(keys, k, /\n/)
+            for (i = 1; i <= n; i++) if (k[i] != "") skip[k[i]] = 1
+        }
+        /^[[:space:]]*#/ || /^[[:space:]]*$/ { print; next }
+        {
+            line = $0
+            sub(/[[:space:]]*#.*/, "", line)
+            split(line, parts, "=")
+            key = parts[1]
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+            if (key in skip) {
+                print "# server-manage moved to sysctl.d: " $0
+                next
+            }
+            print
+        }
+    ' "$conf_file"
+}
+
+_sysctl_snapshot_create() {
+    local ts="${1:-$(date '+%Y%m%d-%H%M%S')}" backup_parent backup_root conf_file sysctl_d f i=0
+    backup_parent="$(_sysctl_backup_dir_path)"
+    backup_root="${backup_parent}/$ts"
+    conf_file="$(_sysctl_conf_path)"
+    sysctl_d="$(_sysctl_d_dir_path)"
+    mkdir -p "$backup_parent" || return 1
+    while ! mkdir "$backup_root" 2>/dev/null; do
+        [[ -e "$backup_root" ]] || return 1
+        i=$((i + 1))
+        backup_root="${backup_parent}/${ts}-${i}"
+    done
+    mkdir -p "${backup_root}/sysctl.d" || return 1
+    if [[ -f "$conf_file" ]]; then
+        cp -a "$conf_file" "${backup_root}/sysctl.conf" || return 1
+    else
+        : > "${backup_root}/sysctl.conf.missing" || return 1
+    fi
+    if [[ -d "$sysctl_d" ]]; then
+        for f in "$sysctl_d"/*.conf; do
+            [[ -e "$f" ]] || continue
+            cp -a "$f" "${backup_root}/sysctl.d/" || return 1
+        done
+    else
+        : > "${backup_root}/sysctl.d.missing" || return 1
+    fi
+    printf '%s' "$backup_root"
+}
+
+_sysctl_restore_managed_snapshot() {
+    local backup_root="$1" conf_file tuning_conf tuning_base ts
+    [[ -n "$backup_root" && -d "$backup_root" ]] || return 1
+    conf_file="$(_sysctl_conf_path)"
+    tuning_conf="$(_sysctl_tuning_conf_path)"
+    tuning_base="$(basename "$tuning_conf")"
+    ts=$(date '+%Y%m%d-%H%M%S')
+    if [[ -f "${backup_root}/sysctl.conf" ]]; then
+        cp -a "${backup_root}/sysctl.conf" "$conf_file" 2>/dev/null || return 1
+    elif [[ -f "${backup_root}/sysctl.conf.missing" ]]; then
+        rm -f "$conf_file" 2>/dev/null || true
+    fi
+    if [[ -f "${backup_root}/sysctl.d/${tuning_base}" ]]; then
+        mkdir -p "$(dirname "$tuning_conf")" || return 1
+        cp -a "${backup_root}/sysctl.d/${tuning_base}" "$tuning_conf" || return 1
+    elif [[ -f "$tuning_conf" ]]; then
+        mv "$tuning_conf" "${tuning_conf}.failed-${ts}" 2>/dev/null || return 1
+    fi
+}
+
+_sysctl_read_latest_snapshot() {
+    local latest_file snapshot backup_dir
+    latest_file="$(_sysctl_latest_snapshot_path)"
+    [[ -f "$latest_file" ]] || return 1
+    snapshot=$(head -n 1 "$latest_file" 2>/dev/null || true)
+    backup_dir="$(_sysctl_backup_dir_path)"
+    case "$snapshot" in
+        "$backup_dir"/*)
+            [[ -d "$snapshot" ]] || return 1
+            printf '%s' "$snapshot"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+_sysctl_cleanup_registered_paths() {
+    local path
+    for path in "$@"; do
+        [[ -n "${path:-}" ]] || continue
+        rm -f -- "$path" 2>/dev/null || true
+        _tmp_unregister "$path"
+    done
+}
+
+_sysctl_restore_metadata_backups() {
+    local rollback_path="$1" rollback_backup="$2" rollback_existed="$3"
+    local latest_path="$4" latest_backup="$5" latest_existed="$6"
+    if [[ "$rollback_existed" == "1" && -n "$rollback_backup" && -f "$rollback_backup" ]]; then
+        cp -a "$rollback_backup" "$rollback_path" 2>/dev/null || true
+    else
+        rm -f "$rollback_path" 2>/dev/null || true
+    fi
+    if [[ "$latest_existed" == "1" && -n "$latest_backup" && -f "$latest_backup" ]]; then
+        cp -a "$latest_backup" "$latest_path" 2>/dev/null || true
+    else
+        rm -f "$latest_path" 2>/dev/null || true
+    fi
+}
+
+_sysctl_apply_runtime_file() {
+    local conf_file="$1"
+    sysctl -p "$conf_file" >/dev/null 2>&1
+}
+
+_sysctl_apply_system_with_fallback() {
+    local conf_file="$1"
+    if sysctl --system >/dev/null 2>&1; then
+        return 0
+    fi
+    print_warn "sysctl --system 执行失败，尝试只应用托管配置。"
+    _sysctl_apply_runtime_file "$conf_file"
+}
+
+_sysctl_persistent_ip_forward_enabled() {
+    local file
+    if [[ -d "$(_sysctl_d_dir_path)" ]]; then
+        for file in "$(_sysctl_d_dir_path)"/*.conf; do
+            [[ -f "$file" ]] || continue
+            grep -Eq '^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=[[:space:]]*1([[:space:]]*(#.*)?)?$' "$file" && return 0
+        done
+    fi
+    return 1
+}
+
+_sysctl_verify_effective_params() {
+    local params="$1" line key expected actual failed=0
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*([A-Za-z0-9_.-]+)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+        key="${BASH_REMATCH[1]}"
+        expected="$(_sysctl_normalize_value "${BASH_REMATCH[2]}")"
+        actual="$(_sysctl_normalize_value "$(sysctl -n "$key" 2>/dev/null || true)")"
+        if [[ "$actual" != "$expected" ]]; then
+            print_warn "读回不一致: $key 期望 [$expected] 实际 [$actual]"
+            failed=1
+        fi
+    done <<< "$params"
+    return "$failed"
+}
+
+_sysctl_detect_cc_for_tuning() {
+    local available
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    if [[ " $available " == *" bbr3 "* ]]; then
+        printf '%s' "bbr3"
+    elif [[ " $available " == *" bbr "* ]]; then
+        printf '%s' "bbr"
+    fi
+}
+
+_sysctl_buffer_bytes_for_class() {
+    case "${1:-2}" in
+        1) printf '%s' "16777216" ;;   # 16 MB: 100M/小内存/保守
+        2) printf '%s' "67108864" ;;   # 64 MB: 常见 1G VPS
+        3) printf '%s' "134217728" ;;  # 128 MB: 高带宽/高 RTT，仍不默认上 256 MB
+        *) printf '%s' "33554432" ;;   # 32 MB: 未知环境
+    esac
+}
+
+_sysctl_build_role_params() {
+    local role="$1" bw_class="$2" buf cc block_start block_end include_forward=0
+    buf="$(_sysctl_buffer_bytes_for_class "$bw_class")"
+    cc="$(_sysctl_detect_cc_for_tuning)"
+    block_start="# BEGIN server-manage sysctl tuning: ${role}"
+    block_end="# END server-manage sysctl tuning"
+
+    case "$role" in
+        kernel-relay)
+            include_forward=1
+            ;;
+    esac
+
+    {
+        printf '%s\n' "$block_start"
+        [[ -n "$cc" ]] && {
+            printf 'net.core.default_qdisc = fq\n'
+            printf 'net.ipv4.tcp_congestion_control = %s\n' "$cc"
+        }
+        case "$role" in
+            relay)
+                printf 'fs.file-max = 1048576\n'
+                printf 'net.core.somaxconn = 4096\n'
+                printf 'net.core.netdev_max_backlog = 4096\n'
+                printf 'net.core.rmem_max = %s\n' "$buf"
+                printf 'net.core.wmem_max = %s\n' "$buf"
+                printf 'net.ipv4.tcp_max_syn_backlog = 4096\n'
+                printf 'net.ipv4.tcp_tw_reuse = 1\n'
+                printf 'net.ipv4.tcp_fin_timeout = 15\n'
+                printf 'net.ipv4.tcp_keepalive_time = 600\n'
+                printf 'net.ipv4.tcp_keepalive_intvl = 15\n'
+                printf 'net.ipv4.tcp_keepalive_probes = 5\n'
+                printf 'net.ipv4.tcp_max_tw_buckets = 32768\n'
+                printf 'net.ipv4.tcp_syncookies = 1\n'
+                printf 'net.ipv4.tcp_mtu_probing = 1\n'
+                printf 'net.ipv4.tcp_notsent_lowat = 131072\n'
+                printf 'net.ipv4.tcp_rmem = 4096 87380 %s\n' "$buf"
+                printf 'net.ipv4.tcp_wmem = 4096 65536 %s\n' "$buf"
+                ;;
+            kernel-relay)
+                printf 'fs.file-max = 1048576\n'
+                printf 'net.core.somaxconn = 4096\n'
+                printf 'net.core.netdev_max_backlog = 4096\n'
+                printf 'net.core.rmem_max = %s\n' "$buf"
+                printf 'net.core.wmem_max = %s\n' "$buf"
+                printf 'net.ipv4.tcp_max_syn_backlog = 4096\n'
+                printf 'net.ipv4.tcp_tw_reuse = 1\n'
+                printf 'net.ipv4.tcp_fin_timeout = 15\n'
+                printf 'net.ipv4.tcp_keepalive_time = 600\n'
+                printf 'net.ipv4.tcp_keepalive_intvl = 15\n'
+                printf 'net.ipv4.tcp_keepalive_probes = 5\n'
+                printf 'net.ipv4.tcp_max_tw_buckets = 32768\n'
+                printf 'net.ipv4.tcp_syncookies = 1\n'
+                printf 'net.ipv4.tcp_mtu_probing = 1\n'
+                printf 'net.ipv4.tcp_rmem = 4096 87380 %s\n' "$buf"
+                printf 'net.ipv4.tcp_wmem = 4096 65536 %s\n' "$buf"
+                [[ "$include_forward" -eq 1 ]] && printf 'net.ipv4.ip_forward = 1\n'
+                ;;
+            landing)
+                printf 'fs.file-max = 1048576\n'
+                printf 'net.core.somaxconn = 8192\n'
+                printf 'net.core.netdev_max_backlog = 8192\n'
+                printf 'net.core.rmem_max = %s\n' "$buf"
+                printf 'net.core.wmem_max = %s\n' "$buf"
+                printf 'net.ipv4.tcp_max_syn_backlog = 8192\n'
+                printf 'net.ipv4.tcp_tw_reuse = 1\n'
+                printf 'net.ipv4.tcp_fin_timeout = 10\n'
+                printf 'net.ipv4.tcp_keepalive_time = 300\n'
+                printf 'net.ipv4.tcp_keepalive_intvl = 10\n'
+                printf 'net.ipv4.tcp_keepalive_probes = 3\n'
+                printf 'net.ipv4.tcp_syncookies = 1\n'
+                printf 'net.ipv4.tcp_max_tw_buckets = 65536\n'
+                printf 'net.ipv4.tcp_mtu_probing = 1\n'
+                printf 'net.ipv4.tcp_notsent_lowat = 131072\n'
+                printf 'net.ipv4.tcp_rmem = 4096 87380 %s\n' "$buf"
+                printf 'net.ipv4.tcp_wmem = 4096 65536 %s\n' "$buf"
+                ;;
+            conservative|*)
+                printf 'fs.file-max = 262144\n'
+                printf 'net.core.somaxconn = 2048\n'
+                printf 'net.ipv4.tcp_max_syn_backlog = 2048\n'
+                printf 'net.ipv4.tcp_tw_reuse = 1\n'
+                printf 'net.ipv4.tcp_syncookies = 1\n'
+                printf 'net.ipv4.tcp_fin_timeout = 30\n'
+                ;;
+        esac
+        printf '%s\n' "$block_end"
+    }
+}
+
+_sysctl_render_profile() {
+    local role="$1" bw_label="$2" goal="$3" backup_root="$4" rollback_file="$5" tuning_conf="$6" params="$7"
+    cat <<EOF
+# server-manage sysctl tuning profile
+
+- created_at: $(date '+%Y-%m-%d %H:%M:%S')
+- role: ${role}
+- bandwidth_hint: ${bw_label}
+- user_goal: ${goal:-not specified}
+- tuning_file: ${tuning_conf}
+- rollback_file: ${rollback_file}
+- backup_snapshot: ${backup_root}
+
+## Reasoning
+
+This profile follows an evidence-first tuning policy: keep MTU/TBF unchanged unless PMTU,
+qdisc drops/backlog, retransmission deltas, or real application tests justify them.
+The active change is limited to Linux sysctl values and is stored in sysctl.d.
+
+## Applied Values
+
+\`\`\`
+${params}
+\`\`\`
+
+## Caveats
+
+- TCP buffer ceilings are selected from the bandwidth hint, not from a full BDP calculation.
+- Run PMTU and iperf3 tests from the tuning menu for path-specific validation.
+- UDP/QUIC protocols such as HY2/TUIC are not proven by TCP iperf3 alone.
+EOF
+}
+
+_sysctl_commit_tuning() {
+    local params="$1" role="$2" bw_label="$3" goal="$4"
+    local tuning_conf profile_path rollback_path latest_path conf_file sysctl_d conf_dir ts
+    local tmp_tuning="" tmp_rollback="" tmp_latest="" tmp_conf="" keys rollback_content backup_root profile_content
+    local rollback_backup="" latest_backup="" rollback_existed=0 latest_existed=0
+    tuning_conf="$(_sysctl_tuning_conf_path)"
+    profile_path="$(_sysctl_tuning_profile_path)"
+    rollback_path="$(_sysctl_rollback_path)"
+    latest_path="$(_sysctl_latest_snapshot_path)"
+    conf_file="$(_sysctl_conf_path)"
+    sysctl_d="$(_sysctl_d_dir_path)"
+    conf_dir="$(dirname "$conf_file")"
+    ts=$(date '+%Y%m%d-%H%M%S')
+    keys="$(_sysctl_extract_keys_from_params "$params")"
+    rollback_content="$(_sysctl_render_runtime_rollback_conf "$params" "$role")"
+
+    mkdir -p "$sysctl_d" "$conf_dir" "$(dirname "$rollback_path")" "$(dirname "$latest_path")" || {
+        print_error "创建 sysctl 配置目录失败"
+        return 1
+    }
+    backup_root="$(_sysctl_snapshot_create "$ts")" || {
+        print_error "备份 sysctl 配置失败"
+        return 1
+    }
+
+    if [[ -f "$rollback_path" ]]; then
+        rollback_backup=$(mktemp "$(dirname "$rollback_path")/.bak.server-manage.rollback.XXXXXX") || return 1
+        _tmp_register "$rollback_backup"
+        if ! cp -a "$rollback_path" "$rollback_backup"; then
+            print_error "备份现有回滚配置失败"
+            _sysctl_cleanup_registered_paths "$rollback_backup"
+            return 1
+        fi
+        rollback_existed=1
+    fi
+    if [[ -f "$latest_path" ]]; then
+        latest_backup=$(mktemp "$(dirname "$latest_path")/.bak.server-manage.latest.XXXXXX") || {
+            _sysctl_cleanup_registered_paths "$rollback_backup"
+            return 1
+        }
+        _tmp_register "$latest_backup"
+        if ! cp -a "$latest_path" "$latest_backup"; then
+            print_error "备份最近快照指针失败"
+            _sysctl_cleanup_registered_paths "$rollback_backup" "$latest_backup"
+            return 1
+        fi
+        latest_existed=1
+    fi
+
+    tmp_tuning=$(mktemp "${sysctl_d}/.tmp.server-manage.sysctl.XXXXXX") || {
+        _sysctl_cleanup_registered_paths "$rollback_backup" "$latest_backup"
+        return 1
+    }
+    _tmp_register "$tmp_tuning"
+    tmp_rollback=$(mktemp "$(dirname "$rollback_path")/.tmp.server-manage.rollback.XXXXXX") || {
+        _sysctl_cleanup_registered_paths "$tmp_tuning" "$rollback_backup" "$latest_backup"; return 1
+    }
+    _tmp_register "$tmp_rollback"
+    tmp_latest=$(mktemp "$(dirname "$latest_path")/.tmp.server-manage.latest.XXXXXX") || {
+        _sysctl_cleanup_registered_paths "$tmp_tuning" "$tmp_rollback" "$rollback_backup" "$latest_backup"; return 1
+    }
+    _tmp_register "$tmp_latest"
+    printf '%s\n' "$params" > "$tmp_tuning" || {
+        _sysctl_cleanup_registered_paths "$tmp_tuning" "$tmp_rollback" "$tmp_latest" "$rollback_backup" "$latest_backup"; return 1
+    }
+    printf '%s\n' "$rollback_content" > "$tmp_rollback" || {
+        _sysctl_cleanup_registered_paths "$tmp_tuning" "$tmp_rollback" "$tmp_latest" "$rollback_backup" "$latest_backup"; return 1
+    }
+    printf '%s\n' "$backup_root" > "$tmp_latest" || {
+        _sysctl_cleanup_registered_paths "$tmp_tuning" "$tmp_rollback" "$tmp_latest" "$rollback_backup" "$latest_backup"; return 1
+    }
+    chmod 644 "$tmp_tuning" "$tmp_rollback" "$tmp_latest" 2>/dev/null || true
+
+    if ! _sysctl_apply_runtime_file "$tmp_tuning"; then
+        _sysctl_apply_runtime_file "$tmp_rollback" >/dev/null 2>&1 || true
+        _sysctl_cleanup_registered_paths "$tmp_tuning" "$tmp_rollback" "$tmp_latest" "$rollback_backup" "$latest_backup"
+        print_error "sysctl -p 校验失败，未写入正式配置。"
+        log_action "Sysctl tuning failed before commit: role=$role" "ERROR"
+        return 1
+    fi
+
+    if [[ -f "$conf_file" && -n "$keys" ]]; then
+        tmp_conf=$(mktemp "${conf_dir}/.tmp.server-manage.sysctl-conf.XXXXXX") || {
+            _sysctl_apply_runtime_file "$tmp_rollback" >/dev/null 2>&1 || true
+            _sysctl_cleanup_registered_paths "$tmp_tuning" "$tmp_rollback" "$tmp_latest" "$rollback_backup" "$latest_backup"; return 1
+        }
+        _tmp_register "$tmp_conf"
+        _sysctl_render_conf_without_keys "$conf_file" "$keys" > "$tmp_conf" || {
+            _sysctl_apply_runtime_file "$tmp_rollback" >/dev/null 2>&1 || true
+            _sysctl_cleanup_registered_paths "$tmp_tuning" "$tmp_rollback" "$tmp_latest" "$tmp_conf" "$rollback_backup" "$latest_backup"
+            print_error "生成 sysctl.conf 去冲突配置失败"
+            return 1
+        }
+        chmod --reference="$conf_file" "$tmp_conf" 2>/dev/null || chmod 644 "$tmp_conf" 2>/dev/null || true
+        chown --reference="$conf_file" "$tmp_conf" 2>/dev/null || true
+        if ! mv "$tmp_conf" "$conf_file"; then
+            _sysctl_apply_runtime_file "$tmp_rollback" >/dev/null 2>&1 || true
+            _sysctl_cleanup_registered_paths "$tmp_tuning" "$tmp_rollback" "$tmp_latest" "$tmp_conf" "$rollback_backup" "$latest_backup"
+            print_error "写入 $conf_file 失败"
+            return 1
+        fi
+        _tmp_unregister "$tmp_conf"
+    fi
+
+    if ! mv "$tmp_tuning" "$tuning_conf"; then
+        _sysctl_restore_managed_snapshot "$backup_root" >/dev/null 2>&1 || true
+        _sysctl_apply_runtime_file "$tmp_rollback" >/dev/null 2>&1 || true
+        _sysctl_cleanup_registered_paths "$tmp_tuning" "$tmp_rollback" "$tmp_latest" "$rollback_backup" "$latest_backup"
+        print_error "写入 $tuning_conf 失败"
+        return 1
+    fi
+    _tmp_unregister "$tmp_tuning"
+
+    if ! _sysctl_apply_system_with_fallback "$tuning_conf" || ! _sysctl_verify_effective_params "$params"; then
+        _sysctl_restore_managed_snapshot "$backup_root" >/dev/null 2>&1 || true
+        _sysctl_apply_runtime_file "$tmp_rollback" >/dev/null 2>&1 || true
+        _sysctl_restore_metadata_backups "$rollback_path" "$rollback_backup" "$rollback_existed" "$latest_path" "$latest_backup" "$latest_existed"
+        _sysctl_cleanup_registered_paths "$tmp_rollback" "$tmp_latest" "$rollback_backup" "$latest_backup"
+        print_error "应用后读回校验失败，已尝试回滚运行态。"
+        log_action "Sysctl tuning failed after commit: role=$role" "ERROR"
+        return 1
+    fi
+
+    if ! mv "$tmp_rollback" "$rollback_path"; then
+        _sysctl_restore_managed_snapshot "$backup_root" >/dev/null 2>&1 || true
+        _sysctl_apply_runtime_file "$tmp_rollback" >/dev/null 2>&1 || true
+        _sysctl_restore_metadata_backups "$rollback_path" "$rollback_backup" "$rollback_existed" "$latest_path" "$latest_backup" "$latest_existed"
+        _sysctl_cleanup_registered_paths "$tmp_rollback" "$tmp_latest" "$rollback_backup" "$latest_backup"
+        print_error "写入回滚配置失败"
+        return 1
+    fi
+    _tmp_unregister "$tmp_rollback"
+
+    if ! mv "$tmp_latest" "$latest_path"; then
+        _sysctl_restore_managed_snapshot "$backup_root" >/dev/null 2>&1 || true
+        _sysctl_apply_runtime_file "$rollback_path" >/dev/null 2>&1 || true
+        _sysctl_restore_metadata_backups "$rollback_path" "$rollback_backup" "$rollback_existed" "$latest_path" "$latest_backup" "$latest_existed"
+        _sysctl_cleanup_registered_paths "$tmp_latest" "$rollback_backup" "$latest_backup"
+        print_error "写入最近快照指针失败，已回滚本次调优。"
+        return 1
+    fi
+    _tmp_unregister "$tmp_latest"
+    _sysctl_cleanup_registered_paths "$rollback_backup" "$latest_backup"
+
+    profile_content="$(_sysctl_render_profile "$role" "$bw_label" "$goal" "$backup_root" "$rollback_path" "$tuning_conf" "$params")"
+    write_file_atomic "$profile_path" "$profile_content" || {
+        print_warn "调优已写入，但 profile 写入失败: $profile_path"
+    }
+
+    print_success "内核参数已应用并读回确认。"
+    echo "  配置: $tuning_conf"
+    echo "  说明: $profile_path"
+    echo "  回滚: $rollback_path"
+    echo "  备份: $backup_root"
+    log_action "Sysctl tuning applied: role=$role backup=$backup_root"
 }
 
 _sysctl_render_bbr_conf() {
@@ -739,134 +1254,304 @@ _sysctl_disable_wireguard_forward() {
         rm -f "$tmp_check"; _tmp_unregister "$tmp_check"
         return 0
     }
-    if ! grep -q '^[[:space:]]*net\.ipv4\.ip_forward[[:space:]=]' "$tmp_check"; then
+    if ! grep -q '^[[:space:]]*net\.ipv4\.ip_forward[[:space:]=]' "$tmp_check" \
+       && ! _sysctl_persistent_ip_forward_enabled; then
         sysctl -w net.ipv4.ip_forward=0 >/dev/null 2>&1 || true
     fi
     rm -f "$tmp_check"; _tmp_unregister "$tmp_check"
 }
 
-opt_sysctl() {
-    print_title "内核参数调优"
-    echo -e "${C_CYAN}当前关键参数:${C_RESET}"
-    printf "  %-40s %s\n" "net.core.somaxconn" "$(sysctl -n net.core.somaxconn 2>/dev/null)"
-    printf "  %-40s %s\n" "fs.file-max" "$(sysctl -n fs.file-max 2>/dev/null)"
-    printf "  %-40s %s\n" "net.ipv4.tcp_max_syn_backlog" "$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null)"
-    printf "  %-40s %s\n" "net.ipv4.tcp_tw_reuse" "$(sysctl -n net.ipv4.tcp_tw_reuse 2>/dev/null)"
+_sysctl_print_inspection() {
+    print_title "内核参数调优 - 只读检查"
+    local iface os_info mem_total mem_avail swap_total cc qdisc route
+    iface="$(_sysctl_main_iface)"
+    os_info=$(grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d '"' || uname -s)
+    mem_total=$(awk '/^MemTotal:/ {print int($2/1024) "M"}' /proc/meminfo 2>/dev/null)
+    mem_avail=$(awk '/^MemAvailable:/ {print int($2/1024) "M"}' /proc/meminfo 2>/dev/null)
+    swap_total=$(awk '/^SwapTotal:/ {print int($2/1024) "M"}' /proc/meminfo 2>/dev/null)
+    cc="$(_sysctl_read_value net.ipv4.tcp_congestion_control)"
+    qdisc="$(_sysctl_read_value net.core.default_qdisc)"
+    route=$(ip route get 1.1.1.1 2>/dev/null | head -1 || true)
+
+    echo -e "${C_CYAN}基础信息:${C_RESET}"
+    printf "  %-18s %s\n" "主机名:" "$(hostname 2>/dev/null || echo unknown)"
+    printf "  %-18s %s\n" "系统:" "$os_info"
+    printf "  %-18s %s\n" "内核:" "$(uname -r)"
+    printf "  %-18s %s\n" "内存/可用:" "${mem_total:-N/A}/${mem_avail:-N/A}"
+    printf "  %-18s %s\n" "Swap:" "${swap_total:-N/A}"
+    printf "  %-18s %s\n" "主接口:" "${iface:-N/A}"
+    if [[ -n "$iface" && -d "/sys/class/net/$iface" ]]; then
+        printf "  %-18s %s\n" "MTU:" "$(cat "/sys/class/net/$iface/mtu" 2>/dev/null || echo N/A)"
+    fi
+    printf "  %-18s %s\n" "默认路由:" "${route:-N/A}"
+    printf "  %-18s %s\n" "TCP算法:" "${cc} + ${qdisc}"
     echo ""
-    echo -e "${C_CYAN}选择预设方案:${C_RESET}"
-    echo "  1. 代理/隧道场景 (WireGuard/Xray 等，高并发连接)"
-    echo "  2. Web 服务器场景 (Nginx 反代，优化 HTTP 并发)"
-    echo "  3. 保守方案 (仅基础优化，适合小内存机器)"
-    echo "  4. 回滚到备份 (恢复修改前的配置)"
-    echo "  0. 返回"
-    read -e -r -p "选择: " sc
-    [[ "$sc" == "0" || -z "$sc" ]] && return
-    local sysctl_conf sysctl_backup
-    sysctl_conf="$(_sysctl_conf_path)"
-    sysctl_backup="$(_sysctl_backup_path)"
-    if [[ "$sc" == "4" ]]; then
-        if [[ -f "$sysctl_backup" ]]; then
-            cp "$sysctl_backup" "$sysctl_conf"
-            sysctl -p "$sysctl_conf" >/dev/null 2>&1
-            print_success "已回滚到调优前的配置。"
-            log_action "Sysctl tuning rolled back"
-        else
-            print_warn "没有找到备份文件。"
-        fi
-        pause; return
-    fi
-    local params=""
-    local block_start="# BEGIN server-manage sysctl tuning"
-    local block_end="# END server-manage sysctl tuning"
-    case $sc in
-    1)
-        params="${block_start}: proxy/tunnel
-fs.file-max = 1048576
-net.core.somaxconn = 4096
-net.core.netdev_max_backlog = 4096
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_max_syn_backlog = 4096
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_intvl = 15
-net.ipv4.tcp_keepalive_probes = 5
-net.ipv4.tcp_max_tw_buckets = 32768
-net.ipv4.tcp_syncookies = 1
-net.ipv4.ip_forward = 1
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-${block_end}"
-        ;;
-    2)
-        params="${block_start}: web server
-fs.file-max = 524288
-net.core.somaxconn = 8192
-net.core.netdev_max_backlog = 8192
-net.ipv4.tcp_max_syn_backlog = 8192
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 10
-net.ipv4.tcp_keepalive_time = 300
-net.ipv4.tcp_keepalive_intvl = 10
-net.ipv4.tcp_keepalive_probes = 3
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_max_tw_buckets = 65536
-${block_end}"
-        ;;
-    3)
-        params="${block_start}: conservative
-fs.file-max = 262144
-net.core.somaxconn = 2048
-net.ipv4.tcp_max_syn_backlog = 2048
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_fin_timeout = 30
-${block_end}"
-        ;;
-    *) print_error "无效选择"; pause; return ;;
-    esac
-    local sysctl_dir tmp_candidate
-    sysctl_dir="$(dirname "$sysctl_conf")"
-    mkdir -p "$sysctl_dir" || { print_error "创建 sysctl 配置目录失败"; pause; return 1; }
-    tmp_candidate=$(mktemp "${sysctl_dir}/.tmp.server-manage.sysctl.XXXXXX") || { print_error "创建临时 sysctl 配置失败"; pause; return 1; }
-    _tmp_register "$tmp_candidate"
-    if ! _sysctl_render_tuned_conf "$sysctl_conf" "$params" > "$tmp_candidate"; then
-        rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
-        print_error "生成 sysctl 配置失败"; pause; return 1
-    fi
-    if [[ -f "$sysctl_conf" ]]; then
-        chmod --reference="$sysctl_conf" "$tmp_candidate" 2>/dev/null || true
-        chown --reference="$sysctl_conf" "$tmp_candidate" 2>/dev/null || true
+
+    echo -e "${C_CYAN}关键 sysctl:${C_RESET}"
+    local key
+    for key in \
+        net.ipv4.tcp_available_congestion_control \
+        net.ipv4.tcp_congestion_control \
+        net.core.default_qdisc \
+        net.core.rmem_max \
+        net.core.wmem_max \
+        net.ipv4.tcp_rmem \
+        net.ipv4.tcp_wmem \
+        net.core.somaxconn \
+        net.ipv4.tcp_max_syn_backlog \
+        net.core.netdev_max_backlog \
+        net.ipv4.tcp_notsent_lowat \
+        net.ipv4.ip_forward \
+        net.ipv6.conf.all.forwarding \
+        net.ipv4.tcp_fastopen \
+        net.ipv4.tcp_ecn \
+        net.ipv4.tcp_syncookies \
+        net.ipv4.tcp_mtu_probing; do
+        printf "  %-42s %s\n" "$key" "$(_sysctl_read_value "$key")"
+    done
+    echo ""
+
+    echo -e "${C_CYAN}套接字摘要:${C_RESET}"
+    if command_exists ss; then
+        ss -s 2>/dev/null | sed 's/^/  /'
     else
-        chmod 644 "$tmp_candidate" 2>/dev/null || true
+        echo "  ss 未安装"
     fi
-    if sysctl -p "$tmp_candidate" >/dev/null 2>&1; then
-        if [[ ! -f "$sysctl_backup" && -f "$sysctl_conf" ]]; then
-            if ! cp -a "$sysctl_conf" "$sysctl_backup"; then
-                rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
-                sysctl -p "$sysctl_conf" >/dev/null 2>&1 || true
-                print_error "备份 sysctl 配置失败，未写入正式配置。"
-                log_action "Sysctl tuning failed before commit: backup" "ERROR"
-                pause; return 1
-            fi
-        fi
-        if ! mv "$tmp_candidate" "$sysctl_conf"; then
-            rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
-            sysctl -p "$sysctl_conf" >/dev/null 2>&1 || true
-            print_error "写入 $sysctl_conf 失败"
-            pause; return 1
-        fi
-        _tmp_unregister "$tmp_candidate"
-        print_success "内核参数已应用 (无需重启)。"
-        log_action "Sysctl tuning applied: preset=$sc"
+    echo ""
+
+    echo -e "${C_CYAN}qdisc 状态:${C_RESET}"
+    if [[ -n "$iface" ]] && command_exists tc; then
+        tc -s qdisc show dev "$iface" 2>/dev/null | sed 's/^/  /'
     else
-        rm -f "$tmp_candidate"; _tmp_unregister "$tmp_candidate"
-        print_error "sysctl -p 执行失败，未写入正式配置。"
-        log_action "Sysctl tuning failed before commit: preset=$sc" "ERROR"
+        echo "  tc 不可用或未识别主接口"
+    fi
+    echo ""
+
+    echo -e "${C_CYAN}进程角色线索:${C_RESET}"
+    if command_exists ps; then
+        ps -eo comm,args 2>/dev/null | grep -Ei 'sing-box|xray|realm|gost|nodepass|hysteria|tuic|nginx|caddy|apache|iperf3|qos-agent' | grep -v grep | sed 's/^/  /' || echo "  未发现常见代理/Web/测速进程"
+    else
+        echo "  ps 不可用"
+    fi
+    echo ""
+
+    echo -e "${C_CYAN}相关配置文件:${C_RESET}"
+    echo "  主配置: $(_sysctl_conf_path)"
+    echo "  托管配置: $(_sysctl_tuning_conf_path)"
+    echo "  Profile: $(_sysctl_tuning_profile_path)"
+    if [[ -d "$(_sysctl_d_dir_path)" ]]; then
+        ls -1 "$(_sysctl_d_dir_path)"/*.conf 2>/dev/null | sed 's/^/  /' || true
+    fi
+    log_action "Sysctl tuning inspection completed"
+    pause
+}
+
+_sysctl_pmtu_test() {
+    print_title "PMTU 路径测试"
+    local target s mtu
+    read -e -r -p "目标 IP/域名: " target
+    [[ -z "$target" ]] && return
+    if ! validate_host "$target"; then
+        print_error "目标主机格式无效。"
         pause; return 1
     fi
+    if [[ "$target" == *:* ]]; then
+        print_warn "当前 PMTU 阶梯测试主要面向 IPv4；IPv6 请优先看 tracepath 输出。"
+    fi
+    if command_exists tracepath; then
+        echo -e "${C_CYAN}tracepath:${C_RESET}"
+        tracepath -n "$target" 2>/dev/null || true
+        echo ""
+    else
+        print_warn "tracepath 未安装，跳过。"
+    fi
+    echo -e "${C_CYAN}IPv4 DF ping ladder:${C_RESET}"
+    for s in 1472 1452 1432 1412 1392 1352 1332 1312 1292; do
+        mtu=$((s + 28))
+        if ping -M do -s "$s" -c 2 -W 1 "$target" >/dev/null 2>&1; then
+            echo "  payload=$s mtu=$mtu OK"
+        else
+            echo "  payload=$s mtu=$mtu FAIL"
+        fi
+    done
+    log_action "PMTU test completed target=$target"
     pause
+}
+
+_sysctl_iperf3_direction_test() {
+    print_title "iPerf3 关键方向测试"
+    if ! command_exists iperf3; then
+        if ! confirm "iperf3 未安装，是否现在安装？"; then
+            print_warn "已取消 iPerf3 测试。"
+            pause; return 1
+        fi
+        install_package "iperf3" "silent"
+    fi
+    if ! command_exists iperf3; then
+        print_error "iperf3 安装失败或命令不可用。"
+        pause; return 1
+    fi
+    local peer port duration iface qdisc_before qdisc_after fail_count=0
+    read -e -r -p "peer IP/域名: " peer
+    [[ -z "$peer" ]] && return
+    if ! validate_host "$peer"; then
+        print_error "peer 格式无效。"
+        pause; return 1
+    fi
+    read -e -r -p "iperf3 端口 [25201]: " port
+    port=${port:-25201}
+    validate_port "$port" || { print_error "端口无效。"; pause; return 1; }
+    read -e -r -p "单项测试时长秒数 [8]: " duration
+    duration=${duration:-8}
+    [[ "$duration" =~ ^[0-9]+$ && "$duration" -ge 3 && "$duration" -le 120 ]] || {
+        print_error "时长需为 3-120 秒。"; pause; return 1
+    }
+    iface="$(_sysctl_main_iface)"
+    if [[ -n "$iface" ]] && command_exists tc; then
+        qdisc_before=$(tc -s qdisc show dev "$iface" 2>/dev/null)
+    fi
+    echo -e "${C_CYAN}target -> peer, P1:${C_RESET}"
+    iperf3 -c "$peer" -p "$port" -t "$duration" -P 1 || ((fail_count++)) || true
+    echo -e "${C_CYAN}target -> peer, P4:${C_RESET}"
+    iperf3 -c "$peer" -p "$port" -t "$duration" -P 4 || ((fail_count++)) || true
+    echo -e "${C_CYAN}peer -> target (-R), P1:${C_RESET}"
+    iperf3 -c "$peer" -p "$port" -t "$duration" -P 1 -R || ((fail_count++)) || true
+    echo -e "${C_CYAN}peer -> target (-R), P4:${C_RESET}"
+    iperf3 -c "$peer" -p "$port" -t "$duration" -P 4 -R || ((fail_count++)) || true
+    if [[ -n "$iface" ]] && command_exists tc; then
+        qdisc_after=$(tc -s qdisc show dev "$iface" 2>/dev/null)
+        echo -e "${C_CYAN}qdisc 测试前:${C_RESET}"
+        printf '%s\n' "$qdisc_before" | sed 's/^/  /'
+        echo -e "${C_CYAN}qdisc 测试后:${C_RESET}"
+        printf '%s\n' "$qdisc_after" | sed 's/^/  /'
+    fi
+    if [[ "$fail_count" -gt 0 ]]; then
+        print_warn "iPerf3 测试完成，但有 ${fail_count} 项失败，请按输出判断是否为 peer/端口/防火墙问题。"
+        log_action "iPerf3 direction test completed with failures peer=$peer port=$port duration=$duration failures=$fail_count" "WARN"
+    else
+        print_success "iPerf3 四个方向测试均已完成。"
+        log_action "iPerf3 direction test completed peer=$peer port=$port duration=$duration"
+    fi
+    pause
+}
+
+_sysctl_apply_role_preset() {
+    print_title "应用角色化 sysctl 调优"
+    echo "这一步只修改 sysctl，不自动修改 MTU、TBF/HTB 或 qos-agent。"
+    echo "建议先完成只读检查、PMTU 和关键方向 iPerf3 测试。"
+    echo ""
+    echo "选择机器角色:"
+    echo "  1. 用户态代理/中转 (sing-box/xray/realm/gost 等，不开启 ip_forward)"
+    echo "  2. 内核转发/WireGuard 中转 (需要 IPv4 forwarding)"
+    echo "  3. 落地机/Web 出口 (TCP 终点或重新发起方)"
+    echo "  4. 保守方案 (小内存/未知链路)"
+    echo "  0. 返回"
+    local r role role_label bw bw_label goal params ok
+    read -e -r -p "选择: " r
+    case "$r" in
+        1) role="relay"; role_label="userspace relay" ;;
+        2) role="kernel-relay"; role_label="kernel relay / WireGuard" ;;
+        3) role="landing"; role_label="landing / web exit" ;;
+        4) role="conservative"; role_label="conservative" ;;
+        0|q|"") return ;;
+        *) print_error "无效选择"; pause; return 1 ;;
+    esac
+    echo ""
+    echo "带宽/BDP 提示:"
+    echo "  1. 100M 或小内存"
+    echo "  2. 1G 常规 VPS"
+    echo "  3. 高带宽/高 RTT，已有测试依据"
+    echo "  4. 未知，偏保守"
+    read -e -r -p "选择 [2]: " bw
+    bw=${bw:-2}
+    case "$bw" in
+        1) bw_label="100M/small-memory" ;;
+        2) bw_label="1G/common" ;;
+        3) bw_label="high-bandwidth/high-rtt" ;;
+        4) bw_label="unknown/conservative" ;;
+        *) print_error "无效选择"; pause; return 1 ;;
+    esac
+    read -e -r -p "优化目标备注 (可空): " goal
+    params="$(_sysctl_build_role_params "$role" "$bw")"
+    echo ""
+    echo -e "${C_CYAN}即将写入的托管配置:${C_RESET}"
+    printf '%s\n' "$params" | sed 's/^/  /'
+    echo ""
+    print_warn "不会根据单个异常 peer 推导 MTU/TBF；如需限速或改 MTU，请先用测试证据确认。"
+    read -e -r -p "输入 APPLY 确认写入: " ok
+    [[ "$ok" == "APPLY" ]] || { print_warn "已取消。"; pause; return 0; }
+    _sysctl_commit_tuning "$params" "$role_label" "$bw_label" "$goal"
+    pause
+}
+
+_sysctl_rollback_tuning() {
+    print_title "回滚 sysctl 调优"
+    local tuning_conf rollback_path legacy_backup snapshot latest_path
+    tuning_conf="$(_sysctl_tuning_conf_path)"
+    rollback_path="$(_sysctl_rollback_path)"
+    legacy_backup="$(_sysctl_backup_path)"
+    latest_path="$(_sysctl_latest_snapshot_path)"
+    snapshot="$(_sysctl_read_latest_snapshot 2>/dev/null || true)"
+
+    if [[ -n "$snapshot" ]]; then
+        if ! _sysctl_restore_managed_snapshot "$snapshot"; then
+            print_error "恢复持久化快照失败: $snapshot"
+            pause; return 1
+        fi
+        if [[ -f "$rollback_path" ]]; then
+            _sysctl_apply_runtime_file "$rollback_path" >/dev/null 2>&1 || true
+        else
+            sysctl --system >/dev/null 2>&1 || true
+        fi
+        rm -f "$latest_path" 2>/dev/null || true
+        print_success "已恢复调优前的持久化配置。"
+        echo "  快照: $snapshot"
+        log_action "Sysctl tuning rolled back via snapshot $snapshot"
+    elif [[ -f "$rollback_path" ]]; then
+        if [[ -f "$tuning_conf" ]]; then
+            mv "$tuning_conf" "${tuning_conf}.disabled-$(date '+%Y%m%d-%H%M%S')" || {
+                print_error "停用托管配置失败"
+                pause; return 1
+            }
+        fi
+        if _sysctl_apply_runtime_file "$rollback_path"; then
+            print_success "已按运行态回滚配置恢复。"
+            log_action "Sysctl tuning rolled back via $rollback_path"
+        else
+            print_error "运行态回滚失败，请检查 $rollback_path"
+            pause; return 1
+        fi
+    elif [[ -f "$legacy_backup" ]]; then
+        cp "$legacy_backup" "$(_sysctl_conf_path)"
+        sysctl -p "$(_sysctl_conf_path)" >/dev/null 2>&1 || true
+        print_success "已回滚到旧版调优前的 sysctl.conf。"
+        log_action "Sysctl tuning rolled back via legacy backup"
+    else
+        print_warn "没有找到回滚配置。"
+    fi
+    pause
+}
+
+opt_sysctl() {
+    while true; do
+        print_title "内核参数调优"
+        echo "1. 只读检查现状"
+        echo "2. PMTU 路径测试"
+        echo "3. iPerf3 关键方向测试"
+        echo "4. 应用角色化 sysctl 调优"
+        echo "5. 回滚上次调优"
+        echo "0. 返回"
+        read -e -r -p "选择: " sc
+        case "$sc" in
+            1) _sysctl_print_inspection ;;
+            2) _sysctl_pmtu_test ;;
+            3) _sysctl_iperf3_direction_test ;;
+            4) _sysctl_apply_role_preset ;;
+            5) _sysctl_rollback_tuning ;;
+            0|q|"") break ;;
+            *) print_error "无效选择"; pause ;;
+        esac
+    done
 }
 
 menu_opt() {

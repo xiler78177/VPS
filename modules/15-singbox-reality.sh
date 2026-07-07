@@ -350,6 +350,40 @@ reality_generate_keypair() {
     printf '%s\n%s\n' "$private" "$public"
 }
 
+reality_public_key_from_private() {
+    # sing-box 目前没有可靠的 "private -> public" 子命令；不要调用
+    # `sing-box generate reality-keypair --private-key ...`，实测会生成新 keypair。
+    # 这里按 RFC8410 包装 X25519 raw private key，再由 openssl 导出 raw public key。
+    local private="$1" tmp_dir raw der spki pub b64 len
+    [[ -n "$private" ]] || return 1
+    command_exists openssl || return 1
+    tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/reality-x25519.XXXXXX") || return 1
+    raw="$tmp_dir/private.raw"
+    der="$tmp_dir/private.der"
+    spki="$tmp_dir/public.spki.der"
+    pub="$tmp_dir/public.raw"
+    b64="${private//-/+}"
+    b64="${b64//_//}"
+    case $(( ${#b64} % 4 )) in
+        2) b64="${b64}==" ;;
+        3) b64="${b64}=" ;;
+        1) rm -rf "$tmp_dir"; return 1 ;;
+    esac
+    if ! printf '%s' "$b64" | openssl base64 -d -A > "$raw" 2>/dev/null; then
+        rm -rf "$tmp_dir"; return 1
+    fi
+    len=$(wc -c < "$raw" | tr -d '[:space:]')
+    if [[ "$len" != "32" ]]; then rm -rf "$tmp_dir"; return 1; fi
+    printf '%b' '\x30\x2e\x02\x01\x00\x30\x05\x06\x03\x2b\x65\x6e\x04\x22\x04\x20' > "$der"
+    cat "$raw" >> "$der"
+    if ! openssl pkey -inform DER -in "$der" -pubout -outform DER > "$spki" 2>/dev/null; then
+        rm -rf "$tmp_dir"; return 1
+    fi
+    tail -c 32 "$spki" > "$pub"
+    openssl base64 -A -in "$pub" 2>/dev/null | tr '+/' '-_' | sed 's/=*$//'
+    rm -rf "$tmp_dir"
+}
+
 reality_detect_listen_host() {
     # 决定 sing-box / realm 应绑定的本机地址：
     #   本机存在全局 IPv6 地址 → "::"（双栈监听；bindv6only=0 默认下经 IPv4-mapped 同时覆盖 IPv4），
@@ -1177,14 +1211,15 @@ reality_cdn_apply_origin_rule() {
 }
 
 reality_build_vless_link() {
-    local uuid="$1" node="$2" port="$3" sni="$4" public_key="$5" short_id="$6" name="${7:-singbox-reality}" fp="${8:-}"
+    local uuid="$1" node="$2" port="$3" sni="$4" public_key="$5" short_id="$6" name="${7:-singbox-reality}" fp="${8:-}" flow="${9:-xtls-rprx-vision}"
     local encoded_name node_uri
     encoded_name=$(reality_urlencode "$name")
     node_uri=$(reality_uri_host "$node")
     # fp 未显式传入时回退 chrome（保持旧调用/旧节点链接不变）；经 sanitize 防非法值。
     fp=$(reality_sanitize_fingerprint "${fp:-chrome}")
-    printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=%s&pbk=%s&sid=%s&type=tcp&flow=xtls-rprx-vision#%s\n' \
-        "$uuid" "$node_uri" "$port" "$sni" "$fp" "$public_key" "$short_id" "$encoded_name"
+    flow="${flow:-xtls-rprx-vision}"
+    printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=%s&pbk=%s&sid=%s&type=tcp&flow=%s#%s\n' \
+        "$uuid" "$node_uri" "$port" "$sni" "$fp" "$public_key" "$short_id" "$flow" "$encoded_name"
 }
 
 reality_parse_vless_link() {
@@ -2273,6 +2308,27 @@ reality_relay_route_files() {
     find "$REALITY_RELAY_DIR" -maxdepth 1 -type f -name 'relay-*.conf' 2>/dev/null | sort
 }
 
+reality_relay_next_port() {
+    local base="${REALITY_RELAY_PORT_BASE:-35101}" max port f start
+    validate_port "$base" || base="35101"
+    max=$((base - 1))
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        port="$(grep -E '^RLY_LISTEN_PORT=' "$f" 2>/dev/null | head -n1 | sed -E 's/^RLY_LISTEN_PORT=["'\'']?([0-9]+)["'\'']?.*/\1/')"
+        validate_port "$port" || continue
+        (( port > max )) && max="$port"
+    done < <(reality_relay_route_files)
+    start=$((max + 1))
+    (( start < base )) && start="$base"
+    for port in $(seq "$start" 65535); do
+        reality_port_reserved "$port" && continue
+        reality_port_in_use "$port" && continue
+        printf '%s\n' "$port"
+        return 0
+    done
+    return 1
+}
+
 # 校验并加载一条线路到 RLY_* 全局；校验失败跳过
 reality_relay_load_route() {
     local file="$1"
@@ -2282,6 +2338,111 @@ reality_relay_load_route() {
     RLY_UUID=""; RLY_SNI=""; RLY_PUBLIC_KEY=""; RLY_SHORT_ID=""; RLY_FLOW=""; RLY_FINGERPRINT=""
     # shellcheck disable=SC1090
     source "$file"
+}
+
+reality_host_resolves() {
+    local host="$1"
+    [[ -n "$host" ]] || return 1
+    validate_ip "$host" 2>/dev/null && return 0
+    [[ "$host" == *:* ]] && return 0
+    if command_exists getent; then
+        getent ahosts "$host" >/dev/null 2>&1 && return 0
+        return 1
+    fi
+    if command_exists python3; then
+        python3 - "$host" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+socket.getaddrinfo(sys.argv[1], None)
+PY
+        return $?
+    fi
+    return 2
+}
+
+reality_tcp_connect_check() {
+    local host="$1" port="$2" timeout_s="${3:-5}"
+    [[ -n "$host" ]] && validate_port "$port" || return 1
+    if command_exists nc; then
+        if command_exists timeout; then
+            timeout "$((timeout_s + 2))" nc -z -w "$timeout_s" "$host" "$port" >/dev/null 2>&1
+        else
+            nc -z -w "$timeout_s" "$host" "$port" >/dev/null 2>&1
+        fi
+        return $?
+    fi
+    if command_exists python3; then
+        python3 - "$host" "$port" "$timeout_s" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+host = sys.argv[1]
+port = int(sys.argv[2])
+timeout_s = float(sys.argv[3])
+with socket.create_connection((host, port), timeout_s):
+    pass
+PY
+        return $?
+    fi
+    return 2
+}
+
+reality_relay_preflight_route() {
+    local mode="${1:-new}" rc=0 dns_rc tcp_rc public_ip dns_ip
+    validate_port "${RLY_LISTEN_PORT:-}" || { print_error "中转监听端口无效: ${RLY_LISTEN_PORT:-空}"; return 1; }
+    validate_domain "${RLY_CONNECT_HOST:-}" || validate_ip "${RLY_CONNECT_HOST:-}" || { print_error "中转连接域名/IP 无效: ${RLY_CONNECT_HOST:-空}"; return 1; }
+    validate_domain "${RLY_TARGET_HOST:-}" || validate_ip "${RLY_TARGET_HOST:-}" || { print_error "落地地址无效: ${RLY_TARGET_HOST:-空}"; return 1; }
+    validate_port "${RLY_TARGET_PORT:-}" || { print_error "落地端口无效: ${RLY_TARGET_PORT:-空}"; return 1; }
+    [[ -n "${RLY_UUID:-}" && -n "${RLY_SNI:-}" && -n "${RLY_PUBLIC_KEY:-}" && -n "${RLY_SHORT_ID:-}" ]] || {
+        print_error "中转线路缺少 Reality 客户端身份(uuid/sni/pbk/sid)"
+        return 1
+    }
+    if [[ "$mode" != "existing" && -f "$REALITY_RELAY_DIR/relay-${RLY_LISTEN_PORT}.conf" ]]; then
+        print_error "该端口已有中转线路: ${RLY_LISTEN_PORT}"
+        return 1
+    fi
+    if [[ "$mode" != "existing" ]] && reality_port_reserved "$RLY_LISTEN_PORT"; then
+        print_error "中转端口已被本项目其他功能保留: ${RLY_LISTEN_PORT}"
+        return 1
+    fi
+    if [[ "$mode" != "existing" ]] && reality_port_in_use "$RLY_LISTEN_PORT"; then
+        print_error "中转端口已被占用: ${RLY_LISTEN_PORT}"
+        return 1
+    fi
+
+    if validate_domain "$RLY_TARGET_HOST"; then
+        reality_host_resolves "$RLY_TARGET_HOST"; dns_rc=$?
+        if [[ "$dns_rc" -eq 1 ]]; then
+            print_error "落地域名无法解析: ${RLY_TARGET_HOST}"
+            rc=1
+        elif [[ "$dns_rc" -eq 2 ]]; then
+            print_warn "缺少 DNS 检查工具(getent/python3)，已跳过落地域名解析预检"
+        fi
+    fi
+    reality_tcp_connect_check "$RLY_TARGET_HOST" "$RLY_TARGET_PORT" "${REALITY_RELAY_PREFLIGHT_TIMEOUT:-5}"; tcp_rc=$?
+    if [[ "$tcp_rc" -eq 1 ]]; then
+        print_error "中转机无法 TCP 连接落地: ${RLY_TARGET_HOST}:${RLY_TARGET_PORT}"
+        rc=1
+    elif [[ "$tcp_rc" -eq 2 ]]; then
+        print_warn "缺少 TCP 检查工具(nc/python3)，已跳过落地端口预检"
+    fi
+
+    if validate_domain "$RLY_CONNECT_HOST"; then
+        if declare -F get_public_ipv4 >/dev/null 2>&1; then
+            public_ip="$(get_public_ipv4 2>/dev/null || true)"
+        else
+            public_ip=""
+        fi
+        dns_ip="$(reality_resolve_public_a "$RLY_CONNECT_HOST" 2>/dev/null || true)"
+        if [[ -n "$public_ip" && -n "$dns_ip" && "$public_ip" != "$dns_ip" ]]; then
+            if [[ "${REALITY_RELAY_STRICT_CONNECT_DNS:-0}" == "1" ]]; then
+                print_error "中转域名 A 记录(${dns_ip})与本机公网 IPv4(${public_ip})不一致: ${RLY_CONNECT_HOST}"
+                rc=1
+            else
+                print_warn "中转域名 A 记录(${dns_ip})与本机公网 IPv4(${public_ip})不一致: ${RLY_CONNECT_HOST}"
+            fi
+        fi
+    fi
+    return "$rc"
 }
 
 # 用当前 RLY_* 写出一条线路文件（值经 reality_state_quote，满足 validate_conf_file）
@@ -2321,17 +2482,85 @@ reality_relay_write_client_artifacts() {
     local json_sni; json_sni=$(reality_json_escape "$RLY_SNI")
     local json_public_key; json_public_key=$(reality_json_escape "$RLY_PUBLIC_KEY")
     local json_short_id; json_short_id=$(reality_json_escape "$RLY_SHORT_ID")
-    local rly_fp; rly_fp=$(reality_sanitize_fingerprint "${RLY_FINGERPRINT:-}")
+    local rly_fp rly_flow; rly_fp=$(reality_sanitize_fingerprint "${RLY_FINGERPRINT:-}")
+    rly_flow="${RLY_FLOW:-xtls-rprx-vision}"
     local link_path="${REALITY_RELAY_DIR}/relay-${port}.link.txt"
     local json_path="${REALITY_RELAY_DIR}/relay-${port}.client.json"
     local link_content json_content
-    link_content="$(reality_build_vless_link "$RLY_UUID" "$host" "$port" "$RLY_SNI" "$RLY_PUBLIC_KEY" "$RLY_SHORT_ID" "$name" "$rly_fp")" || return 1
+    link_content="$(reality_build_vless_link "$RLY_UUID" "$host" "$port" "$RLY_SNI" "$RLY_PUBLIC_KEY" "$RLY_SHORT_ID" "$name" "$rly_fp" "$rly_flow")" || return 1
     json_content=$(cat <<EOF
-{"type":"vless","tag":"${json_name}","server":"${json_host}","server_port":${port},"uuid":"${json_uuid}","flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":"${json_sni}","utls":{"enabled":true,"fingerprint":"${rly_fp}"},"reality":{"enabled":true,"public_key":"${json_public_key}","short_id":"${json_short_id}"}}}
+{"type":"vless","tag":"${json_name}","server":"${json_host}","server_port":${port},"uuid":"${json_uuid}","flow":"${rly_flow}","tls":{"enabled":true,"server_name":"${json_sni}","utls":{"enabled":true,"fingerprint":"${rly_fp}"},"reality":{"enabled":true,"public_key":"${json_public_key}","short_id":"${json_short_id}"}}}
 EOF
 )
     reality_write_secure_file "$link_path" "$link_content" || return 1
     reality_write_secure_file "$json_path" "$json_content" || return 1
+}
+
+reality_relay_validate_route() {
+    local expected_exit_ip="${1:-}" test_url="${REALITY_RELAY_TEST_URL:-https://api.ipify.org}" tmp_dir cfg log curl_log pid_file pid test_port i out rc status="failed" json_path
+    command_exists sing-box || { print_warn "sing-box 不存在，跳过中转端到端验证"; return 2; }
+    command_exists curl || { print_warn "curl 不存在，跳过中转端到端验证"; return 2; }
+    test_port="${REALITY_RELAY_SELFTEST_PORT:-}"
+    if [[ -z "$test_port" ]]; then
+        for i in $(seq 1 100); do
+            test_port=$((19090 + i))
+            reality_port_in_use "$test_port" || break
+        done
+    fi
+    validate_port "$test_port" || return 1
+    tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/reality-relay-test.XXXXXX") || return 1
+    chmod 700 "$tmp_dir" 2>/dev/null || true
+    cfg="$tmp_dir/client.json"
+    log="$tmp_dir/sing-box.log"
+    curl_log="$tmp_dir/curl.log"
+    pid_file="$tmp_dir/sing-box.pid"
+    json_path="${REALITY_RELAY_DIR}/relay-${RLY_LISTEN_PORT}.health.json"
+    local rly_fp rly_flow json_name json_host json_uuid json_sni json_public_key json_short_id
+    rly_fp=$(reality_sanitize_fingerprint "${RLY_FINGERPRINT:-}")
+    rly_flow="${RLY_FLOW:-xtls-rprx-vision}"
+    json_name=$(reality_json_escape "${RLY_NAME:-relay-${RLY_LISTEN_PORT:-0}}")
+    json_host=$(reality_json_escape "$RLY_CONNECT_HOST")
+    json_uuid=$(reality_json_escape "$RLY_UUID")
+    json_sni=$(reality_json_escape "$RLY_SNI")
+    json_public_key=$(reality_json_escape "$RLY_PUBLIC_KEY")
+    json_short_id=$(reality_json_escape "$RLY_SHORT_ID")
+    cat > "$cfg" <<EOF
+{"log":{"level":"warn","timestamp":true},"inbounds":[{"type":"mixed","tag":"mixed-in","listen":"127.0.0.1","listen_port":${test_port}}],"outbounds":[{"type":"vless","tag":"${json_name}","server":"${json_host}","server_port":${RLY_LISTEN_PORT},"uuid":"${json_uuid}","flow":"${rly_flow}","tls":{"enabled":true,"server_name":"${json_sni}","utls":{"enabled":true,"fingerprint":"${rly_fp}"},"reality":{"enabled":true,"public_key":"${json_public_key}","short_id":"${json_short_id}"}}},{"type":"direct","tag":"direct"}],"route":{"final":"${json_name}"}}
+EOF
+    if ! sing-box check -c "$cfg" > "$log" 2>&1; then
+        print_warn "中转客户端配置自检失败"
+        sed -E 's/[0-9a-fA-F-]{36}/<uuid>/g' "$log" 2>/dev/null | tail -n 20 || true
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    ( sing-box run -c "$cfg" >> "$log" 2>&1 & echo $! > "$pid_file" )
+    pid=$(cat "$pid_file" 2>/dev/null || true)
+    for i in $(seq 1 30); do
+        ss -ltn 2>/dev/null | grep -q ":${test_port} " && break
+        sleep 0.2
+    done
+    out=$(curl -4 -sS --max-time "${REALITY_RELAY_VALIDATE_TIMEOUT:-25}" --socks5-hostname "127.0.0.1:${test_port}" "$test_url" 2>"$curl_log"); rc=$?
+    [[ -n "$pid" ]] && kill "$pid" >/dev/null 2>&1 || true
+    [[ -n "$pid" ]] && wait "$pid" >/dev/null 2>&1 || true
+    mkdir -p "$REALITY_RELAY_DIR"
+    if [[ "$rc" -eq 0 && ( -z "$expected_exit_ip" || "$out" == "$expected_exit_ip" ) ]]; then
+        status="ok"
+        print_success "中转端到端验证通过: ${RLY_CONNECT_HOST}:${RLY_LISTEN_PORT} 出口 ${out}"
+    elif [[ "$rc" -eq 0 ]]; then
+        status="mismatch"
+        print_warn "中转端到端验证出口不符: got=${out} expected=${expected_exit_ip}"
+    else
+        status="failed"
+        print_warn "中转端到端验证失败，最近日志:"
+        tail -n 10 "$curl_log" 2>/dev/null || true
+        sed -E 's/[0-9a-fA-F-]{36}/<uuid>/g' "$log" 2>/dev/null | tail -n 20 || true
+    fi
+    cat > "$json_path" <<EOF
+{"route":"${json_name}","listen_port":${RLY_LISTEN_PORT},"connect_host":"${json_host}","target_host":"$(reality_json_escape "${RLY_TARGET_HOST:-}")","target_port":${RLY_TARGET_PORT:-0},"status":"${status}","exit_ip":"$(reality_json_escape "$out")","expected_exit_ip":"$(reality_json_escape "$expected_exit_ip")","checked_at":"$(date -Is 2>/dev/null || date)"}
+EOF
+    chmod 600 "$json_path" 2>/dev/null || true
+    rm -rf "$tmp_dir"
+    [[ "$status" == "ok" ]]
 }
 
 # 由全部线路渲染 realm 多端点配置（保持单端点格式：log.level + [[endpoints]]）
@@ -2482,12 +2711,13 @@ reality_relay_add() {
         RLY_CONNECT_HOST="$in_host"
     done
     [[ "$RLY_CONNECT_HOST" == "$connect_default" && -n "$connect_default" ]] && echo "（复用本机域名，按端口区分线路）"
-    # 监听端口：唯一、未占用、不等于本机落地端口；优先推荐 443，无法使用时再回落随机端口。
+    # 监听端口：唯一、未占用、不等于本机落地端口；优先推荐 443，无法使用时按已有 relay 最大端口递增。
     local def_port="443"
     if [[ "${REALITY_PORT:-}" == "443" || -f "$REALITY_RELAY_DIR/relay-443.conf" ]] || reality_port_in_use 443 || reality_port_reserved 443; then
         local candidate_port=""
-        def_port=""
+        def_port="$(reality_relay_next_port 2>/dev/null || true)"
         for _ in $(seq 1 200); do
+            [[ -n "$def_port" ]] && break
             candidate_port=$(reality_random_port 2>/dev/null || echo "")
             [[ -n "$candidate_port" ]] || continue
             reality_port_reserved "$candidate_port" && continue
@@ -2523,6 +2753,7 @@ reality_relay_add() {
     # 返回后 RLY_* 已是“最后一条线路”的值；后续引用必须用这些 local，否则报错/回滚会指向别的线路。
     local new_port="$RLY_LISTEN_PORT" new_name="$RLY_NAME" new_chost="$RLY_CONNECT_HOST" \
           new_thost="$RLY_TARGET_HOST" new_tport="$RLY_TARGET_PORT"
+    reality_relay_preflight_route new || { pause; return 1; }
     reality_relay_write_route "$new_port"
     # 应用失败时回滚刚加的线路，避免把 realm 留在半残/停止状态
     if ! reality_relay_regenerate; then
@@ -2555,14 +2786,20 @@ reality_relay_add() {
 # 列出全部中转线路及客户端链接
 reality_relay_list() {
     print_title "中转线路列表"
-    local f n=0 st
+    local f n=0 st health status exit_ip
     while IFS= read -r f; do
         [[ -n "$f" ]] || continue
         reality_relay_load_route "$f" || continue
         n=$((n+1))
         st="[未监听]"
         if command_exists ss && ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${RLY_LISTEN_PORT}$"; then st="[监听中]"; fi
-        echo "${n}. ${RLY_NAME}  本机:${RLY_LISTEN_PORT} -> ${RLY_TARGET_HOST}:${RLY_TARGET_PORT}  ${st}"
+        health=""
+        if [[ -f "$REALITY_RELAY_DIR/relay-${RLY_LISTEN_PORT}.health.json" ]]; then
+            status="$(grep -Eo '"status":"[^"]+"' "$REALITY_RELAY_DIR/relay-${RLY_LISTEN_PORT}.health.json" 2>/dev/null | head -n1 | cut -d'"' -f4)"
+            exit_ip="$(grep -Eo '"exit_ip":"[^"]*"' "$REALITY_RELAY_DIR/relay-${RLY_LISTEN_PORT}.health.json" 2>/dev/null | head -n1 | cut -d'"' -f4)"
+            [[ -n "$status" ]] && health="  [验证:${status}${exit_ip:+/$exit_ip}]"
+        fi
+        echo "${n}. ${RLY_NAME}  本机:${RLY_LISTEN_PORT} -> ${RLY_TARGET_HOST}:${RLY_TARGET_PORT}  ${st}${health}"
     done < <(reality_relay_route_files)
     if [[ $n -eq 0 ]]; then
         print_warn "暂无中转线路"
@@ -2691,6 +2928,7 @@ reality_install_relay() {
     # 否则本次 write_route 会让 relays 目录非空 → regenerate 里的 migrate 提前 return →
     # 老线路永远不被渲染，升级用户原有中转静默失效。菜单路径已先迁移，这里对齐。
     reality_relay_migrate_legacy
+    reality_relay_preflight_route new || return 1
     reality_relay_write_route "$listen_port"
     if [[ -n "$cf_token" ]]; then reality_sync_cloudflare_dns "$relay_domain" "$cf_token"; fi
     # MED-3：regenerate 失败时回滚本次新写的线路文件并重建，避免残留半配置线路
