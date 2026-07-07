@@ -1875,15 +1875,35 @@ reality_ipv4_is_likely_warp_egress() {
     local ip="${1:-}"
     # Cloudflare WARP 常见 IPv4 出口段。若本机网卡没有公网 IPv4 且探测到这些出口，
     # 不能把它写进 CF 回源 A 记录，否则 CF 会回源到 WARP 出口而不是本机。
+    # 消费级 WARP 出口主要落在 104.28.0.0/16；免费/plus 也见于 104.16-31 的 Cloudflare 段。
     case "$ip" in
-        104.28.*|104.29.*) return 0 ;;
+        104.1[6-9].*|104.2[0-9].*|104.3[01].*) return 0 ;;
     esac
+    return 1
+}
+
+# 按 wireguard peer endpoint 判断是否 WARP：不依赖接口名（wgcf 常落在 wg0），
+# 直接匹配 Cloudflare WARP 服务端 IP 段，命中即认定本机在用 WARP。
+reality_has_warp_wg_endpoint() {
+    command_exists wg || return 1
+    local _iface _pub ep _rest host
+    while read -r _iface _pub ep _rest; do
+        [[ -n "$ep" && "$ep" != "(none)" ]] || continue
+        host="${ep%:*}"          # 去掉端口（IPv6 端口在 ]: 之后，下面按段前缀匹配即可）
+        host="${host#[}"; host="${host%]}"
+        case "$host" in
+            162.159.192.*|162.159.193.*|162.159.195.*) return 0 ;;
+            188.114.9[6-9].*)                          return 0 ;;
+            2606:4700:d0*|2606:4700:d1*)               return 0 ;;
+        esac
+    done < <(wg show all endpoints 2>/dev/null)
     return 1
 }
 
 reality_has_warp_interface() {
     command_exists ip || return 1
-    ip -o link show 2>/dev/null | grep -Eiq '(warp|wgcf|cloudflare)'
+    ip -o link show 2>/dev/null | grep -Eiq '(warp|wgcf|cloudflare)' && return 0
+    reality_has_warp_wg_endpoint
 }
 
 reality_should_clear_detected_ipv4() {
@@ -2580,6 +2600,9 @@ reality_render_realm_config_multi() {
         reality_relay_load_route "$f" || continue
         validate_port "$RLY_LISTEN_PORT" || continue
         [[ -n "$RLY_TARGET_HOST" && -n "$RLY_TARGET_PORT" ]] || continue
+        # 防畸形值渲染出坏 TOML：target 必须是合法 host/IP + 端口
+        validate_port "$RLY_TARGET_PORT" || continue
+        validate_host "$RLY_TARGET_HOST" || continue
         cat <<EOF
 
 [[endpoints]]
@@ -3752,11 +3775,12 @@ copy_cert_pair_atomic \"\$LIVE/fullchain.pem\" \"\$LIVE/privkey.pem\" \"\$CERT_D
 systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || true
 "
             chmod +x "$hook" || { print_error "续签 Hook 授权失败"; reality_cdn_cleanup_cert_resources "$cdn_domain" "$cleanup_cert_dir" "$cleanup_cred" "$cleanup_hook" 0 "$cleanup_le" "$cert_snapshot_dir"; pause; return 1; }
-            cron_add_job "CertRenew_${cdn_domain}" "$(( $(echo "$cdn_domain" | cksum | cut -d' ' -f1) % 60 )) 3 * * * certbot renew --quiet --cert-name '${cdn_domain}' --deploy-hook '${hook}' # CertRenew_${cdn_domain}" || {
+            # 把 hook 持久化进该证书的 renewal conf，再用单条共享 cron 续期（官方推荐，避免多域名撞锁）
+            if ! _cert_persist_renew_hook "$cdn_domain" "$hook" || ! _cert_ensure_shared_renew_cron; then
                 print_error "自动续签 cron 配置失败"
                 reality_cdn_cleanup_cert_resources "$cdn_domain" "$cleanup_cert_dir" "$cleanup_cred" "$cleanup_hook" "$cleanup_cron" "$cleanup_le" "$cert_snapshot_dir"
                 pause; return 1
-            }
+            fi
             cleanup_cron=1
         else
             print_error "证书申请失败，已中止 CDN 安装。请检查 Token 权限(Zone:DNS Edit)与域名。"

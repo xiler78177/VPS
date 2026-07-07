@@ -15,6 +15,11 @@ ck(){ if eval "$2"; then echo "  PASS: $1"; pass=$((pass+1)); else echo "  FAIL:
 validate_port(){ [[ "${1:-}" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 && "$1" -le 65535 ]]; }
 validate_domain(){ [[ "${1:-}" == *.* ]]; }
 validate_ip(){ [[ "${1:-}" =~ ^[0-9]+\.[0-9.]+$ ]]; }
+validate_host(){ validate_ip "${1:-}" || validate_domain "${1:-}"; }
+# 09a 提供的证书续期 helper（构建产物里在 15 之前加载）；测试只 source 15，需补桩。
+# 模拟真实行为：persist 成功、shared cron 走 cron_add_job（各场景 mock 会记录到 cron-added）。
+_cert_persist_renew_hook(){ return 0; }
+_cert_ensure_shared_renew_cron(){ cron_add_job "CertRenewShared" "17 3 * * * certbot renew --quiet # CertRenewShared"; }
 command_exists(){ return 1; }
 systemctl(){ return 0; }
 confirm(){ return 0; }
@@ -265,6 +270,7 @@ ck "CDN 卸载失败回滚会恢复 state" '[[ -f "$REALITY_CDN_STATE_FILE" ]] &
 	    export CERT_HOOKS_DIR="$REALITY_CONFIG_DIR/hooks"
 	    export REALITY_CDN_CF_CRED_DIR="$REALITY_CONFIG_DIR/root"
 	    export REALITY_CDN_LE_LIVE_DIR="$REALITY_CONFIG_DIR/le-live"
+	    export LETSENCRYPT_RENEWAL_DIR="$REALITY_CONFIG_DIR/renewal"
 	    export EMAIL="audit@example.com"
 	    mkdir -p "$REALITY_CONFIG_DIR" "$CERT_HOOKS_DIR" "$REALITY_CDN_CF_CRED_DIR" "$REALITY_CDN_LE_LIVE_DIR"
     REALITY_ROLE="landing"; REALITY_UUID="uid-fw"; REALITY_PRIVATE_KEY="pk-fw"; REALITY_PUBLIC_KEY="pbk-fw"
@@ -280,7 +286,7 @@ ck "CDN 卸载失败回滚会恢复 state" '[[ -f "$REALITY_CDN_STATE_FILE" ]] &
 	    write_private_file_atomic(){ mkdir -p "$(dirname "$1")"; printf '%s\n' "$2" > "$1"; chmod 600 "$1"; return 0; }
 	    certbot(){
 	        case "$*" in
-	            certonly*) mkdir -p "$REALITY_CDN_LE_LIVE_DIR/cdn.example.com"; printf 'cert\n' > "$REALITY_CDN_LE_LIVE_DIR/cdn.example.com/fullchain.pem"; printf 'key\n' > "$REALITY_CDN_LE_LIVE_DIR/cdn.example.com/privkey.pem" ;;
+	            certonly*) mkdir -p "$REALITY_CDN_LE_LIVE_DIR/cdn.example.com"; printf 'cert\n' > "$REALITY_CDN_LE_LIVE_DIR/cdn.example.com/fullchain.pem"; printf 'key\n' > "$REALITY_CDN_LE_LIVE_DIR/cdn.example.com/privkey.pem"; mkdir -p "$LETSENCRYPT_RENEWAL_DIR"; printf '[renewalparams]\n' > "$LETSENCRYPT_RENEWAL_DIR/cdn.example.com.conf" ;;
 	            delete*) rm -rf "$REALITY_CDN_LE_LIVE_DIR/cdn.example.com" ;;
 	        esac
 	        return 0
@@ -312,6 +318,7 @@ ck "CDN 卸载失败回滚会恢复 state" '[[ -f "$REALITY_CDN_STATE_FILE" ]] &
 	    export CERT_HOOKS_DIR="$REALITY_CONFIG_DIR/hooks"
 	    export REALITY_CDN_CF_CRED_DIR="$REALITY_CONFIG_DIR/root"
 	    export REALITY_CDN_LE_LIVE_DIR="$REALITY_CONFIG_DIR/le-live"
+	    export LETSENCRYPT_RENEWAL_DIR="$REALITY_CONFIG_DIR/renewal"
 	    export EMAIL="audit@example.com"
 	    mkdir -p "$REALITY_CONFIG_DIR" "$CERT_HOOKS_DIR" "$REALITY_CDN_CF_CRED_DIR" "$REALITY_CDN_LE_LIVE_DIR"
     REALITY_ROLE="landing"; REALITY_UUID="uid-dns"; REALITY_PRIVATE_KEY="pk-dns"; REALITY_PUBLIC_KEY="pbk-dns"
@@ -327,7 +334,7 @@ ck "CDN 卸载失败回滚会恢复 state" '[[ -f "$REALITY_CDN_STATE_FILE" ]] &
 	    write_private_file_atomic(){ mkdir -p "$(dirname "$1")"; printf '%s\n' "$2" > "$1"; chmod 600 "$1"; return 0; }
 	    certbot(){
 	        case "$*" in
-	            certonly*) mkdir -p "$REALITY_CDN_LE_LIVE_DIR/cdn.example.com"; printf 'cert\n' > "$REALITY_CDN_LE_LIVE_DIR/cdn.example.com/fullchain.pem"; printf 'key\n' > "$REALITY_CDN_LE_LIVE_DIR/cdn.example.com/privkey.pem" ;;
+	            certonly*) mkdir -p "$REALITY_CDN_LE_LIVE_DIR/cdn.example.com"; printf 'cert\n' > "$REALITY_CDN_LE_LIVE_DIR/cdn.example.com/fullchain.pem"; printf 'key\n' > "$REALITY_CDN_LE_LIVE_DIR/cdn.example.com/privkey.pem"; mkdir -p "$LETSENCRYPT_RENEWAL_DIR"; printf '[renewalparams]\n' > "$LETSENCRYPT_RENEWAL_DIR/cdn.example.com.conf" ;;
 	            delete*) rm -rf "$REALITY_CDN_LE_LIVE_DIR/cdn.example.com" ;;
 	        esac
 	        return 0
@@ -361,6 +368,7 @@ ck "CDN 卸载失败回滚会恢复 state" '[[ -f "$REALITY_CDN_STATE_FILE" ]] &
 	    export CERT_HOOKS_DIR="$REALITY_CONFIG_DIR/hooks"
 	    export REALITY_CDN_CF_CRED_DIR="$REALITY_CONFIG_DIR/root"
 	    export REALITY_CDN_LE_LIVE_DIR="$REALITY_CONFIG_DIR/le-live"
+	    export LETSENCRYPT_RENEWAL_DIR="$REALITY_CONFIG_DIR/renewal"
 	    export EMAIL="audit@example.com"
 	    mkdir -p "$REALITY_CONFIG_DIR" "$CERT_HOOKS_DIR" "$REALITY_CDN_CF_CRED_DIR" "$REALITY_CDN_LE_LIVE_DIR" "$CERT_PATH_PREFIX/new.example.com" "$REALITY_CDN_LE_LIVE_DIR/new.example.com"
 	    printf 'old-cert\n' > "$CERT_PATH_PREFIX/new.example.com/fullchain.pem"
@@ -387,7 +395,7 @@ ck "CDN 卸载失败回滚会恢复 state" '[[ -f "$REALITY_CDN_STATE_FILE" ]] &
 	    write_private_file_atomic(){ mkdir -p "$(dirname "$1")"; printf '%s\n' "$2" > "$1"; chmod 600 "$1"; return 0; }
 	    certbot(){
 	        case "$*" in
-	            certonly*) printf 'new-live-cert\n' > "$REALITY_CDN_LE_LIVE_DIR/new.example.com/fullchain.pem"; printf 'new-live-key\n' > "$REALITY_CDN_LE_LIVE_DIR/new.example.com/privkey.pem" ;;
+	            certonly*) printf 'new-live-cert\n' > "$REALITY_CDN_LE_LIVE_DIR/new.example.com/fullchain.pem"; printf 'new-live-key\n' > "$REALITY_CDN_LE_LIVE_DIR/new.example.com/privkey.pem"; mkdir -p "$LETSENCRYPT_RENEWAL_DIR"; printf '[renewalparams]\n' > "$LETSENCRYPT_RENEWAL_DIR/new.example.com.conf" ;;
 	            delete*) rm -rf "$REALITY_CDN_LE_LIVE_DIR/new.example.com" ;;
 	        esac
 	        return 0

@@ -6,6 +6,9 @@ readonly CACHE_DIR="/var/cache/${SCRIPT_NAME}"
 readonly CACHE_FILE="${CACHE_DIR}/sysinfo.cache"
 readonly CACHE_TTL=300 
 readonly CERT_HOOKS_DIR="/root/cert-hooks"
+# 证书续签共享 cron（单条 certbot renew 覆盖所有证书，各证书 hook 存于其 renewal conf 的 renew_hook）
+readonly CERT_RENEW_SHARED_CRON_TAG="CertRenewShared"
+CERT_RENEW_SHARED_CRON_MINUTE="${CERT_RENEW_SHARED_CRON_MINUTE:-17}"
 readonly WG_SHARED_DB_DIR="/etc/wireguard/db"
 readonly WG_SHARED_DB_FILE="${WG_SHARED_DB_DIR}/wg-data.json"
 readonly WG_SHARED_ROLE_FILE="/etc/wireguard/.role"

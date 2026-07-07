@@ -291,15 +291,18 @@ _wg_update_peer_routes() {
     _pi=0
     while [[ $_pi -lt $_pc ]]; do
         local _cur=$(wg_db_get ".peers[$_pi].client_allowed_ips")
-        # 跳过全局代理和仅 VPN 内网的
-        [[ "$_cur" == *"0.0.0.0/0"* ]] && { _pi=$((_pi + 1)); continue; }
-        [[ "$_cur" == "$server_subnet" ]] && { _pi=$((_pi + 1)); continue; }
-
         local _is_gw=$(wg_db_get ".peers[$_pi].is_gateway // false")
         local _own=$(wg_db_get ".peers[$_pi].lan_subnets // empty")
         local _ptype=$(wg_db_get ".peers[$_pi].peer_type // \"standard\"")
         local _route_mode=$(wg_db_get ".peers[$_pi].route_mode // empty")
-        [[ "$_route_mode" == "custom" ]] && { _pi=$((_pi + 1)); continue; }
+        # 跳过用户显式选择的路由模式：custom(自定义)/full(全局)/vpn(仅内网)——这些不应被联动改写
+        case "$_route_mode" in
+            custom|full|vpn) _pi=$((_pi + 1)); continue ;;
+        esac
+        # 跳过全局代理
+        [[ "$_cur" == *"0.0.0.0/0"* || "$_cur" == *"::/0"* ]] && { _pi=$((_pi + 1)); continue; }
+        # 旧数据兼容：无 route_mode 且当前恰为 VPN 子网时视为仅内网，跳过（managed 类不受影响）
+        [[ -z "$_route_mode" && "$_cur" == "$server_subnet" ]] && { _pi=$((_pi + 1)); continue; }
 
         if [[ "$_is_gw" == "true" ]]; then
             # 网关: VPN 子网 + 服务端 LAN + 其他网关 LAN (排除自己)

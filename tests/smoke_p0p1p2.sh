@@ -1717,7 +1717,9 @@ echo "$wg_add_body" | grep -q 'route_mode: \$route_mode' \
     && echo "$wg_deb_add_body" | grep -q 'route_mode: \$route_mode' \
     && pass "G4: 新增 peer 持久化 route_mode" \
     || fail "G4: 新增 peer 未持久化 route_mode"
-echo "$wg_update_routes_body" | grep -q 'route_mode.*custom' \
+{ echo "$wg_update_routes_body" | grep -q 'route_mode.*custom' \
+    || { echo "$wg_update_routes_body" | grep -q 'case "\$_route_mode"' \
+         && echo "$wg_update_routes_body" | grep -q 'custom|full|vpn'; }; } \
     && { echo "$wg_deb_update_routes_body" | grep -q 'route_mode.*custom' \
          || { echo "$wg_deb_update_routes_body" | grep -q 'case "\$_route_mode"' \
               && echo "$wg_deb_update_routes_body" | grep -q 'custom|full|vpn'; }; } \
@@ -3005,7 +3007,7 @@ echo "$web_home_body" | grep -Fq 'write_file_atomic "${CONFIG_DIR}/${full_domain
 web_home_rollback_body=$(awk '/^_web_home_expose_rollback\(\)/,/^web_home_expose\(\)/' "$BUILT")
 if echo "$web_home_body" | grep -Fq 'if ! write_file_atomic "$hook_script" "$hook_content"; then' \
    && echo "$web_home_body" | grep -Fq 'if ! chmod +x "$hook_script"; then' \
-   && echo "$web_home_body" | grep -Fq 'if ! cron_add_job "$cron_tag"' \
+   && echo "$web_home_body" | grep -Fq 'if ! _cert_ensure_shared_renew_cron; then' \
    && echo "$web_home_body" | grep -Fq 'if ! write_file_atomic "${CONFIG_DIR}/${full_domain}.conf" "$domain_config_content"; then' \
    && grep -q '^_web_home_expose_rollback()' "$BUILT" \
    && echo "$web_home_rollback_body" | grep -Fq '_cf_dns_restore_records "$zone_id" "$token" "$domain" "$dns_snapshot" A AAAA CNAME' \

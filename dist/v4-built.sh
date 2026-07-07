@@ -7,6 +7,9 @@ readonly CACHE_DIR="/var/cache/${SCRIPT_NAME}"
 readonly CACHE_FILE="${CACHE_DIR}/sysinfo.cache"
 readonly CACHE_TTL=300 
 readonly CERT_HOOKS_DIR="/root/cert-hooks"
+# 证书续签共享 cron（单条 certbot renew 覆盖所有证书，各证书 hook 存于其 renewal conf 的 renew_hook）
+readonly CERT_RENEW_SHARED_CRON_TAG="CertRenewShared"
+CERT_RENEW_SHARED_CRON_MINUTE="${CERT_RENEW_SHARED_CRON_MINUTE:-17}"
 readonly WG_SHARED_DB_DIR="/etc/wireguard/db"
 readonly WG_SHARED_DB_FILE="${WG_SHARED_DB_DIR}/wg-data.json"
 readonly WG_SHARED_ROLE_FILE="/etc/wireguard/.role"
@@ -535,16 +538,70 @@ _ssh_authorized_keys_file_has_key() {
     grep -Eq '^[[:space:]]*(ssh-(rsa|ed25519|dss)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256))[[:space:]]+[A-Za-z0-9+/=]+' "$file" 2>/dev/null
 }
 
+# 依据 sshd 有效策略判断某用户是否被允许登录（AllowUsers/AllowGroups/DenyUsers/
+# DenyGroups，以及 root 的 PermitRootLogin）。用于禁用密码登录前的防误锁检查：
+# 仅"既有密钥、又被 sshd 允许登录"的用户才算作可用的密钥登录出口。
+# sshd 不可用或无法解析时 fail-open（返回 0），保持旧行为、不因检查本身新增锁外风险。
+_ssh_login_policy_allows() {
+    local user="$1" sshd_out line key val
+    [[ -n "$user" ]] || return 0
+    command_exists sshd || return 0
+    # 优先带 -C user= 解析（评估 Match 块）；旧版不支持时回退全局 sshd -T
+    sshd_out=$(sshd -T -C user="$user" 2>/dev/null)
+    [[ -n "$sshd_out" ]] || sshd_out=$(sshd -T 2>/dev/null)
+    [[ -n "$sshd_out" ]] || return 0
+
+    local deny_users="" allow_users="" deny_groups="" allow_groups="" permitroot=""
+    # sshd -T 输出的 directive 名统一为小写
+    while IFS= read -r line; do
+        key="${line%% *}"; key="${key,,}"
+        val="${line#* }"
+        case "$key" in
+            denyusers)       deny_users="$val" ;;
+            allowusers)      allow_users="$val" ;;
+            denygroups)      deny_groups="$val" ;;
+            allowgroups)     allow_groups="$val" ;;
+            permitrootlogin) permitroot="${val,,}" ;;
+        esac
+    done <<< "$sshd_out"
+
+    [[ "$user" == "root" && "$permitroot" == "no" ]] && return 1
+
+    local groups="" g pat
+    command_exists id && groups=$(id -nG "$user" 2>/dev/null)
+
+    # DenyUsers / DenyGroups 优先（命中即拒）。RHS 不加引号 → 支持 sshd 的通配符匹配。
+    for pat in $deny_users; do [[ "$user" == $pat ]] && return 1; done
+    for g in $groups; do for pat in $deny_groups; do [[ "$g" == $pat ]] && return 1; done; done
+
+    # AllowUsers 存在时用户必须命中；AllowGroups 存在时用户任一组必须命中。
+    if [[ -n "$allow_users" ]]; then
+        local matched=1
+        for pat in $allow_users; do [[ "$user" == $pat ]] && { matched=0; break; }; done
+        [[ $matched -eq 0 ]] || return 1
+    fi
+    if [[ -n "$allow_groups" ]]; then
+        local matched=1
+        for g in $groups; do for pat in $allow_groups; do [[ "$g" == $pat ]] && { matched=0; break 2; }; done; done
+        [[ $matched -eq 0 ]] || return 1
+    fi
+    return 0
+}
+
 _ssh_authorized_keys_available() {
     local root_home="${SSH_ROOT_HOME:-/root}"
     local passwd_file="${SSH_PASSWD_FILE:-/etc/passwd}"
-    _ssh_authorized_keys_file_has_key "${root_home}/.ssh/authorized_keys" && return 0
+    if _ssh_authorized_keys_file_has_key "${root_home}/.ssh/authorized_keys" && _ssh_login_policy_allows "root"; then
+        return 0
+    fi
     [[ -f "$passwd_file" ]] || return 1
     local user _x uid gid gecos home shell
     while IFS=: read -r user _x uid gid gecos home shell; do
         [[ -z "$user" || "$user" == "root" ]] && continue
         [[ -z "$home" || "$shell" =~ (nologin|false)$ ]] && continue
-        _ssh_authorized_keys_file_has_key "${home}/.ssh/authorized_keys" && return 0
+        if _ssh_authorized_keys_file_has_key "${home}/.ssh/authorized_keys" && _ssh_login_policy_allows "$user"; then
+            return 0
+        fi
     done < "$passwd_file"
     return 1
 }
@@ -6989,6 +7046,47 @@ _web_allow_public_tcp_port() {
     esac
 }
 
+# 把 deploy/renew hook 持久化进证书的 renewal 配置（/etc/letsencrypt/renewal/<domain>.conf 的
+# [renewalparams] renew_hook）。这样单条共享 `certbot renew` 就会自动为每个证书跑各自的 hook，
+# 无需再给每个域名单独挂 --cert-name cron（避免多域名撞 certbot 全局锁）。
+# 做法：先删除所有旧 renew_hook 行，再把新值插到 [renewalparams] 段头之后（configobj 要求
+# key 落在 section 内才生效）；若该 conf 无 [renewalparams] 段则补建段头再写。
+_cert_persist_renew_hook() {
+    local domain="$1" hook="$2" conf tmp renewal_dir
+    [[ -n "$domain" && -n "$hook" ]] || return 1
+    renewal_dir="${LETSENCRYPT_RENEWAL_DIR:-/etc/letsencrypt/renewal}"
+    conf="${renewal_dir}/${domain}.conf"
+    [[ -f "$conf" ]] || return 1   # certonly 成功后必然存在；不存在说明签发异常
+    tmp=$(mktemp "$(dirname "$conf")/.tmp.server-manage.renewal.XXXXXX") || return 1
+    _tmp_register "$tmp"
+    # certbot 的 renewal conf 用 configobj 解析：renew_hook 必须落在 [renewalparams] 段内才生效。
+    # 先删除所有旧 renew_hook 行，再把新值插到 [renewalparams] 段头之后；若无该段则追加到末尾并补段头。
+    if ! awk -v hook="$hook" '
+        /^[[:space:]]*renew_hook[[:space:]]*=/ { next }
+        /^\[renewalparams\]/ { print; print "renew_hook = " hook; injected=1; next }
+        { print }
+        END { if (!injected) { print "[renewalparams]"; print "renew_hook = " hook } }
+    ' "$conf" > "$tmp"; then
+        rm -f "$tmp"; _tmp_unregister "$tmp"; return 1
+    fi
+    chmod --reference="$conf" "$tmp" 2>/dev/null || chmod 644 "$tmp" 2>/dev/null || true
+    if ! mv "$tmp" "$conf"; then
+        rm -f "$tmp"; _tmp_unregister "$tmp"; return 1
+    fi
+    _tmp_unregister "$tmp"
+    return 0
+}
+
+# 安装单条共享的每日续期 cron（官方推荐：一条 `certbot renew` 覆盖所有证书，各证书跑自己
+# 持久化的 renew_hook）。幂等——cron_add_job 会先按 tag 去重。避开整点分钟分散负载。
+# tag/minute 由 00-constants.sh 定义（readonly）；此处仅在未定义时兜底，供单模块测试隔离用。
+_cert_ensure_shared_renew_cron() {
+    local tag="${CERT_RENEW_SHARED_CRON_TAG:-CertRenewShared}"
+    local minute="${CERT_RENEW_SHARED_CRON_MINUTE:-17}"
+    cron_add_job "$tag" \
+        "${minute} 3 * * * certbot renew --quiet # ${tag}"
+}
+
 # 确保 SSL 参数文件存在
 _ensure_ssl_params() {
     [[ -f /etc/nginx/snippets/ssl-params.conf ]] && return 0
@@ -7416,13 +7514,17 @@ _cf_dns_delete() {
         print_error "读取 DNS 记录失败: $(_cf_api_err "$resp")"
         return 1
     fi
-    local rid=$(echo "$resp" | jq -r '.result[0].id // empty')
-    [[ -n "$rid" ]] || return 0
-    resp=$(_cf_api DELETE "/zones/$zone_id/dns_records/$rid" "$token")
-    if ! _cf_api_ok "$resp"; then
-        print_error "删除 DNS 记录失败: $(_cf_api_err "$resp")"
-        return 1
-    fi
+    local rids rid
+    rids=$(echo "$resp" | jq -r '.result[]?.id // empty')
+    [[ -n "$rids" ]] || return 0
+    while IFS= read -r rid; do
+        [[ -n "$rid" ]] || continue
+        resp=$(_cf_api DELETE "/zones/$zone_id/dns_records/$rid" "$token")
+        if ! _cf_api_ok "$resp"; then
+            print_error "删除 DNS 记录失败: $(_cf_api_err "$resp")"
+            return 1
+        fi
+    done <<< "$rids"
 }
 
 _cf_dns_snapshot_records() {
@@ -8288,7 +8390,6 @@ $(_nginx_tls_http2_block "$NGINX_HTTPS_PORT")
     server_name $DOMAIN;
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
-    ssl_trusted_certificate ${cert_dir}/fullchain.pem;
     include snippets/ssl-params.conf;
     client_max_body_size 50M;
     location / {
@@ -8370,10 +8471,10 @@ exit 0
 "
         write_file_atomic "$DEPLOY_HOOK_SCRIPT" "$hook_content" || { print_error "续签 Hook 写入失败"; _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
         chmod +x "$DEPLOY_HOOK_SCRIPT" || { print_error "续签 Hook 授权失败"; _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
-        local cron_tag="CertRenew_${DOMAIN}"
-        local cron_minute=$(( $(echo "$DOMAIN" | cksum | cut -d' ' -f1) % 60 ))
-        cron_add_job "$cron_tag" "${cron_minute} 3 * * * certbot renew --quiet --cert-name '${DOMAIN}' --deploy-hook '${DEPLOY_HOOK_SCRIPT}' # ${cron_tag}" || { print_error "自动续签 cron 配置失败"; _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
-        print_success "自动续签已配置 (每日 3:$(printf '%02d' $cron_minute) AM)"
+        # 把 hook 持久化进该证书的 renewal conf，再用单条共享 cron 续期（官方推荐，避免多域名撞锁）
+        _cert_persist_renew_hook "$DOMAIN" "$DEPLOY_HOOK_SCRIPT" || { print_error "续签 Hook 持久化失败"; _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
+        _cert_ensure_shared_renew_cron || { print_error "自动续签 cron 配置失败"; _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
+        print_success "自动续签已配置 (每日 3:17 AM，单条 certbot renew 覆盖所有证书)"
 
         # 保存域名管理配置
         local config_content="# Domain configuration for $DOMAIN
@@ -8429,7 +8530,7 @@ LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
         fi
         echo -e "\n${C_CYAN}[自动续签]${C_RESET}"
         echo "  Hook 脚本: $DEPLOY_HOOK_SCRIPT"
-        echo "  Crontab: 每日 3:$(printf '%02d' $cron_minute) AM 自动检查"
+        echo "  Crontab: 每日 3:xx AM 自动续期 (所有证书共用一条 certbot renew)"
         draw_line
         log_action "Domain configured: $DOMAIN (Nginx: $do_nginx)"
     else
@@ -8923,7 +9024,6 @@ $(_nginx_tls_http2_block "$HTTPS_PORT")
     server_name $DOMAIN;
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
-    ssl_trusted_certificate ${cert_dir}/fullchain.pem;
     include snippets/ssl-params.conf;
 
     # 流媒体优化参数
@@ -8994,7 +9094,6 @@ $(_nginx_tls_http2_block "$HTTPS_PORT")
     server_name $DOMAIN;
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
-    ssl_trusted_certificate ${cert_dir}/fullchain.pem;
     include snippets/ssl-params.conf;
     client_max_body_size 20G;
     proxy_read_timeout 86400s;
@@ -9026,7 +9125,6 @@ $(_nginx_tls_http2_block "$HTTPS_PORT")
     server_name $DOMAIN;
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
-    ssl_trusted_certificate ${cert_dir}/fullchain.pem;
     include snippets/ssl-params.conf;
     client_max_body_size 10G;
     proxy_read_timeout 86400s;
@@ -9060,7 +9158,6 @@ $(_nginx_tls_http2_block "$HTTPS_PORT")
     server_name $DOMAIN;
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
-    ssl_trusted_certificate ${cert_dir}/fullchain.pem;
     include snippets/ssl-params.conf;
     client_max_body_size 50M;
     location / {
@@ -9101,7 +9198,6 @@ $(_nginx_tls_http2_block "$HTTPS_PORT")
     server_name $DOMAIN;
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
-    ssl_trusted_certificate ${cert_dir}/fullchain.pem;
     include snippets/ssl-params.conf;
     client_max_body_size 50M;
     location / {
@@ -9274,7 +9370,7 @@ menu_web() {
                 read -e -r -p "选择 [1]: " renew_mode
                 renew_mode=${renew_mode:-1}
                 print_info "正在续签..."
-                local renew_log="/var/log/certbot-renew.log"
+                local renew_log="/var/log/cert-renew.log"
                 if [[ "$renew_mode" == "2" ]]; then
                     print_warn "强制续签: Let's Encrypt 限制每周 5 次相同证书"
                     if confirm "确认强制续签?"; then
@@ -9502,10 +9598,15 @@ web_home_expose() {
     print_info "探测公网 IP..."
     local public_ip=""
     public_ip=$(get_public_ipv4)
+    # 自动探测结果同样校验：避免探测源返回垃圾串/IPv6 污染 A 记录
+    if [[ -n "$public_ip" ]] && { ! validate_ip "$public_ip" || [[ "$public_ip" == *:* ]]; }; then
+        print_warn "自动探测到的 IP 无效: ${public_ip}"
+        public_ip=""
+    fi
     if [[ -z "$public_ip" ]]; then
-        print_warn "未自动检测到 IPv4，请手动输入"
+        print_warn "未自动检测到有效 IPv4，请手动输入"
         read -e -r -p "公网 IPv4: " public_ip
-        if ! validate_ip "$public_ip"; then
+        if ! validate_ip "$public_ip" || [[ "$public_ip" == *:* ]]; then
             print_error "IP 格式无效"; pause; return
         fi
     fi
@@ -9632,7 +9733,6 @@ $(_nginx_tls_http2_block "$https_port")
     server_name ${full_domain};
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
-    ssl_trusted_certificate ${cert_dir}/fullchain.pem;
     include snippets/ssl-params.conf;
     client_max_body_size 50M;
     location / {
@@ -9814,10 +9914,13 @@ exit 0
         pause; return 1
     fi
 
-    # Crontab 自动续签
-    local cron_tag="CertRenew_${full_domain}"
-    local cron_minute=$(( $(echo "$full_domain" | cksum | cut -d' ' -f1) % 60 ))
-    if ! cron_add_job "$cron_tag" "${cron_minute} 3 * * * certbot renew --quiet --cert-name '${full_domain}' --deploy-hook '${hook_script}' # ${cron_tag}"; then
+    # Crontab 自动续签：hook 持久化进 renewal conf + 单条共享 cron（官方推荐，避免多域名撞锁）
+    if ! _cert_persist_renew_hook "$full_domain" "$hook_script"; then
+        print_error "证书续签 Hook 持久化失败，正在清理本地半成品"
+        _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 1
+        pause; return 1
+    fi
+    if ! _cert_ensure_shared_renew_cron; then
         print_error "证书续签 cron 安装失败，正在清理本地半成品"
         _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 1
         pause; return 1
@@ -11809,6 +11912,11 @@ wg_server_install() {
         echo -e "  ${C_YELLOW}未检测到 br-lan 接口${C_RESET}"
         read -e -r -p "服务端 LAN 子网 (留空跳过): " server_lan_subnet
     fi
+    # 校验 LAN 子网格式（留空则跳过），畸形值会污染 client AllowedIPs / bypass 规则 / rc.local 持久化块
+    while [[ -n "$server_lan_subnet" ]] && ! validate_cidr_list "$server_lan_subnet"; do
+        print_error "LAN 子网格式无效: ${server_lan_subnet}（示例 192.168.1.0/24，多个用逗号分隔）"
+        read -e -r -p "重新输入服务端 LAN 子网 (留空跳过): " server_lan_subnet
+    done
 
     # Endpoint: 优先使用 DDNS 域名
     local ddns_domain=""
@@ -13051,15 +13159,18 @@ _wg_update_peer_routes() {
     _pi=0
     while [[ $_pi -lt $_pc ]]; do
         local _cur=$(wg_db_get ".peers[$_pi].client_allowed_ips")
-        # 跳过全局代理和仅 VPN 内网的
-        [[ "$_cur" == *"0.0.0.0/0"* ]] && { _pi=$((_pi + 1)); continue; }
-        [[ "$_cur" == "$server_subnet" ]] && { _pi=$((_pi + 1)); continue; }
-
         local _is_gw=$(wg_db_get ".peers[$_pi].is_gateway // false")
         local _own=$(wg_db_get ".peers[$_pi].lan_subnets // empty")
         local _ptype=$(wg_db_get ".peers[$_pi].peer_type // \"standard\"")
         local _route_mode=$(wg_db_get ".peers[$_pi].route_mode // empty")
-        [[ "$_route_mode" == "custom" ]] && { _pi=$((_pi + 1)); continue; }
+        # 跳过用户显式选择的路由模式：custom(自定义)/full(全局)/vpn(仅内网)——这些不应被联动改写
+        case "$_route_mode" in
+            custom|full|vpn) _pi=$((_pi + 1)); continue ;;
+        esac
+        # 跳过全局代理
+        [[ "$_cur" == *"0.0.0.0/0"* || "$_cur" == *"::/0"* ]] && { _pi=$((_pi + 1)); continue; }
+        # 旧数据兼容：无 route_mode 且当前恰为 VPN 子网时视为仅内网，跳过（managed 类不受影响）
+        [[ -z "$_route_mode" && "$_cur" == "$server_subnet" ]] && { _pi=$((_pi + 1)); continue; }
 
         if [[ "$_is_gw" == "true" ]]; then
             # 网关: VPN 子网 + 服务端 LAN + 其他网关 LAN (排除自己)
@@ -15809,6 +15920,11 @@ wg_deb_server_install() {
     if [[ -z "$server_lan_subnet" ]]; then
         read -e -r -p "服务端 LAN 子网 (留空跳过，VPS 一般不需要): " server_lan_subnet
     fi
+    # 校验 LAN 子网格式：非空则必须是合法 CIDR（列表），畸形值会污染 client AllowedIPs / bypass 规则
+    while [[ -n "$server_lan_subnet" ]] && ! validate_cidr_list "$server_lan_subnet"; do
+        print_error "LAN 子网格式无效: ${server_lan_subnet}（需形如 192.168.1.0/24，多个用逗号分隔）"
+        read -e -r -p "重新输入服务端 LAN 子网 (留空跳过): " server_lan_subnet
+    done
 
     # Endpoint: 优先使用 DDNS 域名
     local ddns_domain=""
@@ -15886,6 +16002,11 @@ wg_deb_server_install() {
     local server_privkey server_pubkey
     server_privkey=$(wg genkey)
     server_pubkey=$(echo "$server_privkey" | wg pubkey)
+    if [[ -z "$server_privkey" || -z "$server_pubkey" ]]; then
+        print_error "WireGuard 服务端密钥生成失败"
+        _wg_deb_rollback_new_udp_allow "$wg_port" "$wg_udp_rule_added" "$wg_non_ufw_open_backends"
+        pause; return 1
+    fi
     print_success "密钥已生成"
 
     # 服务器名称
@@ -21951,15 +22072,35 @@ reality_ipv4_is_likely_warp_egress() {
     local ip="${1:-}"
     # Cloudflare WARP 常见 IPv4 出口段。若本机网卡没有公网 IPv4 且探测到这些出口，
     # 不能把它写进 CF 回源 A 记录，否则 CF 会回源到 WARP 出口而不是本机。
+    # 消费级 WARP 出口主要落在 104.28.0.0/16；免费/plus 也见于 104.16-31 的 Cloudflare 段。
     case "$ip" in
-        104.28.*|104.29.*) return 0 ;;
+        104.1[6-9].*|104.2[0-9].*|104.3[01].*) return 0 ;;
     esac
+    return 1
+}
+
+# 按 wireguard peer endpoint 判断是否 WARP：不依赖接口名（wgcf 常落在 wg0），
+# 直接匹配 Cloudflare WARP 服务端 IP 段，命中即认定本机在用 WARP。
+reality_has_warp_wg_endpoint() {
+    command_exists wg || return 1
+    local _iface _pub ep _rest host
+    while read -r _iface _pub ep _rest; do
+        [[ -n "$ep" && "$ep" != "(none)" ]] || continue
+        host="${ep%:*}"          # 去掉端口（IPv6 端口在 ]: 之后，下面按段前缀匹配即可）
+        host="${host#[}"; host="${host%]}"
+        case "$host" in
+            162.159.192.*|162.159.193.*|162.159.195.*) return 0 ;;
+            188.114.9[6-9].*)                          return 0 ;;
+            2606:4700:d0*|2606:4700:d1*)               return 0 ;;
+        esac
+    done < <(wg show all endpoints 2>/dev/null)
     return 1
 }
 
 reality_has_warp_interface() {
     command_exists ip || return 1
-    ip -o link show 2>/dev/null | grep -Eiq '(warp|wgcf|cloudflare)'
+    ip -o link show 2>/dev/null | grep -Eiq '(warp|wgcf|cloudflare)' && return 0
+    reality_has_warp_wg_endpoint
 }
 
 reality_should_clear_detected_ipv4() {
@@ -22656,6 +22797,9 @@ reality_render_realm_config_multi() {
         reality_relay_load_route "$f" || continue
         validate_port "$RLY_LISTEN_PORT" || continue
         [[ -n "$RLY_TARGET_HOST" && -n "$RLY_TARGET_PORT" ]] || continue
+        # 防畸形值渲染出坏 TOML：target 必须是合法 host/IP + 端口
+        validate_port "$RLY_TARGET_PORT" || continue
+        validate_host "$RLY_TARGET_HOST" || continue
         cat <<EOF
 
 [[endpoints]]
@@ -23828,11 +23972,12 @@ copy_cert_pair_atomic \"\$LIVE/fullchain.pem\" \"\$LIVE/privkey.pem\" \"\$CERT_D
 systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || true
 "
             chmod +x "$hook" || { print_error "续签 Hook 授权失败"; reality_cdn_cleanup_cert_resources "$cdn_domain" "$cleanup_cert_dir" "$cleanup_cred" "$cleanup_hook" 0 "$cleanup_le" "$cert_snapshot_dir"; pause; return 1; }
-            cron_add_job "CertRenew_${cdn_domain}" "$(( $(echo "$cdn_domain" | cksum | cut -d' ' -f1) % 60 )) 3 * * * certbot renew --quiet --cert-name '${cdn_domain}' --deploy-hook '${hook}' # CertRenew_${cdn_domain}" || {
+            # 把 hook 持久化进该证书的 renewal conf，再用单条共享 cron 续期（官方推荐，避免多域名撞锁）
+            if ! _cert_persist_renew_hook "$cdn_domain" "$hook" || ! _cert_ensure_shared_renew_cron; then
                 print_error "自动续签 cron 配置失败"
                 reality_cdn_cleanup_cert_resources "$cdn_domain" "$cleanup_cert_dir" "$cleanup_cred" "$cleanup_hook" "$cleanup_cron" "$cleanup_le" "$cert_snapshot_dir"
                 pause; return 1
-            }
+            fi
             cleanup_cron=1
         else
             print_error "证书申请失败，已中止 CDN 安装。请检查 Token 权限(Zone:DNS Edit)与域名。"

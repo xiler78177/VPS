@@ -3819,6 +3819,7 @@ if [[ "$(id -u)" -eq 0 ]]; then
                 *) return 0 ;;
             esac
         }
+        _cert_persist_renew_hook() { return 0; }
         printf 'tok-home-runtime\n1\nhome\n5244\n8443\n7\n' | web_home_expose
     ) > "$tmp_root/web-home.out" 2>&1 \
        && [[ -f "$web_home_cert_prefix/${web_home_domain}/fullchain.pem" ]] \
@@ -3834,7 +3835,7 @@ if [[ "$(id -u)" -eq 0 ]]; then
        && grep -Fq "LOCAL_PROXY_PASS=\"http://127.0.0.1:5244\"" "$web_home_config_dir/${web_home_domain}.conf" \
        && grep -Fxq 'cf-upsert|zone-home-runtime|tok-home-runtime|home.example.com|A|198.51.100.45|true' "$web_home_log" \
        && grep -Fq 'cf-origin-put|tok-home-runtime|zone-home-runtime|' "$web_home_log" \
-       && grep -Fq "cron-add|CertRenew_${web_home_domain}|" "$web_home_log" \
+       && grep -Fq "cron-add|CertRenewShared|" "$web_home_log" \
        && ! find "$web_home_root" -name '.tmp.server-manage.*' -print -quit | grep -q .; then
         pass "Web 家宽暴露在实体机 mock 下落地证书/DDNS/hook/domain 配置并调用 CF/Nginx"
     else
@@ -3886,6 +3887,7 @@ if [[ "$(id -u)" -eq 0 ]]; then
             return 0
         }
         confirm() { [[ "$1" == *"开始执行"* ]]; }
+        _cert_persist_renew_hook() { return 0; }
         printf 'tok-home-runtime\n1\nhome\n5244\n8443\n7\n' | web_home_expose
     ) > "$tmp_root/web-home-origin-fail.out" 2>&1; then
         fail "Web 家宽暴露 Origin Rule 读取失败时仍返回成功"
@@ -3945,6 +3947,7 @@ if [[ "$(id -u)" -eq 0 ]]; then
             return 0
         }
         confirm() { [[ "$1" == *"开始执行"* ]]; }
+        _cert_persist_renew_hook() { return 0; }
         printf 'tok-home-runtime\n1\nhome\n5244\n8443\n7\n' | web_home_expose
     ) > "$tmp_root/web-home-fail.out" 2>&1; then
         fail "Web 家宽暴露 DDNS cron 失败时仍返回成功"
@@ -4004,11 +4007,12 @@ if [[ "$(id -u)" -eq 0 ]]; then
             return 0
         }
         confirm() { [[ "$1" == *"开始执行"* ]]; }
+        _cert_persist_renew_hook() { return 0; }
         printf 'tok-home-runtime\n1\nhome\n5244\n8443\n7\n' | web_home_expose
     ) > "$tmp_root/web-home-tail-cron.out" 2>&1; then
         fail "Web 家宽暴露续签 cron 安装失败时仍返回成功"
         sed 's/^/    /' "$tmp_root/web-home-tail-cron.out" 2>/dev/null || true
-    elif grep -Fq "cert-cron-fail|CertRenew_${web_home_domain}|" "$web_home_tail_cron_log" \
+    elif grep -Fq "cert-cron-fail|CertRenewShared|" "$web_home_tail_cron_log" \
          && grep -Fq 'origin-restore|tok-home-runtime|zone-home-runtime|[]' "$web_home_tail_cron_log" \
          && grep -Fq 'dns-restore|zone-home-runtime|tok-home-runtime|home.example.com|[{"type":"A","name":"home.example.com","content":"198.51.100.7","ttl":1,"proxied":true}]' "$web_home_tail_cron_log" \
          && grep -Fxq "cleanup-domain|${web_home_domain}|quiet" "$web_home_tail_cron_log" \
@@ -4074,6 +4078,7 @@ if [[ "$(id -u)" -eq 0 ]]; then
             return 0
         }
         confirm() { [[ "$1" == *"开始执行"* ]]; }
+        _cert_persist_renew_hook() { return 0; }
         printf 'tok-home-runtime\n1\nhome\n5244\n8443\n7\n' | web_home_expose
     ) > "$tmp_root/web-home-tail-config.out" 2>&1; then
         fail "Web 家宽暴露管理配置写入失败时仍返回成功"
@@ -4181,6 +4186,7 @@ DDNS_INTERVAL=\"5\""
             printf 'confirm|%s\n' "$1" >> "$web_domain_log"
             return 0
         }
+        _cert_persist_renew_hook() { return 0; }
         printf '1\npanel\n\n\n1\n8080\n1\ny\n' | web_add_domain
     ) > "$tmp_root/web-domain.out" 2>&1 \
        && [[ -f "$web_domain_cert_prefix/${web_domain_domain}/fullchain.pem" ]] \
@@ -4192,7 +4198,7 @@ DDNS_INTERVAL=\"5\""
        && grep -Fxq 'DDNS_PROXIED="true"' "$web_domain_ddns_dir/${web_domain_domain}.conf" \
        && grep -Fxq 'cf-upsert|zone-domain-runtime|tok-domain-runtime|panel.example.com|A|198.51.100.46|true' "$web_domain_log" \
        && grep -Fq "nginx-deploy|${web_domain_domain}" "$web_domain_log" \
-       && grep -Fq "cron-add|CertRenew_${web_domain_domain}|" "$web_domain_log" \
+       && grep -Fq "cron-add|CertRenewShared|" "$web_domain_log" \
        && grep -Fxq 'ddns-setup|panel.example.com|tok-domain-runtime|zone-domain-runtime|true|false|true' "$web_domain_log" \
        && ! find "$web_domain_root" -name '.tmp.server-manage.*' -print -quit | grep -q .; then
         pass "Web 添加域名在实体机 mock 下落地证书/Nginx/hook/domain/DDNS 配置"
@@ -4260,6 +4266,7 @@ DDNS_INTERVAL=\"5\""
         log_action() { printf 'cleanup-log|%s\n' "$1" >> "$web_domain_fail_log"; }
         ddns_setup() { printf 'ddns-fail\n' >> "$web_domain_fail_log"; return 23; }
         confirm() { return 0; }
+        _cert_persist_renew_hook() { return 0; }
         printf '1\npanel\n\n\n1\n8080\n1\ny\n' | web_add_domain
     ) > "$tmp_root/web-domain-fail.out" 2>&1; then
         fail "Web 添加域名 DDNS 失败时仍返回成功"

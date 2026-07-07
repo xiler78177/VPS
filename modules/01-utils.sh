@@ -426,16 +426,70 @@ _ssh_authorized_keys_file_has_key() {
     grep -Eq '^[[:space:]]*(ssh-(rsa|ed25519|dss)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256))[[:space:]]+[A-Za-z0-9+/=]+' "$file" 2>/dev/null
 }
 
+# 依据 sshd 有效策略判断某用户是否被允许登录（AllowUsers/AllowGroups/DenyUsers/
+# DenyGroups，以及 root 的 PermitRootLogin）。用于禁用密码登录前的防误锁检查：
+# 仅"既有密钥、又被 sshd 允许登录"的用户才算作可用的密钥登录出口。
+# sshd 不可用或无法解析时 fail-open（返回 0），保持旧行为、不因检查本身新增锁外风险。
+_ssh_login_policy_allows() {
+    local user="$1" sshd_out line key val
+    [[ -n "$user" ]] || return 0
+    command_exists sshd || return 0
+    # 优先带 -C user= 解析（评估 Match 块）；旧版不支持时回退全局 sshd -T
+    sshd_out=$(sshd -T -C user="$user" 2>/dev/null)
+    [[ -n "$sshd_out" ]] || sshd_out=$(sshd -T 2>/dev/null)
+    [[ -n "$sshd_out" ]] || return 0
+
+    local deny_users="" allow_users="" deny_groups="" allow_groups="" permitroot=""
+    # sshd -T 输出的 directive 名统一为小写
+    while IFS= read -r line; do
+        key="${line%% *}"; key="${key,,}"
+        val="${line#* }"
+        case "$key" in
+            denyusers)       deny_users="$val" ;;
+            allowusers)      allow_users="$val" ;;
+            denygroups)      deny_groups="$val" ;;
+            allowgroups)     allow_groups="$val" ;;
+            permitrootlogin) permitroot="${val,,}" ;;
+        esac
+    done <<< "$sshd_out"
+
+    [[ "$user" == "root" && "$permitroot" == "no" ]] && return 1
+
+    local groups="" g pat
+    command_exists id && groups=$(id -nG "$user" 2>/dev/null)
+
+    # DenyUsers / DenyGroups 优先（命中即拒）。RHS 不加引号 → 支持 sshd 的通配符匹配。
+    for pat in $deny_users; do [[ "$user" == $pat ]] && return 1; done
+    for g in $groups; do for pat in $deny_groups; do [[ "$g" == $pat ]] && return 1; done; done
+
+    # AllowUsers 存在时用户必须命中；AllowGroups 存在时用户任一组必须命中。
+    if [[ -n "$allow_users" ]]; then
+        local matched=1
+        for pat in $allow_users; do [[ "$user" == $pat ]] && { matched=0; break; }; done
+        [[ $matched -eq 0 ]] || return 1
+    fi
+    if [[ -n "$allow_groups" ]]; then
+        local matched=1
+        for g in $groups; do for pat in $allow_groups; do [[ "$g" == $pat ]] && { matched=0; break 2; }; done; done
+        [[ $matched -eq 0 ]] || return 1
+    fi
+    return 0
+}
+
 _ssh_authorized_keys_available() {
     local root_home="${SSH_ROOT_HOME:-/root}"
     local passwd_file="${SSH_PASSWD_FILE:-/etc/passwd}"
-    _ssh_authorized_keys_file_has_key "${root_home}/.ssh/authorized_keys" && return 0
+    if _ssh_authorized_keys_file_has_key "${root_home}/.ssh/authorized_keys" && _ssh_login_policy_allows "root"; then
+        return 0
+    fi
     [[ -f "$passwd_file" ]] || return 1
     local user _x uid gid gecos home shell
     while IFS=: read -r user _x uid gid gecos home shell; do
         [[ -z "$user" || "$user" == "root" ]] && continue
         [[ -z "$home" || "$shell" =~ (nologin|false)$ ]] && continue
-        _ssh_authorized_keys_file_has_key "${home}/.ssh/authorized_keys" && return 0
+        if _ssh_authorized_keys_file_has_key "${home}/.ssh/authorized_keys" && _ssh_login_policy_allows "$user"; then
+            return 0
+        fi
     done < "$passwd_file"
     return 1
 }

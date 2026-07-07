@@ -178,10 +178,15 @@ web_home_expose() {
     print_info "探测公网 IP..."
     local public_ip=""
     public_ip=$(get_public_ipv4)
+    # 自动探测结果同样校验：避免探测源返回垃圾串/IPv6 污染 A 记录
+    if [[ -n "$public_ip" ]] && { ! validate_ip "$public_ip" || [[ "$public_ip" == *:* ]]; }; then
+        print_warn "自动探测到的 IP 无效: ${public_ip}"
+        public_ip=""
+    fi
     if [[ -z "$public_ip" ]]; then
-        print_warn "未自动检测到 IPv4，请手动输入"
+        print_warn "未自动检测到有效 IPv4，请手动输入"
         read -e -r -p "公网 IPv4: " public_ip
-        if ! validate_ip "$public_ip"; then
+        if ! validate_ip "$public_ip" || [[ "$public_ip" == *:* ]]; then
             print_error "IP 格式无效"; pause; return
         fi
     fi
@@ -308,7 +313,6 @@ $(_nginx_tls_http2_block "$https_port")
     server_name ${full_domain};
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
-    ssl_trusted_certificate ${cert_dir}/fullchain.pem;
     include snippets/ssl-params.conf;
     client_max_body_size 50M;
     location / {
@@ -490,10 +494,13 @@ exit 0
         pause; return 1
     fi
 
-    # Crontab 自动续签
-    local cron_tag="CertRenew_${full_domain}"
-    local cron_minute=$(( $(echo "$full_domain" | cksum | cut -d' ' -f1) % 60 ))
-    if ! cron_add_job "$cron_tag" "${cron_minute} 3 * * * certbot renew --quiet --cert-name '${full_domain}' --deploy-hook '${hook_script}' # ${cron_tag}"; then
+    # Crontab 自动续签：hook 持久化进 renewal conf + 单条共享 cron（官方推荐，避免多域名撞锁）
+    if ! _cert_persist_renew_hook "$full_domain" "$hook_script"; then
+        print_error "证书续签 Hook 持久化失败，正在清理本地半成品"
+        _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 1
+        pause; return 1
+    fi
+    if ! _cert_ensure_shared_renew_cron; then
         print_error "证书续签 cron 安装失败，正在清理本地半成品"
         _web_home_expose_rollback "$full_domain" "$zone_id" "$token" "$dns_snapshot" "$dns_restore_needed" "$origin_rules_snapshot" "$origin_restore_needed" 1
         pause; return 1

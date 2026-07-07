@@ -254,7 +254,6 @@ $(_nginx_tls_http2_block "$HTTPS_PORT")
     server_name $DOMAIN;
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
-    ssl_trusted_certificate ${cert_dir}/fullchain.pem;
     include snippets/ssl-params.conf;
 
     # 流媒体优化参数
@@ -325,7 +324,6 @@ $(_nginx_tls_http2_block "$HTTPS_PORT")
     server_name $DOMAIN;
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
-    ssl_trusted_certificate ${cert_dir}/fullchain.pem;
     include snippets/ssl-params.conf;
     client_max_body_size 20G;
     proxy_read_timeout 86400s;
@@ -357,7 +355,6 @@ $(_nginx_tls_http2_block "$HTTPS_PORT")
     server_name $DOMAIN;
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
-    ssl_trusted_certificate ${cert_dir}/fullchain.pem;
     include snippets/ssl-params.conf;
     client_max_body_size 10G;
     proxy_read_timeout 86400s;
@@ -391,7 +388,6 @@ $(_nginx_tls_http2_block "$HTTPS_PORT")
     server_name $DOMAIN;
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
-    ssl_trusted_certificate ${cert_dir}/fullchain.pem;
     include snippets/ssl-params.conf;
     client_max_body_size 50M;
     location / {
@@ -432,7 +428,6 @@ $(_nginx_tls_http2_block "$HTTPS_PORT")
     server_name $DOMAIN;
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
-    ssl_trusted_certificate ${cert_dir}/fullchain.pem;
     include snippets/ssl-params.conf;
     client_max_body_size 50M;
     location / {
@@ -605,7 +600,7 @@ menu_web() {
                 read -e -r -p "选择 [1]: " renew_mode
                 renew_mode=${renew_mode:-1}
                 print_info "正在续签..."
-                local renew_log="/var/log/certbot-renew.log"
+                local renew_log="/var/log/cert-renew.log"
                 if [[ "$renew_mode" == "2" ]]; then
                     print_warn "强制续签: Let's Encrypt 限制每周 5 次相同证书"
                     if confirm "确认强制续签?"; then

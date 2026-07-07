@@ -123,13 +123,17 @@ _cf_dns_delete() {
         print_error "读取 DNS 记录失败: $(_cf_api_err "$resp")"
         return 1
     fi
-    local rid=$(echo "$resp" | jq -r '.result[0].id // empty')
-    [[ -n "$rid" ]] || return 0
-    resp=$(_cf_api DELETE "/zones/$zone_id/dns_records/$rid" "$token")
-    if ! _cf_api_ok "$resp"; then
-        print_error "删除 DNS 记录失败: $(_cf_api_err "$resp")"
-        return 1
-    fi
+    local rids rid
+    rids=$(echo "$resp" | jq -r '.result[]?.id // empty')
+    [[ -n "$rids" ]] || return 0
+    while IFS= read -r rid; do
+        [[ -n "$rid" ]] || continue
+        resp=$(_cf_api DELETE "/zones/$zone_id/dns_records/$rid" "$token")
+        if ! _cf_api_ok "$resp"; then
+            print_error "删除 DNS 记录失败: $(_cf_api_err "$resp")"
+            return 1
+        fi
+    done <<< "$rids"
 }
 
 _cf_dns_snapshot_records() {

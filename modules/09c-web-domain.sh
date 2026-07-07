@@ -326,7 +326,6 @@ $(_nginx_tls_http2_block "$NGINX_HTTPS_PORT")
     server_name $DOMAIN;
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
-    ssl_trusted_certificate ${cert_dir}/fullchain.pem;
     include snippets/ssl-params.conf;
     client_max_body_size 50M;
     location / {
@@ -408,10 +407,10 @@ exit 0
 "
         write_file_atomic "$DEPLOY_HOOK_SCRIPT" "$hook_content" || { print_error "续签 Hook 写入失败"; _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
         chmod +x "$DEPLOY_HOOK_SCRIPT" || { print_error "续签 Hook 授权失败"; _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
-        local cron_tag="CertRenew_${DOMAIN}"
-        local cron_minute=$(( $(echo "$DOMAIN" | cksum | cut -d' ' -f1) % 60 ))
-        cron_add_job "$cron_tag" "${cron_minute} 3 * * * certbot renew --quiet --cert-name '${DOMAIN}' --deploy-hook '${DEPLOY_HOOK_SCRIPT}' # ${cron_tag}" || { print_error "自动续签 cron 配置失败"; _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
-        print_success "自动续签已配置 (每日 3:$(printf '%02d' $cron_minute) AM)"
+        # 把 hook 持久化进该证书的 renewal conf，再用单条共享 cron 续期（官方推荐，避免多域名撞锁）
+        _cert_persist_renew_hook "$DOMAIN" "$DEPLOY_HOOK_SCRIPT" || { print_error "续签 Hook 持久化失败"; _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
+        _cert_ensure_shared_renew_cron || { print_error "自动续签 cron 配置失败"; _web_add_domain_rollback "$DOMAIN" "$rollback_clean_start" "$zone_id" "$CF_API_TOKEN" "$dns_snapshot" "$dns_restore_needed"; pause; return 1; }
+        print_success "自动续签已配置 (每日 3:17 AM，单条 certbot renew 覆盖所有证书)"
 
         # 保存域名管理配置
         local config_content="# Domain configuration for $DOMAIN
@@ -467,7 +466,7 @@ LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
         fi
         echo -e "\n${C_CYAN}[自动续签]${C_RESET}"
         echo "  Hook 脚本: $DEPLOY_HOOK_SCRIPT"
-        echo "  Crontab: 每日 3:$(printf '%02d' $cron_minute) AM 自动检查"
+        echo "  Crontab: 每日 3:xx AM 自动续期 (所有证书共用一条 certbot renew)"
         draw_line
         log_action "Domain configured: $DOMAIN (Nginx: $do_nginx)"
     else

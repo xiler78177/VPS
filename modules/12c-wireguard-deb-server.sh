@@ -162,6 +162,11 @@ wg_deb_server_install() {
     if [[ -z "$server_lan_subnet" ]]; then
         read -e -r -p "服务端 LAN 子网 (留空跳过，VPS 一般不需要): " server_lan_subnet
     fi
+    # 校验 LAN 子网格式：非空则必须是合法 CIDR（列表），畸形值会污染 client AllowedIPs / bypass 规则
+    while [[ -n "$server_lan_subnet" ]] && ! validate_cidr_list "$server_lan_subnet"; do
+        print_error "LAN 子网格式无效: ${server_lan_subnet}（需形如 192.168.1.0/24，多个用逗号分隔）"
+        read -e -r -p "重新输入服务端 LAN 子网 (留空跳过): " server_lan_subnet
+    done
 
     # Endpoint: 优先使用 DDNS 域名
     local ddns_domain=""
@@ -239,6 +244,11 @@ wg_deb_server_install() {
     local server_privkey server_pubkey
     server_privkey=$(wg genkey)
     server_pubkey=$(echo "$server_privkey" | wg pubkey)
+    if [[ -z "$server_privkey" || -z "$server_pubkey" ]]; then
+        print_error "WireGuard 服务端密钥生成失败"
+        _wg_deb_rollback_new_udp_allow "$wg_port" "$wg_udp_rule_added" "$wg_non_ufw_open_backends"
+        pause; return 1
+    fi
     print_success "密钥已生成"
 
     # 服务器名称

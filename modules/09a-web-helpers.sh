@@ -469,6 +469,47 @@ _web_allow_public_tcp_port() {
     esac
 }
 
+# 把 deploy/renew hook 持久化进证书的 renewal 配置（/etc/letsencrypt/renewal/<domain>.conf 的
+# [renewalparams] renew_hook）。这样单条共享 `certbot renew` 就会自动为每个证书跑各自的 hook，
+# 无需再给每个域名单独挂 --cert-name cron（避免多域名撞 certbot 全局锁）。
+# 做法：先删除所有旧 renew_hook 行，再把新值插到 [renewalparams] 段头之后（configobj 要求
+# key 落在 section 内才生效）；若该 conf 无 [renewalparams] 段则补建段头再写。
+_cert_persist_renew_hook() {
+    local domain="$1" hook="$2" conf tmp renewal_dir
+    [[ -n "$domain" && -n "$hook" ]] || return 1
+    renewal_dir="${LETSENCRYPT_RENEWAL_DIR:-/etc/letsencrypt/renewal}"
+    conf="${renewal_dir}/${domain}.conf"
+    [[ -f "$conf" ]] || return 1   # certonly 成功后必然存在；不存在说明签发异常
+    tmp=$(mktemp "$(dirname "$conf")/.tmp.server-manage.renewal.XXXXXX") || return 1
+    _tmp_register "$tmp"
+    # certbot 的 renewal conf 用 configobj 解析：renew_hook 必须落在 [renewalparams] 段内才生效。
+    # 先删除所有旧 renew_hook 行，再把新值插到 [renewalparams] 段头之后；若无该段则追加到末尾并补段头。
+    if ! awk -v hook="$hook" '
+        /^[[:space:]]*renew_hook[[:space:]]*=/ { next }
+        /^\[renewalparams\]/ { print; print "renew_hook = " hook; injected=1; next }
+        { print }
+        END { if (!injected) { print "[renewalparams]"; print "renew_hook = " hook } }
+    ' "$conf" > "$tmp"; then
+        rm -f "$tmp"; _tmp_unregister "$tmp"; return 1
+    fi
+    chmod --reference="$conf" "$tmp" 2>/dev/null || chmod 644 "$tmp" 2>/dev/null || true
+    if ! mv "$tmp" "$conf"; then
+        rm -f "$tmp"; _tmp_unregister "$tmp"; return 1
+    fi
+    _tmp_unregister "$tmp"
+    return 0
+}
+
+# 安装单条共享的每日续期 cron（官方推荐：一条 `certbot renew` 覆盖所有证书，各证书跑自己
+# 持久化的 renew_hook）。幂等——cron_add_job 会先按 tag 去重。避开整点分钟分散负载。
+# tag/minute 由 00-constants.sh 定义（readonly）；此处仅在未定义时兜底，供单模块测试隔离用。
+_cert_ensure_shared_renew_cron() {
+    local tag="${CERT_RENEW_SHARED_CRON_TAG:-CertRenewShared}"
+    local minute="${CERT_RENEW_SHARED_CRON_MINUTE:-17}"
+    cron_add_job "$tag" \
+        "${minute} 3 * * * certbot renew --quiet # ${tag}"
+}
+
 # 确保 SSL 参数文件存在
 _ensure_ssl_params() {
     [[ -f /etc/nginx/snippets/ssl-params.conf ]] && return 0

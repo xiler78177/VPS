@@ -475,6 +475,11 @@ wg_server_install() {
         echo -e "  ${C_YELLOW}未检测到 br-lan 接口${C_RESET}"
         read -e -r -p "服务端 LAN 子网 (留空跳过): " server_lan_subnet
     fi
+    # 校验 LAN 子网格式（留空则跳过），畸形值会污染 client AllowedIPs / bypass 规则 / rc.local 持久化块
+    while [[ -n "$server_lan_subnet" ]] && ! validate_cidr_list "$server_lan_subnet"; do
+        print_error "LAN 子网格式无效: ${server_lan_subnet}（示例 192.168.1.0/24，多个用逗号分隔）"
+        read -e -r -p "重新输入服务端 LAN 子网 (留空跳过): " server_lan_subnet
+    done
 
     # Endpoint: 优先使用 DDNS 域名
     local ddns_domain=""
