@@ -2046,7 +2046,7 @@ else
     fail "DDNS: 更新脚本仍可能吞掉 get_ip/update_cf 失败"
 fi
 ddns_force_body=$(awk '/^ddns_force_update\(\)/,/^}/' "$BUILT")
-if echo "$ddns_force_body" | grep -q 'if "\$DDNS_UPDATE_SCRIPT"; then' \
+if echo "$ddns_force_body" | grep -q 'if DDNS_FORCE=1 "\$DDNS_UPDATE_SCRIPT"; then' \
    && echo "$ddns_force_body" | grep -q 'print_error "DDNS 更新失败' \
    && echo "$ddns_force_body" | grep -q 'return "\$rc"'; then
     pass "DDNS: 手动强制更新检查脚本退出码"
@@ -2247,6 +2247,7 @@ fi
 
 # G10 漏项：输出给 OpenWrt 用户执行的部署命令也不能使用 BusyBox sed 不兼容的多行 i\ 插入。
 wg_openwrt_deploy_body=$(awk '/^_wg_show_openwrt_deploy\(\)/,/^wg_setup_watchdog\(\)/' "$BUILT")
+wg_openwrt_endpoint_migrate_body=$(awk '/^wg_show_openwrt_endpoint_migrate_cmd\(\)/,0' "$BUILT")
 if echo "$wg_openwrt_deploy_body" | grep -q 'sed -i "/\^exit 0/i'; then
     fail "G10: OpenWrt 部署命令仍用 BusyBox 不兼容 sed 多行插入"
 else
@@ -3196,6 +3197,13 @@ echo "$wg_openwrt_deploy_body" | grep -q 'WG_NFT_FAMILY=ip6' \
     && echo "$wg_openwrt_deploy_body" | grep -q 'mangle_prerouting "\\$WG_NFT_FAMILY" daddr "\\$WG_EP"' \
     && pass "WG/OpenWrt: rc.local bypass 支持 IPv6 endpoint" \
     || fail "WG/OpenWrt: rc.local bypass 仍可能 IPv4-only"
+echo "$wg_openwrt_endpoint_migrate_body" | grep -q '^install_rc_local_bypass()' \
+    && echo "$wg_openwrt_endpoint_migrate_body" | grep -q 'BEGIN server-manage wireguard bypass' \
+    && echo "$wg_openwrt_endpoint_migrate_body" | grep -Fq 'WG_EP=\$(wg_resolve_real' \
+    && echo "$wg_openwrt_endpoint_migrate_body" | grep -q 'WG_NFT_FAMILY=ip6' \
+    && ! echo "$wg_openwrt_endpoint_migrate_body" | grep -Fq "awk '/^Address:/{a=" \
+    && pass "WG/OpenWrt: endpoint 迁移命令会重建 fake-ip 安全 rc.local bypass" \
+    || fail "WG/OpenWrt: endpoint 迁移命令仍只替换旧 rc.local 或解析不安全"
 grep -q '^wg_shared_format_endpoint()' "$BUILT" \
     && grep -q 'Endpoint = ${endpoint}' "$BUILT" \
     && pass "WG: 客户端配置使用共享 endpoint formatter" \

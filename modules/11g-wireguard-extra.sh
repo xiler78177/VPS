@@ -452,6 +452,8 @@ wg_server_menu() {
   13. 生成 OpenWrt 清空 WG 配置命令
   14. 服务端看门狗 (自动重启保活)
   15. Mihomo bypass 规则管理
+  18. 仅修改公网端点 (不重载 wg0)
+  19. 生成 OpenWrt 客户端 endpoint 迁移命令
   [数据管理]
   16. 导出设备配置 (JSON)
   17. 导入设备配置 (JSON)
@@ -476,6 +478,8 @@ wg_server_menu() {
             15) wg_mihomo_bypass_status ;;
             16) wg_export_peers ;;
             17) wg_import_peers ;;
+            18) wg_modify_server_endpoint_only ;;
+            19) wg_show_openwrt_endpoint_migrate_cmd ;;
             0|"") return ;;
             *) print_warn "无效选项" ;;
         esac

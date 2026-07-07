@@ -4,7 +4,7 @@
 
 _cf_api() {
     # 基础速率保护：防止触发 CF API 1200 req/5min 限制
-    sleep 0.3
+    sleep 0.3 2>/dev/null || sleep 1
     local method=$1 endpoint=$2 token=$3; shift 3
     local attempt resp
     for attempt in 1 2 3; do

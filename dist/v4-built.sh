@@ -1096,9 +1096,85 @@ _extract_ipv4_from_text() {
     return 1
 }
 
-# 统一公网 IP 获取函数（使用国内可达的 API）
+_ipv4_is_public() {
+    local ip="${1:-}" o1 o2 o3 o4 extra n1 n2 n3 n4 octet
+    IFS='.' read -r o1 o2 o3 o4 extra <<< "$ip"
+    [[ -z "${extra:-}" ]] || return 1
+    for octet in "$o1" "$o2" "$o3" "$o4"; do
+        [[ "$octet" =~ ^[0-9]+$ ]] || return 1
+        (( 10#$octet <= 255 )) || return 1
+    done
+    n1=$((10#$o1)); n2=$((10#$o2)); n3=$((10#$o3)); n4=$((10#$o4))
+
+    (( n1 == 0 || n1 == 10 || n1 == 127 || n1 >= 224 )) && return 1
+    (( n1 == 100 && n2 >= 64 && n2 <= 127 )) && return 1
+    (( n1 == 169 && n2 == 254 )) && return 1
+    (( n1 == 172 && n2 >= 16 && n2 <= 31 )) && return 1
+    (( n1 == 192 && n2 == 168 )) && return 1
+    (( n1 == 198 && (n2 == 18 || n2 == 19) )) && return 1
+    (( n1 == 192 && n2 == 0 && (n3 == 0 || n3 == 2) )) && return 1
+    (( n1 == 198 && n2 == 51 && n3 == 100 )) && return 1
+    (( n1 == 203 && n2 == 0 && n3 == 113 )) && return 1
+    (( n1 == 255 && n2 == 255 && n3 == 255 && n4 == 255 )) && return 1
+    return 0
+}
+
+_get_ipv4_from_device() {
+    local dev="${1:-}" ip
+    [[ -n "$dev" ]] || return 1
+    while IFS= read -r ip; do
+        ip="${ip%%/*}"
+        _ipv4_is_public "$ip" || continue
+        echo "$ip"
+        return 0
+    done < <(ip -4 -o addr show dev "$dev" scope global 2>/dev/null | awk '{print $4}')
+    return 1
+}
+
+get_openwrt_public_ipv4() {
+    local iface="${1:-wan}" device="${2:-}" ip dev candidates=""
+    if command -v ifstatus >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+        while IFS= read -r ip; do
+            [[ -n "$ip" && "$ip" != "null" ]] || continue
+            if _ipv4_is_public "$ip"; then
+                echo "$ip"
+                return 0
+            fi
+        done < <(ifstatus "$iface" 2>/dev/null | jq -r '."ipv4-address"[]?.address // empty' 2>/dev/null)
+        candidates=$(ifstatus "$iface" 2>/dev/null | jq -r '.l3_device // empty, .device // empty' 2>/dev/null | awk 'NF && !seen[$0]++')
+    fi
+
+    [[ -n "$device" ]] && candidates=$(printf '%s\n%s\n' "$device" "$candidates" | awk 'NF && !seen[$0]++')
+    if command -v uci >/dev/null 2>&1; then
+        for dev in "$(uci -q get "network.${iface}.device" 2>/dev/null)" "$(uci -q get "network.${iface}.ifname" 2>/dev/null)"; do
+            [[ -n "$dev" ]] && candidates=$(printf '%s\n%s\n' "$candidates" "$dev" | awk 'NF && !seen[$0]++')
+        done
+    fi
+
+    while IFS= read -r dev; do
+        [[ -n "$dev" ]] || continue
+        if ip=$(_get_ipv4_from_device "$dev"); then
+            echo "$ip"
+            return 0
+        fi
+    done <<< "$candidates"
+    return 1
+}
+
+# 统一公网 IP 获取函数：OpenWrt 优先读取 WAN 接口，失败后回退到国内可达的 API。
 get_public_ipv4() {
-    local raw="" ip="" url=""
+    local source="${1:-auto}" iface="${2:-wan}" device="${3:-}" raw="" ip="" url=""
+    case "$source" in
+        auto|interface|api) ;;
+        *) source="auto" ;;
+    esac
+    if [[ "$source" == "auto" || "$source" == "interface" ]]; then
+        if ip=$(get_openwrt_public_ipv4 "$iface" "$device") && [[ -n "$ip" ]]; then
+            echo "$ip"
+            return 0
+        fi
+        [[ "$source" == "interface" ]] && return 1
+    fi
     local endpoints=(
         "https://4.ipw.cn"
         "https://myip.ipip.net/ip"
@@ -1129,11 +1205,42 @@ ddns_rebuild_cron() {
         # cron 的 */59 语义是每小时第 0/59 分钟触发（中间会出现 1 分钟间隔），
         # 因此统一每分钟唤醒，再由 ddns-update.sh 按每份配置的 DDNS_INTERVAL 节流。
         cron_add_job "ddns-update.sh" "* * * * * $DDNS_UPDATE_SCRIPT >/dev/null 2>&1"
+        ddns_install_hotplug >/dev/null 2>&1 || true
+    elif [[ "$PLATFORM" == "openwrt" ]]; then
+        rm -f /etc/hotplug.d/iface/95-server-manage-ddns 2>/dev/null || true
     fi
+}
+
+ddns_install_hotplug() {
+    [[ "$PLATFORM" == "openwrt" ]] || return 0
+    local hotplug_file="/etc/hotplug.d/iface/95-server-manage-ddns"
+    local content="#!/bin/sh
+[ \"\${ACTION:-}\" = \"ifup\" ] || exit 0
+[ -x \"$DDNS_UPDATE_SCRIPT\" ] || exit 0
+case \"\${INTERFACE:-}\" in \"\"|loopback|lan) exit 0 ;; esac
+match=0
+for conf in \"$DDNS_CONFIG_DIR\"/*.conf; do
+    [ -f \"\$conf\" ] || continue
+    if grep -q \"^DDNS_INTERFACE=\\\"\${INTERFACE}\\\"\$\" \"\$conf\" 2>/dev/null; then
+        match=1
+        break
+    fi
+    if [ \"\${INTERFACE}\" = \"wan\" ] && ! grep -q '^DDNS_INTERFACE=' \"\$conf\" 2>/dev/null; then
+        match=1
+        break
+    fi
+done
+[ \"\$match\" = \"1\" ] || exit 0
+DDNS_FORCE=1 \"$DDNS_UPDATE_SCRIPT\" --force >/dev/null 2>&1 &
+exit 0"
+    write_private_file_atomic "$hotplug_file" "$content" || return 1
+    chmod 0755 "$hotplug_file" 2>/dev/null || true
+    return 0
 }
 
 ddns_create_script() {
     mkdir -p "$DDNS_CONFIG_DIR"
+    chmod 700 "$DDNS_CONFIG_DIR" 2>/dev/null || true
     mkdir -p "$(dirname "$DDNS_UPDATE_SCRIPT")"
     local ddns_script_tmp
     ddns_script_tmp=$(mktemp "$(dirname "$DDNS_UPDATE_SCRIPT")/.tmp.server-manage.ddns-update.XXXXXX") || return 1
@@ -1175,9 +1282,82 @@ extract_ipv4() {
     return 1
 }
 
+ipv4_is_public() {
+    local ip="${1:-}" o1 o2 o3 o4 extra n1 n2 n3 n4 octet
+    IFS='.' read -r o1 o2 o3 o4 extra <<< "$ip"
+    [[ -z "${extra:-}" ]] || return 1
+    for octet in "$o1" "$o2" "$o3" "$o4"; do
+        [[ "$octet" =~ ^[0-9]+$ ]] || return 1
+        (( 10#$octet <= 255 )) || return 1
+    done
+    n1=$((10#$o1)); n2=$((10#$o2)); n3=$((10#$o3)); n4=$((10#$o4))
+    (( n1 == 0 || n1 == 10 || n1 == 127 || n1 >= 224 )) && return 1
+    (( n1 == 100 && n2 >= 64 && n2 <= 127 )) && return 1
+    (( n1 == 169 && n2 == 254 )) && return 1
+    (( n1 == 172 && n2 >= 16 && n2 <= 31 )) && return 1
+    (( n1 == 192 && n2 == 168 )) && return 1
+    (( n1 == 198 && (n2 == 18 || n2 == 19) )) && return 1
+    (( n1 == 192 && n2 == 0 && (n3 == 0 || n3 == 2) )) && return 1
+    (( n1 == 198 && n2 == 51 && n3 == 100 )) && return 1
+    (( n1 == 203 && n2 == 0 && n3 == 113 )) && return 1
+    (( n1 == 255 && n2 == 255 && n3 == 255 && n4 == 255 )) && return 1
+    return 0
+}
+
+get_ipv4_from_device() {
+    local dev="${1:-}" ip
+    [[ -n "$dev" ]] || return 1
+    while IFS= read -r ip; do
+        ip="${ip%%/*}"
+        ipv4_is_public "$ip" || continue
+        echo "$ip"
+        return 0
+    done < <(ip -4 -o addr show dev "$dev" scope global 2>/dev/null | awk '{print $4}')
+    return 1
+}
+
+get_openwrt_public_ipv4() {
+    local iface="${1:-wan}" device="${2:-}" ip dev candidates=""
+    if command -v ifstatus >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+        while IFS= read -r ip; do
+            [[ -n "$ip" && "$ip" != "null" ]] || continue
+            if ipv4_is_public "$ip"; then
+                echo "$ip"
+                return 0
+            fi
+        done < <(ifstatus "$iface" 2>/dev/null | jq -r '."ipv4-address"[]?.address // empty' 2>/dev/null)
+        candidates=$(ifstatus "$iface" 2>/dev/null | jq -r '.l3_device // empty, .device // empty' 2>/dev/null | awk 'NF && !seen[$0]++')
+    fi
+    [[ -n "$device" ]] && candidates=$(printf '%s\n%s\n' "$device" "$candidates" | awk 'NF && !seen[$0]++')
+    if command -v uci >/dev/null 2>&1; then
+        for dev in "$(uci -q get "network.${iface}.device" 2>/dev/null)" "$(uci -q get "network.${iface}.ifname" 2>/dev/null)"; do
+            [[ -n "$dev" ]] && candidates=$(printf '%s\n%s\n' "$candidates" "$dev" | awk 'NF && !seen[$0]++')
+        done
+    fi
+    while IFS= read -r dev; do
+        [[ -n "$dev" ]] || continue
+        if ip=$(get_ipv4_from_device "$dev"); then
+            echo "$ip"
+            return 0
+        fi
+    done <<< "$candidates"
+    return 1
+}
+
 get_ip() {
-    local raw="" ip="" url=""
-    if [[ "$1" == "4" ]]; then
+    local family="${1:-4}" source="${2:-auto}" iface="${3:-wan}" device="${4:-}" raw="" ip="" url=""
+    case "$source" in
+        auto|interface|api) ;;
+        *) source="auto" ;;
+    esac
+    if [[ "$family" == "4" ]]; then
+        if [[ "$source" == "auto" || "$source" == "interface" ]]; then
+            if ip=$(get_openwrt_public_ipv4 "$iface" "$device") && [[ -n "$ip" ]]; then
+                echo "$ip"
+                return 0
+            fi
+            [[ "$source" == "interface" ]] && return 1
+        fi
         for url in \
             https://4.ipw.cn \
             https://myip.ipip.net/ip \
@@ -1230,24 +1410,38 @@ update_cf() {
 # 仅接受白名单 KEY，value 必须是双引号包裹的简单字面量
 parse_ddns_conf() {
     local conf="$1" line key val
-    local fown fmode
-    fown=$(stat -c '%U' "$conf" 2>/dev/null || echo "")
-    fmode=$(stat -c '%a' "$conf" 2>/dev/null || echo "")
-    if [[ "$fown" != "root" ]]; then
-        log "owner 非 root，跳过: $conf (owner=$fown)"
-        return 1
-    fi
-    if [[ "$fmode" =~ ^[0-7]+$ ]] && (( 8#${fmode} & 022 )); then
-        log "权限过宽，跳过: $conf (mode=$fmode)"
-        return 1
+    local fown fmode meta perm uid
+    if command -v stat >/dev/null 2>&1 && fown=$(stat -c '%U' "$conf" 2>/dev/null); then
+        fmode=$(stat -c '%a' "$conf" 2>/dev/null || echo "")
+        if [[ "$fown" != "root" && "$fown" != "0" ]]; then
+            log "owner 非 root，跳过: $conf (owner=$fown)"
+            return 1
+        fi
+        if [[ "$fmode" =~ ^[0-7]+$ ]] && (( 8#${fmode} & 022 )); then
+            log "权限过宽，跳过: $conf (mode=$fmode)"
+            return 1
+        fi
+    else
+        meta=$(ls -ldn "$conf" 2>/dev/null || echo "")
+        perm=$(printf '%s\n' "$meta" | awk '{print $1}')
+        uid=$(printf '%s\n' "$meta" | awk '{print $3}')
+        if [[ "$uid" != "0" ]]; then
+            log "owner 非 root，跳过: $conf (uid=$uid)"
+            return 1
+        fi
+        if [[ "${perm:5:1}" == "w" || "${perm:8:1}" == "w" ]]; then
+            log "权限过宽，跳过: $conf (perm=$perm)"
+            return 1
+        fi
     fi
     DDNS_DOMAIN="" DDNS_TOKEN="" DDNS_ZONE_ID=""
     DDNS_IPV4="" DDNS_IPV6="" DDNS_PROXIED="" DDNS_INTERVAL=""
+    DDNS_IP_SOURCE="" DDNS_INTERFACE="" DDNS_DEVICE=""
     while IFS= read -r line || [ -n "$line" ]; do
         line="${line%$'\r'}"
         [[ -z "${line// }" ]] && continue
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
-        if [[ "$line" =~ ^(DDNS_DOMAIN|DDNS_TOKEN|DDNS_ZONE_ID|DDNS_IPV4|DDNS_IPV6|DDNS_PROXIED|DDNS_INTERVAL)=\"([^\"\$\`\\]*)\"$ ]]; then
+        if [[ "$line" =~ ^(DDNS_DOMAIN|DDNS_TOKEN|DDNS_ZONE_ID|DDNS_IPV4|DDNS_IPV6|DDNS_PROXIED|DDNS_INTERVAL|DDNS_IP_SOURCE|DDNS_INTERFACE|DDNS_DEVICE)=\"([^\"\$\`\\]*)\"$ ]]; then
             key="${BASH_REMATCH[1]}"
             val="${BASH_REMATCH[2]}"
             case "$key" in
@@ -1258,6 +1452,9 @@ parse_ddns_conf() {
                 DDNS_IPV6)     DDNS_IPV6="$val" ;;
                 DDNS_PROXIED)  DDNS_PROXIED="$val" ;;
                 DDNS_INTERVAL) DDNS_INTERVAL="$val" ;;
+                DDNS_IP_SOURCE) DDNS_IP_SOURCE="$val" ;;
+                DDNS_INTERFACE) DDNS_INTERFACE="$val" ;;
+                DDNS_DEVICE)   DDNS_DEVICE="$val" ;;
             esac
         else
             log "格式异常行，跳过: $conf"
@@ -1271,9 +1468,15 @@ parse_ddns_conf() {
     DDNS_IPV4=${DDNS_IPV4:-false}
     DDNS_IPV6=${DDNS_IPV6:-false}
     DDNS_PROXIED=${DDNS_PROXIED:-false}
+    DDNS_IP_SOURCE=${DDNS_IP_SOURCE:-auto}
+    DDNS_INTERFACE=${DDNS_INTERFACE:-wan}
+    DDNS_DEVICE=${DDNS_DEVICE:-}
     [[ "$DDNS_IPV4" == "true" || "$DDNS_IPV4" == "false" ]] || DDNS_IPV4="false"
     [[ "$DDNS_IPV6" == "true" || "$DDNS_IPV6" == "false" ]] || DDNS_IPV6="false"
     [[ "$DDNS_PROXIED" == "true" || "$DDNS_PROXIED" == "false" ]] || DDNS_PROXIED="false"
+    [[ "$DDNS_IP_SOURCE" == "auto" || "$DDNS_IP_SOURCE" == "interface" || "$DDNS_IP_SOURCE" == "api" ]] || DDNS_IP_SOURCE="auto"
+    [[ "$DDNS_INTERFACE" =~ ^[A-Za-z0-9_.:-]+$ ]] || DDNS_INTERFACE="wan"
+    [[ -z "$DDNS_DEVICE" || "$DDNS_DEVICE" =~ ^[A-Za-z0-9_.:-]+$ ]] || DDNS_DEVICE=""
     return 0
 }
 
@@ -1283,6 +1486,10 @@ ddns_should_run() {
     stamp_name=$(basename "$conf" | sed 's/[^A-Za-z0-9_.-]/_/g')
     stamp="$DDNS_STAMP_DIR/${stamp_name}.stamp"
     now=$(date +%s)
+    if [[ "${DDNS_FORCE:-0}" == "1" || "${DDNS_FORCE:-0}" == "true" ]]; then
+        printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
+        return 0
+    fi
     [[ -f "$stamp" ]] && read -r last < "$stamp" || true
     if [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < interval * 60 )); then
         return 1
@@ -1293,13 +1500,14 @@ ddns_should_run() {
 
 failed=0
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    [[ "${1:-}" == "--force" ]] && DDNS_FORCE=1
     failed=0
     for conf in "$DDNS_CONFIG_DIR"/*.conf; do
         [ -f "$conf" ] || continue
         parse_ddns_conf "$conf" || continue
         ddns_should_run "$conf" || continue
         if [[ "$DDNS_IPV4" == "true" ]]; then
-            if ip=$(get_ip 4) && [[ -n "$ip" ]]; then
+            if ip=$(get_ip 4 "$DDNS_IP_SOURCE" "$DDNS_INTERFACE" "$DDNS_DEVICE") && [[ -n "$ip" ]]; then
                 update_cf "$DDNS_DOMAIN" A "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED" || failed=1
             else
                 log "[$DDNS_DOMAIN] A 获取公网 IPv4 失败"
@@ -1345,13 +1553,17 @@ ddns_setup() {
         interval=5
     fi
     mkdir -p "$DDNS_CONFIG_DIR"
+    chmod 700 "$DDNS_CONFIG_DIR" 2>/dev/null || true
     local ddns_conf_content="DDNS_DOMAIN=\"$domain\"
 DDNS_TOKEN=\"$token\"
 DDNS_ZONE_ID=\"$zone_id\"
 DDNS_IPV4=\"$ipv4\"
 DDNS_IPV6=\"$ipv6\"
 DDNS_PROXIED=\"$proxied\"
-DDNS_INTERVAL=\"$interval\""
+DDNS_INTERVAL=\"$interval\"
+DDNS_IP_SOURCE=\"auto\"
+DDNS_INTERFACE=\"wan\"
+DDNS_DEVICE=\"\""
     write_private_file_atomic "$DDNS_CONFIG_DIR/${domain}.conf" "$ddns_conf_content" || { print_error "DDNS 配置写入失败"; return 1; }
     ddns_create_script || { print_error "DDNS 更新脚本生成失败"; return 1; }
     ddns_rebuild_cron || { print_error "DDNS cron 更新失败"; return 1; }
@@ -1362,18 +1574,26 @@ DDNS_INTERVAL=\"$interval\""
 
 ddns_setup_noninteractive() {
     local domain=$1 token=$2 zone_id=$3 ipv4=${4:-true} ipv6=${5:-false} proxied=${6:-false} interval=${7:-5}
+    local ip_source="${8:-auto}" iface="${9:-wan}" device="${10:-}"
     [[ -z "$domain" || -z "$token" || -z "$zone_id" ]] && return 1
     if [[ ! "$interval" =~ ^[0-9]+$ ]] || [[ "$interval" -lt 1 || "$interval" -gt 59 ]]; then
         interval=5
     fi
+    [[ "$ip_source" == "auto" || "$ip_source" == "interface" || "$ip_source" == "api" ]] || ip_source="auto"
+    [[ "$iface" =~ ^[A-Za-z0-9_.:-]+$ ]] || iface="wan"
+    [[ -z "$device" || "$device" =~ ^[A-Za-z0-9_.:-]+$ ]] || device=""
     mkdir -p "$DDNS_CONFIG_DIR"
+    chmod 700 "$DDNS_CONFIG_DIR" 2>/dev/null || true
     local ddns_conf_content="DDNS_DOMAIN=\"$domain\"
 DDNS_TOKEN=\"$token\"
 DDNS_ZONE_ID=\"$zone_id\"
 DDNS_IPV4=\"$ipv4\"
 DDNS_IPV6=\"$ipv6\"
 DDNS_PROXIED=\"$proxied\"
-DDNS_INTERVAL=\"$interval\""
+DDNS_INTERVAL=\"$interval\"
+DDNS_IP_SOURCE=\"$ip_source\"
+DDNS_INTERFACE=\"$iface\"
+DDNS_DEVICE=\"$device\""
     write_private_file_atomic "$DDNS_CONFIG_DIR/${domain}.conf" "$ddns_conf_content" || { print_error "DDNS 配置写入失败"; return 1; }
     ddns_create_script || { print_error "DDNS 更新脚本生成失败"; return 1; }
     ddns_rebuild_cron || { print_error "DDNS cron 更新失败"; return 1; }
@@ -1386,24 +1606,38 @@ DDNS_INTERVAL=\"$interval\""
 # ddns_list / ddns_delete 复用本函数——与本文件 get_public_ipv4(顶层)/get_ip(生成脚本) 的双份模式一致。
 parse_ddns_conf() {
     local conf="$1" line key val
-    local fown fmode
-    fown=$(stat -c '%U' "$conf" 2>/dev/null || echo "")
-    fmode=$(stat -c '%a' "$conf" 2>/dev/null || echo "")
-    if [[ "$fown" != "root" ]]; then
-        log_action "DDNS 解析跳过：owner 非 root: $conf (owner=$fown)"
-        return 1
-    fi
-    if [[ "$fmode" =~ ^[0-7]+$ ]] && (( 8#${fmode} & 022 )); then
-        log_action "DDNS 解析跳过：权限过宽: $conf (mode=$fmode)"
-        return 1
+    local fown fmode meta perm uid
+    if command -v stat >/dev/null 2>&1 && fown=$(stat -c '%U' "$conf" 2>/dev/null); then
+        fmode=$(stat -c '%a' "$conf" 2>/dev/null || echo "")
+        if [[ "$fown" != "root" && "$fown" != "0" ]]; then
+            log_action "DDNS 解析跳过：owner 非 root: $conf (owner=$fown)"
+            return 1
+        fi
+        if [[ "$fmode" =~ ^[0-7]+$ ]] && (( 8#${fmode} & 022 )); then
+            log_action "DDNS 解析跳过：权限过宽: $conf (mode=$fmode)"
+            return 1
+        fi
+    else
+        meta=$(ls -ldn "$conf" 2>/dev/null || echo "")
+        perm=$(printf '%s\n' "$meta" | awk '{print $1}')
+        uid=$(printf '%s\n' "$meta" | awk '{print $3}')
+        if [[ "$uid" != "0" ]]; then
+            log_action "DDNS 解析跳过：owner 非 root: $conf (uid=$uid)"
+            return 1
+        fi
+        if [[ "${perm:5:1}" == "w" || "${perm:8:1}" == "w" ]]; then
+            log_action "DDNS 解析跳过：权限过宽: $conf (perm=$perm)"
+            return 1
+        fi
     fi
     DDNS_DOMAIN="" DDNS_TOKEN="" DDNS_ZONE_ID=""
     DDNS_IPV4="" DDNS_IPV6="" DDNS_PROXIED="" DDNS_INTERVAL=""
+    DDNS_IP_SOURCE="" DDNS_INTERFACE="" DDNS_DEVICE=""
     while IFS= read -r line || [ -n "$line" ]; do
         line="${line%$'\r'}"
         [[ -z "${line// }" ]] && continue
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
-        if [[ "$line" =~ ^(DDNS_DOMAIN|DDNS_TOKEN|DDNS_ZONE_ID|DDNS_IPV4|DDNS_IPV6|DDNS_PROXIED|DDNS_INTERVAL)=\"([^\"\$\`\\]*)\"$ ]]; then
+        if [[ "$line" =~ ^(DDNS_DOMAIN|DDNS_TOKEN|DDNS_ZONE_ID|DDNS_IPV4|DDNS_IPV6|DDNS_PROXIED|DDNS_INTERVAL|DDNS_IP_SOURCE|DDNS_INTERFACE|DDNS_DEVICE)=\"([^\"\$\`\\]*)\"$ ]]; then
             key="${BASH_REMATCH[1]}"
             val="${BASH_REMATCH[2]}"
             case "$key" in
@@ -1414,6 +1648,9 @@ parse_ddns_conf() {
                 DDNS_IPV6)     DDNS_IPV6="$val" ;;
                 DDNS_PROXIED)  DDNS_PROXIED="$val" ;;
                 DDNS_INTERVAL) DDNS_INTERVAL="$val" ;;
+                DDNS_IP_SOURCE) DDNS_IP_SOURCE="$val" ;;
+                DDNS_INTERFACE) DDNS_INTERFACE="$val" ;;
+                DDNS_DEVICE)   DDNS_DEVICE="$val" ;;
             esac
         else
             log_action "DDNS 解析跳过：格式异常行: $conf"
@@ -1427,25 +1664,32 @@ parse_ddns_conf() {
     DDNS_IPV4=${DDNS_IPV4:-false}
     DDNS_IPV6=${DDNS_IPV6:-false}
     DDNS_PROXIED=${DDNS_PROXIED:-false}
+    DDNS_IP_SOURCE=${DDNS_IP_SOURCE:-auto}
+    DDNS_INTERFACE=${DDNS_INTERFACE:-wan}
+    DDNS_DEVICE=${DDNS_DEVICE:-}
     [[ "$DDNS_IPV4" == "true" || "$DDNS_IPV4" == "false" ]] || DDNS_IPV4="false"
     [[ "$DDNS_IPV6" == "true" || "$DDNS_IPV6" == "false" ]] || DDNS_IPV6="false"
     [[ "$DDNS_PROXIED" == "true" || "$DDNS_PROXIED" == "false" ]] || DDNS_PROXIED="false"
+    [[ "$DDNS_IP_SOURCE" == "auto" || "$DDNS_IP_SOURCE" == "interface" || "$DDNS_IP_SOURCE" == "api" ]] || DDNS_IP_SOURCE="auto"
+    [[ "$DDNS_INTERFACE" =~ ^[A-Za-z0-9_.:-]+$ ]] || DDNS_INTERFACE="wan"
+    [[ -z "$DDNS_DEVICE" || "$DDNS_DEVICE" =~ ^[A-Za-z0-9_.:-]+$ ]] || DDNS_DEVICE=""
     return 0
 }
 
 ddns_list() {
     print_title "DDNS 配置列表"
     [[ ! -d "$DDNS_CONFIG_DIR" || -z "$(ls -A "$DDNS_CONFIG_DIR" 2>/dev/null)" ]] && { print_warn "暂无 DDNS 配置"; pause; return; }
-    printf "${C_CYAN}%-30s %-6s %-6s %-8s %s${C_RESET}\n" "域名" "IPv4" "IPv6" "代理" "间隔"
+    printf "${C_CYAN}%-30s %-6s %-6s %-8s %-8s %s${C_RESET}\n" "域名" "IPv4" "IPv6" "代理" "来源" "间隔"
     draw_line
     for conf in "$DDNS_CONFIG_DIR"/*.conf; do
         [[ -f "$conf" ]] || continue
         DDNS_DOMAIN="" DDNS_TOKEN="" DDNS_ZONE_ID="" DDNS_IPV4="" DDNS_IPV6="" DDNS_PROXIED="" DDNS_INTERVAL=""
         parse_ddns_conf "$conf" || continue
-        printf "%-30s %-6s %-6s %-8s %s\n" "$DDNS_DOMAIN" \
+        printf "%-30s %-6s %-6s %-8s %-8s %s\n" "$DDNS_DOMAIN" \
             "$([[ "$DDNS_IPV4" == "true" ]] && echo "✓" || echo "-")" \
             "$([[ "$DDNS_IPV6" == "true" ]] && echo "✓" || echo "-")" \
             "$([[ "$DDNS_PROXIED" == "true" ]] && echo "开启" || echo "关闭")" \
+            "${DDNS_IP_SOURCE:-auto}" \
             "${DDNS_INTERVAL}分钟"
     done
     local ip4=$(get_public_ipv4)
@@ -1473,6 +1717,7 @@ ddns_delete() {
         if [[ -z "$(ls -A "$DDNS_CONFIG_DIR" 2>/dev/null)" ]]; then
             cron_remove_job "ddns-update.sh"
             rm -f "$DDNS_UPDATE_SCRIPT"
+            [[ "$PLATFORM" == "openwrt" ]] && rm -f /etc/hotplug.d/iface/95-server-manage-ddns 2>/dev/null || true
         else
             ddns_rebuild_cron
         fi
@@ -1483,7 +1728,7 @@ ddns_delete() {
 ddns_force_update() {
     if [[ -x "$DDNS_UPDATE_SCRIPT" ]]; then
         print_info "正在更新..."
-        if "$DDNS_UPDATE_SCRIPT"; then
+        if DDNS_FORCE=1 "$DDNS_UPDATE_SCRIPT"; then
             print_success "更新完成"
         else
             local rc=$?
@@ -6367,7 +6612,7 @@ _web_cleanup_domain() {
 
 _cf_api() {
     # 基础速率保护：防止触发 CF API 1200 req/5min 限制
-    sleep 0.3
+    sleep 0.3 2>/dev/null || sleep 1
     local method=$1 endpoint=$2 token=$3; shift 3
     local attempt resp
     for attempt in 1 2 3; do
@@ -10553,6 +10798,87 @@ _wg_openwrt_rollback_server_modify() {
     wg_regenerate_client_confs >/dev/null 2>&1 || true
 }
 
+wg_update_server_endpoint_metadata() {
+    wg_check_server || return 1
+    local new_ep="${1:-}" new_ddns="${2:-}" old_ep old_ddns snapshot
+    local clients_dir="/etc/wireguard/clients" clients_snapshot_dir="" clients_existed=false
+    if ! new_ep=$(wg_shared_normalize_endpoint_host "$new_ep"); then
+        print_error "公网端点无效，仅支持 IP 或域名"
+        return 1
+    fi
+    if [[ -n "$new_ddns" ]]; then
+        if ! new_ddns=$(wg_shared_normalize_endpoint_host "$new_ddns"); then
+            print_error "DDNS 域名无效"
+            return 1
+        fi
+    fi
+
+    old_ep=$(wg_db_get '.server.endpoint // empty')
+    old_ddns=$(wg_db_get '.server.ddns_domain // empty')
+    snapshot=$(cat "$WG_DB_FILE" 2>/dev/null) || {
+        print_error "读取 WireGuard 数据库失败"
+        return 1
+    }
+    clients_snapshot_dir=$(mktemp -d "${TMPDIR:-/tmp}/${SCRIPT_NAME}-wg-clients.XXXXXX") || {
+        print_error "创建客户端配置快照目录失败"
+        return 1
+    }
+    chmod 700 "$clients_snapshot_dir" 2>/dev/null || true
+    if [[ -d "$clients_dir" ]]; then
+        clients_existed=true
+        cp -p "$clients_dir"/* "$clients_snapshot_dir"/ 2>/dev/null || true
+    fi
+
+    if ! wg_db_set --arg e "$new_ep" \
+                  --arg d "${new_ddns:-}" \
+                  '.server.endpoint = $e | .server.ddns_domain = $d'; then
+        print_error "WireGuard 数据库写入失败"
+        rm -rf "$clients_snapshot_dir" 2>/dev/null || true
+        return 1
+    fi
+
+    if ! wg_regenerate_client_confs; then
+        print_error "重生成客户端配置失败，正在回滚 endpoint 元数据"
+        wg_write_private_file "$WG_DB_FILE" "$snapshot" >/dev/null 2>&1 || print_warn "回滚 WireGuard 数据库失败，请手动检查"
+        rm -rf "$clients_dir" 2>/dev/null || true
+        if [[ "$clients_existed" == "true" ]]; then
+            mkdir -p "$clients_dir" 2>/dev/null || true
+            cp -p "$clients_snapshot_dir"/* "$clients_dir"/ 2>/dev/null || true
+        fi
+        rm -rf "$clients_snapshot_dir" 2>/dev/null || true
+        return 1
+    fi
+    rm -rf "$clients_snapshot_dir" 2>/dev/null || true
+
+    log_action "WireGuard server endpoint metadata updated: ${old_ep:-none} -> ${new_ep} ddns=${new_ddns:-none}"
+    [[ "${old_ep:-}" != "$new_ep" ]] && print_success "服务端 endpoint 元数据已更新: ${old_ep:-无} -> ${new_ep}"
+    [[ "${old_ddns:-}" != "${new_ddns:-}" ]] && print_info "DDNS 元数据: ${old_ddns:-无} -> ${new_ddns:-无}"
+    print_info "已重生成 /etc/wireguard/clients/*.conf，未重载服务端 wg0/UCI。"
+    return 0
+}
+
+wg_modify_server_endpoint_only() {
+    wg_check_server || return 1
+    print_title "仅修改 WireGuard 服务端公网端点"
+    local cur_ep cur_ddns new_ep
+    cur_ep=$(wg_db_get '.server.endpoint')
+    cur_ddns=$(wg_db_get '.server.ddns_domain // empty')
+    echo -e "  当前端点: ${C_GREEN}${cur_ep}${C_RESET}"
+    [[ -n "$cur_ddns" && "$cur_ddns" != "null" ]] && echo -e "  当前 DDNS: ${C_CYAN}${cur_ddns}${C_RESET}"
+    read -e -r -p "新公网端点 [${cur_ep}]: " new_ep
+    new_ep=${new_ep:-$cur_ep}
+    if [[ "$new_ep" == "$cur_ep" ]]; then
+        print_info "未做任何更改"
+        pause; return 0
+    fi
+    local endpoint_ddns=""
+    validate_ip "$new_ep" || endpoint_ddns="$new_ep"
+    wg_update_server_endpoint_metadata "$new_ep" "$endpoint_ddns"
+    local rc=$?
+    pause
+    return "$rc"
+}
+
 _wg_openwrt_configure_server_uci() {
     local server_privkey="${1:-}" server_ip="${2:-}" wg_mask="${3:-}" wg_port="${4:-}" mtu="${5:-}"
     local snapshot_dir network_snapshot firewall_snapshot
@@ -10993,7 +11319,7 @@ wg_modify_server() {
     echo -e "  当前 DNS:   ${C_GREEN}${cur_dns}${C_RESET}"
     echo -e "  当前端点:   ${C_GREEN}${cur_ep}${C_RESET}"
     [[ -n "$cur_lan" && "$cur_lan" != "null" ]] && echo -e "  当前 LAN:   ${C_GREEN}${cur_lan}${C_RESET}"
-    local changed=false lan_changed=false port_changed=false port_firewall_changed=false
+    local changed=false lan_changed=false port_changed=false dns_changed=false endpoint_changed=false port_firewall_changed=false
 
     read -e -r -p "新监听端口 [${cur_port}]: " new_port
     new_port=${new_port:-$cur_port}
@@ -11012,6 +11338,7 @@ wg_modify_server() {
     new_dns=${new_dns:-$cur_dns}
     if [[ "$new_dns" != "$cur_dns" ]]; then
         changed=true
+        dns_changed=true
         print_info "DNS 将更改为 ${new_dns}"
     fi
 
@@ -11023,6 +11350,7 @@ wg_modify_server() {
             new_ep="$cur_ep"
         else
             changed=true
+            endpoint_changed=true
             print_info "端点将更改为 ${new_ep}"
         fi
     fi
@@ -11043,6 +11371,15 @@ wg_modify_server() {
     if [[ "$changed" != "true" ]]; then
         print_info "未做任何更改"
         pause; return 0
+    fi
+
+    if [[ "$endpoint_changed" == "true" && "$port_changed" != "true" && "$dns_changed" != "true" && "$lan_changed" != "true" ]]; then
+        local endpoint_ddns=""
+        validate_ip "$new_ep" || endpoint_ddns="$new_ep"
+        if wg_update_server_endpoint_metadata "$new_ep" "$endpoint_ddns"; then
+            pause; return 0
+        fi
+        pause; return 1
     fi
 
     if [[ "$port_changed" == "true" ]]; then
@@ -12903,6 +13240,358 @@ NO_WATCHDOG_EOF
     echo "  • 看门狗: 每分钟检测 fake-ip 并自动修正"
     draw_line
 }
+
+wg_show_openwrt_endpoint_migrate_cmd() {
+    wg_check_server || return 1
+    print_title "生成 OpenWrt 客户端 endpoint 安全迁移命令"
+
+    local cur_ep cur_port new_ep ep_host server_ip server_lan health_lan=""
+    cur_ep=$(wg_db_get '.server.endpoint')
+    cur_port=$(wg_db_get '.server.port')
+    server_ip=$(wg_db_get '.server.ip')
+    server_lan=$(wg_db_get '.server.server_lan_subnet // empty')
+    echo -e "  当前服务端 endpoint: ${C_GREEN}${cur_ep}:${cur_port}${C_RESET}"
+    read -e -r -p "目标 endpoint 主机名/IP [${cur_ep}]: " new_ep
+    new_ep=${new_ep:-$cur_ep}
+    if ! ep_host=$(wg_shared_normalize_endpoint_host "$new_ep"); then
+        print_error "endpoint 无效"
+        pause; return 1
+    fi
+
+    if [[ -n "$server_lan" && "$server_lan" != "null" && "$server_lan" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.0/24$ ]]; then
+        health_lan="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}.1"
+    fi
+
+    draw_line
+    echo -e "${C_CYAN}=== OpenWrt 客户端 endpoint 安全迁移命令 ===${C_RESET}"
+    echo -e "${C_YELLOW}在目标 OpenWrt 客户端 SSH 终端执行。脚本会先运行态切换并健康检查，成功后才持久化。${C_RESET}"
+    draw_line
+    cat << MIGRATE_HEAD
+NEW_HOST='${ep_host}'
+NEW_PORT='${cur_port}'
+HEALTH_WG='${server_ip}'
+HEALTH_LAN='${health_lan}'
+MIGRATE_HEAD
+    cat <<'MIGRATE_BODY'
+set -u
+WG_IF="wg0"
+SNAP_DIR="/root/wg-endpoint-migrate-$(date +%Y%m%d-%H%M%S)"
+
+die() { echo "[!] $*" >&2; exit 1; }
+mkdir -p "$SNAP_DIR" || die "创建回滚快照目录失败"
+chmod 700 "$SNAP_DIR" 2>/dev/null || true
+uci export network > "$SNAP_DIR/network.uci" 2>/dev/null || die "备份 network UCI 失败"
+for f in /etc/init.d/wg-client /etc/rc.local /usr/bin/wg-watchdog.sh; do
+    [ -e "$f" ] && cp -p "$f" "$SNAP_DIR/$(basename "$f").bak" 2>/dev/null || true
+done
+
+OLD_HOST=$(uci -q get network.wg_server.endpoint_host 2>/dev/null || true)
+OLD_PORT=$(uci -q get network.wg_server.endpoint_port 2>/dev/null || true)
+[ -n "$OLD_HOST" ] || die "未找到 network.wg_server.endpoint_host"
+[ -n "$NEW_PORT" ] || NEW_PORT="$OLD_PORT"
+[ -n "$NEW_PORT" ] || die "未找到 endpoint_port"
+PUB=$(wg show "$WG_IF" peers 2>/dev/null | head -1)
+OLD_RUNTIME_EP=$(wg show "$WG_IF" endpoints 2>/dev/null | awk '{print $2}' | head -1)
+[ -n "$PUB" ] || die "未找到 WireGuard peer"
+
+restore_all() {
+    echo "[!] 回滚 endpoint 迁移" >&2
+    [ -s "$SNAP_DIR/network.uci" ] && {
+        uci revert network >/dev/null 2>&1 || true
+        uci import network < "$SNAP_DIR/network.uci" >/dev/null 2>&1 || true
+        uci commit network >/dev/null 2>&1 || true
+    }
+    [ -f "$SNAP_DIR/wg-client.bak" ] && cp -p "$SNAP_DIR/wg-client.bak" /etc/init.d/wg-client 2>/dev/null || true
+    [ -f "$SNAP_DIR/rc.local.bak" ] && cp -p "$SNAP_DIR/rc.local.bak" /etc/rc.local 2>/dev/null || true
+    [ -f "$SNAP_DIR/wg-watchdog.sh.bak" ] && cp -p "$SNAP_DIR/wg-watchdog.sh.bak" /usr/bin/wg-watchdog.sh 2>/dev/null || true
+    [ -n "${OLD_RUNTIME_EP:-}" ] && wg set "$WG_IF" peer "$PUB" endpoint "$OLD_RUNTIME_EP" 2>/dev/null || true
+}
+
+resolve_real() {
+    h="$1"
+    case "$h" in *:*) echo "$h"; return 0 ;; esac
+    echo "$h" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && { echo "$h"; return 0; }
+    for dns in 223.5.5.5 119.29.29.29 8.8.8.8; do
+        ip=$(nslookup "$h" "$dns" 2>/dev/null | awk '
+            /^Name:/ { seen_name=1; next }
+            seen_name && /^Address[[:space:]][0-9]+:/ {
+                ip=$3
+                if (ip !~ /^(198\.18\.|198\.19\.)/) { print ip; exit }
+                next
+            }
+            seen_name && /^Address:/ {
+                ip=$2
+                sub(/#.*/, "", ip)
+                if (ip !~ /^(198\.18\.|198\.19\.)/) { print ip; exit }
+                next
+            }
+        ')
+        [ -n "$ip" ] && { echo "$ip"; return 0; }
+    done
+    return 1
+}
+
+format_endpoint() {
+    case "$1" in *:*) echo "[$1]:$2" ;; *) echo "$1:$2" ;; esac
+}
+
+replace_literal() {
+    file="$1"; old="$2"; new="$3"
+    [ -f "$file" ] || return 0
+    old_re=$(printf '%s' "$old" | sed 's/[.[\*^$()+?{}|\\]/\\&/g')
+    new_re=$(printf '%s' "$new" | sed 's/[\/&]/\\&/g')
+    tmp=$(mktemp "$(dirname "$file")/.endpoint-migrate.XXXXXX") || return 1
+    sed "s/${old_re}/${new_re}/g" "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+    chmod --reference="$file" "$tmp" 2>/dev/null || chmod 700 "$tmp" 2>/dev/null || true
+    mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+}
+
+install_rc_local_bypass() {
+    host="$1"; port="$2"; rc="/etc/rc.local"
+    [ -f "$rc" ] || { printf '#!/bin/sh\nexit 0\n' > "$rc" || return 1; chmod 755 "$rc" 2>/dev/null || true; }
+    dir=$(dirname "$rc")
+    base=$(mktemp "$dir/.endpoint-migrate-rc-base.XXXXXX") || return 1
+    block=$(mktemp "$dir/.endpoint-migrate-rc-block.XXXXXX") || { rm -f "$base"; return 1; }
+    tmp=$(mktemp "$dir/.endpoint-migrate-rc.XXXXXX") || { rm -f "$base" "$block"; return 1; }
+    awk '
+        /^# BEGIN server-manage wireguard bypass$/ { skip=1; next }
+        /^# END server-manage wireguard bypass$/ { skip=0; next }
+        skip { next }
+        /# wg_bypass/ { next }
+        /# wg_ep_resolve/ { next }
+        { print }
+    ' "$rc" > "$base" || { rm -f "$base" "$block" "$tmp"; return 1; }
+    cat > "$block" <<RCBLOCK || { rm -f "$base" "$block" "$tmp"; return 1; }
+# BEGIN server-manage wireguard bypass
+wg_resolve_real() {
+    h="\$1"
+    for dns in 223.5.5.5 119.29.29.29 8.8.8.8; do
+        ip=\$(nslookup "\$h" "\$dns" 2>/dev/null | awk '
+            /^Name:/ { seen_name=1; next }
+            seen_name && /^Address[[:space:]][0-9]+:/ {
+                ip=\$3
+                if (ip !~ /^(198\\.18\\.|198\\.19\\.)/) { print ip; exit }
+                next
+            }
+            seen_name && /^Address:/ {
+                ip=\$2
+                sub(/#.*/, "", ip)
+                if (ip !~ /^(198\\.18\\.|198\\.19\\.)/) { print ip; exit }
+                next
+            }
+        ')
+        [ -n "\$ip" ] && { echo "\$ip"; return 0; }
+    done
+    return 1
+}
+WG_EP=""
+case '$host' in
+    *:*) WG_EP='$host' ;;
+    [0-9]*.[0-9]*.[0-9]*.[0-9]*) WG_EP='$host' ;;
+    *) WG_EP=\$(wg_resolve_real '$host' || true) ;;
+esac
+if [ -n "\$WG_EP" ]; then
+    case "\$WG_EP" in
+        *:*) WG_NFT_FAMILY=ip6; ip -6 rule add to "\$WG_EP" lookup main prio 100 2>/dev/null || true ;;
+        *) WG_NFT_FAMILY=ip; ip rule add to "\$WG_EP" lookup main prio 100 2>/dev/null || true ;;
+    esac
+    nft insert rule inet fw4 mangle_prerouting "\$WG_NFT_FAMILY" daddr "\$WG_EP" udp dport $port counter return comment "wg_bypass" 2>/dev/null || true
+fi
+nft insert rule inet fw4 mangle_prerouting iifname "wg0" counter return comment "wg_bypass_iface" 2>/dev/null || true
+# END server-manage wireguard bypass
+RCBLOCK
+    awk -v block="$block" '
+        function emit_block() {
+            while ((getline line < block) > 0) print line
+            close(block)
+        }
+        BEGIN { inserted=0 }
+        {
+            if (!inserted && $0 ~ /^[[:space:]]*exit[[:space:]]+0[[:space:]]*($|#)/) {
+                emit_block()
+                inserted=1
+            }
+            print
+        }
+        END {
+            if (!inserted) {
+                emit_block()
+                print "exit 0"
+            }
+        }
+    ' "$base" > "$tmp" || { rm -f "$base" "$block" "$tmp"; return 1; }
+    chmod 755 "$tmp" 2>/dev/null || true
+    mv "$tmp" "$rc" || { rm -f "$base" "$block" "$tmp"; return 1; }
+    rm -f "$base" "$block"
+}
+
+install_watchdog() {
+    tmp=$(mktemp /usr/bin/.wg-watchdog.XXXXXX 2>/dev/null) || return 1
+    cat > "$tmp" <<'WDSCRIPT'
+#!/bin/sh
+LOG_DIR="/var/run/server-manage"
+LOG_FILE="$LOG_DIR/wg-watchdog.log"
+MAX_LOG_SIZE=32768
+
+wdlog() {
+    size=0
+    tmp=""
+    logger -t wg-watchdog "$1"
+    if [ -L "$LOG_DIR" ] || { [ -e "$LOG_DIR" ] && [ ! -d "$LOG_DIR" ]; }; then return 0; fi
+    mkdir -p "$LOG_DIR" 2>/dev/null || return 0
+    chmod 0700 "$LOG_DIR" 2>/dev/null || true
+    [ -L "$LOG_FILE" ] && return 0
+    echo "$(date '+%m-%d %H:%M:%S') $1" >> "$LOG_FILE" 2>/dev/null || return 0
+    if [ -f "$LOG_FILE" ]; then
+        size=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+        case "$size" in *[!0-9]*|"") size=0 ;; esac
+    fi
+    if [ "$size" -gt "$MAX_LOG_SIZE" ]; then
+        tmp=$(mktemp "$LOG_DIR/.wg-watchdog-log.XXXXXX" 2>/dev/null) || tmp=""
+        [ -n "$tmp" ] && tail -n 50 "$LOG_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$LOG_FILE"
+        rm -f "$tmp" 2>/dev/null || true
+    fi
+}
+
+resolve_real() {
+    host="$1"
+    for dns in 223.5.5.5 119.29.29.29 8.8.8.8; do
+        ip=$(nslookup "$host" "$dns" 2>/dev/null | awk '
+            /^Name:/ { seen_name=1; next }
+            seen_name && /^Address[[:space:]][0-9]+:/ {
+                ip=$3
+                if (ip !~ /^(198\.18\.|198\.19\.)/) { print ip; exit }
+                next
+            }
+            seen_name && /^Address:/ {
+                ip=$2
+                sub(/#.*/, "", ip)
+                if (ip !~ /^(198\.18\.|198\.19\.)/) { print ip; exit }
+                next
+            }
+        ')
+        [ -n "$ip" ] && { echo "$ip"; return 0; }
+    done
+    return 1
+}
+
+wg_endpoint_host() {
+    case "$1" in \[*\]:*) echo "$1" | sed -n 's/^\[\(.*\)\]:[0-9][0-9]*$/\1/p' ;; *:*) echo "$1" | sed 's/:[0-9][0-9]*$//' ;; *) echo "$1" ;; esac
+}
+wg_format_endpoint() { case "$1" in *:*) echo "[$1]:$2" ;; *) echo "$1:$2" ;; esac; }
+wg_nft_addr_family() { case "$1" in *:*) echo "ip6" ;; *) echo "ip" ;; esac; }
+wg_ip_rule_show() { case "$1" in *:*) ip -6 rule show 2>/dev/null ;; *) ip rule show 2>/dev/null ;; esac; }
+wg_ip_rule_del() { case "$1" in *:*) ip -6 rule del to "$1" lookup main prio 100 2>/dev/null ;; *) ip rule del to "$1" lookup main prio 100 2>/dev/null ;; esac; }
+wg_ip_rule_add() { case "$1" in *:*) ip -6 rule add to "$1" lookup main prio 100 2>/dev/null ;; *) ip rule add to "$1" lookup main prio 100 2>/dev/null ;; esac; }
+wg_is_up() { ifstatus wg0 2>/dev/null | grep -q '"up": true'; }
+wg_proto_registered() { ubus call network get_proto_handlers 2>/dev/null | grep -q '"wireguard"'; }
+
+if ! wg_is_up; then
+    wdlog "wg0 not up, restarting"
+    if ! wg_proto_registered; then
+        wdlog "wireguard proto missing, restarting network"
+        /etc/init.d/network restart >/dev/null 2>&1 || true
+        sleep 5
+    fi
+    ifup wg0 >/dev/null 2>&1 || true
+    exit 0
+fi
+
+EP_HOST=$(uci get network.wg_server.endpoint_host 2>/dev/null)
+PORT=$(uci get network.wg_server.endpoint_port 2>/dev/null)
+RESOLVED=""
+if echo "$EP_HOST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    RESOLVED="$EP_HOST"
+elif echo "$EP_HOST" | grep -q ':'; then
+    RESOLVED="$EP_HOST"
+elif [ -n "$EP_HOST" ]; then
+    RESOLVED=$(resolve_real "$EP_HOST")
+fi
+
+if [ -n "$EP_HOST" ] && [ -n "$PORT" ] && ! echo "$EP_HOST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && ! echo "$EP_HOST" | grep -q ':'; then
+    CURRENT_EP=$(wg show wg0 endpoints 2>/dev/null | awk '{print $2}' | head -1)
+    CURRENT=$(wg_endpoint_host "$CURRENT_EP")
+    FAKE_IP=0
+    case "$CURRENT" in 198.18.*|198.19.*|"") FAKE_IP=1 ;; esac
+    if [ -n "$RESOLVED" ] && { [ "$RESOLVED" != "$CURRENT" ] || [ "$FAKE_IP" = "1" ]; }; then
+        PUB=$(wg show wg0 endpoints 2>/dev/null | awk '{print $1}' | head -1)
+        if [ -n "$PUB" ]; then
+            wdlog "endpoint update: $CURRENT -> $RESOLVED (fake=$FAKE_IP)"
+            wg set wg0 peer "$PUB" endpoint "$(wg_format_endpoint "$RESOLVED" "$PORT")" >/dev/null 2>&1 || true
+            for h in $(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | grep -v 'iface' | awk '{print $NF}'); do
+                nft delete rule inet fw4 mangle_prerouting handle "$h" 2>/dev/null; true
+            done
+            NFT_FAMILY=$(wg_nft_addr_family "$RESOLVED")
+            nft insert rule inet fw4 mangle_prerouting "$NFT_FAMILY" daddr "$RESOLVED" udp dport "$PORT" counter return comment "wg_bypass" 2>/dev/null; true
+            wg_ip_rule_del "$RESOLVED"; true
+            wg_ip_rule_add "$RESOLVED"; true
+            wdlog "bypass updated -> $RESOLVED"
+        fi
+    fi
+fi
+
+if nft list chain inet fw4 mangle_prerouting >/dev/null 2>&1; then
+    if ! nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep -q 'wg_bypass_iface'; then
+        nft insert rule inet fw4 mangle_prerouting iifname "wg0" counter return comment "wg_bypass_iface" 2>/dev/null; true
+        wdlog "restored wg_bypass_iface rule"
+    fi
+    if [ -n "$RESOLVED" ] && ! nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep -q "daddr $RESOLVED"; then
+        NFT_FAMILY=$(wg_nft_addr_family "$RESOLVED")
+        nft insert rule inet fw4 mangle_prerouting "$NFT_FAMILY" daddr "$RESOLVED" udp dport "$PORT" counter return comment "wg_bypass" 2>/dev/null; true
+        wdlog "restored IP bypass -> $RESOLVED"
+    fi
+fi
+if [ -n "$RESOLVED" ] && ! wg_ip_rule_show "$RESOLVED" | grep -q "$RESOLVED"; then
+    wg_ip_rule_add "$RESOLVED"; true
+    wdlog "restored ip rule -> $RESOLVED"
+fi
+
+LAST_HS=$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)
+NOW=$(date +%s)
+if [ -n "$LAST_HS" ] && [ "$LAST_HS" != "0" ] && [ $((NOW - LAST_HS)) -gt 180 ]; then
+    VIP=$(uci get network.wg0.addresses 2>/dev/null | awk '{print $1}' | cut -d/ -f1)
+    VIP=$(echo "$VIP" | awk -F. '{printf "%s.%s.%s.1",$1,$2,$3}')
+    if [ -n "$VIP" ] && ! ping -c 2 -W 3 "$VIP" >/dev/null 2>&1; then
+        wdlog "no handshake for $((NOW - LAST_HS))s + ping failed, restarting"
+        ifdown wg0; sleep 2; ifup wg0
+    fi
+fi
+WDSCRIPT
+    chmod 0700 "$tmp" && mv "$tmp" /usr/bin/wg-watchdog.sh || { rm -f "$tmp"; return 1; }
+    cron_tmp=$(mktemp /tmp/.wg-watchdog-cron.XXXXXX 2>/dev/null) || return 1
+    (crontab -l 2>/dev/null | awk '$6 != "/usr/bin/wg-watchdog.sh"'; echo '* * * * * /usr/bin/wg-watchdog.sh') > "$cron_tmp" || { rm -f "$cron_tmp"; return 1; }
+    mkdir -p /etc/crontabs 2>/dev/null || { rm -f "$cron_tmp"; return 1; }
+    cp "$cron_tmp" /etc/crontabs/root 2>/dev/null || { rm -f "$cron_tmp"; return 1; }
+    chmod 600 /etc/crontabs/root 2>/dev/null || true
+    rm -f "$cron_tmp"
+    /etc/init.d/cron restart >/dev/null 2>&1 || return 1
+}
+
+NEW_IP=$(resolve_real "$NEW_HOST") || die "解析新 endpoint 失败: $NEW_HOST"
+NEW_RUNTIME_EP=$(format_endpoint "$NEW_IP" "$NEW_PORT")
+echo "[*] runtime endpoint: ${OLD_RUNTIME_EP:-none} -> $NEW_RUNTIME_EP"
+wg set "$WG_IF" peer "$PUB" endpoint "$NEW_RUNTIME_EP" || { restore_all; exit 1; }
+sleep 2
+ping -c 2 -W 2 "$HEALTH_WG" >/dev/null 2>&1 || { restore_all; die "运行态切换后 VPN 健康检查失败"; }
+[ -z "$HEALTH_LAN" ] || ping -c 2 -W 2 "$HEALTH_LAN" >/dev/null 2>&1 || { restore_all; die "运行态切换后 LAN 健康检查失败"; }
+
+uci set network.wg_server.endpoint_host="$NEW_HOST" || { restore_all; exit 1; }
+uci set network.wg_server.endpoint_port="$NEW_PORT" || { restore_all; exit 1; }
+uci commit network || { restore_all; exit 1; }
+replace_literal /etc/init.d/wg-client "$OLD_HOST" "$NEW_HOST" || { restore_all; exit 1; }
+install_rc_local_bypass "$NEW_HOST" "$NEW_PORT" || { restore_all; exit 1; }
+install_watchdog || { restore_all; die "安装新版 wg-watchdog 失败"; }
+/usr/bin/wg-watchdog.sh >/dev/null 2>&1 || true
+sleep 2
+ping -c 2 -W 2 "$HEALTH_WG" >/dev/null 2>&1 || { restore_all; die "持久化后 VPN 健康检查失败"; }
+[ -z "$HEALTH_LAN" ] || ping -c 2 -W 2 "$HEALTH_LAN" >/dev/null 2>&1 || { restore_all; die "持久化后 LAN 健康检查失败"; }
+echo "[+] endpoint 已迁移: $NEW_HOST:$NEW_PORT"
+echo "[+] 快照目录: $SNAP_DIR"
+wg show "$WG_IF" endpoints 2>/dev/null || true
+MIGRATE_BODY
+    draw_line
+    pause
+}
 _wg_clash_db_get() {
     local mode="$1"; shift
     case "$mode" in
@@ -13765,6 +14454,8 @@ wg_server_menu() {
   13. 生成 OpenWrt 清空 WG 配置命令
   14. 服务端看门狗 (自动重启保活)
   15. Mihomo bypass 规则管理
+  18. 仅修改公网端点 (不重载 wg0)
+  19. 生成 OpenWrt 客户端 endpoint 迁移命令
   [数据管理]
   16. 导出设备配置 (JSON)
   17. 导入设备配置 (JSON)
@@ -13789,6 +14480,8 @@ wg_server_menu() {
             15) wg_mihomo_bypass_status ;;
             16) wg_export_peers ;;
             17) wg_import_peers ;;
+            18) wg_modify_server_endpoint_only ;;
+            19) wg_show_openwrt_endpoint_migrate_cmd ;;
             0|"") return ;;
             *) print_warn "无效选项" ;;
         esac

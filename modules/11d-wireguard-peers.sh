@@ -1165,3 +1165,355 @@ NO_WATCHDOG_EOF
     echo "  • 看门狗: 每分钟检测 fake-ip 并自动修正"
     draw_line
 }
+
+wg_show_openwrt_endpoint_migrate_cmd() {
+    wg_check_server || return 1
+    print_title "生成 OpenWrt 客户端 endpoint 安全迁移命令"
+
+    local cur_ep cur_port new_ep ep_host server_ip server_lan health_lan=""
+    cur_ep=$(wg_db_get '.server.endpoint')
+    cur_port=$(wg_db_get '.server.port')
+    server_ip=$(wg_db_get '.server.ip')
+    server_lan=$(wg_db_get '.server.server_lan_subnet // empty')
+    echo -e "  当前服务端 endpoint: ${C_GREEN}${cur_ep}:${cur_port}${C_RESET}"
+    read -e -r -p "目标 endpoint 主机名/IP [${cur_ep}]: " new_ep
+    new_ep=${new_ep:-$cur_ep}
+    if ! ep_host=$(wg_shared_normalize_endpoint_host "$new_ep"); then
+        print_error "endpoint 无效"
+        pause; return 1
+    fi
+
+    if [[ -n "$server_lan" && "$server_lan" != "null" && "$server_lan" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.0/24$ ]]; then
+        health_lan="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}.1"
+    fi
+
+    draw_line
+    echo -e "${C_CYAN}=== OpenWrt 客户端 endpoint 安全迁移命令 ===${C_RESET}"
+    echo -e "${C_YELLOW}在目标 OpenWrt 客户端 SSH 终端执行。脚本会先运行态切换并健康检查，成功后才持久化。${C_RESET}"
+    draw_line
+    cat << MIGRATE_HEAD
+NEW_HOST='${ep_host}'
+NEW_PORT='${cur_port}'
+HEALTH_WG='${server_ip}'
+HEALTH_LAN='${health_lan}'
+MIGRATE_HEAD
+    cat <<'MIGRATE_BODY'
+set -u
+WG_IF="wg0"
+SNAP_DIR="/root/wg-endpoint-migrate-$(date +%Y%m%d-%H%M%S)"
+
+die() { echo "[!] $*" >&2; exit 1; }
+mkdir -p "$SNAP_DIR" || die "创建回滚快照目录失败"
+chmod 700 "$SNAP_DIR" 2>/dev/null || true
+uci export network > "$SNAP_DIR/network.uci" 2>/dev/null || die "备份 network UCI 失败"
+for f in /etc/init.d/wg-client /etc/rc.local /usr/bin/wg-watchdog.sh; do
+    [ -e "$f" ] && cp -p "$f" "$SNAP_DIR/$(basename "$f").bak" 2>/dev/null || true
+done
+
+OLD_HOST=$(uci -q get network.wg_server.endpoint_host 2>/dev/null || true)
+OLD_PORT=$(uci -q get network.wg_server.endpoint_port 2>/dev/null || true)
+[ -n "$OLD_HOST" ] || die "未找到 network.wg_server.endpoint_host"
+[ -n "$NEW_PORT" ] || NEW_PORT="$OLD_PORT"
+[ -n "$NEW_PORT" ] || die "未找到 endpoint_port"
+PUB=$(wg show "$WG_IF" peers 2>/dev/null | head -1)
+OLD_RUNTIME_EP=$(wg show "$WG_IF" endpoints 2>/dev/null | awk '{print $2}' | head -1)
+[ -n "$PUB" ] || die "未找到 WireGuard peer"
+
+restore_all() {
+    echo "[!] 回滚 endpoint 迁移" >&2
+    [ -s "$SNAP_DIR/network.uci" ] && {
+        uci revert network >/dev/null 2>&1 || true
+        uci import network < "$SNAP_DIR/network.uci" >/dev/null 2>&1 || true
+        uci commit network >/dev/null 2>&1 || true
+    }
+    [ -f "$SNAP_DIR/wg-client.bak" ] && cp -p "$SNAP_DIR/wg-client.bak" /etc/init.d/wg-client 2>/dev/null || true
+    [ -f "$SNAP_DIR/rc.local.bak" ] && cp -p "$SNAP_DIR/rc.local.bak" /etc/rc.local 2>/dev/null || true
+    [ -f "$SNAP_DIR/wg-watchdog.sh.bak" ] && cp -p "$SNAP_DIR/wg-watchdog.sh.bak" /usr/bin/wg-watchdog.sh 2>/dev/null || true
+    [ -n "${OLD_RUNTIME_EP:-}" ] && wg set "$WG_IF" peer "$PUB" endpoint "$OLD_RUNTIME_EP" 2>/dev/null || true
+}
+
+resolve_real() {
+    h="$1"
+    case "$h" in *:*) echo "$h"; return 0 ;; esac
+    echo "$h" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && { echo "$h"; return 0; }
+    for dns in 223.5.5.5 119.29.29.29 8.8.8.8; do
+        ip=$(nslookup "$h" "$dns" 2>/dev/null | awk '
+            /^Name:/ { seen_name=1; next }
+            seen_name && /^Address[[:space:]][0-9]+:/ {
+                ip=$3
+                if (ip !~ /^(198\.18\.|198\.19\.)/) { print ip; exit }
+                next
+            }
+            seen_name && /^Address:/ {
+                ip=$2
+                sub(/#.*/, "", ip)
+                if (ip !~ /^(198\.18\.|198\.19\.)/) { print ip; exit }
+                next
+            }
+        ')
+        [ -n "$ip" ] && { echo "$ip"; return 0; }
+    done
+    return 1
+}
+
+format_endpoint() {
+    case "$1" in *:*) echo "[$1]:$2" ;; *) echo "$1:$2" ;; esac
+}
+
+replace_literal() {
+    file="$1"; old="$2"; new="$3"
+    [ -f "$file" ] || return 0
+    old_re=$(printf '%s' "$old" | sed 's/[.[\*^$()+?{}|\\]/\\&/g')
+    new_re=$(printf '%s' "$new" | sed 's/[\/&]/\\&/g')
+    tmp=$(mktemp "$(dirname "$file")/.endpoint-migrate.XXXXXX") || return 1
+    sed "s/${old_re}/${new_re}/g" "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+    chmod --reference="$file" "$tmp" 2>/dev/null || chmod 700 "$tmp" 2>/dev/null || true
+    mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+}
+
+install_rc_local_bypass() {
+    host="$1"; port="$2"; rc="/etc/rc.local"
+    [ -f "$rc" ] || { printf '#!/bin/sh\nexit 0\n' > "$rc" || return 1; chmod 755 "$rc" 2>/dev/null || true; }
+    dir=$(dirname "$rc")
+    base=$(mktemp "$dir/.endpoint-migrate-rc-base.XXXXXX") || return 1
+    block=$(mktemp "$dir/.endpoint-migrate-rc-block.XXXXXX") || { rm -f "$base"; return 1; }
+    tmp=$(mktemp "$dir/.endpoint-migrate-rc.XXXXXX") || { rm -f "$base" "$block"; return 1; }
+    awk '
+        /^# BEGIN server-manage wireguard bypass$/ { skip=1; next }
+        /^# END server-manage wireguard bypass$/ { skip=0; next }
+        skip { next }
+        /# wg_bypass/ { next }
+        /# wg_ep_resolve/ { next }
+        { print }
+    ' "$rc" > "$base" || { rm -f "$base" "$block" "$tmp"; return 1; }
+    cat > "$block" <<RCBLOCK || { rm -f "$base" "$block" "$tmp"; return 1; }
+# BEGIN server-manage wireguard bypass
+wg_resolve_real() {
+    h="\$1"
+    for dns in 223.5.5.5 119.29.29.29 8.8.8.8; do
+        ip=\$(nslookup "\$h" "\$dns" 2>/dev/null | awk '
+            /^Name:/ { seen_name=1; next }
+            seen_name && /^Address[[:space:]][0-9]+:/ {
+                ip=\$3
+                if (ip !~ /^(198\\.18\\.|198\\.19\\.)/) { print ip; exit }
+                next
+            }
+            seen_name && /^Address:/ {
+                ip=\$2
+                sub(/#.*/, "", ip)
+                if (ip !~ /^(198\\.18\\.|198\\.19\\.)/) { print ip; exit }
+                next
+            }
+        ')
+        [ -n "\$ip" ] && { echo "\$ip"; return 0; }
+    done
+    return 1
+}
+WG_EP=""
+case '$host' in
+    *:*) WG_EP='$host' ;;
+    [0-9]*.[0-9]*.[0-9]*.[0-9]*) WG_EP='$host' ;;
+    *) WG_EP=\$(wg_resolve_real '$host' || true) ;;
+esac
+if [ -n "\$WG_EP" ]; then
+    case "\$WG_EP" in
+        *:*) WG_NFT_FAMILY=ip6; ip -6 rule add to "\$WG_EP" lookup main prio 100 2>/dev/null || true ;;
+        *) WG_NFT_FAMILY=ip; ip rule add to "\$WG_EP" lookup main prio 100 2>/dev/null || true ;;
+    esac
+    nft insert rule inet fw4 mangle_prerouting "\$WG_NFT_FAMILY" daddr "\$WG_EP" udp dport $port counter return comment "wg_bypass" 2>/dev/null || true
+fi
+nft insert rule inet fw4 mangle_prerouting iifname "wg0" counter return comment "wg_bypass_iface" 2>/dev/null || true
+# END server-manage wireguard bypass
+RCBLOCK
+    awk -v block="$block" '
+        function emit_block() {
+            while ((getline line < block) > 0) print line
+            close(block)
+        }
+        BEGIN { inserted=0 }
+        {
+            if (!inserted && $0 ~ /^[[:space:]]*exit[[:space:]]+0[[:space:]]*($|#)/) {
+                emit_block()
+                inserted=1
+            }
+            print
+        }
+        END {
+            if (!inserted) {
+                emit_block()
+                print "exit 0"
+            }
+        }
+    ' "$base" > "$tmp" || { rm -f "$base" "$block" "$tmp"; return 1; }
+    chmod 755 "$tmp" 2>/dev/null || true
+    mv "$tmp" "$rc" || { rm -f "$base" "$block" "$tmp"; return 1; }
+    rm -f "$base" "$block"
+}
+
+install_watchdog() {
+    tmp=$(mktemp /usr/bin/.wg-watchdog.XXXXXX 2>/dev/null) || return 1
+    cat > "$tmp" <<'WDSCRIPT'
+#!/bin/sh
+LOG_DIR="/var/run/server-manage"
+LOG_FILE="$LOG_DIR/wg-watchdog.log"
+MAX_LOG_SIZE=32768
+
+wdlog() {
+    size=0
+    tmp=""
+    logger -t wg-watchdog "$1"
+    if [ -L "$LOG_DIR" ] || { [ -e "$LOG_DIR" ] && [ ! -d "$LOG_DIR" ]; }; then return 0; fi
+    mkdir -p "$LOG_DIR" 2>/dev/null || return 0
+    chmod 0700 "$LOG_DIR" 2>/dev/null || true
+    [ -L "$LOG_FILE" ] && return 0
+    echo "$(date '+%m-%d %H:%M:%S') $1" >> "$LOG_FILE" 2>/dev/null || return 0
+    if [ -f "$LOG_FILE" ]; then
+        size=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+        case "$size" in *[!0-9]*|"") size=0 ;; esac
+    fi
+    if [ "$size" -gt "$MAX_LOG_SIZE" ]; then
+        tmp=$(mktemp "$LOG_DIR/.wg-watchdog-log.XXXXXX" 2>/dev/null) || tmp=""
+        [ -n "$tmp" ] && tail -n 50 "$LOG_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$LOG_FILE"
+        rm -f "$tmp" 2>/dev/null || true
+    fi
+}
+
+resolve_real() {
+    host="$1"
+    for dns in 223.5.5.5 119.29.29.29 8.8.8.8; do
+        ip=$(nslookup "$host" "$dns" 2>/dev/null | awk '
+            /^Name:/ { seen_name=1; next }
+            seen_name && /^Address[[:space:]][0-9]+:/ {
+                ip=$3
+                if (ip !~ /^(198\.18\.|198\.19\.)/) { print ip; exit }
+                next
+            }
+            seen_name && /^Address:/ {
+                ip=$2
+                sub(/#.*/, "", ip)
+                if (ip !~ /^(198\.18\.|198\.19\.)/) { print ip; exit }
+                next
+            }
+        ')
+        [ -n "$ip" ] && { echo "$ip"; return 0; }
+    done
+    return 1
+}
+
+wg_endpoint_host() {
+    case "$1" in \[*\]:*) echo "$1" | sed -n 's/^\[\(.*\)\]:[0-9][0-9]*$/\1/p' ;; *:*) echo "$1" | sed 's/:[0-9][0-9]*$//' ;; *) echo "$1" ;; esac
+}
+wg_format_endpoint() { case "$1" in *:*) echo "[$1]:$2" ;; *) echo "$1:$2" ;; esac; }
+wg_nft_addr_family() { case "$1" in *:*) echo "ip6" ;; *) echo "ip" ;; esac; }
+wg_ip_rule_show() { case "$1" in *:*) ip -6 rule show 2>/dev/null ;; *) ip rule show 2>/dev/null ;; esac; }
+wg_ip_rule_del() { case "$1" in *:*) ip -6 rule del to "$1" lookup main prio 100 2>/dev/null ;; *) ip rule del to "$1" lookup main prio 100 2>/dev/null ;; esac; }
+wg_ip_rule_add() { case "$1" in *:*) ip -6 rule add to "$1" lookup main prio 100 2>/dev/null ;; *) ip rule add to "$1" lookup main prio 100 2>/dev/null ;; esac; }
+wg_is_up() { ifstatus wg0 2>/dev/null | grep -q '"up": true'; }
+wg_proto_registered() { ubus call network get_proto_handlers 2>/dev/null | grep -q '"wireguard"'; }
+
+if ! wg_is_up; then
+    wdlog "wg0 not up, restarting"
+    if ! wg_proto_registered; then
+        wdlog "wireguard proto missing, restarting network"
+        /etc/init.d/network restart >/dev/null 2>&1 || true
+        sleep 5
+    fi
+    ifup wg0 >/dev/null 2>&1 || true
+    exit 0
+fi
+
+EP_HOST=$(uci get network.wg_server.endpoint_host 2>/dev/null)
+PORT=$(uci get network.wg_server.endpoint_port 2>/dev/null)
+RESOLVED=""
+if echo "$EP_HOST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    RESOLVED="$EP_HOST"
+elif echo "$EP_HOST" | grep -q ':'; then
+    RESOLVED="$EP_HOST"
+elif [ -n "$EP_HOST" ]; then
+    RESOLVED=$(resolve_real "$EP_HOST")
+fi
+
+if [ -n "$EP_HOST" ] && [ -n "$PORT" ] && ! echo "$EP_HOST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && ! echo "$EP_HOST" | grep -q ':'; then
+    CURRENT_EP=$(wg show wg0 endpoints 2>/dev/null | awk '{print $2}' | head -1)
+    CURRENT=$(wg_endpoint_host "$CURRENT_EP")
+    FAKE_IP=0
+    case "$CURRENT" in 198.18.*|198.19.*|"") FAKE_IP=1 ;; esac
+    if [ -n "$RESOLVED" ] && { [ "$RESOLVED" != "$CURRENT" ] || [ "$FAKE_IP" = "1" ]; }; then
+        PUB=$(wg show wg0 endpoints 2>/dev/null | awk '{print $1}' | head -1)
+        if [ -n "$PUB" ]; then
+            wdlog "endpoint update: $CURRENT -> $RESOLVED (fake=$FAKE_IP)"
+            wg set wg0 peer "$PUB" endpoint "$(wg_format_endpoint "$RESOLVED" "$PORT")" >/dev/null 2>&1 || true
+            for h in $(nft -a list chain inet fw4 mangle_prerouting 2>/dev/null | grep 'wg_bypass' | grep -v 'iface' | awk '{print $NF}'); do
+                nft delete rule inet fw4 mangle_prerouting handle "$h" 2>/dev/null; true
+            done
+            NFT_FAMILY=$(wg_nft_addr_family "$RESOLVED")
+            nft insert rule inet fw4 mangle_prerouting "$NFT_FAMILY" daddr "$RESOLVED" udp dport "$PORT" counter return comment "wg_bypass" 2>/dev/null; true
+            wg_ip_rule_del "$RESOLVED"; true
+            wg_ip_rule_add "$RESOLVED"; true
+            wdlog "bypass updated -> $RESOLVED"
+        fi
+    fi
+fi
+
+if nft list chain inet fw4 mangle_prerouting >/dev/null 2>&1; then
+    if ! nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep -q 'wg_bypass_iface'; then
+        nft insert rule inet fw4 mangle_prerouting iifname "wg0" counter return comment "wg_bypass_iface" 2>/dev/null; true
+        wdlog "restored wg_bypass_iface rule"
+    fi
+    if [ -n "$RESOLVED" ] && ! nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep -q "daddr $RESOLVED"; then
+        NFT_FAMILY=$(wg_nft_addr_family "$RESOLVED")
+        nft insert rule inet fw4 mangle_prerouting "$NFT_FAMILY" daddr "$RESOLVED" udp dport "$PORT" counter return comment "wg_bypass" 2>/dev/null; true
+        wdlog "restored IP bypass -> $RESOLVED"
+    fi
+fi
+if [ -n "$RESOLVED" ] && ! wg_ip_rule_show "$RESOLVED" | grep -q "$RESOLVED"; then
+    wg_ip_rule_add "$RESOLVED"; true
+    wdlog "restored ip rule -> $RESOLVED"
+fi
+
+LAST_HS=$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)
+NOW=$(date +%s)
+if [ -n "$LAST_HS" ] && [ "$LAST_HS" != "0" ] && [ $((NOW - LAST_HS)) -gt 180 ]; then
+    VIP=$(uci get network.wg0.addresses 2>/dev/null | awk '{print $1}' | cut -d/ -f1)
+    VIP=$(echo "$VIP" | awk -F. '{printf "%s.%s.%s.1",$1,$2,$3}')
+    if [ -n "$VIP" ] && ! ping -c 2 -W 3 "$VIP" >/dev/null 2>&1; then
+        wdlog "no handshake for $((NOW - LAST_HS))s + ping failed, restarting"
+        ifdown wg0; sleep 2; ifup wg0
+    fi
+fi
+WDSCRIPT
+    chmod 0700 "$tmp" && mv "$tmp" /usr/bin/wg-watchdog.sh || { rm -f "$tmp"; return 1; }
+    cron_tmp=$(mktemp /tmp/.wg-watchdog-cron.XXXXXX 2>/dev/null) || return 1
+    (crontab -l 2>/dev/null | awk '$6 != "/usr/bin/wg-watchdog.sh"'; echo '* * * * * /usr/bin/wg-watchdog.sh') > "$cron_tmp" || { rm -f "$cron_tmp"; return 1; }
+    mkdir -p /etc/crontabs 2>/dev/null || { rm -f "$cron_tmp"; return 1; }
+    cp "$cron_tmp" /etc/crontabs/root 2>/dev/null || { rm -f "$cron_tmp"; return 1; }
+    chmod 600 /etc/crontabs/root 2>/dev/null || true
+    rm -f "$cron_tmp"
+    /etc/init.d/cron restart >/dev/null 2>&1 || return 1
+}
+
+NEW_IP=$(resolve_real "$NEW_HOST") || die "解析新 endpoint 失败: $NEW_HOST"
+NEW_RUNTIME_EP=$(format_endpoint "$NEW_IP" "$NEW_PORT")
+echo "[*] runtime endpoint: ${OLD_RUNTIME_EP:-none} -> $NEW_RUNTIME_EP"
+wg set "$WG_IF" peer "$PUB" endpoint "$NEW_RUNTIME_EP" || { restore_all; exit 1; }
+sleep 2
+ping -c 2 -W 2 "$HEALTH_WG" >/dev/null 2>&1 || { restore_all; die "运行态切换后 VPN 健康检查失败"; }
+[ -z "$HEALTH_LAN" ] || ping -c 2 -W 2 "$HEALTH_LAN" >/dev/null 2>&1 || { restore_all; die "运行态切换后 LAN 健康检查失败"; }
+
+uci set network.wg_server.endpoint_host="$NEW_HOST" || { restore_all; exit 1; }
+uci set network.wg_server.endpoint_port="$NEW_PORT" || { restore_all; exit 1; }
+uci commit network || { restore_all; exit 1; }
+replace_literal /etc/init.d/wg-client "$OLD_HOST" "$NEW_HOST" || { restore_all; exit 1; }
+install_rc_local_bypass "$NEW_HOST" "$NEW_PORT" || { restore_all; exit 1; }
+install_watchdog || { restore_all; die "安装新版 wg-watchdog 失败"; }
+/usr/bin/wg-watchdog.sh >/dev/null 2>&1 || true
+sleep 2
+ping -c 2 -W 2 "$HEALTH_WG" >/dev/null 2>&1 || { restore_all; die "持久化后 VPN 健康检查失败"; }
+[ -z "$HEALTH_LAN" ] || ping -c 2 -W 2 "$HEALTH_LAN" >/dev/null 2>&1 || { restore_all; die "持久化后 LAN 健康检查失败"; }
+echo "[+] endpoint 已迁移: $NEW_HOST:$NEW_PORT"
+echo "[+] 快照目录: $SNAP_DIR"
+wg show "$WG_IF" endpoints 2>/dev/null || true
+MIGRATE_BODY
+    draw_line
+    pause
+}

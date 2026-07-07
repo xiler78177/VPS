@@ -16,9 +16,85 @@ _extract_ipv4_from_text() {
     return 1
 }
 
-# 统一公网 IP 获取函数（使用国内可达的 API）
+_ipv4_is_public() {
+    local ip="${1:-}" o1 o2 o3 o4 extra n1 n2 n3 n4 octet
+    IFS='.' read -r o1 o2 o3 o4 extra <<< "$ip"
+    [[ -z "${extra:-}" ]] || return 1
+    for octet in "$o1" "$o2" "$o3" "$o4"; do
+        [[ "$octet" =~ ^[0-9]+$ ]] || return 1
+        (( 10#$octet <= 255 )) || return 1
+    done
+    n1=$((10#$o1)); n2=$((10#$o2)); n3=$((10#$o3)); n4=$((10#$o4))
+
+    (( n1 == 0 || n1 == 10 || n1 == 127 || n1 >= 224 )) && return 1
+    (( n1 == 100 && n2 >= 64 && n2 <= 127 )) && return 1
+    (( n1 == 169 && n2 == 254 )) && return 1
+    (( n1 == 172 && n2 >= 16 && n2 <= 31 )) && return 1
+    (( n1 == 192 && n2 == 168 )) && return 1
+    (( n1 == 198 && (n2 == 18 || n2 == 19) )) && return 1
+    (( n1 == 192 && n2 == 0 && (n3 == 0 || n3 == 2) )) && return 1
+    (( n1 == 198 && n2 == 51 && n3 == 100 )) && return 1
+    (( n1 == 203 && n2 == 0 && n3 == 113 )) && return 1
+    (( n1 == 255 && n2 == 255 && n3 == 255 && n4 == 255 )) && return 1
+    return 0
+}
+
+_get_ipv4_from_device() {
+    local dev="${1:-}" ip
+    [[ -n "$dev" ]] || return 1
+    while IFS= read -r ip; do
+        ip="${ip%%/*}"
+        _ipv4_is_public "$ip" || continue
+        echo "$ip"
+        return 0
+    done < <(ip -4 -o addr show dev "$dev" scope global 2>/dev/null | awk '{print $4}')
+    return 1
+}
+
+get_openwrt_public_ipv4() {
+    local iface="${1:-wan}" device="${2:-}" ip dev candidates=""
+    if command -v ifstatus >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+        while IFS= read -r ip; do
+            [[ -n "$ip" && "$ip" != "null" ]] || continue
+            if _ipv4_is_public "$ip"; then
+                echo "$ip"
+                return 0
+            fi
+        done < <(ifstatus "$iface" 2>/dev/null | jq -r '."ipv4-address"[]?.address // empty' 2>/dev/null)
+        candidates=$(ifstatus "$iface" 2>/dev/null | jq -r '.l3_device // empty, .device // empty' 2>/dev/null | awk 'NF && !seen[$0]++')
+    fi
+
+    [[ -n "$device" ]] && candidates=$(printf '%s\n%s\n' "$device" "$candidates" | awk 'NF && !seen[$0]++')
+    if command -v uci >/dev/null 2>&1; then
+        for dev in "$(uci -q get "network.${iface}.device" 2>/dev/null)" "$(uci -q get "network.${iface}.ifname" 2>/dev/null)"; do
+            [[ -n "$dev" ]] && candidates=$(printf '%s\n%s\n' "$candidates" "$dev" | awk 'NF && !seen[$0]++')
+        done
+    fi
+
+    while IFS= read -r dev; do
+        [[ -n "$dev" ]] || continue
+        if ip=$(_get_ipv4_from_device "$dev"); then
+            echo "$ip"
+            return 0
+        fi
+    done <<< "$candidates"
+    return 1
+}
+
+# 统一公网 IP 获取函数：OpenWrt 优先读取 WAN 接口，失败后回退到国内可达的 API。
 get_public_ipv4() {
-    local raw="" ip="" url=""
+    local source="${1:-auto}" iface="${2:-wan}" device="${3:-}" raw="" ip="" url=""
+    case "$source" in
+        auto|interface|api) ;;
+        *) source="auto" ;;
+    esac
+    if [[ "$source" == "auto" || "$source" == "interface" ]]; then
+        if ip=$(get_openwrt_public_ipv4 "$iface" "$device") && [[ -n "$ip" ]]; then
+            echo "$ip"
+            return 0
+        fi
+        [[ "$source" == "interface" ]] && return 1
+    fi
     local endpoints=(
         "https://4.ipw.cn"
         "https://myip.ipip.net/ip"
@@ -49,11 +125,42 @@ ddns_rebuild_cron() {
         # cron 的 */59 语义是每小时第 0/59 分钟触发（中间会出现 1 分钟间隔），
         # 因此统一每分钟唤醒，再由 ddns-update.sh 按每份配置的 DDNS_INTERVAL 节流。
         cron_add_job "ddns-update.sh" "* * * * * $DDNS_UPDATE_SCRIPT >/dev/null 2>&1"
+        ddns_install_hotplug >/dev/null 2>&1 || true
+    elif [[ "$PLATFORM" == "openwrt" ]]; then
+        rm -f /etc/hotplug.d/iface/95-server-manage-ddns 2>/dev/null || true
     fi
+}
+
+ddns_install_hotplug() {
+    [[ "$PLATFORM" == "openwrt" ]] || return 0
+    local hotplug_file="/etc/hotplug.d/iface/95-server-manage-ddns"
+    local content="#!/bin/sh
+[ \"\${ACTION:-}\" = \"ifup\" ] || exit 0
+[ -x \"$DDNS_UPDATE_SCRIPT\" ] || exit 0
+case \"\${INTERFACE:-}\" in \"\"|loopback|lan) exit 0 ;; esac
+match=0
+for conf in \"$DDNS_CONFIG_DIR\"/*.conf; do
+    [ -f \"\$conf\" ] || continue
+    if grep -q \"^DDNS_INTERFACE=\\\"\${INTERFACE}\\\"\$\" \"\$conf\" 2>/dev/null; then
+        match=1
+        break
+    fi
+    if [ \"\${INTERFACE}\" = \"wan\" ] && ! grep -q '^DDNS_INTERFACE=' \"\$conf\" 2>/dev/null; then
+        match=1
+        break
+    fi
+done
+[ \"\$match\" = \"1\" ] || exit 0
+DDNS_FORCE=1 \"$DDNS_UPDATE_SCRIPT\" --force >/dev/null 2>&1 &
+exit 0"
+    write_private_file_atomic "$hotplug_file" "$content" || return 1
+    chmod 0755 "$hotplug_file" 2>/dev/null || true
+    return 0
 }
 
 ddns_create_script() {
     mkdir -p "$DDNS_CONFIG_DIR"
+    chmod 700 "$DDNS_CONFIG_DIR" 2>/dev/null || true
     mkdir -p "$(dirname "$DDNS_UPDATE_SCRIPT")"
     local ddns_script_tmp
     ddns_script_tmp=$(mktemp "$(dirname "$DDNS_UPDATE_SCRIPT")/.tmp.server-manage.ddns-update.XXXXXX") || return 1
@@ -95,9 +202,82 @@ extract_ipv4() {
     return 1
 }
 
+ipv4_is_public() {
+    local ip="${1:-}" o1 o2 o3 o4 extra n1 n2 n3 n4 octet
+    IFS='.' read -r o1 o2 o3 o4 extra <<< "$ip"
+    [[ -z "${extra:-}" ]] || return 1
+    for octet in "$o1" "$o2" "$o3" "$o4"; do
+        [[ "$octet" =~ ^[0-9]+$ ]] || return 1
+        (( 10#$octet <= 255 )) || return 1
+    done
+    n1=$((10#$o1)); n2=$((10#$o2)); n3=$((10#$o3)); n4=$((10#$o4))
+    (( n1 == 0 || n1 == 10 || n1 == 127 || n1 >= 224 )) && return 1
+    (( n1 == 100 && n2 >= 64 && n2 <= 127 )) && return 1
+    (( n1 == 169 && n2 == 254 )) && return 1
+    (( n1 == 172 && n2 >= 16 && n2 <= 31 )) && return 1
+    (( n1 == 192 && n2 == 168 )) && return 1
+    (( n1 == 198 && (n2 == 18 || n2 == 19) )) && return 1
+    (( n1 == 192 && n2 == 0 && (n3 == 0 || n3 == 2) )) && return 1
+    (( n1 == 198 && n2 == 51 && n3 == 100 )) && return 1
+    (( n1 == 203 && n2 == 0 && n3 == 113 )) && return 1
+    (( n1 == 255 && n2 == 255 && n3 == 255 && n4 == 255 )) && return 1
+    return 0
+}
+
+get_ipv4_from_device() {
+    local dev="${1:-}" ip
+    [[ -n "$dev" ]] || return 1
+    while IFS= read -r ip; do
+        ip="${ip%%/*}"
+        ipv4_is_public "$ip" || continue
+        echo "$ip"
+        return 0
+    done < <(ip -4 -o addr show dev "$dev" scope global 2>/dev/null | awk '{print $4}')
+    return 1
+}
+
+get_openwrt_public_ipv4() {
+    local iface="${1:-wan}" device="${2:-}" ip dev candidates=""
+    if command -v ifstatus >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+        while IFS= read -r ip; do
+            [[ -n "$ip" && "$ip" != "null" ]] || continue
+            if ipv4_is_public "$ip"; then
+                echo "$ip"
+                return 0
+            fi
+        done < <(ifstatus "$iface" 2>/dev/null | jq -r '."ipv4-address"[]?.address // empty' 2>/dev/null)
+        candidates=$(ifstatus "$iface" 2>/dev/null | jq -r '.l3_device // empty, .device // empty' 2>/dev/null | awk 'NF && !seen[$0]++')
+    fi
+    [[ -n "$device" ]] && candidates=$(printf '%s\n%s\n' "$device" "$candidates" | awk 'NF && !seen[$0]++')
+    if command -v uci >/dev/null 2>&1; then
+        for dev in "$(uci -q get "network.${iface}.device" 2>/dev/null)" "$(uci -q get "network.${iface}.ifname" 2>/dev/null)"; do
+            [[ -n "$dev" ]] && candidates=$(printf '%s\n%s\n' "$candidates" "$dev" | awk 'NF && !seen[$0]++')
+        done
+    fi
+    while IFS= read -r dev; do
+        [[ -n "$dev" ]] || continue
+        if ip=$(get_ipv4_from_device "$dev"); then
+            echo "$ip"
+            return 0
+        fi
+    done <<< "$candidates"
+    return 1
+}
+
 get_ip() {
-    local raw="" ip="" url=""
-    if [[ "$1" == "4" ]]; then
+    local family="${1:-4}" source="${2:-auto}" iface="${3:-wan}" device="${4:-}" raw="" ip="" url=""
+    case "$source" in
+        auto|interface|api) ;;
+        *) source="auto" ;;
+    esac
+    if [[ "$family" == "4" ]]; then
+        if [[ "$source" == "auto" || "$source" == "interface" ]]; then
+            if ip=$(get_openwrt_public_ipv4 "$iface" "$device") && [[ -n "$ip" ]]; then
+                echo "$ip"
+                return 0
+            fi
+            [[ "$source" == "interface" ]] && return 1
+        fi
         for url in \
             https://4.ipw.cn \
             https://myip.ipip.net/ip \
@@ -150,24 +330,38 @@ update_cf() {
 # 仅接受白名单 KEY，value 必须是双引号包裹的简单字面量
 parse_ddns_conf() {
     local conf="$1" line key val
-    local fown fmode
-    fown=$(stat -c '%U' "$conf" 2>/dev/null || echo "")
-    fmode=$(stat -c '%a' "$conf" 2>/dev/null || echo "")
-    if [[ "$fown" != "root" ]]; then
-        log "owner 非 root，跳过: $conf (owner=$fown)"
-        return 1
-    fi
-    if [[ "$fmode" =~ ^[0-7]+$ ]] && (( 8#${fmode} & 022 )); then
-        log "权限过宽，跳过: $conf (mode=$fmode)"
-        return 1
+    local fown fmode meta perm uid
+    if command -v stat >/dev/null 2>&1 && fown=$(stat -c '%U' "$conf" 2>/dev/null); then
+        fmode=$(stat -c '%a' "$conf" 2>/dev/null || echo "")
+        if [[ "$fown" != "root" && "$fown" != "0" ]]; then
+            log "owner 非 root，跳过: $conf (owner=$fown)"
+            return 1
+        fi
+        if [[ "$fmode" =~ ^[0-7]+$ ]] && (( 8#${fmode} & 022 )); then
+            log "权限过宽，跳过: $conf (mode=$fmode)"
+            return 1
+        fi
+    else
+        meta=$(ls -ldn "$conf" 2>/dev/null || echo "")
+        perm=$(printf '%s\n' "$meta" | awk '{print $1}')
+        uid=$(printf '%s\n' "$meta" | awk '{print $3}')
+        if [[ "$uid" != "0" ]]; then
+            log "owner 非 root，跳过: $conf (uid=$uid)"
+            return 1
+        fi
+        if [[ "${perm:5:1}" == "w" || "${perm:8:1}" == "w" ]]; then
+            log "权限过宽，跳过: $conf (perm=$perm)"
+            return 1
+        fi
     fi
     DDNS_DOMAIN="" DDNS_TOKEN="" DDNS_ZONE_ID=""
     DDNS_IPV4="" DDNS_IPV6="" DDNS_PROXIED="" DDNS_INTERVAL=""
+    DDNS_IP_SOURCE="" DDNS_INTERFACE="" DDNS_DEVICE=""
     while IFS= read -r line || [ -n "$line" ]; do
         line="${line%$'\r'}"
         [[ -z "${line// }" ]] && continue
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
-        if [[ "$line" =~ ^(DDNS_DOMAIN|DDNS_TOKEN|DDNS_ZONE_ID|DDNS_IPV4|DDNS_IPV6|DDNS_PROXIED|DDNS_INTERVAL)=\"([^\"\$\`\\]*)\"$ ]]; then
+        if [[ "$line" =~ ^(DDNS_DOMAIN|DDNS_TOKEN|DDNS_ZONE_ID|DDNS_IPV4|DDNS_IPV6|DDNS_PROXIED|DDNS_INTERVAL|DDNS_IP_SOURCE|DDNS_INTERFACE|DDNS_DEVICE)=\"([^\"\$\`\\]*)\"$ ]]; then
             key="${BASH_REMATCH[1]}"
             val="${BASH_REMATCH[2]}"
             case "$key" in
@@ -178,6 +372,9 @@ parse_ddns_conf() {
                 DDNS_IPV6)     DDNS_IPV6="$val" ;;
                 DDNS_PROXIED)  DDNS_PROXIED="$val" ;;
                 DDNS_INTERVAL) DDNS_INTERVAL="$val" ;;
+                DDNS_IP_SOURCE) DDNS_IP_SOURCE="$val" ;;
+                DDNS_INTERFACE) DDNS_INTERFACE="$val" ;;
+                DDNS_DEVICE)   DDNS_DEVICE="$val" ;;
             esac
         else
             log "格式异常行，跳过: $conf"
@@ -191,9 +388,15 @@ parse_ddns_conf() {
     DDNS_IPV4=${DDNS_IPV4:-false}
     DDNS_IPV6=${DDNS_IPV6:-false}
     DDNS_PROXIED=${DDNS_PROXIED:-false}
+    DDNS_IP_SOURCE=${DDNS_IP_SOURCE:-auto}
+    DDNS_INTERFACE=${DDNS_INTERFACE:-wan}
+    DDNS_DEVICE=${DDNS_DEVICE:-}
     [[ "$DDNS_IPV4" == "true" || "$DDNS_IPV4" == "false" ]] || DDNS_IPV4="false"
     [[ "$DDNS_IPV6" == "true" || "$DDNS_IPV6" == "false" ]] || DDNS_IPV6="false"
     [[ "$DDNS_PROXIED" == "true" || "$DDNS_PROXIED" == "false" ]] || DDNS_PROXIED="false"
+    [[ "$DDNS_IP_SOURCE" == "auto" || "$DDNS_IP_SOURCE" == "interface" || "$DDNS_IP_SOURCE" == "api" ]] || DDNS_IP_SOURCE="auto"
+    [[ "$DDNS_INTERFACE" =~ ^[A-Za-z0-9_.:-]+$ ]] || DDNS_INTERFACE="wan"
+    [[ -z "$DDNS_DEVICE" || "$DDNS_DEVICE" =~ ^[A-Za-z0-9_.:-]+$ ]] || DDNS_DEVICE=""
     return 0
 }
 
@@ -203,6 +406,10 @@ ddns_should_run() {
     stamp_name=$(basename "$conf" | sed 's/[^A-Za-z0-9_.-]/_/g')
     stamp="$DDNS_STAMP_DIR/${stamp_name}.stamp"
     now=$(date +%s)
+    if [[ "${DDNS_FORCE:-0}" == "1" || "${DDNS_FORCE:-0}" == "true" ]]; then
+        printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
+        return 0
+    fi
     [[ -f "$stamp" ]] && read -r last < "$stamp" || true
     if [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < interval * 60 )); then
         return 1
@@ -213,13 +420,14 @@ ddns_should_run() {
 
 failed=0
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    [[ "${1:-}" == "--force" ]] && DDNS_FORCE=1
     failed=0
     for conf in "$DDNS_CONFIG_DIR"/*.conf; do
         [ -f "$conf" ] || continue
         parse_ddns_conf "$conf" || continue
         ddns_should_run "$conf" || continue
         if [[ "$DDNS_IPV4" == "true" ]]; then
-            if ip=$(get_ip 4) && [[ -n "$ip" ]]; then
+            if ip=$(get_ip 4 "$DDNS_IP_SOURCE" "$DDNS_INTERFACE" "$DDNS_DEVICE") && [[ -n "$ip" ]]; then
                 update_cf "$DDNS_DOMAIN" A "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED" || failed=1
             else
                 log "[$DDNS_DOMAIN] A 获取公网 IPv4 失败"
@@ -265,13 +473,17 @@ ddns_setup() {
         interval=5
     fi
     mkdir -p "$DDNS_CONFIG_DIR"
+    chmod 700 "$DDNS_CONFIG_DIR" 2>/dev/null || true
     local ddns_conf_content="DDNS_DOMAIN=\"$domain\"
 DDNS_TOKEN=\"$token\"
 DDNS_ZONE_ID=\"$zone_id\"
 DDNS_IPV4=\"$ipv4\"
 DDNS_IPV6=\"$ipv6\"
 DDNS_PROXIED=\"$proxied\"
-DDNS_INTERVAL=\"$interval\""
+DDNS_INTERVAL=\"$interval\"
+DDNS_IP_SOURCE=\"auto\"
+DDNS_INTERFACE=\"wan\"
+DDNS_DEVICE=\"\""
     write_private_file_atomic "$DDNS_CONFIG_DIR/${domain}.conf" "$ddns_conf_content" || { print_error "DDNS 配置写入失败"; return 1; }
     ddns_create_script || { print_error "DDNS 更新脚本生成失败"; return 1; }
     ddns_rebuild_cron || { print_error "DDNS cron 更新失败"; return 1; }
@@ -282,18 +494,26 @@ DDNS_INTERVAL=\"$interval\""
 
 ddns_setup_noninteractive() {
     local domain=$1 token=$2 zone_id=$3 ipv4=${4:-true} ipv6=${5:-false} proxied=${6:-false} interval=${7:-5}
+    local ip_source="${8:-auto}" iface="${9:-wan}" device="${10:-}"
     [[ -z "$domain" || -z "$token" || -z "$zone_id" ]] && return 1
     if [[ ! "$interval" =~ ^[0-9]+$ ]] || [[ "$interval" -lt 1 || "$interval" -gt 59 ]]; then
         interval=5
     fi
+    [[ "$ip_source" == "auto" || "$ip_source" == "interface" || "$ip_source" == "api" ]] || ip_source="auto"
+    [[ "$iface" =~ ^[A-Za-z0-9_.:-]+$ ]] || iface="wan"
+    [[ -z "$device" || "$device" =~ ^[A-Za-z0-9_.:-]+$ ]] || device=""
     mkdir -p "$DDNS_CONFIG_DIR"
+    chmod 700 "$DDNS_CONFIG_DIR" 2>/dev/null || true
     local ddns_conf_content="DDNS_DOMAIN=\"$domain\"
 DDNS_TOKEN=\"$token\"
 DDNS_ZONE_ID=\"$zone_id\"
 DDNS_IPV4=\"$ipv4\"
 DDNS_IPV6=\"$ipv6\"
 DDNS_PROXIED=\"$proxied\"
-DDNS_INTERVAL=\"$interval\""
+DDNS_INTERVAL=\"$interval\"
+DDNS_IP_SOURCE=\"$ip_source\"
+DDNS_INTERFACE=\"$iface\"
+DDNS_DEVICE=\"$device\""
     write_private_file_atomic "$DDNS_CONFIG_DIR/${domain}.conf" "$ddns_conf_content" || { print_error "DDNS 配置写入失败"; return 1; }
     ddns_create_script || { print_error "DDNS 更新脚本生成失败"; return 1; }
     ddns_rebuild_cron || { print_error "DDNS cron 更新失败"; return 1; }
@@ -306,24 +526,38 @@ DDNS_INTERVAL=\"$interval\""
 # ddns_list / ddns_delete 复用本函数——与本文件 get_public_ipv4(顶层)/get_ip(生成脚本) 的双份模式一致。
 parse_ddns_conf() {
     local conf="$1" line key val
-    local fown fmode
-    fown=$(stat -c '%U' "$conf" 2>/dev/null || echo "")
-    fmode=$(stat -c '%a' "$conf" 2>/dev/null || echo "")
-    if [[ "$fown" != "root" ]]; then
-        log_action "DDNS 解析跳过：owner 非 root: $conf (owner=$fown)"
-        return 1
-    fi
-    if [[ "$fmode" =~ ^[0-7]+$ ]] && (( 8#${fmode} & 022 )); then
-        log_action "DDNS 解析跳过：权限过宽: $conf (mode=$fmode)"
-        return 1
+    local fown fmode meta perm uid
+    if command -v stat >/dev/null 2>&1 && fown=$(stat -c '%U' "$conf" 2>/dev/null); then
+        fmode=$(stat -c '%a' "$conf" 2>/dev/null || echo "")
+        if [[ "$fown" != "root" && "$fown" != "0" ]]; then
+            log_action "DDNS 解析跳过：owner 非 root: $conf (owner=$fown)"
+            return 1
+        fi
+        if [[ "$fmode" =~ ^[0-7]+$ ]] && (( 8#${fmode} & 022 )); then
+            log_action "DDNS 解析跳过：权限过宽: $conf (mode=$fmode)"
+            return 1
+        fi
+    else
+        meta=$(ls -ldn "$conf" 2>/dev/null || echo "")
+        perm=$(printf '%s\n' "$meta" | awk '{print $1}')
+        uid=$(printf '%s\n' "$meta" | awk '{print $3}')
+        if [[ "$uid" != "0" ]]; then
+            log_action "DDNS 解析跳过：owner 非 root: $conf (uid=$uid)"
+            return 1
+        fi
+        if [[ "${perm:5:1}" == "w" || "${perm:8:1}" == "w" ]]; then
+            log_action "DDNS 解析跳过：权限过宽: $conf (perm=$perm)"
+            return 1
+        fi
     fi
     DDNS_DOMAIN="" DDNS_TOKEN="" DDNS_ZONE_ID=""
     DDNS_IPV4="" DDNS_IPV6="" DDNS_PROXIED="" DDNS_INTERVAL=""
+    DDNS_IP_SOURCE="" DDNS_INTERFACE="" DDNS_DEVICE=""
     while IFS= read -r line || [ -n "$line" ]; do
         line="${line%$'\r'}"
         [[ -z "${line// }" ]] && continue
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
-        if [[ "$line" =~ ^(DDNS_DOMAIN|DDNS_TOKEN|DDNS_ZONE_ID|DDNS_IPV4|DDNS_IPV6|DDNS_PROXIED|DDNS_INTERVAL)=\"([^\"\$\`\\]*)\"$ ]]; then
+        if [[ "$line" =~ ^(DDNS_DOMAIN|DDNS_TOKEN|DDNS_ZONE_ID|DDNS_IPV4|DDNS_IPV6|DDNS_PROXIED|DDNS_INTERVAL|DDNS_IP_SOURCE|DDNS_INTERFACE|DDNS_DEVICE)=\"([^\"\$\`\\]*)\"$ ]]; then
             key="${BASH_REMATCH[1]}"
             val="${BASH_REMATCH[2]}"
             case "$key" in
@@ -334,6 +568,9 @@ parse_ddns_conf() {
                 DDNS_IPV6)     DDNS_IPV6="$val" ;;
                 DDNS_PROXIED)  DDNS_PROXIED="$val" ;;
                 DDNS_INTERVAL) DDNS_INTERVAL="$val" ;;
+                DDNS_IP_SOURCE) DDNS_IP_SOURCE="$val" ;;
+                DDNS_INTERFACE) DDNS_INTERFACE="$val" ;;
+                DDNS_DEVICE)   DDNS_DEVICE="$val" ;;
             esac
         else
             log_action "DDNS 解析跳过：格式异常行: $conf"
@@ -347,25 +584,32 @@ parse_ddns_conf() {
     DDNS_IPV4=${DDNS_IPV4:-false}
     DDNS_IPV6=${DDNS_IPV6:-false}
     DDNS_PROXIED=${DDNS_PROXIED:-false}
+    DDNS_IP_SOURCE=${DDNS_IP_SOURCE:-auto}
+    DDNS_INTERFACE=${DDNS_INTERFACE:-wan}
+    DDNS_DEVICE=${DDNS_DEVICE:-}
     [[ "$DDNS_IPV4" == "true" || "$DDNS_IPV4" == "false" ]] || DDNS_IPV4="false"
     [[ "$DDNS_IPV6" == "true" || "$DDNS_IPV6" == "false" ]] || DDNS_IPV6="false"
     [[ "$DDNS_PROXIED" == "true" || "$DDNS_PROXIED" == "false" ]] || DDNS_PROXIED="false"
+    [[ "$DDNS_IP_SOURCE" == "auto" || "$DDNS_IP_SOURCE" == "interface" || "$DDNS_IP_SOURCE" == "api" ]] || DDNS_IP_SOURCE="auto"
+    [[ "$DDNS_INTERFACE" =~ ^[A-Za-z0-9_.:-]+$ ]] || DDNS_INTERFACE="wan"
+    [[ -z "$DDNS_DEVICE" || "$DDNS_DEVICE" =~ ^[A-Za-z0-9_.:-]+$ ]] || DDNS_DEVICE=""
     return 0
 }
 
 ddns_list() {
     print_title "DDNS 配置列表"
     [[ ! -d "$DDNS_CONFIG_DIR" || -z "$(ls -A "$DDNS_CONFIG_DIR" 2>/dev/null)" ]] && { print_warn "暂无 DDNS 配置"; pause; return; }
-    printf "${C_CYAN}%-30s %-6s %-6s %-8s %s${C_RESET}\n" "域名" "IPv4" "IPv6" "代理" "间隔"
+    printf "${C_CYAN}%-30s %-6s %-6s %-8s %-8s %s${C_RESET}\n" "域名" "IPv4" "IPv6" "代理" "来源" "间隔"
     draw_line
     for conf in "$DDNS_CONFIG_DIR"/*.conf; do
         [[ -f "$conf" ]] || continue
         DDNS_DOMAIN="" DDNS_TOKEN="" DDNS_ZONE_ID="" DDNS_IPV4="" DDNS_IPV6="" DDNS_PROXIED="" DDNS_INTERVAL=""
         parse_ddns_conf "$conf" || continue
-        printf "%-30s %-6s %-6s %-8s %s\n" "$DDNS_DOMAIN" \
+        printf "%-30s %-6s %-6s %-8s %-8s %s\n" "$DDNS_DOMAIN" \
             "$([[ "$DDNS_IPV4" == "true" ]] && echo "✓" || echo "-")" \
             "$([[ "$DDNS_IPV6" == "true" ]] && echo "✓" || echo "-")" \
             "$([[ "$DDNS_PROXIED" == "true" ]] && echo "开启" || echo "关闭")" \
+            "${DDNS_IP_SOURCE:-auto}" \
             "${DDNS_INTERVAL}分钟"
     done
     local ip4=$(get_public_ipv4)
@@ -393,6 +637,7 @@ ddns_delete() {
         if [[ -z "$(ls -A "$DDNS_CONFIG_DIR" 2>/dev/null)" ]]; then
             cron_remove_job "ddns-update.sh"
             rm -f "$DDNS_UPDATE_SCRIPT"
+            [[ "$PLATFORM" == "openwrt" ]] && rm -f /etc/hotplug.d/iface/95-server-manage-ddns 2>/dev/null || true
         else
             ddns_rebuild_cron
         fi
@@ -403,7 +648,7 @@ ddns_delete() {
 ddns_force_update() {
     if [[ -x "$DDNS_UPDATE_SCRIPT" ]]; then
         print_info "正在更新..."
-        if "$DDNS_UPDATE_SCRIPT"; then
+        if DDNS_FORCE=1 "$DDNS_UPDATE_SCRIPT"; then
             print_success "更新完成"
         else
             local rc=$?

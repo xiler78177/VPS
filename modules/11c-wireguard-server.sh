@@ -149,6 +149,87 @@ _wg_openwrt_rollback_server_modify() {
     wg_regenerate_client_confs >/dev/null 2>&1 || true
 }
 
+wg_update_server_endpoint_metadata() {
+    wg_check_server || return 1
+    local new_ep="${1:-}" new_ddns="${2:-}" old_ep old_ddns snapshot
+    local clients_dir="/etc/wireguard/clients" clients_snapshot_dir="" clients_existed=false
+    if ! new_ep=$(wg_shared_normalize_endpoint_host "$new_ep"); then
+        print_error "公网端点无效，仅支持 IP 或域名"
+        return 1
+    fi
+    if [[ -n "$new_ddns" ]]; then
+        if ! new_ddns=$(wg_shared_normalize_endpoint_host "$new_ddns"); then
+            print_error "DDNS 域名无效"
+            return 1
+        fi
+    fi
+
+    old_ep=$(wg_db_get '.server.endpoint // empty')
+    old_ddns=$(wg_db_get '.server.ddns_domain // empty')
+    snapshot=$(cat "$WG_DB_FILE" 2>/dev/null) || {
+        print_error "读取 WireGuard 数据库失败"
+        return 1
+    }
+    clients_snapshot_dir=$(mktemp -d "${TMPDIR:-/tmp}/${SCRIPT_NAME}-wg-clients.XXXXXX") || {
+        print_error "创建客户端配置快照目录失败"
+        return 1
+    }
+    chmod 700 "$clients_snapshot_dir" 2>/dev/null || true
+    if [[ -d "$clients_dir" ]]; then
+        clients_existed=true
+        cp -p "$clients_dir"/* "$clients_snapshot_dir"/ 2>/dev/null || true
+    fi
+
+    if ! wg_db_set --arg e "$new_ep" \
+                  --arg d "${new_ddns:-}" \
+                  '.server.endpoint = $e | .server.ddns_domain = $d'; then
+        print_error "WireGuard 数据库写入失败"
+        rm -rf "$clients_snapshot_dir" 2>/dev/null || true
+        return 1
+    fi
+
+    if ! wg_regenerate_client_confs; then
+        print_error "重生成客户端配置失败，正在回滚 endpoint 元数据"
+        wg_write_private_file "$WG_DB_FILE" "$snapshot" >/dev/null 2>&1 || print_warn "回滚 WireGuard 数据库失败，请手动检查"
+        rm -rf "$clients_dir" 2>/dev/null || true
+        if [[ "$clients_existed" == "true" ]]; then
+            mkdir -p "$clients_dir" 2>/dev/null || true
+            cp -p "$clients_snapshot_dir"/* "$clients_dir"/ 2>/dev/null || true
+        fi
+        rm -rf "$clients_snapshot_dir" 2>/dev/null || true
+        return 1
+    fi
+    rm -rf "$clients_snapshot_dir" 2>/dev/null || true
+
+    log_action "WireGuard server endpoint metadata updated: ${old_ep:-none} -> ${new_ep} ddns=${new_ddns:-none}"
+    [[ "${old_ep:-}" != "$new_ep" ]] && print_success "服务端 endpoint 元数据已更新: ${old_ep:-无} -> ${new_ep}"
+    [[ "${old_ddns:-}" != "${new_ddns:-}" ]] && print_info "DDNS 元数据: ${old_ddns:-无} -> ${new_ddns:-无}"
+    print_info "已重生成 /etc/wireguard/clients/*.conf，未重载服务端 wg0/UCI。"
+    return 0
+}
+
+wg_modify_server_endpoint_only() {
+    wg_check_server || return 1
+    print_title "仅修改 WireGuard 服务端公网端点"
+    local cur_ep cur_ddns new_ep
+    cur_ep=$(wg_db_get '.server.endpoint')
+    cur_ddns=$(wg_db_get '.server.ddns_domain // empty')
+    echo -e "  当前端点: ${C_GREEN}${cur_ep}${C_RESET}"
+    [[ -n "$cur_ddns" && "$cur_ddns" != "null" ]] && echo -e "  当前 DDNS: ${C_CYAN}${cur_ddns}${C_RESET}"
+    read -e -r -p "新公网端点 [${cur_ep}]: " new_ep
+    new_ep=${new_ep:-$cur_ep}
+    if [[ "$new_ep" == "$cur_ep" ]]; then
+        print_info "未做任何更改"
+        pause; return 0
+    fi
+    local endpoint_ddns=""
+    validate_ip "$new_ep" || endpoint_ddns="$new_ep"
+    wg_update_server_endpoint_metadata "$new_ep" "$endpoint_ddns"
+    local rc=$?
+    pause
+    return "$rc"
+}
+
 _wg_openwrt_configure_server_uci() {
     local server_privkey="${1:-}" server_ip="${2:-}" wg_mask="${3:-}" wg_port="${4:-}" mtu="${5:-}"
     local snapshot_dir network_snapshot firewall_snapshot
@@ -589,7 +670,7 @@ wg_modify_server() {
     echo -e "  当前 DNS:   ${C_GREEN}${cur_dns}${C_RESET}"
     echo -e "  当前端点:   ${C_GREEN}${cur_ep}${C_RESET}"
     [[ -n "$cur_lan" && "$cur_lan" != "null" ]] && echo -e "  当前 LAN:   ${C_GREEN}${cur_lan}${C_RESET}"
-    local changed=false lan_changed=false port_changed=false port_firewall_changed=false
+    local changed=false lan_changed=false port_changed=false dns_changed=false endpoint_changed=false port_firewall_changed=false
 
     read -e -r -p "新监听端口 [${cur_port}]: " new_port
     new_port=${new_port:-$cur_port}
@@ -608,6 +689,7 @@ wg_modify_server() {
     new_dns=${new_dns:-$cur_dns}
     if [[ "$new_dns" != "$cur_dns" ]]; then
         changed=true
+        dns_changed=true
         print_info "DNS 将更改为 ${new_dns}"
     fi
 
@@ -619,6 +701,7 @@ wg_modify_server() {
             new_ep="$cur_ep"
         else
             changed=true
+            endpoint_changed=true
             print_info "端点将更改为 ${new_ep}"
         fi
     fi
@@ -639,6 +722,15 @@ wg_modify_server() {
     if [[ "$changed" != "true" ]]; then
         print_info "未做任何更改"
         pause; return 0
+    fi
+
+    if [[ "$endpoint_changed" == "true" && "$port_changed" != "true" && "$dns_changed" != "true" && "$lan_changed" != "true" ]]; then
+        local endpoint_ddns=""
+        validate_ip "$new_ep" || endpoint_ddns="$new_ep"
+        if wg_update_server_endpoint_metadata "$new_ep" "$endpoint_ddns"; then
+            pause; return 0
+        fi
+        pause; return 1
     fi
 
     if [[ "$port_changed" == "true" ]]; then
