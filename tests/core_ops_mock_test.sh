@@ -3428,6 +3428,7 @@ test_wg_clash_output_uses_private_random_dir() {
        && "$generated" != *"peer name with spaces"* \
        && "$perms_ok" -eq 1 ]] \
        && grep -qF 'peer-private-key' "$generated" \
+       && grep -qF 'allowed-ips:' "$generated" \
        && grep -qF 'WireGuard VPN 路由规则' "$generated" \
        && grep -qF 'nameserver-policy:' "$generated" \
        && grep -qF '+.example.net' "$generated" \

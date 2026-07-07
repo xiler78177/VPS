@@ -1844,6 +1844,10 @@ if echo "$wg_clash_body" | grep -q 'mktemp "\${output_dir}/.clash-config.yaml.po
 else
     fail "G7: Clash nameserver-policy 二次写回仍可能落公共临时文件"
 fi
+echo "$wg_clash_body" | grep -q 'allowed_ips_yaml' \
+    && echo "$wg_clash_body" | grep -q 'allowed-ips:' \
+    && pass "G7: Clash WireGuard 节点生成 allowed-ips" \
+    || fail "G7: Clash WireGuard 节点缺少 allowed-ips"
 
 echo ""
 echo "== review #24 审计报告 WireGuard 运行时回归 =="

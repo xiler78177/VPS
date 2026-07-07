@@ -13713,6 +13713,12 @@ _wg_generate_clash_config_impl() {
     # ── 构建 proxy 节点列表 ──
     local all_proxy_names=()
     local all_proxy_yaml=""
+    local allowed_ips_yaml=""
+    local cidr
+    for cidr in "${unique_cidrs[@]}"; do
+        allowed_ips_yaml+="      - ${cidr}
+"
+    done
 
     # 主机节点
     local primary_name="WG-$(_wg_clash_server_name "$mode")"
@@ -13724,7 +13730,8 @@ _wg_generate_clash_config_impl() {
     server: ${server_endpoint}
     port: ${server_port}
     ip: ${peer_ip}
-    private-key: \"${peer_privkey}\"
+    allowed-ips:
+${allowed_ips_yaml}    private-key: \"${peer_privkey}\"
     public-key: \"${server_pubkey}\"
     pre-shared-key: \"${peer_psk}\"
     reserved: [0, 0, 0]
