@@ -2,7 +2,7 @@
 menu_update() {
     print_title "依赖检查与修复"
     print_info "强制重新检查所有依赖包..."
-    local FULL_DEPS="curl wget jq unzip openssl ca-certificates ufw fail2ban ipset iproute2 net-tools procps"
+    local FULL_DEPS="curl wget jq unzip openssl ca-certificates ufw fail2ban ipset iptables iproute2 net-tools procps"
     local ufw_was_active=0
     local f2b_was_active=0
     if ufw_is_active; then
@@ -72,7 +72,7 @@ _deps_save_state() {
 }
 
 auto_deps() {
-    local FULL_DEPS="curl wget jq unzip openssl ca-certificates ufw fail2ban ipset iproute2 net-tools procps"
+    local FULL_DEPS="curl wget jq unzip openssl ca-certificates ufw fail2ban ipset iptables iproute2 net-tools procps"
     local state_file="/etc/server-manage/.deps-ok"
 
     # 快速路径: 状态文件存在时只做轻量级验证
@@ -526,7 +526,14 @@ opt_bbr() {
         pause; return
     fi
     if [[ " $available_cc " != *" bbr "* ]]; then
-        print_error "当前内核未暴露 bbr 拥塞控制算法。"
+        # Debian 13 等镜像默认不加载 tcp_bbr 模块，导致 available_cc 里没有 bbr。
+        # 统一走 _sysctl_ensure_bbr_module（modprobe + 持久化到 modules-load.d），再重读 available_cc。
+        _sysctl_ensure_bbr_module || true
+        available_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
+    fi
+    if [[ " $available_cc " != *" bbr "* ]]; then
+        print_error "当前内核未暴露 bbr 拥塞控制算法，且加载 tcp_bbr 模块失败。"
+        print_info "可能是内核未编译 BBR 支持（需内核 ≥ 4.9），请确认内核版本或更换内核。"
         pause; return 1
     fi
     if [[ "$current_cc" == "bbr" && "$current_qdisc" != "fq" ]]; then
@@ -861,8 +868,29 @@ _sysctl_verify_effective_params() {
     return "$failed"
 }
 
+# 确保 tcp_bbr 内核模块已加载并开机持久化。Debian 13/trixie 等镜像默认不预载该模块，
+# 导致 tcp_available_congestion_control 里没有 bbr、被误判为“内核不支持”。
+# 幂等：模块已在则直接返回 0。返回 0=bbr 现已可用；1=加载失败/内核无 BBR 支持。
+# 所有提示输出到 stderr —— 本函数会被 _sysctl_detect_cc_for_tuning 在 $(...) 命令替换中调用，
+# 任何 stdout 都会污染被捕获的算法名。
+_sysctl_ensure_bbr_module() {
+    local available
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    [[ " $available " == *" bbr "* ]] && return 0
+    command_exists modprobe || return 1
+    modprobe tcp_bbr 2>/dev/null || return 1
+    print_info "已加载 tcp_bbr 内核模块。" >&2
+    local bbr_modconf="/etc/modules-load.d/${SCRIPT_NAME}-bbr.conf"
+    write_file_atomic "$bbr_modconf" "# ${SCRIPT_NAME}: 开机自动加载 BBR 拥塞控制模块
+tcp_bbr" || print_warn "tcp_bbr 已加载，但持久化 ${bbr_modconf} 失败；重启后可能需重新加载。" >&2
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    [[ " $available " == *" bbr "* ]]
+}
+
 _sysctl_detect_cc_for_tuning() {
     local available
+    # 先确保 bbr 模块已加载（Debian 13 默认不预载），避免角色调优静默不写 bbr/fq。
+    _sysctl_ensure_bbr_module >/dev/null 2>&1 || true
     available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
     if [[ " $available " == *" bbr3 "* ]]; then
         printf '%s' "bbr3"

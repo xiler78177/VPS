@@ -31,6 +31,8 @@
 ### Changed
 - **证书自动续签改为单条共享 `certbot renew`（官方推荐，消除多域名撞锁）**：原先每个域名（Web 加域名 / 家宽暴露 / Reality CDN）各挂一条 `certbot renew --cert-name '<域名>' --deploy-hook '<hook>'` cron，全部落在凌晨 3 点仅按分钟散列——`certbot renew` 有全局锁，多域名撞同分钟会锁等待/失败。改为签发后经新增的 `_cert_persist_renew_hook` 把 deploy hook 持久化进各证书的 `renewal/<域名>.conf` 的 `[renewalparams] renew_hook`，再由单条幂等的共享 cron（`CertRenewShared`，每日 3:17）`certbot renew --quiet` 覆盖所有证书、各证书跑各自 hook。删除单个域名不影响其余域名续期；旧的 per-domain `CertRenew_<域名>` cron 仍在域名清理路径中做向后兼容删除。
 - **移除失效的 `ssl_trusted_certificate` 指令**：Web 反代/建站/家宽暴露的 nginx 模板均设了 `ssl_trusted_certificate <fullchain>` 却未开 `ssl_stapling`，该指令实际不生效且 stapling 本应使用不含叶子证书的链文件。删除该冗余行（7 处）。
+- **[Debian 13] BBR 与角色调优在未预载 `tcp_bbr` 的镜像上不再静默失效**：Debian 13/trixie 等镜像默认不加载 `tcp_bbr`，`net.ipv4.tcp_available_congestion_control` 里没有 bbr。原 `opt_bbr` 会直接报「内核不支持」退出；「角色/内核参数调优」菜单走的孪生路径 `_sysctl_detect_cc_for_tuning` 更隐蔽——探测不到 bbr 时静默不写 `default_qdisc=fq`/`tcp_congestion_control`，用户以为做了代理优化实际仍是 cubic 且无任何告警。修复：抽出公共 helper `_sysctl_ensure_bbr_module`（`modprobe tcp_bbr` + 持久化到 `/etc/modules-load.d/${SCRIPT_NAME}-bbr.conf` 保证重启后自动加载 + 重读 available），`opt_bbr` 与 `_sysctl_detect_cc_for_tuning` 两处统一复用（后者在命令替换子壳内调用，提示全走 stderr 不污染返回值），彻底消除两条路径分叉。仅在内核确实未编译 BBR 支持时才报错。
+- **[Debian 13] `iptables` 补入 `FULL_DEPS`**：GeoIP 白/黑名单直接调用 `iptables` 命令，但依赖列表原仅靠 `ufw` 间接带入 iptables；未装 ufw 就直接配 GeoIP 的边界场景会因 iptables 缺席报错。修复：将 `iptables` 显式加入 `FULL_DEPS`，由 `auto_deps` 启动时安装。
 
 ## [v14.5] — 2026-06-24
 
