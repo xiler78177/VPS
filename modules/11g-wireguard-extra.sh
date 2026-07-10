@@ -330,7 +330,7 @@ wg_import_peers() {
             skipped=$((skipped + 1)); i=$((i + 1)); continue
         fi
         case "$peer_type" in
-            standard|gateway) ;;
+            standard|gateway|clash) ;;
             *) print_warn "跳过: $name (设备类型无效: $peer_type)"; skipped=$((skipped + 1)); i=$((i + 1)); continue ;;
         esac
         case "$route_mode" in
