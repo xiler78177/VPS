@@ -65,6 +65,7 @@ ufw_del() {
     echo -e "${C_YELLOW}多个用空格分隔，不指定协议则同时删除 tcp 和 udp${C_RESET}"
     read -e -r -p "要删除的规则: " rules
     [[ -z "$rules" ]] && return
+    refresh_ssh_port
     for rule in $rules; do
         if [[ "$rule" =~ ^([0-9]+)(/tcp|/udp)?$ ]]; then
             local port="${BASH_REMATCH[1]}"
@@ -72,6 +73,11 @@ ufw_del() {
             if ! validate_port "$port"; then
                 print_error "端口无效: $port"
                 continue
+            fi
+            # 防误锁：删除当前 SSH 端口的放行规则前强制二次确认
+            if [[ " $CURRENT_SSH_PORTS " == *" $port "* ]]; then
+                print_warn "端口 ${port} 是当前 SSH 端口！删除其放行规则可能导致断开后无法重连。"
+                confirm "确认仍要删除 ${port} 的放行规则?" || { print_info "已跳过 ${port}"; continue; }
             fi
             if [[ -n "$proto" ]]; then
                 ufw delete allow "${port}${proto}" 2>/dev/null && print_success "已删除: ${port}${proto}" || print_warn "${port}${proto} 不存在"
