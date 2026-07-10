@@ -440,15 +440,17 @@ _ssh_login_policy_allows() {
     [[ -n "$sshd_out" ]] || return 0
 
     local deny_users="" allow_users="" deny_groups="" allow_groups="" permitroot=""
-    # sshd -T 输出的 directive 名统一为小写
+    # sshd -T 对多值 AllowUsers/DenyUsers/AllowGroups/DenyGroups 是「每个值输出一行」
+    # （如 `allowusers alice` / `allowusers bob` 各一行），因此必须累加而非覆盖，
+    # 否则只保留最后一个 token，会漏判 Deny 列表里的用户（可能导致误锁）。
     while IFS= read -r line; do
         key="${line%% *}"; key="${key,,}"
         val="${line#* }"
         case "$key" in
-            denyusers)       deny_users="$val" ;;
-            allowusers)      allow_users="$val" ;;
-            denygroups)      deny_groups="$val" ;;
-            allowgroups)     allow_groups="$val" ;;
+            denyusers)       deny_users+=" $val" ;;
+            allowusers)      allow_users+=" $val" ;;
+            denygroups)      deny_groups+=" $val" ;;
+            allowgroups)     allow_groups+=" $val" ;;
             permitrootlogin) permitroot="${val,,}" ;;
         esac
     done <<< "$sshd_out"
