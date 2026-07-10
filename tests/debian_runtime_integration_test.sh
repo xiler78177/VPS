@@ -1136,7 +1136,7 @@ if (
    && grep -Fxq 'apt-get|install -y fail2ban' "$menu_update_log" \
    && grep -Fxq 'ufw|--force enable' "$menu_update_log" \
    && grep -Fxq 'systemctl|disable --now fail2ban' "$menu_update_log" \
-   && grep -Fq 'deps-save|curl wget jq unzip openssl ca-certificates ufw fail2ban ipset iproute2 net-tools procps' "$menu_update_log" \
+   && grep -Fq 'deps-save|curl wget jq unzip openssl ca-certificates ufw fail2ban ipset iptables iproute2 net-tools procps' "$menu_update_log" \
    && grep -Fxq 'log-action|Dependencies checked/repaired manually' "$menu_update_log"; then
     pass "menu_update 在实体机 mock 下执行依赖检查、状态记录和 fail2ban 新装停用分支"
 else
