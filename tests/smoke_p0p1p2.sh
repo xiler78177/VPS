@@ -71,12 +71,6 @@ if grep -qE '^[[:space:]]*source[[:space:]]+"\$conf"' "$BUILT"; then
 else
     pass "DDNS 管理端不再 source 配置文件"
 fi
-# geoip 模板里应不再有 'source "$CONF"'（注意大写 CONF 是 geoip 独有变量名）
-if grep -qE '^[[:space:]]*source[[:space:]]+"\$CONF"' "$BUILT"; then
-    fail "GeoIP 仍有裸 source"
-else
-    pass "GeoIP cron 模板已移除裸 source"
-fi
 
 echo ""
 echo "== P1-5: origin.*.conf 通配已收窄 =="
@@ -887,30 +881,6 @@ grep -q '_sshd_effective_value "permitrootlogin"' "$BUILT" \
     && pass "H4: 禁用 root 后复验 PermitRootLogin" \
     || fail "H4: 禁用 root 后未复验 PermitRootLogin"
 
-# H3: GeoIP 自动更新必须 fail-closed，下载到临时文件且校验非空，避免白名单集合被 cron 清空。
-geoip_download_body=$(awk '/^_geoip_download\(\)/,/^}/' "$BUILT")
-echo "$geoip_download_body" | grep -q 'curl -fsSL' \
-    && pass "H3: GeoIP 交互下载使用 curl -f" \
-    || fail "H3: GeoIP 交互下载未使用 curl -f"
-echo "$geoip_download_body" | grep -q 'mktemp' \
-    && pass "H3: GeoIP 交互下载使用临时文件" \
-    || fail "H3: GeoIP 交互下载未使用临时文件"
-echo "$geoip_download_body" | grep -q '\[\[ \$fail -eq 0 \]\]' \
-    && pass "H3: GeoIP 任一国家失败即拒绝应用" \
-    || fail "H3: GeoIP 仍允许部分国家失败后继续"
-geoip_apply_body=$(awk '/^_geoip_apply\(\)/,/^}/' "$BUILT")
-echo "$geoip_apply_body" | grep -q 'total_entries' \
-    && pass "H3: GeoIP apply 统计有效条目" \
-    || fail "H3: GeoIP apply 未统计有效条目"
-echo "$geoip_apply_body" | grep -q 'return 1' \
-    && pass "H3: GeoIP apply 可拒绝空集合/失败 swap" \
-    || fail "H3: GeoIP apply 失败路径缺失"
-grep -q 'curl -fsSL --connect-timeout 10 --max-time 30' "$BUILT" \
-    && pass "H3: GeoIP cron 下载使用 curl -f/超时" \
-    || fail "H3: GeoIP cron 下载仍不安全"
-grep -q '/usr/local/bin/geoip-apply.sh || exit 1' "$BUILT" \
-    && pass "H3: GeoIP cron apply 失败会中止" \
-    || fail "H3: GeoIP cron 未检查 apply 结果"
 
 # H5/P1: Cloudflare GET 失败必须与“不存在”区分，Origin Rules 不允许读取失败后全量 PUT 空数组。
 cf_get_origin_body=$(awk '/^_cf_get_origin_ruleset\(\)/,/^}/' "$BUILT")
@@ -1375,34 +1345,6 @@ grep -q '^_sysctl_verify_effective_params()' "$BUILT" \
     || fail "S10: BBR 应用后缺少读回复验"
 
 echo ""
-echo "== review #19 审计报告 GeoIP IPv6 回归 =="
-# S4: GeoIP 国家规则必须覆盖 IPv6，避免 IPv6 绕过白/黑名单。
-geoip_download_body=$(awk '/^_geoip_download\(\)/,/^}/' "$BUILT")
-geoip_apply_body=$(awk '/^_geoip_apply\(\)/,/^}/' "$BUILT")
-geoip_clear_body=$(awk '/^_geoip_clear\(\)/,/^}/' "$BUILT")
-geoip_persist_body=$(awk '/^_geoip_install_persistence\(\)/,/^}/' "$BUILT")
-grep -q '^readonly GEOIP6_URL=' "$BUILT" \
-    && pass "S4: GeoIP IPv6 数据源常量已定义" \
-    || fail "S4: 缺少 GeoIP IPv6 数据源常量"
-echo "$geoip_download_body" | grep -q 'GEOIP6_URL' \
-    && echo "$geoip_download_body" | grep -q '\.zone6' \
-    && pass "S4: GeoIP 下载 IPv6 zone6 数据" \
-    || fail "S4: GeoIP 下载未覆盖 IPv6 zone6 数据"
-echo "$geoip_apply_body" | grep -q 'family inet6' \
-    && pass "S4: GeoIP IPv6 ipset 使用 family inet6" \
-    || fail "S4: GeoIP IPv6 ipset 未使用 family inet6"
-echo "$geoip_apply_body" | grep -q 'ip6tables' \
-    && echo "$geoip_apply_body" | grep -q 'GEOIP6_CHAIN' \
-    && pass "S4: GeoIP 应用 ip6tables IPv6 链" \
-    || fail "S4: GeoIP 应用未配置 ip6tables IPv6 链"
-echo "$geoip_clear_body" | grep -q 'GEOIP6_CHAIN' \
-    && echo "$geoip_clear_body" | grep -q 'geoip_whitelist6' \
-    && pass "S4: GeoIP 清理 IPv6 链和集合" \
-    || fail "S4: GeoIP 清理未覆盖 IPv6 链和集合"
-echo "$geoip_persist_body" | grep -q 'ip6tables' \
-    && echo "$geoip_persist_body" | grep -q 'family inet6' \
-    && pass "S4: GeoIP 持久化 apply 脚本覆盖 IPv6" \
-    || fail "S4: GeoIP 持久化 apply 脚本未覆盖 IPv6"
 
 echo ""
 echo "== review #20 审计报告 Web 安全回归 =="
@@ -1934,39 +1876,6 @@ fi
 
 echo ""
 echo "== review #25 第二轮审计 fix_broken 回归 =="
-# N1: geoip-update.sh 写回 GEOIP_LAST_UPDATE 时必须保留 KEY=\"value\" 格式，
-# 且不能原地 sed 修改配置，避免中断/异常时留下半写状态。
-geoip_update_body=$(awk '/^geoip_update\(\)/,/^geoip_disable\(\)/' "$BUILT")
-geoip_persistence_body=$(awk '/^_geoip_install_persistence\(\)/,/^geoip_setup\(\)/' "$BUILT")
-geoip_setup_body=$(awk '/^geoip_setup\(\)/,/^geoip_status\(\)/' "$BUILT")
-if grep -q '^_geoip_update_last_update()' "$BUILT" \
-   && grep -q '^_geoip_render_conf_last_update()' "$BUILT" \
-   && grep -q 'write_private_file_atomic "\$conf_file" "\$content"' "$BUILT" \
-   && ! echo "$geoip_update_body" | grep -q 'sed -i.*GEOIP_LAST_UPDATE' \
-   && ! echo "$geoip_persistence_body" | grep -q 'sed -i.*GEOIP_LAST_UPDATE'; then
-    pass "N1: GeoIP update 通过原子写入维护 LAST_UPDATE 双引号"
-else
-    fail "N1: GeoIP update 仍可能原地改写 LAST_UPDATE 或破坏 KEY=\"value\" 格式"
-fi
-if echo "$geoip_persistence_body" | grep -q 'cat > /etc/systemd/system/geoip-firewall.service' \
-   || echo "$geoip_persistence_body" | grep -q 'cat > /usr/local/bin/geoip'; then
-    fail "N1: GeoIP 持久化脚本/unit 仍直接重定向到系统路径"
-else
-    pass "N1: GeoIP 持久化脚本/unit 不再直接重定向到系统路径"
-fi
-if echo "$geoip_persistence_body" | grep -q 'systemctl daemon-reload || return 1' \
-   && echo "$geoip_persistence_body" | grep -q 'systemctl enable geoip-firewall >/dev/null 2>&1 || return 1'; then
-    pass "N1: GeoIP 持久化检查 systemd reload/enable 失败"
-else
-    fail "N1: GeoIP 持久化仍可能忽略 systemd reload/enable 失败"
-fi
-if echo "$geoip_setup_body" | grep -q 'persistence_ok=1' \
-   && echo "$geoip_setup_body" | grep -q '自动更新: 未安装成功' \
-   && echo "$geoip_setup_body" | grep -q 'return 1'; then
-    pass "N1: GeoIP 持久化失败时不再提示完整成功"
-else
-    fail "N1: GeoIP 持久化失败仍可能提示完整成功"
-fi
 
 # N2: DDNS 新建配置必须真实写出双引号，匹配 cron parse_ddns_conf 白名单格式。
 ddns_tmp=$(mktemp -d)
@@ -2702,7 +2611,6 @@ menu_update_body=$(awk '/^menu_update\(\)/,/^}/' "$BUILT")
 ufw_setup_body=$(awk '/^ufw_setup\(\)/,/^}/' "$BUILT")
 ufw_reset_body=$(awk '/^ufw_safe_reset\(\)/,/^}/' "$BUILT")
 ufw_apply_ssh_body=$(awk '/^_ufw_apply_default_ssh_rules\(\)/,/^}/' "$BUILT")
-geoip_update_body=$(awk '/^geoip_update\(\)/,/^}/' "$BUILT")
 wg_rebuild_conf_body=$(awk '/^wg_rebuild_conf\(\)/,/^}/' "$BUILT")
 wg_deb_rebuild_conf_body=$(awk '/^wg_deb_rebuild_conf\(\)/,/^}/' "$BUILT")
 wg_deb_apply_conf_body=$(awk '/^wg_deb_apply_conf\(\)/,/^}/' "$BUILT")
@@ -2713,10 +2621,6 @@ sysinfo_body=$(awk '/^show_dual_column_sysinfo\(\)/,/^}/' "$BUILT")
 net_iperf_body=$(awk '/^net_iperf3\(\)/,/^}/' "$BUILT")
 net_dns_body=$(awk '/^net_dns\(\)/,/^}/' "$BUILT")
 
-# S5: geoip_update 必须检查 _geoip_apply 返回值，否则下载成功但规则加载失败仍会误报完成。
-echo "$geoip_update_body" | grep -q 'if ! _geoip_apply "\$GEOIP_MODE" "\$GEOIP_COUNTRIES"' \
-    && pass "S5: geoip_update 检查 _geoip_apply 返回值" \
-    || fail "S5: geoip_update 未检查 _geoip_apply 返回值"
 
 # S6: 手动依赖修复也要记录本次是否新装 fail2ban，避免引用未赋值变量且无法停掉默认 jail。
 echo "$menu_update_body" | grep -q 'local f2b_newly_installed=0' \
@@ -2986,7 +2890,6 @@ ufw_del_body=$(awk '/^ufw_del\(\)/,/^}/' "$BUILT")
 ssh_keys_body=$(awk '/^ssh_keys\(\)/,/^}/' "$BUILT")
 wg_rc_helper_body=$(awk '/^_wg_rc_local_insert_block\(\)/,/^}/' "$BUILT")
 wg_openwrt_deploy_body=$(awk '/^_wg_show_openwrt_deploy\(\)/,/^wg_setup_watchdog\(\)/' "$BUILT")
-geoip_update_template_body=$(awk '/cat > \/usr\/local\/bin\/geoip-update\.sh/,/UPDATE_EOF/' "$BUILT")
 sshd_directive_body=$(awk '/^_sshd_set_directive\(\)/,/^}/' "$BUILT")
 reality_apply_body=$(awk '/^reality_apply_singbox_config\(\)/,/^reality_load_state\(\)/' "$BUILT")
 ddns_setup_body=$(awk '/^ddns_setup\(\)/,/^ddns_setup_noninteractive\(\)/' "$BUILT")
@@ -3218,10 +3121,6 @@ grep -q '^wg_shared_format_endpoint()' "$BUILT" \
     && pass "WG: 客户端配置使用共享 endpoint formatter" \
     || fail "WG: 客户端配置仍可能生成裸 IPv6 Endpoint"
 
-# GeoIP cron IPv4 失败路径必须同时清理 tmp6。
-grep -q 'rm -f "\$tmp" "\$tmp6"' "$BUILT" \
-    && pass "GeoIP: cron IPv4 失败路径清理 tmp6" \
-    || fail "GeoIP: cron IPv4 失败路径仍泄漏 tmp6"
 
 # 新增临时文件也要接入统一中断清理。
 echo "$sshd_directive_body" | grep -q '.tmp.server-manage.sshd-directive' \

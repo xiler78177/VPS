@@ -27,12 +27,18 @@
 - **[P2] realm 多线路渲染未校验中转目标 host/port**：`reality_render_realm_config_multi` 仅校验监听端口与非空，未校验导入线路的 `RLY_TARGET_HOST/PORT` 格式，畸形值会渲染出坏 TOML。修复：补 `validate_host`/`validate_port` 校验，畸形线路跳过。
 - **[P2] 安装时服务端 LAN 子网未做格式校验**：`11c`/`12c` 安装流程的 `server_lan_subnet`（自动推算或手动输入）未经 `validate_cidr_list` 就写入 DB（修改时却校验了），畸形 CIDR 会流入客户端 `AllowedIPs`、bypass nft 规则与持久化块导致 wg0 起不来。修复：安装分支对非空 `server_lan_subnet` 补校验循环，畸形要求重输、留空跳过。
 - **[P2] 手动续签日志路径与查看器不一致**：Nginx 反代菜单手动续签写 `/var/log/certbot-renew.log`，而日志查看器与续签 hook 读/写的是 `/var/log/cert-renew.log`，导致手动续签输出永远看不到。修复：统一为 `cert-renew.log`。
+- **[高] 禁用密码登录防误锁检查漏解析多值 `sshd -T` 指令**：`_ssh_login_policy_allows` 用覆盖赋值解析 `AllowUsers/DenyUsers/AllowGroups/DenyGroups`，但 `sshd -T` 对多值指令是「每值一行」输出，覆盖只保留最后一个 token——会漏判 Deny 列表里非末位的用户；若被漏判者是唯一密钥持有者，禁用密码登录时会误判其可登录而放行，反而制造锁死。修复：改为 `+=` 累加解析。
+- **[P1] WireGuard 导入丢失 clash 类型设备（迁移数据丢失）**：`wg_add_peer` 默认 `peer_type=clash`（多数设备），导出侧原样带出，但导入白名单（`11g`/`12e`）只认 `standard|gateway`，clash 被静默跳过——导出→新机导入会丢失全部 clash 设备，配合覆盖导入模式可致现有 clash 设备全丢。修复：两平台导入白名单补入 `clash`。
+- **[P2] `ufw_del` 可无警告删除当前 SSH 端口放行规则**：UFW default deny 下删掉 SSH 放行规则、当前会话断开后即锁死。修复：删除前 `refresh_ssh_port` 取当前 SSH 端口集，命中时强警告 + 二次确认，取消则跳过该端口。
 
 ### Changed
 - **证书自动续签改为单条共享 `certbot renew`（官方推荐，消除多域名撞锁）**：原先每个域名（Web 加域名 / 家宽暴露 / Reality CDN）各挂一条 `certbot renew --cert-name '<域名>' --deploy-hook '<hook>'` cron，全部落在凌晨 3 点仅按分钟散列——`certbot renew` 有全局锁，多域名撞同分钟会锁等待/失败。改为签发后经新增的 `_cert_persist_renew_hook` 把 deploy hook 持久化进各证书的 `renewal/<域名>.conf` 的 `[renewalparams] renew_hook`，再由单条幂等的共享 cron（`CertRenewShared`，每日 3:17）`certbot renew --quiet` 覆盖所有证书、各证书跑各自 hook。删除单个域名不影响其余域名续期；旧的 per-domain `CertRenew_<域名>` cron 仍在域名清理路径中做向后兼容删除。
 - **移除失效的 `ssl_trusted_certificate` 指令**：Web 反代/建站/家宽暴露的 nginx 模板均设了 `ssl_trusted_certificate <fullchain>` 却未开 `ssl_stapling`，该指令实际不生效且 stapling 本应使用不含叶子证书的链文件。删除该冗余行（7 处）。
 - **[Debian 13] BBR 与角色调优在未预载 `tcp_bbr` 的镜像上不再静默失效**：Debian 13/trixie 等镜像默认不加载 `tcp_bbr`，`net.ipv4.tcp_available_congestion_control` 里没有 bbr。原 `opt_bbr` 会直接报「内核不支持」退出；「角色/内核参数调优」菜单走的孪生路径 `_sysctl_detect_cc_for_tuning` 更隐蔽——探测不到 bbr 时静默不写 `default_qdisc=fq`/`tcp_congestion_control`，用户以为做了代理优化实际仍是 cubic 且无任何告警。修复：抽出公共 helper `_sysctl_ensure_bbr_module`（`modprobe tcp_bbr` + 持久化到 `/etc/modules-load.d/${SCRIPT_NAME}-bbr.conf` 保证重启后自动加载 + 重读 available），`opt_bbr` 与 `_sysctl_detect_cc_for_tuning` 两处统一复用（后者在命令替换子壳内调用，提示全走 stderr 不污染返回值），彻底消除两条路径分叉。仅在内核确实未编译 BBR 支持时才报错。
-- **[Debian 13] `iptables` 补入 `FULL_DEPS`**：GeoIP 白/黑名单直接调用 `iptables` 命令，但依赖列表原仅靠 `ufw` 间接带入 iptables；未装 ufw 就直接配 GeoIP 的边界场景会因 iptables 缺席报错。修复：将 `iptables` 显式加入 `FULL_DEPS`，由 `auto_deps` 启动时安装。
+- **[Debian 13] `iptables` 补入 `FULL_DEPS`**：多处防火墙功能（fail2ban 后端、业务模块放行）直接或间接调用 `iptables`，原依赖列表仅靠 `ufw` 间接带入；显式加入 `FULL_DEPS` 由 `auto_deps` 启动时安装，避免未装 ufw 的边界场景缺席报错。
+
+### Removed
+- **移除 GeoIP 国家级 IP 白/黑名单功能**：经评估该功能收益低、风险高——按国家封 IP 对个人 VPS 防护价值有限（攻击者用境内跳板/住宅代理即可绕过，无差别扫描噪音已由 Fail2ban + 改 SSH 端口压制），却带来显著风险：白名单模式选错国家即锁死；依赖第三方数据源（ipdeny.com）+ 每周 cron 下载 + ipset/iptables-nft 兼容层，多个故障点且增加 Debian 13 迁移验证负担；`iptables-save` 固化 GeoIP 链后 ipset 销毁可能导致重启 restore 失败。删除 `04-firewall.sh` 内全部 `geoip_*`/`_geoip_*` 函数、GEOIP 常量、boot service、weekly cron、UFW 菜单项「8. GeoIP」及对应测试（smoke_p0p1p2 / debian_runtime / core_ops_mock 中的 GeoIP 断言）。fail2ban 与其它防火墙功能不受影响（ipset 在本项目原本仅 GeoIP 使用，fail2ban 的 ipset 由其自身 banaction 管理）。
 
 ## [v14.5] — 2026-06-24
 

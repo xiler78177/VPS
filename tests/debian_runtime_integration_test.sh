@@ -1065,7 +1065,6 @@ MENU_ROUTE_HARNESS
 	        printf '0\n' | reality_menu
 	    ) > "$secondary_menu_out" 2> "$secondary_menu_err"; then
 	        if grep -qF 'UFW 防火墙管理' "$secondary_menu_out" \
-	           && grep -qF 'GeoIP 国家级 IP 白/黑名单' "$secondary_menu_out" \
 	           && grep -qF 'Fail2ban 入侵防御' "$secondary_menu_out" \
 	           && grep -qF 'SSH 安全管理' "$secondary_menu_out" \
 	           && grep -qF '系统优化' "$secondary_menu_out" \
@@ -1458,10 +1457,6 @@ gai_ipv4="$tmp_root/gai-ipv4.conf"
 gai_ipv6="$tmp_root/gai-ipv6.conf"
 hosts_base="$tmp_root/hosts-base"
 hosts_candidate="$tmp_root/hosts-candidate"
-geoip_base="$tmp_root/geoip.conf"
-geoip_candidate="$tmp_root/geoip-updated.conf"
-geoip_unit="$tmp_root/geoip-firewall.service"
-geoip_apply="$tmp_root/geoip-apply.sh"
 nginx_keyring="$tmp_root/nginx/keyrings/nginx.gpg"
 nginx_source="$tmp_root/nginx/sources/nginx.list"
 nginx_pin="$tmp_root/nginx/preferences/99nginx"
@@ -1637,168 +1632,6 @@ if _hostname_render_hosts_conf "$hosts_base" oldbox newbox > "$hosts_candidate" 
 else
     fail "hosts 主机名候选渲染异常"
     sed 's/^/    /' "$hosts_candidate" 2>/dev/null || true
-fi
-cat > "$geoip_base" <<'EOF'
-# runtime geoip base
-GEOIP_MODE="blacklist"
-GEOIP_COUNTRIES="CN US"
-GEOIP_LAST_UPDATE="2026-07-02"
-GEOIP_LAST_UPDATE="2026-07-01"
-EOF
-if _geoip_render_conf_last_update "$geoip_base" "2026-07-03" > "$geoip_candidate" \
-   && grep -qF '# runtime geoip base' "$geoip_candidate" \
-   && grep -Fxq 'GEOIP_MODE="blacklist"' "$geoip_candidate" \
-   && grep -Fxq 'GEOIP_COUNTRIES="CN US"' "$geoip_candidate" \
-   && [[ "$(grep -c '^GEOIP_LAST_UPDATE=' "$geoip_candidate")" == "1" ]] \
-   && grep -Fxq 'GEOIP_LAST_UPDATE="2026-07-03"' "$geoip_candidate"; then
-    pass "GeoIP LAST_UPDATE 候选渲染保留双引号并去重"
-else
-    fail "GeoIP LAST_UPDATE 候选渲染异常"
-    sed 's/^/    /' "$geoip_candidate" 2>/dev/null || true
-fi
-printf '#!/bin/sh\nexit 0\n' > "$geoip_apply"
-chmod 700 "$geoip_apply"
-if _geoip_render_service_unit "$geoip_apply" > "$geoip_unit" \
-   && grep -q '^ExecStart='"$geoip_apply"'$' "$geoip_unit"; then
-    if command_exists systemd-analyze; then
-        if systemd-analyze verify "$geoip_unit" >/dev/null 2>&1; then
-            pass "systemd 接受 GeoIP firewall unit 候选"
-        else
-            fail "systemd 拒绝 GeoIP firewall unit 候选"
-            systemd-analyze verify "$geoip_unit" 2>&1 | sed 's/^/    /' || true
-        fi
-    else
-        pass "GeoIP firewall unit 候选包含正确 ExecStart"
-    fi
-else
-    fail "GeoIP firewall unit 候选渲染异常"
-    sed 's/^/    /' "$geoip_unit" 2>/dev/null || true
-fi
-if [[ "$(id -u)" -eq 0 ]]; then
-    geoip_apply_runtime_dir="$tmp_root/geoip-apply-runtime"
-    geoip_apply_generated="$geoip_apply_runtime_dir/geoip-apply.generated.sh"
-    geoip_update_generated="$geoip_apply_runtime_dir/geoip-update.generated.sh"
-    geoip_service_generated="$geoip_apply_runtime_dir/geoip-firewall.service"
-    geoip_apply_conf_dir="$geoip_apply_runtime_dir/etc-server-manage"
-    geoip_apply_conf="$geoip_apply_conf_dir/geoip.conf"
-    geoip_apply_data="$geoip_apply_conf_dir/geoip-data"
-    geoip_apply_bin="$geoip_apply_runtime_dir/bin"
-    geoip_ipset_log="$geoip_apply_runtime_dir/ipset.log"
-    geoip_restore_log="$geoip_apply_runtime_dir/ipset-restore.log"
-    geoip_iptables_log="$geoip_apply_runtime_dir/iptables.log"
-    geoip_ip6tables_log="$geoip_apply_runtime_dir/ip6tables.log"
-    geoip_apply_run_out="$geoip_apply_runtime_dir/apply.out"
-    mkdir -p "$geoip_apply_conf_dir" "$geoip_apply_data" "$geoip_apply_bin"
-    if (
-        is_systemd() { return 1; }
-        cron_add_job() { return 0; }
-        GEOIP_APPLY_SCRIPT="$geoip_apply_generated" \
-        GEOIP_UPDATE_SCRIPT="$geoip_update_generated" \
-        GEOIP_SERVICE_FILE="$geoip_service_generated" \
-            _geoip_install_persistence
-    ) && sed -i \
-        -e "s|^CONF=.*|CONF=\"$geoip_apply_conf\"|" \
-        -e "s|^DATA=.*|DATA=\"$geoip_apply_data\"|" \
-        "$geoip_apply_generated"; then
-        cat > "$geoip_apply_conf" <<'EOF_GEOIP_RUNTIME_CONF'
-GEOIP_MODE="blacklist"
-GEOIP_COUNTRIES="CN"
-GEOIP_LAST_UPDATE="2026-07-03"
-EOF_GEOIP_RUNTIME_CONF
-        chmod 600 "$geoip_apply_conf"
-        chown root:root "$geoip_apply_conf" 2>/dev/null || true
-        cat > "$geoip_apply_data/cn.zone" <<'EOF_GEOIP_RUNTIME_ZONE4'
-1.2.3.0/24
-# comment
-not-a-cidr
-EOF_GEOIP_RUNTIME_ZONE4
-        cat > "$geoip_apply_data/cn.zone6" <<'EOF_GEOIP_RUNTIME_ZONE6'
-2001:db8::/32
-# comment
-EOF_GEOIP_RUNTIME_ZONE6
-        cat > "$geoip_apply_bin/ipset" <<'EOF_GEOIP_RUNTIME_IPSET'
-#!/usr/bin/env bash
-printf 'ipset|%s\n' "$*" >> "$GEOIP_IPSET_LOG"
-if [[ "${1:-}" == "restore" ]]; then
-    cat >> "$GEOIP_IPSET_RESTORE_LOG"
-fi
-exit 0
-EOF_GEOIP_RUNTIME_IPSET
-        cat > "$geoip_apply_bin/iptables" <<'EOF_GEOIP_RUNTIME_IPTABLES'
-#!/usr/bin/env bash
-printf 'iptables|%s\n' "$*" >> "$GEOIP_IPTABLES_LOG"
-if [[ "${1:-}" == "-C" && "${2:-}" == "INPUT" && "${3:-}" == "-j" && "${4:-}" == "GEOIP_FILTER" ]]; then
-    exit 1
-fi
-exit 0
-EOF_GEOIP_RUNTIME_IPTABLES
-        cat > "$geoip_apply_bin/ip6tables" <<'EOF_GEOIP_RUNTIME_IP6TABLES'
-#!/usr/bin/env bash
-printf 'ip6tables|%s\n' "$*" >> "$GEOIP_IP6TABLES_LOG"
-if [[ "${1:-}" == "-C" && "${2:-}" == "INPUT" && "${3:-}" == "-j" && "${4:-}" == "GEOIP6_FILTER" ]]; then
-    exit 1
-fi
-exit 0
-EOF_GEOIP_RUNTIME_IP6TABLES
-        chmod +x "$geoip_apply_bin/ipset" "$geoip_apply_bin/iptables" "$geoip_apply_bin/ip6tables"
-        : > "$geoip_ipset_log"
-        : > "$geoip_restore_log"
-        : > "$geoip_iptables_log"
-        : > "$geoip_ip6tables_log"
-        if GEOIP_IPSET_LOG="$geoip_ipset_log" \
-           GEOIP_IPSET_RESTORE_LOG="$geoip_restore_log" \
-           GEOIP_IPTABLES_LOG="$geoip_iptables_log" \
-           GEOIP_IP6TABLES_LOG="$geoip_ip6tables_log" \
-           PATH="$geoip_apply_bin:$PATH" \
-              "$geoip_apply_generated" >"$geoip_apply_run_out" 2>&1 \
-           && grep -Fq 'ipset|create geoip_blacklist_tmp hash:net maxelem 131072' "$geoip_ipset_log" \
-           && grep -Fq 'ipset|swap geoip_blacklist_tmp geoip_blacklist' "$geoip_ipset_log" \
-           && grep -Fq 'ipset|swap geoip_blacklist6_tmp geoip_blacklist6' "$geoip_ipset_log" \
-           && grep -Fq 'add geoip_blacklist_tmp 1.2.3.0/24' "$geoip_restore_log" \
-           && grep -Fq 'add geoip_blacklist6_tmp 2001:db8::/32' "$geoip_restore_log" \
-           && grep -Fq 'iptables|-I INPUT 1 -j GEOIP_FILTER' "$geoip_iptables_log" \
-           && grep -Fq 'iptables|-A GEOIP_FILTER -m set --match-set geoip_blacklist src -j DROP' "$geoip_iptables_log" \
-           && grep -Fq 'ip6tables|-I INPUT 1 -j GEOIP6_FILTER' "$geoip_ip6tables_log" \
-           && grep -Fq 'ip6tables|-A GEOIP6_FILTER -m set --match-set geoip_blacklist6 src -j DROP' "$geoip_ip6tables_log"; then
-            pass "GeoIP 持久化 apply 生成脚本在实体机 mock 下应用 IPv4/IPv6 规则"
-        else
-            fail "GeoIP 持久化 apply 生成脚本未正确应用 IPv4/IPv6 规则"
-            sed 's/^/    out: /' "$geoip_apply_run_out" 2>/dev/null || true
-            sed 's/^/    ipset: /' "$geoip_ipset_log" 2>/dev/null || true
-            sed 's/^/    restore: /' "$geoip_restore_log" 2>/dev/null || true
-            sed 's/^/    iptables: /' "$geoip_iptables_log" 2>/dev/null || true
-            sed 's/^/    ip6tables: /' "$geoip_ip6tables_log" 2>/dev/null || true
-        fi
-        : > "$geoip_ipset_log"
-        : > "$geoip_restore_log"
-        : > "$geoip_iptables_log"
-        : > "$geoip_ip6tables_log"
-        chmod 666 "$geoip_apply_conf"
-        if GEOIP_IPSET_LOG="$geoip_ipset_log" \
-           GEOIP_IPSET_RESTORE_LOG="$geoip_restore_log" \
-           GEOIP_IPTABLES_LOG="$geoip_iptables_log" \
-           GEOIP_IP6TABLES_LOG="$geoip_ip6tables_log" \
-           PATH="$geoip_apply_bin:$PATH" \
-              "$geoip_apply_generated" >"$geoip_apply_run_out" 2>&1 \
-           && [[ ! -s "$geoip_ipset_log" ]] \
-           && [[ ! -s "$geoip_restore_log" ]] \
-           && [[ ! -s "$geoip_iptables_log" ]] \
-           && [[ ! -s "$geoip_ip6tables_log" ]]; then
-            pass "GeoIP 持久化 apply 生成脚本拒绝宽权限配置且不触碰防火墙"
-        else
-            fail "GeoIP 持久化 apply 生成脚本宽权限配置保护异常"
-            sed 's/^/    out: /' "$geoip_apply_run_out" 2>/dev/null || true
-            sed 's/^/    ipset: /' "$geoip_ipset_log" 2>/dev/null || true
-            sed 's/^/    restore: /' "$geoip_restore_log" 2>/dev/null || true
-            sed 's/^/    iptables: /' "$geoip_iptables_log" 2>/dev/null || true
-            sed 's/^/    ip6tables: /' "$geoip_ip6tables_log" 2>/dev/null || true
-        fi
-    else
-        fail "GeoIP 持久化 apply 生成脚本生成或临时路径重定向失败"
-        sed 's/^/    /' "$geoip_apply_generated" 2>/dev/null | head -120 || true
-    fi
-else
-    skip "非 root，跳过 GeoIP 持久化 apply 生成脚本实体机 mock 测试"
 fi
 mkdir -p "$(dirname "$nginx_module_so")"
 : > "$nginx_module_so"

@@ -43,9 +43,6 @@ sed -i \
     -e "s|^readonly WG_DEB_CONF=.*|readonly WG_DEB_CONF=\"$TMP_ROOT/wireguard/wg0.conf\"|" \
     -e "s|^readonly WG_DEB_CLIENT_DIR=.*|readonly WG_DEB_CLIENT_DIR=\"$TMP_ROOT/wireguard/clients\"|" \
     -e "s|^readonly FAIL2BAN_JAIL_LOCAL=.*|readonly FAIL2BAN_JAIL_LOCAL=\"$TMP_ROOT/jail.local\"|" \
-    -e "s|^readonly GEOIP_CONF_DIR=.*|readonly GEOIP_CONF_DIR=\"$TMP_ROOT/geoip\"|" \
-    -e "s|^readonly GEOIP_CONF=.*|readonly GEOIP_CONF=\"$TMP_ROOT/geoip/geoip.conf\"|" \
-    -e "s|^readonly GEOIP_DATA_DIR=.*|readonly GEOIP_DATA_DIR=\"$TMP_ROOT/geoip/geoip-data\"|" \
     -e "s|^CERT_PATH_PREFIX=.*|CERT_PATH_PREFIX=\"$TMP_ROOT/cert\"|" \
     -e "s|^CONFIG_DIR=.*|CONFIG_DIR=\"$TMP_ROOT/cert/.managed_domains\"|" \
     -e "s|^DDNS_CONFIG_DIR=.*|DDNS_CONFIG_DIR=\"$TMP_ROOT/ddns\"|" \
@@ -1728,324 +1725,9 @@ test_web_firewall_allow_helper_modes() {
     fi
 }
 
-test_geoip_conf_loader_rejects_extra_shell_assignments() {
-    local conf_dir="$TMP_ROOT/geoip"
-    local old_platform="${PLATFORM:-}"
-    mkdir -p "$conf_dir"
-    PLATFORM="openwrt"
 
-    cat > "$GEOIP_CONF" <<'EOF'
-GEOIP_MODE="blacklist"
-GEOIP_COUNTRIES="CN US"
-GEOIP_LAST_UPDATE="2026-07-02"
-UNRELATED='should-not-load'
-EOF
-    chmod 600 "$GEOIP_CONF"
 
-    unset UNRELATED
-    if _geoip_load_conf >/dev/null 2>&1; then
-        fail "_geoip_load_conf accepted an unrelated shell assignment"
-    elif [[ -z "${GEOIP_MODE:-}" && -z "${GEOIP_COUNTRIES:-}" && -z "${UNRELATED:-}" ]]; then
-        pass "_geoip_load_conf rejects unrelated assignments without partial state"
-    else
-        fail "_geoip_load_conf left partial/imported state mode=${GEOIP_MODE:-unset} countries=${GEOIP_COUNTRIES:-unset} unrelated=${UNRELATED:-unset}"
-    fi
 
-    cat > "$GEOIP_CONF" <<'EOF'
-GEOIP_MODE="whitelist"
-GEOIP_COUNTRIES="CN US"
-GEOIP_LAST_UPDATE="2026-07-02"
-EOF
-    chmod 600 "$GEOIP_CONF"
-
-    if _geoip_load_conf >/dev/null 2>&1 \
-       && [[ "$GEOIP_MODE" == "whitelist" ]] \
-       && [[ "$GEOIP_COUNTRIES" == "CN US" ]] \
-       && [[ "$GEOIP_LAST_UPDATE" == "2026-07-02" ]]; then
-        pass "_geoip_load_conf parses only the GeoIP state keys"
-    else
-        fail "_geoip_load_conf did not parse valid GeoIP state mode=${GEOIP_MODE:-unset} countries=${GEOIP_COUNTRIES:-unset} date=${GEOIP_LAST_UPDATE:-unset}"
-    fi
-    PLATFORM="$old_platform"
-}
-
-test_geoip_apply_fail_closed_and_builds_ipv4_ipv6_rules() {
-    local data_dir="$GEOIP_DATA_DIR"
-    local ipset_calls="$TMP_ROOT/geoip-ipset-calls.txt"
-    local iptables_calls="$TMP_ROOT/geoip-iptables-calls.txt"
-    local ip6tables_calls="$TMP_ROOT/geoip-ip6tables-calls.txt"
-    local restore_payload="$TMP_ROOT/geoip-restore-payload.txt"
-    mkdir -p "$data_dir"
-    : > "$ipset_calls"
-    : > "$iptables_calls"
-    : > "$ip6tables_calls"
-    : > "$restore_payload"
-
-    command_exists() {
-        case "${1:-}" in
-            ip6tables) [[ "${GEOIP_HAS_IP6TABLES:-1}" == "1" ]] ;;
-            *) return 0 ;;
-        esac
-    }
-    ipset() {
-        printf '%s\n' "$*" >> "$ipset_calls"
-        case "$*" in
-            "restore -exist")
-                cat >> "$restore_payload"
-                [[ "${GEOIP_RESTORE_OK:-1}" == "1" ]]
-                ;;
-            swap\ *)
-                if [[ "$*" == "swap geoip_blacklist6_tmp geoip_blacklist6" && "${GEOIP_FAIL_SWAP6:-0}" == "1" ]]; then
-                    return 1
-                fi
-                [[ "${GEOIP_SWAP_OK:-1}" == "1" ]]
-                ;;
-            *) return 0 ;;
-        esac
-    }
-    iptables() {
-        printf '%s\n' "$*" >> "$iptables_calls"
-        [[ "$*" == "-C INPUT -j $GEOIP_CHAIN" ]] && return 1
-        return 0
-    }
-    ip6tables() {
-        printf '%s\n' "$*" >> "$ip6tables_calls"
-        [[ "$*" == "-C INPUT -j $GEOIP6_CHAIN" ]] && return 1
-        return 0
-    }
-
-    if _geoip_apply whitelist "CN" >/dev/null 2>&1; then
-        fail "_geoip_apply accepted empty GeoIP data"
-    elif [[ ! -s "$ipset_calls" ]]; then
-        pass "_geoip_apply rejects empty data before touching ipset"
-    else
-        fail "_geoip_apply touched ipset for empty data: $(paste -sd ',' "$ipset_calls")"
-    fi
-
-    printf '1.2.3.0/24\n# comment\nbad-line\n' > "$data_dir/cn.zone"
-    printf '2001:db8::/32\n' > "$data_dir/cn.zone6"
-    : > "$ipset_calls"
-    : > "$iptables_calls"
-    : > "$ip6tables_calls"
-    : > "$restore_payload"
-    GEOIP_SWAP_OK=1 GEOIP_RESTORE_OK=1 GEOIP_HAS_IP6TABLES=1
-    if _geoip_apply blacklist "CN" >/dev/null 2>&1 \
-       && grep -q '^create geoip_blacklist_tmp hash:net maxelem 131072$' "$ipset_calls" \
-       && grep -q '^add geoip_blacklist_tmp 1.2.3.0/24$' "$restore_payload" \
-       && grep -q '^add geoip_blacklist6_tmp 2001:db8::/32$' "$restore_payload" \
-       && grep -q '^swap geoip_blacklist_tmp geoip_blacklist$' "$ipset_calls" \
-       && grep -q '^swap geoip_blacklist6_tmp geoip_blacklist6$' "$ipset_calls" \
-       && grep -q "^-A $GEOIP_CHAIN -m set --match-set geoip_blacklist src -j DROP$" "$iptables_calls" \
-       && grep -q "^-I INPUT 1 -j $GEOIP_CHAIN$" "$iptables_calls" \
-       && grep -q "^-A $GEOIP6_CHAIN -m set --match-set geoip_blacklist6 src -j DROP$" "$ip6tables_calls" \
-       && grep -q "^-I INPUT 1 -j $GEOIP6_CHAIN$" "$ip6tables_calls"; then
-        pass "_geoip_apply builds IPv4 and IPv6 ipset/iptables rules from valid data"
-    else
-        fail "_geoip_apply valid data path mismatch"
-        sed 's/^/    ipset: /' "$ipset_calls"
-        sed 's/^/    restore: /' "$restore_payload"
-        sed 's/^/    iptables: /' "$iptables_calls"
-        sed 's/^/    ip6tables: /' "$ip6tables_calls"
-    fi
-
-    : > "$ipset_calls"
-    : > "$iptables_calls"
-    : > "$ip6tables_calls"
-    : > "$restore_payload"
-    GEOIP_SWAP_OK=0 GEOIP_RESTORE_OK=1 GEOIP_HAS_IP6TABLES=1
-    if _geoip_apply blacklist "CN" >/dev/null 2>&1; then
-        fail "_geoip_apply succeeded despite IPv4 ipset swap failure"
-    elif grep -q '^destroy geoip_blacklist_tmp$' "$ipset_calls" \
-         && [[ ! -s "$iptables_calls" ]] \
-         && [[ ! -s "$ip6tables_calls" ]]; then
-        pass "_geoip_apply fails closed and keeps firewall chains untouched when ipset swap fails"
-    else
-        fail "_geoip_apply swap failure path mismatch"
-        sed 's/^/    ipset: /' "$ipset_calls"
-        sed 's/^/    iptables: /' "$iptables_calls"
-        sed 's/^/    ip6tables: /' "$ip6tables_calls"
-    fi
-
-    : > "$ipset_calls"
-    : > "$iptables_calls"
-    : > "$ip6tables_calls"
-    : > "$restore_payload"
-    GEOIP_SWAP_OK=1 GEOIP_RESTORE_OK=1 GEOIP_HAS_IP6TABLES=1 GEOIP_FAIL_SWAP6=1
-    if _geoip_apply blacklist "CN" >/dev/null 2>&1; then
-        fail "_geoip_apply succeeded despite IPv6 ipset swap failure"
-    elif grep -q '^swap geoip_blacklist_tmp geoip_blacklist$' "$ipset_calls" \
-         && grep -q '^swap geoip_blacklist_tmp geoip_blacklist$' <(grep '^swap ' "$ipset_calls" | tail -n 1) \
-         && grep -q '^destroy geoip_blacklist6_tmp$' "$ipset_calls" \
-         && grep -q '^destroy geoip_blacklist_tmp$' "$ipset_calls" \
-         && [[ ! -s "$iptables_calls" ]] \
-         && [[ ! -s "$ip6tables_calls" ]]; then
-        pass "_geoip_apply rolls IPv4 ipset back when IPv6 swap fails"
-    else
-        fail "_geoip_apply IPv6 swap failure rollback mismatch"
-        sed 's/^/    ipset: /' "$ipset_calls"
-        sed 's/^/    iptables: /' "$iptables_calls"
-        sed 's/^/    ip6tables: /' "$ip6tables_calls"
-    fi
-    unset GEOIP_SWAP_OK GEOIP_RESTORE_OK GEOIP_HAS_IP6TABLES GEOIP_FAIL_SWAP6
-}
-
-test_geoip_conf_update_and_persistence_are_atomic() {
-    local service_file="$TMP_ROOT/geoip-firewall.service"
-    local apply_script="$TMP_ROOT/bin/geoip-apply.sh"
-    local update_script="$TMP_ROOT/bin/geoip-update.sh"
-    local systemctl_calls="$TMP_ROOT/geoip-systemctl-calls.txt"
-    local cron_calls="$TMP_ROOT/geoip-cron-calls.txt"
-    local GEOIP_SERVICE_FILE="$service_file"
-    local GEOIP_APPLY_SCRIPT="$apply_script"
-    local GEOIP_UPDATE_SCRIPT="$update_script"
-    local old_platform="${PLATFORM:-}"
-    local real_is_systemd
-    real_is_systemd="$(declare -f is_systemd)"
-    PLATFORM="openwrt"
-    mkdir -p "$(dirname "$GEOIP_CONF")" "$(dirname "$apply_script")"
-    : > "$systemctl_calls"
-    : > "$cron_calls"
-    cat > "$GEOIP_CONF" <<'EOF'
-# keep comment
-GEOIP_MODE="blacklist"
-GEOIP_COUNTRIES="CN US"
-GEOIP_LAST_UPDATE="2026-07-02"
-GEOIP_LAST_UPDATE="2026-07-01"
-EOF
-    chmod 600 "$GEOIP_CONF"
-
-    systemctl() {
-        printf '%s\n' "$*" >> "$systemctl_calls"
-        return 0
-    }
-    is_systemd() {
-        return 0
-    }
-    cron_add_job() {
-        printf '%s|%s\n' "$1" "$2" >> "$cron_calls"
-        return 0
-    }
-
-    if _geoip_update_last_update "$GEOIP_CONF" "2026-07-03" \
-       && grep -qF '# keep comment' "$GEOIP_CONF" \
-       && grep -Fxq 'GEOIP_MODE="blacklist"' "$GEOIP_CONF" \
-       && grep -Fxq 'GEOIP_COUNTRIES="CN US"' "$GEOIP_CONF" \
-       && [[ "$(grep -c '^GEOIP_LAST_UPDATE=' "$GEOIP_CONF")" == "1" ]] \
-       && grep -Fxq 'GEOIP_LAST_UPDATE="2026-07-03"' "$GEOIP_CONF" \
-       && { [[ "$(uname -s 2>/dev/null)" != "Linux" ]] || [[ "$(stat -c '%a' "$GEOIP_CONF" 2>/dev/null || echo "")" == "600" ]]; }; then
-        pass "_geoip_update_last_update atomically updates one quoted timestamp"
-    else
-        fail "_geoip_update_last_update did not preserve/normalize GeoIP config"
-        sed 's/^/    /' "$GEOIP_CONF"
-    fi
-
-    if _geoip_write_conf whitelist "JP SG" "2026-07-03" \
-       && grep -Fxq 'GEOIP_MODE="whitelist"' "$GEOIP_CONF" \
-       && grep -Fxq 'GEOIP_COUNTRIES="JP SG"' "$GEOIP_CONF" \
-       && grep -Fxq 'GEOIP_LAST_UPDATE="2026-07-03"' "$GEOIP_CONF" \
-       && { [[ "$(uname -s 2>/dev/null)" != "Linux" ]] || [[ "$(stat -c '%a' "$GEOIP_CONF" 2>/dev/null || echo "")" == "600" ]]; }; then
-        pass "_geoip_write_conf writes root-private quoted GeoIP state"
-    else
-        fail "_geoip_write_conf did not write expected private GeoIP state"
-        sed 's/^/    /' "$GEOIP_CONF"
-    fi
-
-    if _geoip_install_persistence \
-       && [[ -x "$apply_script" && -x "$update_script" ]] \
-       && grep -q '^ExecStart='"$apply_script"'$' "$service_file" \
-       && grep -q 'write_file_atomic "\$apply_script" "\$apply_content"' "$BUILT" \
-       && grep -q 'write_file_atomic "\$update_script" "\$update_content"' "$BUILT" \
-       && grep -q '_geoip_install_service_unit' "$BUILT" \
-       && grep -Fq "$update_script" "$cron_calls"; then
-        pass "_geoip_install_persistence writes scripts/service through atomic helpers"
-    else
-        fail "_geoip_install_persistence did not atomically write expected persistence files"
-        {
-            echo "service:"
-            sed 's/^/  /' "$service_file" 2>/dev/null || true
-            echo "cron:"
-            sed 's/^/  /' "$cron_calls" 2>/dev/null || true
-        } | sed 's/^/    /'
-    fi
-
-    systemctl() {
-        printf '%s\n' "$*" >> "$systemctl_calls"
-        [[ "$*" != "enable geoip-firewall" ]]
-    }
-    if _geoip_install_persistence >/dev/null 2>&1; then
-        fail "_geoip_install_persistence ignored systemctl enable failure"
-    else
-        pass "_geoip_install_persistence propagates systemctl enable failure"
-    fi
-
-    PLATFORM="$old_platform"
-    eval "$real_is_systemd"
-    unset -f systemctl cron_add_job
-}
-
-test_geoip_disable_cleans_state_and_persistence() {
-    local service_file="$TMP_ROOT/geoip-disable/geoip-firewall.service"
-    local apply_script="$TMP_ROOT/geoip-disable/geoip-apply.sh"
-    local update_script="$TMP_ROOT/geoip-disable/geoip-update.sh"
-    local calls="$TMP_ROOT/geoip-disable-calls.txt"
-    local GEOIP_SERVICE_FILE="$service_file"
-    local GEOIP_APPLY_SCRIPT="$apply_script"
-    local GEOIP_UPDATE_SCRIPT="$update_script"
-    local old_platform="${PLATFORM:-}"
-    local real_geoip_clear real_is_systemd
-    real_geoip_clear="$(declare -f _geoip_clear)"
-    real_is_systemd="$(declare -f is_systemd)"
-    PLATFORM="openwrt"
-    mkdir -p "$(dirname "$GEOIP_CONF")" "$GEOIP_DATA_DIR" "$(dirname "$service_file")"
-    : > "$calls"
-    cat > "$GEOIP_CONF" <<'EOF'
-GEOIP_MODE="blacklist"
-GEOIP_COUNTRIES="CN US"
-GEOIP_LAST_UPDATE="2026-07-03"
-EOF
-    printf '1.2.3.0/24\n' > "$GEOIP_DATA_DIR/cn.zone"
-    printf '#!/bin/sh\n' > "$apply_script"
-    printf '#!/bin/sh\n' > "$update_script"
-    printf '[Unit]\n' > "$service_file"
-    chmod 600 "$GEOIP_CONF" 2>/dev/null || true
-
-    confirm() { return 0; }
-    _geoip_clear() {
-        printf 'clear\n' >> "$calls"
-        return 0
-    }
-    cron_remove_job() {
-        printf 'cron_remove|%s\n' "$1" >> "$calls"
-        return 0
-    }
-    is_systemd() { return 0; }
-    systemctl() {
-        printf 'systemctl|%s\n' "$*" >> "$calls"
-        return 0
-    }
-
-    if geoip_disable >/dev/null 2>&1 \
-       && grep -q '^clear$' "$calls" \
-       && grep -q "^cron_remove|$(basename "$update_script")$" "$calls" \
-       && grep -q '^systemctl|disable geoip-firewall$' "$calls" \
-       && grep -q '^systemctl|daemon-reload$' "$calls" \
-       && [[ ! -e "$GEOIP_CONF" ]] \
-       && [[ ! -e "$GEOIP_DATA_DIR" ]] \
-       && [[ ! -e "$apply_script" ]] \
-       && [[ ! -e "$update_script" ]] \
-       && [[ ! -e "$service_file" ]]; then
-        pass "geoip_disable clears rules, state, scripts, cron and service files"
-    else
-        fail "geoip_disable cleanup mismatch"
-        sed 's/^/    calls: /' "$calls"
-        find "$(dirname "$service_file")" "$(dirname "$GEOIP_CONF")" -maxdepth 2 -print 2>/dev/null | sed 's/^/    left: /'
-    fi
-
-    PLATFORM="$old_platform"
-    eval "$real_geoip_clear"
-    eval "$real_is_systemd"
-    unset -f cron_remove_job systemctl
-}
 
 test_swap_fstab_helpers_are_precise() {
     local swap_file="$TMP_ROOT/swapfile" fstab="$TMP_ROOT/fstab" count mode_before="" mode_after=""
@@ -2990,6 +2672,9 @@ test_wg_shared_gateway_routes_syncs_and_cleans_stale_routes() {
 EOF
     printf '192.168.60.0/24\n192.168.99.0/24\n2001:db8:99::/64\n' > "$WG_SHARED_ROUTE_STATE_FILE"
     : > "$routes"
+    # 自包含：重置 command_exists 为真实语义，避免前置测试泄漏的 mock 污染
+    # （wg_shared_sync_gateway_routes 内 `command_exists ip || return 1`）
+    command_exists() { command -v "$1" >/dev/null 2>&1; }
     wg_is_running() { return 0; }
     wg_db_get() {
         case "$1" in
@@ -3057,6 +2742,9 @@ test_wg_shared_gateway_routes_removes_state_when_no_gateways() {
 EOF
     printf '192.168.50.0/24\n2001:db8:50::/64\n' > "$WG_SHARED_ROUTE_STATE_FILE"
     : > "$routes"
+    # 自包含：重置 command_exists 为真实语义，避免前置测试泄漏的 mock 污染
+    # （wg_shared_sync_gateway_routes 内 `command_exists ip || return 1`）
+    command_exists() { command -v "$1" >/dev/null 2>&1; }
     wg_is_running() { return 0; }
     wg_db_get() {
         case "$1" in
@@ -4116,10 +3804,6 @@ test_wg_deb_watchdog_cron_failure_returns_error
 test_ufw_setup_reset_stop_when_ssh_allow_fails
 test_ufw_manual_add_delete_validate_inputs
 test_web_firewall_allow_helper_modes
-test_geoip_conf_loader_rejects_extra_shell_assignments
-test_geoip_apply_fail_closed_and_builds_ipv4_ipv6_rules
-test_geoip_conf_update_and_persistence_are_atomic
-test_geoip_disable_cleans_state_and_persistence
 test_swap_fstab_helpers_are_precise
 test_opt_swap_delete_only_managed_swapfile
 test_auto_deps_new_fail2ban_not_left_active
