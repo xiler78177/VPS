@@ -1258,6 +1258,10 @@ wg_uninstall() {
         print_error "提交 OpenWrt firewall 清理失败，已中止卸载。请修复 UCI 后重试，避免本地状态先被删除。"
         pause; return 1
     fi
+    # 清理 /etc/rc.local 中所有本脚本托管的 WireGuard 持久化片段（allow-port / bypass / peer-route / ep-resolve）
+    local _wg_rc_file
+    _wg_rc_file="$(_wg_openwrt_rc_local_path)"
+    _wg_rc_local_cleanup_managed_entries all "$_wg_rc_file" >/dev/null 2>&1 || print_warn "清理 /etc/rc.local 持久化片段失败，请手动检查"
 
     print_info "[3/6] 清理 Mihomo bypass 和 nft 规则..."
     wg_mihomo_bypass_clean

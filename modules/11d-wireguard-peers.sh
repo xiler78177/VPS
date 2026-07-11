@@ -106,6 +106,36 @@ wg_add_peer() {
         all_lan_subnets="${all_lan_subnets}${lan_subnets}"
     fi
 
+    # ── LAN 子网重叠检测: 新网关 LAN 若与 VPN 子网/服务端 LAN/其他网关 LAN 重叠，会造成路由不确定 ──
+    if [[ "$is_gateway" == "true" && -n "$lan_subnets" ]]; then
+        local _existing_lans _own IFS_BAK2="$IFS" _ovl _ovl_hit=""
+        _existing_lans="$server_subnet"
+        [[ -n "$server_lan" && "$server_lan" != "null" ]] && _existing_lans="${_existing_lans}, ${server_lan}"
+        local _pj=0
+        while [[ $_pj -lt $pc ]]; do
+            local _pl=$(wg_db_get ".peers[$_pj].lan_subnets // empty")
+            [[ -n "$_pl" && "$_pl" != "null" ]] && _existing_lans="${_existing_lans}, ${_pl}"
+            _pj=$((_pj + 1))
+        done
+        IFS=','
+        for _own in $lan_subnets; do
+            _own=$(echo "$_own" | xargs)
+            [[ -n "$_own" ]] || continue
+            if _ovl=$(cidr_overlaps_list "$_own" "$_existing_lans"); then
+                _ovl_hit="${_own} ↔ ${_ovl}"
+                break
+            fi
+        done
+        IFS="$IFS_BAK2"
+        if [[ -n "$_ovl_hit" ]]; then
+            print_warn "检测到 LAN 网段重叠: ${_ovl_hit}"
+            echo -e "  ${C_YELLOW}重叠会导致 VPN 内路由目标不唯一，跨站点访问可能失败。${C_RESET}"
+            if ! confirm "仍要继续添加该网关?"; then
+                pause; return
+            fi
+        fi
+    fi
+
     if [[ "$peer_type" == "clash" ]]; then
         # Clash 客户端: 路由 VPN 子网 + 服务端 LAN + 所有网关 LAN
         client_allowed_ips="$server_subnet"
@@ -537,6 +567,23 @@ _wg_show_openwrt_deploy() {
 
     draw_line
     echo -e "${C_CYAN}=== OpenWrt 部署命令 ===${C_RESET}"
+    # 若网关 AllowedIPs 含默认路由 (0.0.0.0/0 或 ::/0)，route_allowed_ips=1 会把目标路由器默认路由切入隧道，
+    # 可能瞬间切断正在通过 WAN 侧 SSH 操作的管理员会话（远程自断）。此处显式告警。
+    local _has_default_route=false
+    local _IFS_BAK="$IFS" _cidr; IFS=','
+    for _cidr in $client_allowed_ips; do
+        _cidr=$(echo "$_cidr" | xargs)
+        case "$_cidr" in
+            0.0.0.0/0|::/0) _has_default_route=true ;;
+        esac
+    done
+    IFS="$_IFS_BAK"
+    if [[ "$_has_default_route" == "true" ]]; then
+        echo -e "${C_RED}[远程自断风险]${C_RESET} 该网关 AllowedIPs 含默认路由 (0.0.0.0/0 或 ::/0)。"
+        echo -e "  在目标 OpenWrt 上执行后，全部流量将切入隧道，${C_YELLOW}正通过公网 SSH 操作该路由器的会话可能立即断开${C_RESET}。"
+        echo -e "  建议: 通过 LAN 侧 / 本地控制台执行，或先确认已有带外 (out-of-band) 恢复通道。"
+        draw_line
+    fi
     echo -e "${C_YELLOW}在目标 OpenWrt SSH 终端依次执行以下命令:${C_RESET}"
     draw_line
     cat << OPENWRT_EOF

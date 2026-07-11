@@ -911,6 +911,54 @@ validate_cidr_list() {
     return 0
 }
 
+# 判断两个 IPv4 CIDR 是否重叠。返回 0 表示重叠。IPv6 或非法输入一律返回 1 (视为不重叠，交由上层校验)。
+_ipv4_cidr_to_range() {
+    # 输出 "网络起始整数 网络结束整数"
+    local cidr="${1:-}" ip prefix a b c d base mask
+    [[ "$cidr" == */* ]] || return 1
+    ip="${cidr%/*}"; prefix="${cidr##*/}"
+    [[ "$ip" == *:* ]] && return 1
+    [[ "$prefix" =~ ^[0-9]+$ ]] && (( prefix >= 0 && prefix <= 32 )) || return 1
+    IFS='.' read -r a b c d <<< "$ip"
+    [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ && "$c" =~ ^[0-9]+$ && "$d" =~ ^[0-9]+$ ]] || return 1
+    # 强制十进制解析，避免前导零被 $(( )) 当八进制 (010→8, 08→报错)
+    a=$((10#$a)); b=$((10#$b)); c=$((10#$c)); d=$((10#$d))
+    (( a <= 255 && b <= 255 && c <= 255 && d <= 255 )) || return 1
+    base=$(( (a<<24) + (b<<16) + (c<<8) + d ))
+    if (( prefix == 0 )); then mask=0; else mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF )); fi
+    local net=$(( base & mask ))
+    local bcast=$(( net + (0xFFFFFFFF & ~mask) ))
+    printf '%s %s' "$net" "$bcast"
+}
+
+cidr_overlap() {
+    local r1 r2 s1 e1 s2 e2
+    r1=$(_ipv4_cidr_to_range "${1:-}") || return 1
+    r2=$(_ipv4_cidr_to_range "${2:-}") || return 1
+    local IFS=' '
+    read -r s1 e1 <<< "$r1"
+    read -r s2 e2 <<< "$r2"
+    (( s1 <= e2 && s2 <= e1 ))
+}
+
+# 检查一个 CIDR 是否与逗号分隔的 CIDR 列表中任意项重叠。重叠时通过 stdout 返回冲突的列表项，返回 0。
+cidr_overlaps_list() {
+    local target="${1:-}" list="${2:-}" item
+    [[ -n "$target" && -n "$list" && "$list" != "null" ]] || return 1
+    local IFS=','
+    local -a _items
+    read -ra _items <<< "$list"
+    for item in "${_items[@]}"; do
+        item=$(echo "$item" | xargs)
+        [[ -n "$item" ]] || continue
+        if cidr_overlap "$target" "$item"; then
+            printf '%s' "$item"
+            return 0
+        fi
+    done
+    return 1
+}
+
 validate_wg_allowed_ips() {
     local list="${1:-}" item
     [[ -n "$list" && "$list" != "null" ]] || return 1
@@ -11972,6 +12020,10 @@ wg_uninstall() {
         print_error "提交 OpenWrt firewall 清理失败，已中止卸载。请修复 UCI 后重试，避免本地状态先被删除。"
         pause; return 1
     fi
+    # 清理 /etc/rc.local 中所有本脚本托管的 WireGuard 持久化片段（allow-port / bypass / peer-route / ep-resolve）
+    local _wg_rc_file
+    _wg_rc_file="$(_wg_openwrt_rc_local_path)"
+    _wg_rc_local_cleanup_managed_entries all "$_wg_rc_file" >/dev/null 2>&1 || print_warn "清理 /etc/rc.local 持久化片段失败，请手动检查"
 
     print_info "[3/6] 清理 Mihomo bypass 和 nft 规则..."
     wg_mihomo_bypass_clean
@@ -12249,6 +12301,36 @@ wg_add_peer() {
     if [[ "$is_gateway" == "true" && -n "$lan_subnets" ]]; then
         [[ -n "$all_lan_subnets" ]] && all_lan_subnets="${all_lan_subnets}, "
         all_lan_subnets="${all_lan_subnets}${lan_subnets}"
+    fi
+
+    # ── LAN 子网重叠检测: 新网关 LAN 若与 VPN 子网/服务端 LAN/其他网关 LAN 重叠，会造成路由不确定 ──
+    if [[ "$is_gateway" == "true" && -n "$lan_subnets" ]]; then
+        local _existing_lans _own IFS_BAK2="$IFS" _ovl _ovl_hit=""
+        _existing_lans="$server_subnet"
+        [[ -n "$server_lan" && "$server_lan" != "null" ]] && _existing_lans="${_existing_lans}, ${server_lan}"
+        local _pj=0
+        while [[ $_pj -lt $pc ]]; do
+            local _pl=$(wg_db_get ".peers[$_pj].lan_subnets // empty")
+            [[ -n "$_pl" && "$_pl" != "null" ]] && _existing_lans="${_existing_lans}, ${_pl}"
+            _pj=$((_pj + 1))
+        done
+        IFS=','
+        for _own in $lan_subnets; do
+            _own=$(echo "$_own" | xargs)
+            [[ -n "$_own" ]] || continue
+            if _ovl=$(cidr_overlaps_list "$_own" "$_existing_lans"); then
+                _ovl_hit="${_own} ↔ ${_ovl}"
+                break
+            fi
+        done
+        IFS="$IFS_BAK2"
+        if [[ -n "$_ovl_hit" ]]; then
+            print_warn "检测到 LAN 网段重叠: ${_ovl_hit}"
+            echo -e "  ${C_YELLOW}重叠会导致 VPN 内路由目标不唯一，跨站点访问可能失败。${C_RESET}"
+            if ! confirm "仍要继续添加该网关?"; then
+                pause; return
+            fi
+        fi
     fi
 
     if [[ "$peer_type" == "clash" ]]; then
@@ -12682,6 +12764,23 @@ _wg_show_openwrt_deploy() {
 
     draw_line
     echo -e "${C_CYAN}=== OpenWrt 部署命令 ===${C_RESET}"
+    # 若网关 AllowedIPs 含默认路由 (0.0.0.0/0 或 ::/0)，route_allowed_ips=1 会把目标路由器默认路由切入隧道，
+    # 可能瞬间切断正在通过 WAN 侧 SSH 操作的管理员会话（远程自断）。此处显式告警。
+    local _has_default_route=false
+    local _IFS_BAK="$IFS" _cidr; IFS=','
+    for _cidr in $client_allowed_ips; do
+        _cidr=$(echo "$_cidr" | xargs)
+        case "$_cidr" in
+            0.0.0.0/0|::/0) _has_default_route=true ;;
+        esac
+    done
+    IFS="$_IFS_BAK"
+    if [[ "$_has_default_route" == "true" ]]; then
+        echo -e "${C_RED}[远程自断风险]${C_RESET} 该网关 AllowedIPs 含默认路由 (0.0.0.0/0 或 ::/0)。"
+        echo -e "  在目标 OpenWrt 上执行后，全部流量将切入隧道，${C_YELLOW}正通过公网 SSH 操作该路由器的会话可能立即断开${C_RESET}。"
+        echo -e "  建议: 通过 LAN 侧 / 本地控制台执行，或先确认已有带外 (out-of-band) 恢复通道。"
+        draw_line
+    fi
     echo -e "${C_YELLOW}在目标 OpenWrt SSH 终端依次执行以下命令:${C_RESET}"
     draw_line
     cat << OPENWRT_EOF
@@ -15553,6 +15652,18 @@ wg_deb_modify_server() {
     read -e -r -p "出口网卡 [${cur_iface}]: " new_iface
     new_iface=${new_iface:-$cur_iface}
     if [[ "$new_iface" != "$cur_iface" ]]; then
+        if [[ ! "$new_iface" =~ ^[a-zA-Z0-9._@-]+$ ]]; then
+            print_error "出口网卡名称格式无效: ${new_iface}"
+            _wg_deb_rollback_server_modify "$server_snapshot" "$cur_port" "$new_port" "$new_udp_rule_added" "false" "$new_non_ufw_open_backends"
+            pause; return 1
+        fi
+        if [[ ! -d "/sys/class/net/$new_iface" ]]; then
+            print_warn "网卡 ${new_iface} 当前不存在于系统中，若名称有误将导致 NAT 出口失效。"
+            if ! confirm "确认使用该网卡名?"; then
+                _wg_deb_rollback_server_modify "$server_snapshot" "$cur_port" "$new_port" "$new_udp_rule_added" "false" "$new_non_ufw_open_backends"
+                pause; return
+            fi
+        fi
         if ! wg_deb_db_set --arg i "$new_iface" '.server.default_iface = $i'; then
             print_error "数据库写入失败，出口网卡未修改"
             _wg_deb_rollback_server_modify "$server_snapshot" "$cur_port" "$new_port" "$new_udp_rule_added" "false" "$new_non_ufw_open_backends"
@@ -15948,6 +16059,36 @@ wg_deb_add_peer() {
     if [[ "$is_gateway" == "true" && -n "$lan_subnets" ]]; then
         [[ -n "$all_lan_subnets" ]] && all_lan_subnets="${all_lan_subnets}, "
         all_lan_subnets="${all_lan_subnets}${lan_subnets}"
+    fi
+
+    # ── LAN 子网重叠检测: 新网关 LAN 若与 VPN 子网/服务端 LAN/其他网关 LAN 重叠，会造成路由不确定 ──
+    if [[ "$is_gateway" == "true" && -n "$lan_subnets" ]]; then
+        local _existing_lans _own IFS_BAK2="$IFS" _ovl _ovl_hit=""
+        _existing_lans="$server_subnet"
+        [[ -n "$server_lan" && "$server_lan" != "null" ]] && _existing_lans="${_existing_lans}, ${server_lan}"
+        local _pj=0
+        while [[ $_pj -lt $pc ]]; do
+            local _pl=$(wg_deb_db_get ".peers[$_pj].lan_subnets // empty")
+            [[ -n "$_pl" && "$_pl" != "null" ]] && _existing_lans="${_existing_lans}, ${_pl}"
+            _pj=$((_pj + 1))
+        done
+        IFS=','
+        for _own in $lan_subnets; do
+            _own=$(echo "$_own" | xargs)
+            [[ -n "$_own" ]] || continue
+            if _ovl=$(cidr_overlaps_list "$_own" "$_existing_lans"); then
+                _ovl_hit="${_own} ↔ ${_ovl}"
+                break
+            fi
+        done
+        IFS="$IFS_BAK2"
+        if [[ -n "$_ovl_hit" ]]; then
+            print_warn "检测到 LAN 网段重叠: ${_ovl_hit}"
+            echo -e "  ${C_YELLOW}重叠会导致 VPN 内路由目标不唯一，跨站点访问可能失败。${C_RESET}"
+            if ! confirm "仍要继续添加该网关?"; then
+                pause; return
+            fi
+        fi
     fi
 
     if [[ "$peer_type" == "clash" ]]; then

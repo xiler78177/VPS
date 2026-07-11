@@ -102,6 +102,36 @@ wg_deb_add_peer() {
         all_lan_subnets="${all_lan_subnets}${lan_subnets}"
     fi
 
+    # ── LAN 子网重叠检测: 新网关 LAN 若与 VPN 子网/服务端 LAN/其他网关 LAN 重叠，会造成路由不确定 ──
+    if [[ "$is_gateway" == "true" && -n "$lan_subnets" ]]; then
+        local _existing_lans _own IFS_BAK2="$IFS" _ovl _ovl_hit=""
+        _existing_lans="$server_subnet"
+        [[ -n "$server_lan" && "$server_lan" != "null" ]] && _existing_lans="${_existing_lans}, ${server_lan}"
+        local _pj=0
+        while [[ $_pj -lt $pc ]]; do
+            local _pl=$(wg_deb_db_get ".peers[$_pj].lan_subnets // empty")
+            [[ -n "$_pl" && "$_pl" != "null" ]] && _existing_lans="${_existing_lans}, ${_pl}"
+            _pj=$((_pj + 1))
+        done
+        IFS=','
+        for _own in $lan_subnets; do
+            _own=$(echo "$_own" | xargs)
+            [[ -n "$_own" ]] || continue
+            if _ovl=$(cidr_overlaps_list "$_own" "$_existing_lans"); then
+                _ovl_hit="${_own} ↔ ${_ovl}"
+                break
+            fi
+        done
+        IFS="$IFS_BAK2"
+        if [[ -n "$_ovl_hit" ]]; then
+            print_warn "检测到 LAN 网段重叠: ${_ovl_hit}"
+            echo -e "  ${C_YELLOW}重叠会导致 VPN 内路由目标不唯一，跨站点访问可能失败。${C_RESET}"
+            if ! confirm "仍要继续添加该网关?"; then
+                pause; return
+            fi
+        fi
+    fi
+
     if [[ "$peer_type" == "clash" ]]; then
         client_allowed_ips="$server_subnet"
         [[ -n "$server_lan" && "$server_lan" != "null" ]] && client_allowed_ips="${client_allowed_ips}, ${server_lan}"

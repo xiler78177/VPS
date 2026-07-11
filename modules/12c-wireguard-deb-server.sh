@@ -518,6 +518,18 @@ wg_deb_modify_server() {
     read -e -r -p "出口网卡 [${cur_iface}]: " new_iface
     new_iface=${new_iface:-$cur_iface}
     if [[ "$new_iface" != "$cur_iface" ]]; then
+        if [[ ! "$new_iface" =~ ^[a-zA-Z0-9._@-]+$ ]]; then
+            print_error "出口网卡名称格式无效: ${new_iface}"
+            _wg_deb_rollback_server_modify "$server_snapshot" "$cur_port" "$new_port" "$new_udp_rule_added" "false" "$new_non_ufw_open_backends"
+            pause; return 1
+        fi
+        if [[ ! -d "/sys/class/net/$new_iface" ]]; then
+            print_warn "网卡 ${new_iface} 当前不存在于系统中，若名称有误将导致 NAT 出口失效。"
+            if ! confirm "确认使用该网卡名?"; then
+                _wg_deb_rollback_server_modify "$server_snapshot" "$cur_port" "$new_port" "$new_udp_rule_added" "false" "$new_non_ufw_open_backends"
+                pause; return
+            fi
+        fi
         if ! wg_deb_db_set --arg i "$new_iface" '.server.default_iface = $i'; then
             print_error "数据库写入失败，出口网卡未修改"
             _wg_deb_rollback_server_modify "$server_snapshot" "$cur_port" "$new_port" "$new_udp_rule_added" "false" "$new_non_ufw_open_backends"

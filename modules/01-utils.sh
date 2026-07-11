@@ -799,6 +799,54 @@ validate_cidr_list() {
     return 0
 }
 
+# 判断两个 IPv4 CIDR 是否重叠。返回 0 表示重叠。IPv6 或非法输入一律返回 1 (视为不重叠，交由上层校验)。
+_ipv4_cidr_to_range() {
+    # 输出 "网络起始整数 网络结束整数"
+    local cidr="${1:-}" ip prefix a b c d base mask
+    [[ "$cidr" == */* ]] || return 1
+    ip="${cidr%/*}"; prefix="${cidr##*/}"
+    [[ "$ip" == *:* ]] && return 1
+    [[ "$prefix" =~ ^[0-9]+$ ]] && (( prefix >= 0 && prefix <= 32 )) || return 1
+    IFS='.' read -r a b c d <<< "$ip"
+    [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ && "$c" =~ ^[0-9]+$ && "$d" =~ ^[0-9]+$ ]] || return 1
+    # 强制十进制解析，避免前导零被 $(( )) 当八进制 (010→8, 08→报错)
+    a=$((10#$a)); b=$((10#$b)); c=$((10#$c)); d=$((10#$d))
+    (( a <= 255 && b <= 255 && c <= 255 && d <= 255 )) || return 1
+    base=$(( (a<<24) + (b<<16) + (c<<8) + d ))
+    if (( prefix == 0 )); then mask=0; else mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF )); fi
+    local net=$(( base & mask ))
+    local bcast=$(( net + (0xFFFFFFFF & ~mask) ))
+    printf '%s %s' "$net" "$bcast"
+}
+
+cidr_overlap() {
+    local r1 r2 s1 e1 s2 e2
+    r1=$(_ipv4_cidr_to_range "${1:-}") || return 1
+    r2=$(_ipv4_cidr_to_range "${2:-}") || return 1
+    local IFS=' '
+    read -r s1 e1 <<< "$r1"
+    read -r s2 e2 <<< "$r2"
+    (( s1 <= e2 && s2 <= e1 ))
+}
+
+# 检查一个 CIDR 是否与逗号分隔的 CIDR 列表中任意项重叠。重叠时通过 stdout 返回冲突的列表项，返回 0。
+cidr_overlaps_list() {
+    local target="${1:-}" list="${2:-}" item
+    [[ -n "$target" && -n "$list" && "$list" != "null" ]] || return 1
+    local IFS=','
+    local -a _items
+    read -ra _items <<< "$list"
+    for item in "${_items[@]}"; do
+        item=$(echo "$item" | xargs)
+        [[ -n "$item" ]] || continue
+        if cidr_overlap "$target" "$item"; then
+            printf '%s' "$item"
+            return 0
+        fi
+    done
+    return 1
+}
+
 validate_wg_allowed_ips() {
     local list="${1:-}" item
     [[ -n "$list" && "$list" != "null" ]] || return 1

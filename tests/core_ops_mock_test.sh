@@ -3768,6 +3768,52 @@ EOF
     fi
 }
 
+test_cidr_overlap_detection() {
+    cidr_overlap "192.168.1.0/24" "192.168.1.128/25" \
+        && pass "cidr_overlap detects contained subnet" \
+        || fail "cidr_overlap missed 192.168.1.128/25 in 192.168.1.0/24"
+    cidr_overlap "192.168.1.0/24" "192.168.2.0/24" \
+        && fail "cidr_overlap false-positive on disjoint /24s" \
+        || pass "cidr_overlap rejects disjoint subnets"
+    cidr_overlap "10.0.0.0/8" "10.9.0.0/16" \
+        && pass "cidr_overlap detects supernet/subnet" \
+        || fail "cidr_overlap missed 10.9.0.0/16 in 10.0.0.0/8"
+    cidr_overlap "0.0.0.0/0" "8.8.8.8/32" \
+        && pass "cidr_overlap detects default-route containment" \
+        || fail "cidr_overlap missed host in 0.0.0.0/0"
+    # IPv6 或非法输入视为不重叠 (rc=1)
+    cidr_overlap "fe80::/64" "fe80::/96" \
+        && fail "cidr_overlap should not report overlap for IPv6" \
+        || pass "cidr_overlap skips IPv6 (rc=1)"
+    local hit
+    hit=$(cidr_overlaps_list "192.168.1.0/24" "10.0.0.0/8, 192.168.1.64/26") \
+        && [[ "$hit" == "192.168.1.64/26" ]] \
+        && pass "cidr_overlaps_list returns conflicting item" \
+        || fail "cidr_overlaps_list returned '$hit'"
+    cidr_overlaps_list "172.16.0.0/24" "10.0.0.0/8, 192.168.1.0/24" \
+        && fail "cidr_overlaps_list false-positive" \
+        || pass "cidr_overlaps_list rejects non-overlapping target"
+    # 越界 octet / 非法输入必须安全视为不重叠 (rc=1)，不得因位移溢出误判
+    cidr_overlap "999.1.1.1/24" "10.0.0.0/8" \
+        && fail "cidr_overlap accepted out-of-range octet" \
+        || pass "cidr_overlap rejects out-of-range octet"
+    cidr_overlap "256.0.0.0/8" "0.0.0.0/0" \
+        && fail "cidr_overlap accepted octet 256" \
+        || pass "cidr_overlap rejects octet 256"
+    # 前导零必须按十进制解析 (010=10)，不得被 $(( )) 当八进制 (010=8) 误判
+    cidr_overlap "192.168.010.0/24" "192.168.10.0/24" \
+        && pass "cidr_overlap parses leading-zero octet as decimal" \
+        || fail "cidr_overlap misparsed 010 (octal bug)"
+    cidr_overlap "192.168.010.0/24" "192.168.8.0/24" \
+        && fail "cidr_overlap treated 010 as octal 8" \
+        || pass "cidr_overlap does not treat 010 as octal 8"
+    local _octerr
+    _octerr=$(cidr_overlap "192.168.08.0/24" "192.168.8.0/24" 2>&1) || true
+    [[ -z "$_octerr" ]] \
+        && pass "cidr_overlap does not leak arithmetic error for 08" \
+        || fail "cidr_overlap leaked stderr for 08: $_octerr"
+}
+
 echo "== Fail2ban mocks =="
 test_f2b_ipv6_banned_ip_parsing
 test_f2b_unban_ipv6_exact_match
@@ -3840,6 +3886,7 @@ test_opt_sysctl_latest_pointer_failure_rolls_back
 test_opt_bbr_validates_before_commit
 test_opt_bbr_preserves_existing_role_tuning
 test_wireguard_ip_forward_sysctl_managed_block
+test_cidr_overlap_detection
 
 echo ""
 echo "SUMMARY PASS=$PASS FAIL=$FAIL"
