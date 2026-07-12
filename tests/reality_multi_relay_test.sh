@@ -418,13 +418,16 @@ ck "CDN 卸载失败回滚会恢复 state" '[[ -f "$REALITY_CDN_STATE_FILE" ]] &
 	ck "CDN Origin Rule 失败会恢复安装前证书凭据 hook" 'grep -q "old-cert" "$TMP/cdn-install-origin/cert/new.example.com/fullchain.pem" && grep -q "old-token" "$TMP/cdn-install-origin/root/.cloudflare-new.example.com.ini" && grep -q "old-hook" "$TMP/cdn-install-origin/hooks/renew-new.example.com.sh" && grep -q "old-live-cert" "$TMP/cdn-install-origin/le-live/new.example.com/fullchain.pem" && [[ ! -f "$TMP/cdn-install-origin/cron-removed" ]]'
 
 echo "[FP] 客户端指纹随机化（fp=chrome 特征分散）"
-# 随机指纹只落在真实浏览器池内（不含 randomized/360/q）
-fp_ok=1
+# 随机指纹只落在真实浏览器池内（不含 randomized/360/q，且不含 android——
+# android 的 uTLS 与 sing-box Reality 服务端不兼容，握手 nil ecdheKey）
+fp_ok=1 no_android=1
 for _i in $(seq 1 30); do
     f=$(reality_random_fingerprint)
-    case "$f" in chrome|firefox|edge|safari|ios|android) : ;; *) fp_ok=0; break ;; esac
+    case "$f" in chrome|firefox|edge|safari|ios) : ;; *) fp_ok=0; break ;; esac
+    [[ "$f" == "android" ]] && no_android=0
 done
 ck "reality_random_fingerprint 只产出真实浏览器指纹池成员" '[[ "$fp_ok" == "1" ]]'
+ck "reality_random_fingerprint 不再产出 android（Reality 不兼容）" '[[ "$no_android" == "1" ]]'
 # 30 次抽样至少见到 2 种（几乎不可能恒定单值；概率上验证「确实随机」）
 uniq_n=$(for _i in $(seq 1 30); do reality_random_fingerprint; echo; done | sort -u | wc -l)
 ck "随机指纹有分散性（≥2 种）" '[[ "$uniq_n" -ge 2 ]]'
@@ -432,6 +435,7 @@ ck "随机指纹有分散性（≥2 种）" '[[ "$uniq_n" -ge 2 ]]'
 ck "sanitize 合法 firefox 透传" '[[ "$(reality_sanitize_fingerprint firefox)" == "firefox" ]]'
 ck "sanitize 非法值回退 chrome" '[[ "$(reality_sanitize_fingerprint bogusfp)" == "chrome" ]]'
 ck "sanitize 空值回退 chrome" '[[ "$(reality_sanitize_fingerprint "")" == "chrome" ]]'
+ck "sanitize 把 android 纠正为 chrome（Reality 不兼容）" '[[ "$(reality_sanitize_fingerprint android)" == "chrome" ]]'
 # effective：读 state 的 REALITY_FINGERPRINT；旧版无该字段→chrome
 REALITY_FINGERPRINT="safari"
 ck "effective 读 state 指纹" '[[ "$(reality_effective_fingerprint)" == "safari" ]]'

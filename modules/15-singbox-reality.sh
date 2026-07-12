@@ -302,8 +302,10 @@ reality_generate_short_id() {
 # 关键取舍：不用 uTLS 的 "randomized"（每次连接换指纹反而异常——真实浏览器指纹是稳定的），
 # 而是「装机时定一个真实浏览器指纹并持久化」→ 单节点稳定像真浏览器、节点之间彼此不同。
 # 池仅取主流真实浏览器（sing-box uTLS 合法值），不含 360/q（地域性强、易反成特征）与 randomized。
+# 排除 android：其 uTLS ClientHello 与 sing-box Reality 服务端不兼容，握手报 "nil ecdheKey"
+# （客户端无法从 ServerHello 提取 Reality 公钥），节点直接不可用（实测 android 坏、其余 5 个正常）。
 reality_random_fingerprint() {
-    local fps=(chrome firefox edge safari ios android)
+    local fps=(chrome firefox edge safari ios)
     local n=${#fps[@]} idx
     if command_exists openssl; then
         idx=$(( 0x$(openssl rand -hex 2) % n ))
@@ -314,10 +316,12 @@ reality_random_fingerprint() {
 }
 
 # 校验是否为合法 uTLS 指纹（用于导入/回读兜底）。非法或空 → 回退 chrome。
+# android 虽是 sing-box 合法 uTLS 值，但与 Reality 服务端握手失败（nil ecdheKey），
+# 视同非法一并回退 chrome，纠正历史导入的坏链接。
 reality_sanitize_fingerprint() {
     local fp="${1:-}"
     case "$fp" in
-        chrome|firefox|edge|safari|ios|android|360|q|randomized) printf '%s' "$fp" ;;
+        chrome|firefox|edge|safari|ios|360|q|randomized) printf '%s' "$fp" ;;
         *) printf '%s' "chrome" ;;
     esac
 }
